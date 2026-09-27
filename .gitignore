@@ -1,0 +1,43 @@
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+build/
+bin/
+out/
+x64/
+Debug/
+Release/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.ninja
+.ninja_deps
+.ninja_log
+
+# Compiled binaries and libraries
+*.obj
+*.exe
+*.dll
+*.asi
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.spv
+
+# Logs and runtime artifacts
+*.log
+cbr.log
+cbr_debug.txt
+imgui.ini
+*.bak
+
+# Temporary / OS
+.DS_Store
+Thumbs.db
