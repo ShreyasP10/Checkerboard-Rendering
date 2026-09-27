@@ -1,133 +1,236 @@
 # RDR2 Checkerboard Rendering Mod (CBR)
 
-[![Status: Planning](https://img.shields.io/badge/status-planning-yellow.svg)]()
+[![Status: Planning & Prototyping](https://img.shields.io/badge/status-prototyping-yellow.svg)]()
 [![Platform: Windows](https://img.shields.io/badge/platform-Windows-blue.svg)]()
-[![API: Vulkan/DX12](https://img.shields.io/badge/API-Vulkan%20%7C%20DX12-green.svg)]()
-[![License: MIT](https://img.shields.io/badge/License-MIT-lightgrey.svg)]()
+[![API: Vulkan / DX12](https://img.shields.io/badge/API-Vulkan%20%7C%20DX12-green.svg)]()
+[![Target: GTX 1070 Ti](https://img.shields.io/badge/Target-GTX%201070%20Ti%20(Pascal)-orange.svg)]()
+[![License: MIT](https://img.shields.io/badge/License-MIT-lightgrey.svg)](LICENSE)
 
-A community-driven attempt to implement **Checkerboard Rendering (CBR)** in *Red Dead Redemption 2* on PC, bringing a PS4 Pro‑style temporal upscaling technique to modern GPUs—specifically targeting the **NVIDIA GTX 1070 Ti** and similar Pascal‑era hardware.
+A community-driven graphics modification implementing **Checkerboard Rendering (CBR)** in *Red Dead Redemption 2* (PC), bringing the PlayStation 4 Pro's hardware-assisted temporal reconstruction technique to modern PC GPUs—specifically targeting the **NVIDIA GeForce GTX 1070 Ti** and Pascal-architecture hardware.
 
-> **⚠️ Project Status: Research & Design Phase**
-> This mod is **not yet functional**. We are currently reverse‑engineering the RAGE engine, documenting requirements, and prototyping the rendering pipeline hooks. No public builds are available.
+> **⚠️ Project Status: Prototyping & Pipeline Architecture Phase**  
+> We have reverse-engineered the rendering pipeline concepts, completed the engineering specifications, authored the reconstruction compute shaders, and established the Vulkan/DX12 hook layer. Public release builds will be packaged following game integration validation.
 
 ---
 
 ## 📖 Table of Contents
 - [About](#about)
-- [Goals](#goals)
-- [Current Status](#current-status)
-- [Planned Features](#planned-features)
-- [Technical Approach](#technical-approach)
-- [Documentation](#documentation)
-- [Requirements (Development)](#requirements-development)
+- [How It Works](#how-it-works)
+- [Key Features](#key-features)
+- [Architecture & Repository Structure](#architecture--repository-structure)
+- [Engineering Documentation](#engineering-documentation)
+- [Reconstruction Shader Math](#reconstruction-shader-math)
+- [Hardware & Development Requirements](#hardware--development-requirements)
 - [Building](#building)
+- [Configuration](#configuration)
 - [Contributing](#contributing)
-- [Collaborators](#collaborators)
+- [Collaborators & Maintainers](#collaborators--maintainers)
 - [License](#license)
-- [Acknowledgments](#acknowledgments)
 - [Disclaimer](#disclaimer)
 
 ---
 
 ## About
 
-*Red Dead Redemption 2* on the PlayStation 4 Pro uses **checkerboard rendering** to output a 4K image while rendering only half the pixels per frame. On PC, no equivalent exists—players must choose between native 4K (too demanding for mid‑range GPUs) or modern upscalers like FSR/DLSS.
+On the PlayStation 4 Pro, *Red Dead Redemption 2* outputs a 4K presentation by rendering only half the pixels per frame (1920×2160 or quarter-resolution with 2× MSAA) in an alternating checkerboard pattern, reconstructing missing details across time. 
 
-This project aims to recreate the PS4 Pro’s CBR technique as a mod for RDR2 on PC. The goal is not to replace FSR, but to offer a historically accurate, console‑equivalent rendering path for enthusiasts and researchers.
+On PC, players on mid-range GPUs such as the **NVIDIA GeForce GTX 1070 Ti** face a difficult dilemma:
+- **Native 4K (3840×2160)** is too demanding for 60 FPS gameplay on Pascal hardware.
+- **DLSS** requires RTX hardware (Tensor cores) and cannot run on Pascal GPUs.
+- **FSR** provides spatial/temporal upscaling but has a distinct aesthetic and does not replicate the console presentation.
 
-**Target GPU:** GTX 1070 Ti (Pascal), though the technique should work on any GPU with compute shader support.
-
----
-
-## Goals
-
-- Implement true checkerboard rendering for RDR2’s main scene pass.
-- Reconstruct a full 3840×2160 image from quarter‑resolution MSAA buffers.
-- Maintain compatibility with the game’s existing TAA and post‑processing.
-- Provide a runtime toggle and debug views via an ImGui overlay.
-- Achieve a **≥15% frame‑time reduction** vs native 4K on a GTX 1070 Ti.
-- Keep VRAM overhead under **300 MB**.
+This project delivers a **native ASI plugin** that intercepts RDR2's rendering passes, renders the primary geometry at half shading cost, and reconstructs a full 4K frame using an optimized compute shader with temporal reprojection, depth disocclusion detection, and YCoCg neighborhood color clamping.
 
 ---
 
-## Current Status
+## How It Works
 
-| Phase | Description | Status |
-|-------|-------------|--------|
-| 0 | Research & reverse‑engineering | 🔄 In Progress |
-| 1 | Hook framework (Vulkan/DX12) | ⏳ Planned |
-| 2 | Render target interception | ⏳ Planned |
-| 3 | Projection jitter & quarter‑res render | ⏳ Planned |
-| 4 | Reconstruction shader | ⏳ Planned |
-| 5 | Post‑processing integration | ⏳ Planned |
-| 6 | Optimization | ⏳ Planned |
-| 7 | Polish & release | ⏳ Planned |
+```
+Frame N:     [ X ] [   ] [ X ] [   ]  <-- Shaded at Quarter-Res 2x MSAA + Jitter
+             [   ] [ X ] [   ] [ X ]
+               |
+               v
+Reconstruct: Current Active Pixels  <─── Keep 2x MSAA Samples
+             Missing Holes          <─── Sample Previous Frame (N-1) using Motion Vectors
+                                         [Depth Validation & 3x3 YCoCg Clamping]
+               |
+               v
+Output:      Full 3840×2160 4K Image
+```
 
-**Biggest blocker:** Access to the game’s internal motion vectors. Without them, CBR quality will be severely limited.
-
----
-
-## Planned Features
-
-- [ ] Checkerboard rendering with 2× MSAA at quarter resolution.
-- [ ] One‑pixel projection jitter alternating each frame.
-- [ ] MIP LOD bias of -0.5 during the reduced‑resolution pass.
-- [ ] Custom compute shader for temporal reconstruction.
-- [ ] History buffer with disocclusion detection.
-- [ ] Runtime toggle (`cbr.ini` or ImGui).
-- [ ] Debug visualizations (checkerboard pattern, reprojection mask).
-- [ ] Logging to `cbr.log`.
+1. **Target Interception:** Intercepts main scene color and depth attachments, routing them to quarter-resolution (1920×1080) targets configured with 2× MSAA.
+2. **Subpixel Projection Jitter:** Alternates the camera projection matrix by $\pm 0.5$ pixels every frame, shifting the 2× MSAA subpixel grid to cover complementary checkerboard coordinates.
+3. **MIP LOD Bias Injection:** Injects a $-0.5$ LOD bias into scene texture samplers, ensuring high-frequency textures sample at full 4K Nyquist clarity despite reduced geometry resolution.
+4. **Compute Shader Reconstruction:** Runs a compute shader (`cbr_reconstruct.comp` / `cbr_reconstruct.hlsl`) that evaluates pixel parity, reprojects history using motion vectors, tests depth for disocclusion, and clamps against the 3×3 color neighborhood.
 
 ---
 
-## Technical Approach
+## Key Features
 
-The mod will be an **ASI plugin** or **DLL** that hooks the game’s graphics API calls (Vulkan preferred for Pascal control). It will:
-
-1. Intercept creation of the main scene color/depth targets.
-2. Redirect them to quarter‑resolution (1920×1080 for 4K output) with 2× MSAA.
-3. Inject a checkerboard jitter into the projection matrix each frame.
-4. Run a custom reconstruction shader that merges current and previous frames using motion vectors.
-5. Blend the result back into the game’s post‑processing chain.
-
-For a full technical breakdown, see the [TRD](docs/TRD.md).
-
----
-
-## Documentation
-
-Comprehensive planning documents are available in the [`docs/`](docs/) folder:
-
-- [Product Requirements Document (PRD)](docs/PRD.md)
-- [System Requirements Document (SRD)](docs/SRD.md)
-- [Software Requirements Specification (SRS)](docs/SRS.md)
-- [Technical Requirements Document (TRD)](docs/TRD.md)
-- [Development Plan](docs/DEV_PLAN.md)
-- [Risk Register](docs/RISK_REGISTER.md)
+- [x] Full architectural specification & requirements documentation (PRD, SRD, SRS, TRD, DEV_PLAN, RISK_REGISTER).
+- [x] Complete GLSL & HLSL reconstruction compute shaders with 2× MSAA unpack and subpixel parity testing.
+- [x] Temporal reprojection with velocity vector sampling and camera depth unprojection fallback.
+- [x] Depth delta disocclusion detection with spatial cross-bilateral filter fallback.
+- [x] 3×3 neighborhood color bounding box clamping in YCoCg space to suppress ghosting.
+- [x] Pascal architecture optimization (GP104 warp size 32, shared memory tiling, low register pressure).
+- [x] MinHook-powered Vulkan & DirectX 12 interception layer.
+- [x] Runtime configuration via `cbr.ini` and in-game ImGui debug overlay.
+- [x] Multi-mode debug visualizer (checkerboard grid mask, disocclusion heatmap, motion vector field).
 
 ---
 
-## Requirements (Development)
+## Architecture & Repository Structure
 
-To build and test this mod, you will need:
+```
+Checkerboard-Rendering/
+├── CMakeLists.txt              # CMake build script for rdr2-cbr.asi
+├── LICENSE                     # MIT License
+├── README.md                   # Project overview and instructions
+├── CONTRIBUTING.md             # Contribution guidelines & coding standards
+├── cbr.ini                     # Runtime configuration file
+├── .gitignore                  # Git ignore rules
+│
+├── docs/                       # Comprehensive engineering documentation
+│   ├── PRD.md                  # Product Requirements Document
+│   ├── SRD.md                  # System Requirements Document
+│   ├── SRS.md                  # Software Requirements Specification (IEEE 830)
+│   ├── TRD.md                  # Technical Requirements Document
+│   ├── DEV_PLAN.md             # Phased Development Roadmap & Milestones
+│   └── RISK_REGISTER.md        # Risk Analysis & Mitigation Strategies
+│
+├── include/cbr/                # C++ Architecture Headers
+│   ├── cbr_engine.h            # Core engine controller & frame lifecycle
+│   ├── hooks.h                 # Vulkan & DX12 API hook declarations
+│   ├── render_target_manager.h # Intermediate MSAA & history buffer manager
+│   ├── jitter_manager.h        # Projection matrix jitter calculator
+│   ├── reconstruction_pass.h   # Compute shader dispatch & pipeline manager
+│   ├── config.h                # cbr.ini configuration reader & settings
+│   ├── logger.h                # Thread-safe cbr.log file logger
+│   └── ui_overlay.h            # ImGui in-game debug overlay
+│
+├── src/                        # C++ Implementation
+│   ├── main.cpp                # DLL entry point (DllMain) & loader integration
+│   ├── cbr_engine.cpp          # Pipeline orchestration
+│   ├── hooks_vulkan.cpp        # Vulkan API hooks (vkQueuePresentKHR, vkCmdDraw, etc.)
+│   ├── hooks_dx12.cpp          # DirectX 12 hooks (Present, ExecuteCommandLists, etc.)
+│   ├── render_target_manager.cpp # VRAM allocation & ping-pong history buffers
+│   ├── jitter_manager.cpp      # Subpixel matrix perturbation
+│   ├── reconstruction_pass.cpp # Compute pipeline dispatch
+│   ├── config.cpp              # Configuration file parser
+│   ├── logger.cpp              # Logger implementation
+│   └── ui_overlay.cpp          # ImGui overlay rendering
+│
+└── shaders/                    # GPU Reconstruction Shaders
+    ├── cbr_reconstruct.comp    # Complete GLSL Vulkan compute shader
+    ├── cbr_reconstruct.hlsl    # Complete HLSL DirectX 12 compute shader
+    └── cbr_resolve_simple.comp # Spatial-only fallback resolve shader
+```
 
-- **Visual Studio 2022** (or Build Tools) with C++20.
-- **Vulkan SDK** (latest) or **Windows 10/11 SDK** for DX12.
-- **MinHook** for API hooking.
-- **ImGui** (docking branch) for debug UI.
-- **RDR2-ASI Template** (or similar) for plugin loading.
-- A legitimate copy of **Red Dead Redemption 2** (version 1436.28+).
-- **NVIDIA GTX 1070 Ti** (or similar) for primary testing.
+---
+
+## Engineering Documentation
+
+Detailed specifications are maintained in the [`docs/`](docs/) directory:
+
+- 📄 [**Product Requirements Document (PRD)**](docs/PRD.md) – Problem statement, target personas, KPIs, and scope.
+- 📄 [**System Requirements Document (SRD)**](docs/SRD.md) – Subsystem architecture, external interfaces, and VRAM budget.
+- 📄 [**Software Requirements Specification (SRS)**](docs/SRS.md) – Detailed functional requirements, mathematical formulas, and IEEE 830 standards.
+- 📄 [**Technical Requirements Document (TRD)**](docs/TRD.md) – Vulkan/DX12 hook mechanics, buffer formats, and Pascal GPU optimizations.
+- 📄 [**Development Plan (DEV_PLAN)**](docs/DEV_PLAN.md) – 8-phase roadmap, milestones, and deliverable schedules.
+- 📄 [**Risk Register (RISK_REGISTER)**](docs/RISK_REGISTER.md) – Assessment of motion vector extraction, Pascal bandwidth, and mitigations.
+
+---
+
+## Reconstruction Shader Math
+
+The core compute shader resolves pixels based on parity:
+
+$$\text{Phase}(x, y) = (x + y) \pmod 2$$
+
+- When $\text{Phase}(x, y) = (\text{FrameIndex} \pmod 2)$, the pixel is sampled directly from the current frame's 2× MSAA buffer.
+- When $\text{Phase}(x, y) \neq (\text{FrameIndex} \pmod 2)$, the pixel is reprojected from history:
+
+$$\mathbf{UV}_{\text{prev}} = \mathbf{UV}_{\text{curr}} - \mathbf{V}(x, y)$$
+
+If the depth variance exceeds the tolerance threshold:
+
+$$\Delta Z = \frac{|Z_{\text{curr}} - Z_{\text{prev}}|}{\max(Z_{\text{curr}}, 10^{-5})} > \text{Threshold}$$
+
+The shader rejects the history sample and executes a spatial cross-bilateral filter from the current frame's four diagonally adjacent active samples:
+
+$$C_{\text{spatial}} = \frac{\sum_{k=1}^4 w_k C_k}{\sum_{k=1}^4 w_k}, \quad w_k = \exp\left(-\frac{\|p_k - p\|^2}{2\sigma_d^2}\right) \cdot \exp\left(-\frac{|Z_k - Z|^2}{2\sigma_z^2}\right)$$
+
+---
+
+## Hardware & Development Requirements
+
+- **Target GPU:** NVIDIA GeForce GTX 1070 Ti (Pascal GP104, 8 GB GDDR5) or equivalent.
+- **Operating System:** Windows 10 (64-bit) / Windows 11.
+- **Compiler:** Microsoft Visual C++ 2022 (MSVC v143) with C++20 support.
+- **APIs:** Vulkan SDK (1.3+) or Windows SDK (DX12).
+- **Hooking & UI Libraries:** MinHook, Dear ImGui (Docking branch).
 
 ---
 
 ## Building
 
-> **Note:** Build instructions are placeholders until the project reaches Phase 1.
-
 ```bash
-git clone https://github.com/yourusername/rdr2-cbr-mod.git
-cd rdr2-cbr-mod
+# Clone the repository
+git clone https://github.com/ShreyasP10/Checkerboard-Rendering.git
+cd Checkerboard-Rendering
+
+# Generate build files
 mkdir build && cd build
 cmake .. -G "Visual Studio 17 2022" -A x64
+
+# Build release ASI binary
 cmake --build . --config Release
+```
+
+The resulting `rdr2-cbr.asi` and `cbr.ini` are placed into the *Red Dead Redemption 2* game root directory alongside an ASI loader (e.g., `dinput8.dll`).
+
+---
+
+## Configuration
+
+Settings can be customized at runtime or in `cbr.ini`:
+
+```ini
+[General]
+Enabled = true
+TargetWidth = 3840
+TargetHeight = 2160
+PreferredApi = Vulkan
+MipLodBias = -0.5
+
+[Reconstruction]
+DepthTolerance = 0.010
+EnableColorClamping = true
+ColorSpace = YCoCg
+HistoryWeight = 0.90
+EnableSpatialFallback = true
+```
+
+---
+
+## Contributing
+
+Contributions, feedback, and research findings are welcome! Please check [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines, focus areas, and code standards.
+
+---
+
+## Collaborators & Maintainers
+
+- **Shreyas Pawar** – Project Lead, Co-Owner & Graphics Architecture
+
+---
+
+## License
+
+This project is licensed under the **MIT License**. See [LICENSE](LICENSE) for details.
+
+---
+
+## Disclaimer
+
+This mod is for **educational, experimental, and research purposes only**. It is not affiliated with, endorsed by, or associated with Rockstar Games or Take-Two Interactive. Use strictly in offline single-player mode.

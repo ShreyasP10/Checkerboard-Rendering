@@ -1,0 +1,45 @@
+#version 450 core
+
+/**
+ * RDR2 Checkerboard Rendering Mod (CBR) - Lightweight Spatial Fallback Resolve
+ * Target: Vulkan SPIR-V
+ * Author & Co-Owner: Shreyas Pawar
+ */
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2DMS u_QuarterColorMSAA;
+layout(set = 0, binding = 1, rgba16f) writeonly uniform image2D u_OutputImage;
+
+layout(push_constant) uniform SpatialConstants {
+    vec2 u_TargetResolution;
+    vec2 u_InvTargetResolution;
+    uint u_FrameIndex;
+} pc;
+
+void main() {
+    ivec2 pixelCoord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 targetSize = ivec2(pc.u_TargetResolution);
+
+    if (pixelCoord.x >= targetSize.x || pixelCoord.y >= targetSize.y) {
+        return;
+    }
+
+    ivec2 quarterCoord = pixelCoord / 2;
+    uint pixelParity = (uint(pixelCoord.x) + uint(pixelCoord.y)) & 1u;
+    uint frameParity = pc.u_FrameIndex & 1u;
+
+    int sampleIndex = int((uint(pixelCoord.x) & 1u) ^ (uint(pixelCoord.y) & 1u));
+    vec4 sample0 = texelFetch(u_QuarterColorMSAA, quarterCoord, 0);
+    vec4 sample1 = texelFetch(u_QuarterColorMSAA, quarterCoord, 1);
+
+    vec3 finalColor;
+    if (pixelParity == frameParity) {
+        finalColor = (sampleIndex == 0) ? sample0.rgb : sample1.rgb;
+    } else {
+        // Average the 2 subpixel samples for missing positions
+        finalColor = 0.5 * (sample0.rgb + sample1.rgb);
+    }
+
+    imageStore(u_OutputImage, pixelCoord, vec4(finalColor, 1.0));
+}
