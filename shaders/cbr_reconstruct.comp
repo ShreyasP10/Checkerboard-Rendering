@@ -41,11 +41,6 @@ layout(push_constant) uniform CBRConstants {
     float u_MipLodBias;             // Texture LOD bias (-0.5)
 } pc;
 
-// =============================================================================
-// Pascal Shared Memory Caching (18x18 Tile with 1px Boundary Apron)
-// =============================================================================
-shared vec3  s_TileColor[18][18];
-shared float s_TileDepth[18][18];
 
 // =============================================================================
 // Color Space Conversions (YCoCg for artifact-free color clamping)
@@ -97,13 +92,6 @@ void main() {
     // Fetch current frame sample
     vec4 currentSample = texelFetch(u_QuarterColorMSAA, quarterCoord, msaaSampleIndex);
     float currentDepth = texelFetch(u_QuarterDepthMSAA, quarterCoord, msaaSampleIndex).r;
-
-    // Populate local shared memory for the center thread
-    ivec2 localID = ivec2(gl_LocalInvocationID.xy) + ivec2(1, 1);
-    s_TileColor[localID.x][localID.y] = currentSample.rgb;
-    s_TileDepth[localID.x][localID.y] = currentDepth;
-
-    barrier();
 
     // -------------------------------------------------------------------------
     // 2. Fetch Motion Vectors & Calculate Previous UV Coordinates

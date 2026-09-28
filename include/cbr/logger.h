@@ -24,6 +24,10 @@ public:
 
     void Log(LogLevel level, const std::string& message);
 
+    void LogFmt(LogLevel level, const char* message) {
+        Log(level, std::string(message));
+    }
+
     template<typename... Args>
     void LogFmt(LogLevel level, const char* format, Args... args) {
         char buffer[1024];

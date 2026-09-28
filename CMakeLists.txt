@@ -41,6 +41,7 @@ set(CBR_SOURCES
     ${CBR_SOURCE_DIR}/main.cpp
     ${CBR_SOURCE_DIR}/cbr_engine.cpp
     ${CBR_SOURCE_DIR}/config.cpp
+    ${CBR_SOURCE_DIR}/hooks.cpp
     ${CBR_SOURCE_DIR}/hooks_vulkan.cpp
     ${CBR_SOURCE_DIR}/hooks_dx12.cpp
     ${CBR_SOURCE_DIR}/jitter_manager.cpp

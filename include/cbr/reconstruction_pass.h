@@ -14,6 +14,7 @@ struct ReconstructionPushConstants {
     uint32_t debugView;
     uint32_t enableColorClamping;
     float    mipLodBias;
+    float    padding[2];
 };
 
 class ReconstructionPass {

@@ -96,15 +96,4 @@ void CBREngine::OnPostPresent() {
     m_frameIndex.fetch_add(1);
 }
 
-bool HookManager::Initialize() {
-    CBR_LOG_INFO("HookManager initialized.");
-    return true;
-}
-
-void HookManager::Shutdown() {
-    UninstallVulkanHooks();
-    UninstallDX12Hooks();
-    CBR_LOG_INFO("HookManager shut down.");
-}
-
 } // namespace cbr
