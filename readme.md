@@ -289,7 +289,8 @@ Contributions, feedback, and research findings are welcome! Please check [CONTRI
 
 ## Collaborators & Maintainers
 
-- **Shreyas Pawar** – Project Lead, Co-Owner & Graphics Architecture
+- **Atharva Mahajan** – Project Lead, Co-Owner & Graphics Architecture
+- **Shreyas Pawar** – Co-Owner & Graphics Architecture
 
 ---
 
