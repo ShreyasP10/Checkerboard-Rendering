@@ -111,6 +111,7 @@ Checkerboard-Rendering/
 ├── src/                        # C++ Implementation
 │   ├── main.cpp                # DLL entry point (DllMain) & loader integration
 │   ├── cbr_engine.cpp          # Pipeline orchestration
+│   ├── hooks.cpp               # Hook manager core & lifecycle
 │   ├── hooks_vulkan.cpp        # Vulkan API hooks (vkQueuePresentKHR, vkCmdDraw, etc.)
 │   ├── hooks_dx12.cpp          # DirectX 12 hooks (Present, ExecuteCommandLists, etc.)
 │   ├── render_target_manager.cpp # VRAM allocation & ping-pong history buffers
@@ -164,36 +165,103 @@ $$C_{\text{spatial}} = \frac{\sum_{k=1}^4 w_k C_k}{\sum_{k=1}^4 w_k}, \quad w_k 
 
 ## Hardware & Development Requirements
 
-- **Target GPU:** NVIDIA GeForce GTX 1070 Ti (Pascal GP104, 8 GB GDDR5) or equivalent.
-- **Operating System:** Windows 10 (64-bit) / Windows 11.
-- **Compiler:** Microsoft Visual C++ 2022 (MSVC v143) with C++20 support.
-- **APIs:** Vulkan SDK (1.3+) or Windows SDK (DX12).
-- **Hooking & UI Libraries:** MinHook, Dear ImGui (Docking branch).
+| Component | Minimum Specification | Recommended (Target Baseline) | Role in CBR Pipeline |
+|---|---|---|---|
+| **GPU** | GTX 1060 (6 GB) / RX 580 (8 GB) | **NVIDIA GeForce GTX 1070 Ti (8 GB GDDR5)** | Compute shader capability (SM 5.0+), 2× MSAA rasterization, ≥250 GB/s bandwidth |
+| **GPU VRAM** | 6 GB | **8 GB GDDR5** | Accommodates ~285 MB dedicated VRAM for 4K ping-pong history and depth buffers |
+| **CPU** | Quad-Core (i5-8400 / Ryzen 2600) | **6-Core / 12-Thread (i7 / Ryzen 3600+)** | Interception hooks add minimal overhead ($\le 0.05\,\mu\text{s}$ per draw call) |
+| **RAM** | 12 GB | **16 GB DDR4 Dual-Channel** | System memory stability during texture streaming |
+| **OS** | Windows 10 (64-bit, 19041+) | **Windows 10 / Windows 11 (64-bit)** | Native Vulkan 1.3 and DirectX 12 support |
+| **Display** | 1080p (with DSR 4K) | **Native 1440p or 4K (3840×2160) Monitor / TV** | Presentation resolution for reconstructed output |
 
 ---
 
-## Building
+## 🚀 How to Build, Install & Run
 
-```bash
+### Step 1: Software Prerequisites
+To compile the mod from source, ensure you have:
+1. **Visual Studio 2022** (Community or higher) with the **"Desktop development with C++"** workload (C++20).
+2. **CMake** (v3.20 or newer).
+3. **Vulkan SDK** (1.3.x from [LunarG](https://vulkan.lunarg.com/)).
+4. An **ASI Loader** for RDR2, such as `dinput8.dll` (from ScriptHookRDR2 or open-source ASI loaders).
+
+### Step 2: Build the ASI Plugin
+Run the following commands in PowerShell or Command Prompt:
+
+```powershell
 # Clone the repository
 git clone https://github.com/ShreyasP10/Checkerboard-Rendering.git
 cd Checkerboard-Rendering
 
-# Generate build files
-mkdir build && cd build
+# Create build directory and generate Visual Studio solution
+mkdir build
+cd build
 cmake .. -G "Visual Studio 17 2022" -A x64
 
-# Build release ASI binary
+# Compile the Release build
 cmake --build . --config Release
 ```
 
-The resulting `rdr2-cbr.asi` and `cbr.ini` are placed into the *Red Dead Redemption 2* game root directory alongside an ASI loader (e.g., `dinput8.dll`).
+The build process outputs:
+- `build/bin/rdr2-cbr.asi` — The compiled ASI mod binary.
+- `build/bin/cbr.ini` — The default configuration file.
+
+### Step 3: Install into RDR2
+1. Locate your *Red Dead Redemption 2* game root directory (where `RDR2.exe` is found):
+   - **Steam:** `Steam\steamapps\common\Red Dead Redemption 2\`
+   - **Rockstar Games:** `Rockstar Games\Red Dead Redemption 2\`
+   - **Epic Games:** `Epic Games\Red Dead Redemption 2\`
+2. Copy the following files into the RDR2 root folder:
+   - `dinput8.dll` (ASI Loader)
+   - `rdr2-cbr.asi` (from `build/bin/`)
+   - `cbr.ini` (from `build/bin/`)
+
+```
+Red Dead Redemption 2/
+├── RDR2.exe
+├── dinput8.dll         <-- ASI Loader (executes .asi plugins)
+├── rdr2-cbr.asi        <-- CBR Mod Plugin
+└── cbr.ini             <-- CBR Configuration Settings
+```
+
+### Step 4: Recommended In-Game Settings
+Launch *Red Dead Redemption 2*, open **Settings > Graphics**, and configure:
+1. **Graphics API:** Set to **Vulkan** (Vulkan allows Pascal GPUs direct subpixel sample control).
+2. **Resolution:** Set to **3840×2160 (4K)** (or your target display resolution).
+3. **TAA (Temporal Anti-Aliasing):** Set to **Medium** or **High** (ensures internal velocity vectors are generated).
+4. **Resolution Scale:** Set to **Off / 1.0×** (the mod automatically handles quarter-resolution rendering and resolve).
+
+### Step 5: In-Game Controls & Debug Modes
+- **Toggle Overlay:** Press **`F11`** or **`Insert`** in-game to display the ImGui control panel.
+- **Debug Views (configurable in `cbr.ini` or ImGui):**
+  - `DebugView = 0`: Normal CBR Reconstructed 4K output.
+  - `DebugView = 1`: **Checkerboard Mask** — reveals active frame samples vs reconstructed pixels.
+  - `DebugView = 2`: **Disocclusion Heatmap** — **Green** indicates valid temporal history; **Red** highlights disoccluded geometry using spatial fallback.
+  - `DebugView = 3`: **Motion Vector Field** — visualizes screen-space velocity vectors.
+  - `DebugView = 4`: **Raw Buffer** — displays quarter-resolution unresolved image.
+
+### Step 6: Verifying Installation via Logs
+Upon launching the game, open `cbr.log` in the RDR2 root directory to verify hook initialization:
+```text
+=================================================================
+ RDR2 Checkerboard Rendering Mod (CBR) Log Initialized           
+ Maintainer: Shreyas Pawar                                       
+ Target: NVIDIA GeForce GTX 1070 Ti & Vulkan / DX12              
+=================================================================
+[INFO] Initializing CBREngine for Red Dead Redemption 2...
+[INFO] Configuration successfully loaded from cbr.ini (Target: 3840x2160, API: Vulkan, CBR Enabled: true)
+[INFO] RenderTargetManager initialized for target: 3840x2160
+[INFO] Quarter-Resolution 2x MSAA Buffer size: 1920x1080
+[INFO] Total CBR VRAM Footprint: 285.20 MB
+[INFO] Vulkan interception hooks successfully registered.
+[INFO] CBREngine initialized successfully. Ready for frame interception.
+```
 
 ---
 
-## Configuration
+## Configuration (`cbr.ini`)
 
-Settings can be customized at runtime or in `cbr.ini`:
+Settings can be customized before launch in `cbr.ini` or on the fly via the in-game overlay:
 
 ```ini
 [General]

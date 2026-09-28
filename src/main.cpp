@@ -17,6 +17,11 @@ DWORD WINAPI CBRInitThread(LPVOID /*lpParam*/) {
 
 } // namespace
 
+// Exported symbol ensuring the ASI plugin has an export table entry in PE header
+extern "C" __declspec(dllexport) void CBR_PluginInit() {
+    cbr::CBREngine::Get().Initialize();
+}
+
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID /*lpReserved*/) {
     switch (ul_reason_for_call) {
         case DLL_PROCESS_ATTACH: {

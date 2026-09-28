@@ -35,6 +35,7 @@ cbuffer CBRConstants : register(b0)
     uint   g_DebugView;              // 0=Normal, 1=Mask, 2=Disocclusion, 3=Motion, 4=Raw
     uint   g_EnableColorClamping;    // 1 = True, 0 = False
     float  g_MipLodBias;             // Texture LOD bias (-0.5f)
+    float2 g_Padding;                // 16-byte alignment padding
 };
 
 // =============================================================================
@@ -57,7 +58,7 @@ float3 YCoCgtoRGB(float3 ycocg)
     float R  = Y + Co - Cg;
     float G  = Y + Cg;
     float B  = Y - Co - Cg;
-    return max(0.0f.xxx, float3(R, G, B));
+    return max(float3(0.0f, 0.0f, 0.0f), float3(R, G, B));
 }
 
 // =============================================================================
@@ -89,8 +90,8 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     // Subpixel MSAA sample index calculation
     int msaaSampleIndex = int((uint(pixelCoord.x) & 1u) ^ (uint(pixelCoord.y) & 1u));
 
-    float4 currentSample = g_QuarterColorMSAA.Load(quarterCoord, msaaSampleIndex);
-    float currentDepth   = g_QuarterDepthMSAA.Load(quarterCoord, msaaSampleIndex).r;
+    float4 currentSample = g_QuarterColorMSAA.Load(int3(quarterCoord, 0), msaaSampleIndex);
+    float currentDepth   = g_QuarterDepthMSAA.Load(int3(quarterCoord, 0), msaaSampleIndex).r;
 
     // -------------------------------------------------------------------------
     // 2. Motion Vector Fetch & History Coordinate Calculation
@@ -136,7 +137,7 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
             int2 neighborCoord = clamp(pixelCoord + int2(dx, dy), int2(0, 0), targetSize - int2(1, 1));
             int2 neighborQuarter = neighborCoord / 2;
             int neighborSample = int((uint(neighborCoord.x) & 1u) ^ (uint(neighborCoord.y) & 1u));
-            float3 neighborColor = g_QuarterColorMSAA.Load(neighborQuarter, neighborSample).rgb;
+            float3 neighborColor = g_QuarterColorMSAA.Load(int3(neighborQuarter, 0), neighborSample).rgb;
 
             float3 neighborYCoCg = RGBtoYCoCg(neighborColor);
             colorMin = min(colorMin, neighborYCoCg);
@@ -186,8 +187,8 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
                 int2 sQuarter = sampleCoord / 2;
                 int sIndex = int((uint(sampleCoord.x) & 1u) ^ (uint(sampleCoord.y) & 1u));
 
-                float3 sCol = g_QuarterColorMSAA.Load(sQuarter, sIndex).rgb;
-                float  sDep = g_QuarterDepthMSAA.Load(sQuarter, sIndex).r;
+                float3 sCol = g_QuarterColorMSAA.Load(int3(sQuarter, 0), sIndex).rgb;
+                float  sDep = g_QuarterDepthMSAA.Load(int3(sQuarter, 0), sIndex).r;
 
                 float depthWeight = exp(-abs(currentDepth - sDep) * 100.0f);
                 accumColor += sCol * depthWeight;
