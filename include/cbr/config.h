@@ -1,7 +1,8 @@
 #pragma once
 
-#include <string>
 #include <cstdint>
+#include <filesystem>
+#include <string>
 
 namespace cbr {
 
@@ -51,8 +52,8 @@ class ConfigManager {
 public:
     static ConfigManager& Get();
 
-    bool Load(const std::string& configPath);
-    bool Save(const std::string& configPath);
+    bool Load(const std::filesystem::path& configPath);
+    bool Save(const std::filesystem::path& configPath);
 
     const CBRConfig& GetConfig() const { return m_config; }
     CBRConfig& GetMutableConfig() { return m_config; }

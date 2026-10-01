@@ -70,11 +70,14 @@ Output:      Full 3840×2160 4K Image
 
 - [x] Full architectural specification & requirements documentation (PRD, SRD, SRS, TRD, DEV_PLAN, RISK_REGISTER).
 - [x] Complete GLSL & HLSL reconstruction compute shaders with 2× MSAA unpack and subpixel parity testing.
-- [x] Temporal reprojection math with velocity vector sampling and camera depth unprojection fallback.
+- [x] Temporal reprojection math with velocity vector sampling.
+- [ ] Camera depth unprojection fallback (not implemented).
 - [x] Depth delta disocclusion detection with spatial cross-bilateral filter fallback.
 - [x] 3×3 neighborhood color bounding box clamping in YCoCg space to suppress ghosting.
-- [x] Pascal architecture optimization (GP104 warp size 32, shared memory tiling, low register pressure).
-- [x] Runtime configuration via `cbr.ini` and in-game ImGui debug overlay architecture.
+- [x] Pascal-oriented design (16×16 thread groups, guarded neighborhood fetches to cut bandwidth).
+- [ ] Shared-memory tiling (not implemented; neighborhood data is fetched directly from the MSAA targets).
+- [x] Runtime configuration via `cbr.ini`.
+- [ ] In-game ImGui debug overlay (placeholder only; no ImGui integration or F11/Insert key handling yet).
 - [x] Multi-mode debug visualizer (checkerboard grid mask, disocclusion heatmap, motion vector field).
 - [ ] Live Vulkan & DirectX 12 function hooking & engine command buffer interception (Pending RDR2 dynamic address offset resolution).
 - [ ] Automated game projection matrix offset injection (Pending RDR2 script hook / pattern scan integration).
@@ -172,7 +175,7 @@ $$C_{\text{spatial}} = \frac{\sum_{k=1}^4 w_k C_k}{\sum_{k=1}^4 w_k}, \quad w_k 
 |---|---|---|---|
 | **GPU** | GTX 1060 (6 GB) / RX 580 (8 GB) | **NVIDIA GeForce GTX 1070 Ti (8 GB GDDR5)** | Compute shader capability (SM 5.0+), 2× MSAA rasterization, ≥250 GB/s bandwidth |
 | **GPU VRAM** | 6 GB | **8 GB GDDR5** | Accommodates ~268.95 MB dedicated VRAM for 4K ping-pong history and depth buffers |
-| **CPU** | Quad-Core (i5-8400 / Ryzen 2600) | **6-Core / 12-Thread (i7 / Ryzen 3600+)** | Interception hooks add minimal overhead ($\le 0.05\,\mu\text{s}$ per draw call) |
+| **CPU** | Quad-Core (i5-8400 / Ryzen 2600) | **6-Core / 12-Thread (i7 / Ryzen 3600+)** | Hook overhead to be measured once live hooks exist |
 | **RAM** | 12 GB | **16 GB DDR4 Dual-Channel** | System memory stability during texture streaming |
 | **OS** | Windows 10 (64-bit, 19041+) | **Windows 10 / Windows 11 (64-bit)** | Native Vulkan 1.3 and DirectX 12 support |
 | **Display** | 1080p (with DSR 4K) | **Native 1440p or 4K (3840×2160) Monitor / TV** | Presentation resolution for reconstructed output |
@@ -187,7 +190,7 @@ To compile the mod from source, ensure you have:
 1. **Visual Studio 2022** (Community or higher) with the **"Desktop development with C++"** workload (C++20).
 2. **CMake** (v3.20 or newer).
 3. **Vulkan SDK** (1.3.x from [LunarG](https://vulkan.lunarg.com/)).
-4. An **ASI Loader** for RDR2, such as `dinput8.dll` (from ScriptHookRDR2 or open-source ASI loaders).
+4. An **ASI Loader** for RDR2 (`dinput8.dll`). Download it only from the loader project's official release page and verify its checksum before installing.
 
 ### Step 2: Build the ASI Plugin
 Run the following commands in PowerShell or Command Prompt:
@@ -236,7 +239,7 @@ Launch *Red Dead Redemption 2*, open **Settings > Graphics**, and configure:
 4. **Resolution Scale:** Set to **Off / 1.0×** (the mod automatically handles quarter-resolution rendering and resolve).
 
 ### Step 5: In-Game Controls & Debug Modes
-- **Toggle Overlay:** Press **`F11`** or **`Insert`** in-game to display the ImGui control panel.
+- **Toggle Overlay:** *(planned)* F11 / Insert will toggle the ImGui control panel once the overlay is implemented. For now set `ShowOverlay` in `cbr.ini`.
 - **Debug Views (configurable in `cbr.ini` or ImGui):**
   - `DebugView = 0`: Normal CBR Reconstructed 4K output.
   - `DebugView = 1`: **Checkerboard Mask** — reveals active frame samples vs reconstructed pixels.
@@ -257,7 +260,7 @@ Upon launching the game, open `cbr.log` in the RDR2 root directory to verify hoo
 [INFO] RenderTargetManager initialized for target: 3840x2160
 [INFO] Quarter-Resolution 2x MSAA Buffer size: 1920x1080
 [INFO] Total CBR VRAM Footprint: 268.95 MB
-[INFO] Vulkan interception hooks successfully registered.
+[WARN] Vulkan hook installation is not implemented yet; no hooks are active.
 [INFO] CBREngine initialized successfully. Ready for frame interception.
 ```
 

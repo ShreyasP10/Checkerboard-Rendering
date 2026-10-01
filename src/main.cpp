@@ -2,13 +2,18 @@
 #include "cbr/logger.h"
 
 #if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
+
+#include <filesystem>
 #include <string>
 
 namespace {
-
-HANDLE g_hInitThread = nullptr;
 
 DWORD WINAPI CBRInitThread(LPVOID /*lpParam*/) {
     // Delay slightly to allow game engine core and graphics runtime to settle
@@ -18,18 +23,24 @@ DWORD WINAPI CBRInitThread(LPVOID /*lpParam*/) {
     return 0;
 }
 
-std::string GetModuleDirectoryPath(HMODULE hModule) {
-    char path[MAX_PATH];
-    DWORD len = GetModuleFileNameA(hModule, path, MAX_PATH);
-    if (len == 0 || len == MAX_PATH) {
-        return "";
+// Directory containing this module (wide-char API: safe for non-ASCII and long paths)
+std::filesystem::path GetModuleDirectoryPath(HMODULE hModule) {
+    std::wstring buffer(MAX_PATH, L'\0');
+    for (;;) {
+        DWORD len = GetModuleFileNameW(hModule, buffer.data(), static_cast<DWORD>(buffer.size()));
+        if (len == 0) {
+            return {};
+        }
+        if (len < buffer.size()) {
+            buffer.resize(len);
+            break;
+        }
+        if (buffer.size() >= 32768) { // longest possible NT path
+            return {};
+        }
+        buffer.resize(buffer.size() * 2);
     }
-    std::string fullPath(path);
-    auto lastSlash = fullPath.find_last_of("\\/");
-    if (lastSlash != std::string::npos) {
-        return fullPath.substr(0, lastSlash);
-    }
-    return "";
+    return std::filesystem::path(buffer).parent_path();
 }
 
 } // namespace
@@ -39,34 +50,36 @@ extern "C" __declspec(dllexport) void CBR_PluginInit() {
     cbr::CBREngine::Get().Initialize();
 }
 
-BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID /*lpReserved*/) {
     switch (ul_reason_for_call) {
         case DLL_PROCESS_ATTACH: {
             DisableThreadLibraryCalls(hModule);
 
+            // Pin this module so it can never be unmapped while the init thread or any
+            // installed hook is still executing code inside it. ASI plugins are not meant
+            // to be unloaded, and this removes the need to wait on a thread from DllMain.
+            HMODULE pinned = nullptr;
+            GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                reinterpret_cast<LPCWSTR>(&CBR_PluginInit),
+                &pinned);
+
             // Record module directory for resolving cbr.ini and cbr.log relative to the DLL
             cbr::CBREngine::Get().SetModuleDirectory(GetModuleDirectoryPath(hModule));
 
-            // Launch initialization in background thread to avoid blocking process startup
-            g_hInitThread = CreateThread(nullptr, 0, CBRInitThread, nullptr, 0, nullptr);
+            // Launch initialization in a background thread to avoid blocking process startup.
+            // The handle is not needed afterwards, and the module is pinned, so close it now.
+            HANDLE hThread = CreateThread(nullptr, 0, CBRInitThread, nullptr, 0, nullptr);
+            if (hThread) {
+                CloseHandle(hThread);
+            }
             break;
         }
-        case DLL_PROCESS_DETACH: {
-            bool isProcessExit = (lpReserved != nullptr);
-
-            if (!isProcessExit && g_hInitThread) {
-                // If dynamically unloaded via FreeLibrary, wait up to 2 seconds for init thread to terminate
-                WaitForSingleObject(g_hInitThread, 2000);
-            }
-
-            if (g_hInitThread) {
-                CloseHandle(g_hInitThread);
-                g_hInitThread = nullptr;
-            }
-
-            cbr::CBREngine::Get().Shutdown(isProcessExit);
+        case DLL_PROCESS_DETACH:
+            // Intentionally empty. Under the loader lock (and, on process exit, after other
+            // threads have already been terminated) it is unsafe to take locks, join threads,
+            // or tear down graphics hooks. The OS reclaims all resources at process exit.
             break;
-        }
         case DLL_THREAD_ATTACH:
         case DLL_THREAD_DETACH:
             break;

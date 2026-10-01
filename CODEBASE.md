@@ -51,7 +51,10 @@ This document contains the complete, unabridged source code for every file in th
 ### `CMakeLists.txt`
 ```cmake
 cmake_minimum_required(VERSION 3.20)
-project(RDR2_Checkerboard_Rendering VERSION 1.0.0 LANGUAGES C CXX)
+project(RDR2_Checkerboard_Rendering VERSION 1.0.0 LANGUAGES CXX)
+
+# Required for MSVC_RUNTIME_LIBRARY target property (static CRT below)
+cmake_policy(SET CMP0091 NEW)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -124,12 +127,13 @@ set_target_properties(rdr2-cbr PROPERTIES
 )
 
 # Windows specific definitions
+# (WIN32_LEAN_AND_MEAN / NOMINMAX are defined, guarded, in the sources that include windows.h)
 target_compile_definitions(rdr2-cbr PRIVATE
-    WIN32_LEAN_AND_MEAN
-    NOMINMAX
-    _CRT_SECURE_NO_WARNINGS
     CBR_EXPORTS
 )
+
+# Static CRT: the plugin must not depend on a redistributable that the game may not ship
+set_property(TARGET rdr2-cbr PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 # MSVC optimization and hardening flags
 if(MSVC)
@@ -155,11 +159,11 @@ find_package(Vulkan QUIET)
 if(Vulkan_FOUND)
     message(STATUS "Vulkan SDK headers found: ${Vulkan_INCLUDE_DIRS}")
     target_include_directories(rdr2-cbr PRIVATE ${Vulkan_INCLUDE_DIRS})
-    target_compile_definitions(rdr2-cbr PRIVATE CBR_VULKAN_SUPPORT=1)
 else()
-    message(STATUS "Vulkan SDK not found, using bundled/dynamic runtime headers.")
-    target_compile_definitions(rdr2-cbr PRIVATE CBR_VULKAN_SUPPORT=1)
+    message(STATUS "Vulkan SDK not found, using dynamic runtime function pointers only.")
 endif()
+# Vulkan support does not need the SDK at build time (functions are resolved at runtime)
+target_compile_definitions(rdr2-cbr PRIVATE CBR_VULKAN_SUPPORT=1)
 
 # DirectX 12 linking on Windows
 if(WIN32)
@@ -168,6 +172,43 @@ if(WIN32)
         dxgi.lib
     )
     target_compile_definitions(rdr2-cbr PRIVATE CBR_DX12_SUPPORT=1)
+endif()
+
+# Optional: compile shaders when the toolchain is available (UNTESTED on Windows; verify locally)
+find_program(CBR_GLSLANG glslangValidator HINTS $ENV{VULKAN_SDK}/Bin)
+find_program(CBR_DXC dxc HINTS $ENV{VULKAN_SDK}/Bin)
+set(CBR_SHADER_OUT_DIR "$<TARGET_FILE_DIR:rdr2-cbr>/shaders")
+set(CBR_COMPILED_SHADERS "")
+
+if(CBR_GLSLANG)
+    foreach(shader cbr_reconstruct cbr_resolve_simple)
+        add_custom_command(
+            OUTPUT ${CMAKE_BINARY_DIR}/shaders/${shader}.spv
+            COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/shaders
+            COMMAND ${CBR_GLSLANG} -V ${CBR_SHADER_DIR}/${shader}.comp -o ${CMAKE_BINARY_DIR}/shaders/${shader}.spv
+            DEPENDS ${CBR_SHADER_DIR}/${shader}.comp
+            COMMENT "Compiling ${shader}.comp to SPIR-V")
+        list(APPEND CBR_COMPILED_SHADERS ${CMAKE_BINARY_DIR}/shaders/${shader}.spv)
+    endforeach()
+else()
+    message(STATUS "glslangValidator not found: SPIR-V shaders will not be built.")
+endif()
+
+if(CBR_DXC)
+    add_custom_command(
+        OUTPUT ${CMAKE_BINARY_DIR}/shaders/cbr_reconstruct.dxil
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/shaders
+        COMMAND ${CBR_DXC} -T cs_6_0 -E CSMain ${CBR_SHADER_DIR}/cbr_reconstruct.hlsl -Fo ${CMAKE_BINARY_DIR}/shaders/cbr_reconstruct.dxil
+        DEPENDS ${CBR_SHADER_DIR}/cbr_reconstruct.hlsl
+        COMMENT "Compiling cbr_reconstruct.hlsl to DXIL")
+    list(APPEND CBR_COMPILED_SHADERS ${CMAKE_BINARY_DIR}/shaders/cbr_reconstruct.dxil)
+else()
+    message(STATUS "dxc not found: DXIL shaders will not be built.")
+endif()
+
+if(CBR_COMPILED_SHADERS)
+    add_custom_target(cbr_shaders ALL DEPENDS ${CBR_COMPILED_SHADERS})
+    add_dependencies(rdr2-cbr cbr_shaders)
 endif()
 
 # Copy sample configuration to output directory post-build
@@ -348,7 +389,7 @@ Thank you for your interest in contributing to the **RDR2 Checkerboard Rendering
 ## 📋 Code Guidelines & Style
 
 - **Language Standard:** C++20.
-- **Shaders:** GLSL 4.60 (Vulkan SPIR-V) and HLSL (Shader Model 6.0).
+- **Shaders:** GLSL 4.50 / `#version 450` (Vulkan SPIR-V) and HLSL (Shader Model 6.0).
 - **Naming Conventions:**
   - Classes and Structs: `PascalCase` (e.g., `RenderTargetManager`)
   - Functions and Methods: `PascalCase` or `camelCase` (consistent within modules)
@@ -380,8 +421,8 @@ Thank you for your interest in contributing to the **RDR2 Checkerboard Rendering
 
 #include <cstdint>
 #include <atomic>
+#include <filesystem>
 #include <mutex>
-#include <string>
 #include "cbr/config.h"
 
 namespace cbr {
@@ -393,8 +434,8 @@ public:
     bool Initialize();
     void Shutdown(bool isProcessExit = false);
 
-    void SetModuleDirectory(const std::string& dir) { m_moduleDirectory = dir; }
-    const std::string& GetModuleDirectory() const { return m_moduleDirectory; }
+    void SetModuleDirectory(const std::filesystem::path& dir) { m_moduleDirectory = dir; }
+    const std::filesystem::path& GetModuleDirectory() const { return m_moduleDirectory; }
 
     // Frame lifecycle callbacks
     void OnBeginFrame();
@@ -422,7 +463,7 @@ private:
     std::atomic<uint32_t>      m_frameIndex{ 0 };
     std::atomic<float>         m_lastReconDurationMs{ 0.0f };
     std::atomic<GraphicsApi>   m_activeApi{ GraphicsApi::Vulkan };
-    std::string                m_moduleDirectory;
+    std::filesystem::path      m_moduleDirectory;
 };
 
 } // namespace cbr
@@ -433,8 +474,9 @@ private:
 ```cpp
 #pragma once
 
-#include <string>
 #include <cstdint>
+#include <filesystem>
+#include <string>
 
 namespace cbr {
 
@@ -484,8 +526,8 @@ class ConfigManager {
 public:
     static ConfigManager& Get();
 
-    bool Load(const std::string& configPath);
-    bool Save(const std::string& configPath);
+    bool Load(const std::filesystem::path& configPath);
+    bool Save(const std::filesystem::path& configPath);
 
     const CBRConfig& GetConfig() const { return m_config; }
     CBRConfig& GetMutableConfig() { return m_config; }
@@ -505,6 +547,7 @@ private:
 ```cpp
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 
 namespace cbr {
@@ -522,15 +565,15 @@ public:
     void UninstallVulkanHooks();
     void UninstallDX12Hooks();
 
-    bool IsVulkanHooked() const { return m_vulkanHooked; }
-    bool IsDX12Hooked() const { return m_dx12Hooked; }
+    bool IsVulkanHooked() const { return m_vulkanHooked.load(); }
+    bool IsDX12Hooked() const { return m_dx12Hooked.load(); }
 
 private:
     HookManager() = default;
     ~HookManager() = default;
 
-    bool m_vulkanHooked{ false };
-    bool m_dx12Hooked{ false };
+    std::atomic<bool> m_vulkanHooked{ false };
+    std::atomic<bool> m_dx12Hooked{ false };
 };
 
 } // namespace cbr
@@ -586,11 +629,15 @@ private:
 ```cpp
 #pragma once
 
-#include <string>
+#include <cstdio>
+#include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <mutex>
 #include <sstream>
-#include <iostream>
+#include <string>
+#include <type_traits>
+#include <vector>
 
 namespace cbr {
 
@@ -605,8 +652,13 @@ class Logger {
 public:
     static Logger& Get();
 
-    void Initialize(const std::string& logFilePath);
+    // Opens the log file and flushes any messages buffered before this call.
+    void Initialize(const std::filesystem::path& logFilePath);
+    // Discards buffered messages and stops buffering (used when LogToFile = false).
+    void Disable();
     void Shutdown();
+
+    void SetMinLevel(LogLevel level);
 
     void Log(LogLevel level, const std::string& message);
 
@@ -616,8 +668,13 @@ public:
 
     template<typename... Args>
     void LogFmt(LogLevel level, const char* format, Args... args) {
+        // std::string / std::wstring passed through C varargs is undefined behaviour.
+        static_assert((!std::is_same_v<std::decay_t<Args>, std::string> && ...),
+                      "Pass std::string arguments as .c_str() to CBR_LOG_* macros");
+        static_assert((!std::is_same_v<std::decay_t<Args>, std::wstring> && ...),
+                      "Wide strings are not supported by CBR_LOG_* macros");
         char buffer[1024];
-        snprintf(buffer, sizeof(buffer), format, args...);
+        std::snprintf(buffer, sizeof(buffer), format, args...);
         Log(level, std::string(buffer));
     }
 
@@ -627,9 +684,14 @@ private:
     Logger(const Logger&) = delete;
     Logger& operator=(const Logger&) = delete;
 
-    std::ofstream m_logFile;
-    std::mutex    m_mutex;
-    bool          m_initialized{ false };
+    static constexpr size_t kMaxPendingMessages = 256;
+
+    std::ofstream            m_logFile;
+    std::mutex               m_mutex;
+    bool                     m_initialized{ false };
+    bool                     m_disabled{ false };
+    LogLevel                 m_minLevel{ LogLevel::Info };
+    std::vector<std::string> m_pending; // messages logged before Initialize()/Disable()
 };
 
 } // namespace cbr
@@ -645,6 +707,7 @@ private:
 ```cpp
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <string>
 
@@ -674,13 +737,13 @@ public:
     void DispatchVulkan(void* vkCommandBuffer, uint32_t frameIndex);
     void DispatchDX12(void* d3d12GraphicsCommandList, uint32_t frameIndex);
 
-    bool IsInitialized() const { return m_initialized; }
+    bool IsInitialized() const { return m_initialized.load(); }
 
 private:
     ReconstructionPass() = default;
     ~ReconstructionPass() = default;
 
-    bool m_initialized{ false };
+    std::atomic<bool> m_initialized{ false };
     bool m_isVulkan{ true };
 };
 
@@ -692,6 +755,7 @@ private:
 ```cpp
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <vector>
 
@@ -717,9 +781,9 @@ public:
     bool IsTargetInterceptCandidate(uint32_t width, uint32_t height, uint32_t format) const;
 
     // Ping-pong history buffer index management
-    uint32_t GetCurrentHistoryIndex() const { return m_historyPingPong; }
-    uint32_t GetPreviousHistoryIndex() const { return 1 - m_historyPingPong; }
-    void     SwapHistoryBuffers() { m_historyPingPong = 1 - m_historyPingPong; }
+    uint32_t GetCurrentHistoryIndex() const { return m_historyPingPong.load(); }
+    uint32_t GetPreviousHistoryIndex() const { return 1u - m_historyPingPong.load(); }
+    void     SwapHistoryBuffers() { m_historyPingPong.fetch_xor(1u); }
 
     // Memory footprint tracking
     size_t GetTotalAllocatedVramBytes() const { return m_totalAllocatedVramBytes; }
@@ -729,9 +793,9 @@ private:
     ~RenderTargetManager() = default;
 
     TargetDimensions m_dims;
-    uint32_t         m_historyPingPong{ 0 };
+    std::atomic<uint32_t> m_historyPingPong{ 0 };
     size_t           m_totalAllocatedVramBytes{ 0 };
-    bool             m_initialized{ false };
+    std::atomic<bool> m_initialized{ false };
 };
 
 } // namespace cbr
@@ -778,13 +842,18 @@ private:
 #include "cbr/logger.h"
 
 #if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
+
+#include <filesystem>
 #include <string>
 
 namespace {
-
-HANDLE g_hInitThread = nullptr;
 
 DWORD WINAPI CBRInitThread(LPVOID /*lpParam*/) {
     // Delay slightly to allow game engine core and graphics runtime to settle
@@ -794,18 +863,24 @@ DWORD WINAPI CBRInitThread(LPVOID /*lpParam*/) {
     return 0;
 }
 
-std::string GetModuleDirectoryPath(HMODULE hModule) {
-    char path[MAX_PATH];
-    DWORD len = GetModuleFileNameA(hModule, path, MAX_PATH);
-    if (len == 0 || len == MAX_PATH) {
-        return "";
+// Directory containing this module (wide-char API: safe for non-ASCII and long paths)
+std::filesystem::path GetModuleDirectoryPath(HMODULE hModule) {
+    std::wstring buffer(MAX_PATH, L'\0');
+    for (;;) {
+        DWORD len = GetModuleFileNameW(hModule, buffer.data(), static_cast<DWORD>(buffer.size()));
+        if (len == 0) {
+            return {};
+        }
+        if (len < buffer.size()) {
+            buffer.resize(len);
+            break;
+        }
+        if (buffer.size() >= 32768) { // longest possible NT path
+            return {};
+        }
+        buffer.resize(buffer.size() * 2);
     }
-    std::string fullPath(path);
-    auto lastSlash = fullPath.find_last_of("\\/");
-    if (lastSlash != std::string::npos) {
-        return fullPath.substr(0, lastSlash);
-    }
-    return "";
+    return std::filesystem::path(buffer).parent_path();
 }
 
 } // namespace
@@ -815,34 +890,36 @@ extern "C" __declspec(dllexport) void CBR_PluginInit() {
     cbr::CBREngine::Get().Initialize();
 }
 
-BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID /*lpReserved*/) {
     switch (ul_reason_for_call) {
         case DLL_PROCESS_ATTACH: {
             DisableThreadLibraryCalls(hModule);
 
+            // Pin this module so it can never be unmapped while the init thread or any
+            // installed hook is still executing code inside it. ASI plugins are not meant
+            // to be unloaded, and this removes the need to wait on a thread from DllMain.
+            HMODULE pinned = nullptr;
+            GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                reinterpret_cast<LPCWSTR>(&CBR_PluginInit),
+                &pinned);
+
             // Record module directory for resolving cbr.ini and cbr.log relative to the DLL
             cbr::CBREngine::Get().SetModuleDirectory(GetModuleDirectoryPath(hModule));
 
-            // Launch initialization in background thread to avoid blocking process startup
-            g_hInitThread = CreateThread(nullptr, 0, CBRInitThread, nullptr, 0, nullptr);
+            // Launch initialization in a background thread to avoid blocking process startup.
+            // The handle is not needed afterwards, and the module is pinned, so close it now.
+            HANDLE hThread = CreateThread(nullptr, 0, CBRInitThread, nullptr, 0, nullptr);
+            if (hThread) {
+                CloseHandle(hThread);
+            }
             break;
         }
-        case DLL_PROCESS_DETACH: {
-            bool isProcessExit = (lpReserved != nullptr);
-
-            if (!isProcessExit && g_hInitThread) {
-                // If dynamically unloaded via FreeLibrary, wait up to 2 seconds for init thread to terminate
-                WaitForSingleObject(g_hInitThread, 2000);
-            }
-
-            if (g_hInitThread) {
-                CloseHandle(g_hInitThread);
-                g_hInitThread = nullptr;
-            }
-
-            cbr::CBREngine::Get().Shutdown(isProcessExit);
+        case DLL_PROCESS_DETACH:
+            // Intentionally empty. Under the loader lock (and, on process exit, after other
+            // threads have already been terminated) it is unsafe to take locks, join threads,
+            // or tear down graphics hooks. The OS reclaims all resources at process exit.
             break;
-        }
         case DLL_THREAD_ATTACH:
         case DLL_THREAD_DETACH:
             break;
@@ -864,8 +941,24 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
 #include "cbr/reconstruction_pass.h"
 #include "cbr/ui_overlay.h"
 #include "cbr/hooks.h"
+#include <cctype>
+#include <string>
 
 namespace cbr {
+
+namespace {
+
+LogLevel ParseLogLevel(const std::string& name) {
+    std::string s;
+    s.reserve(name.size());
+    for (unsigned char c : name) s.push_back(static_cast<char>(std::tolower(c)));
+    if (s == "debug")                   return LogLevel::Debug;
+    if (s == "warn" || s == "warning")  return LogLevel::Warning;
+    if (s == "error")                   return LogLevel::Error;
+    return LogLevel::Info;
+}
+
+} // namespace
 
 CBREngine& CBREngine::Get() {
     static CBREngine instance;
@@ -874,15 +967,18 @@ CBREngine& CBREngine::Get() {
 
 bool CBREngine::Initialize() {
     std::call_once(m_initOnce, [this]() {
-        // 1. Resolve configuration path relative to module directory
-        std::string configPath = m_moduleDirectory.empty() ? "cbr.ini" : (m_moduleDirectory + "\\cbr.ini");
-        ConfigManager::Get().Load(configPath);
+        // 1. Load configuration first. Messages logged while loading are buffered by the
+        //    Logger and flushed (or discarded) once the log destination is known.
+        const std::filesystem::path baseDir = m_moduleDirectory; // empty => current directory
+        ConfigManager::Get().Load(baseDir / "cbr.ini");
         const auto& config = ConfigManager::Get().GetConfig();
 
-        // 2. Initialize Logger if enabled in configuration
+        // 2. Configure logging from the loaded settings
+        Logger::Get().SetMinLevel(ParseLogLevel(config.logLevel));
         if (config.logToFile) {
-            std::string logPath = m_moduleDirectory.empty() ? "cbr.log" : (m_moduleDirectory + "\\cbr.log");
-            Logger::Get().Initialize(logPath);
+            Logger::Get().Initialize(baseDir / "cbr.log");
+        } else {
+            Logger::Get().Disable();
         }
 
         CBR_LOG_INFO("Initializing CBREngine for Red Dead Redemption 2...");
@@ -945,16 +1041,18 @@ void CBREngine::OnPostRender() {
     // Geometry pass complete, intermediate quarter-res 2x MSAA buffer ready for resolve
 }
 
-void CBREngine::OnPrePresent(void* queueOrContext, const void* /*presentInfo*/) {
+void CBREngine::OnPrePresent(void* /*queueOrSwapchain*/, const void* /*presentInfo*/) {
     if (!m_enabled.load()) return;
 
     uint32_t currentFrame = m_frameIndex.load();
 
-    // Execute Reconstruction Compute Pass based on active API
+    // NOTE: the argument received here is a VkQueue (Vulkan) or IDXGISwapChain (DX12), NOT a
+    // command buffer / command list. The reconstruction pass must record into its own command
+    // buffer / list, so nullptr is passed until the real recording path exists.
     if (m_activeApi.load() == GraphicsApi::Vulkan) {
-        ReconstructionPass::Get().DispatchVulkan(queueOrContext, currentFrame);
+        ReconstructionPass::Get().DispatchVulkan(nullptr, currentFrame);
     } else {
-        ReconstructionPass::Get().DispatchDX12(queueOrContext, currentFrame);
+        ReconstructionPass::Get().DispatchDX12(nullptr, currentFrame);
     }
 
     // Swap history buffers (ping-pong double buffer)
@@ -1013,9 +1111,12 @@ bool ParseBool(const std::string& val, bool defaultVal) {
 uint32_t ParseUInt(const std::string& val, uint32_t defaultVal, uint32_t minVal, uint32_t maxVal) {
     if (val.empty()) return defaultVal;
     try {
+        // std::stoul accepts a leading '-' (wrapping around) and ignores trailing text ("4k" -> 4);
+        // reject both so typos fall back to the default instead of becoming a bogus value.
+        if (val.front() == '-') return defaultVal;
         size_t idx = 0;
         unsigned long result = std::stoul(val, &idx);
-        if (idx == 0) return defaultVal;
+        if (idx == 0 || idx != val.size()) return defaultVal;
         if (result < minVal) result = minVal;
         if (result > maxVal) result = maxVal;
         return static_cast<uint32_t>(result);
@@ -1029,7 +1130,7 @@ float ParseFloat(const std::string& val, float defaultVal, float minVal, float m
     try {
         size_t idx = 0;
         float result = std::stof(val, &idx);
-        if (idx == 0 || std::isnan(result) || std::isinf(result)) return defaultVal;
+        if (idx == 0 || idx != val.size() || std::isnan(result) || std::isinf(result)) return defaultVal;
         if (result < minVal) result = minVal;
         if (result > maxVal) result = maxVal;
         return result;
@@ -1045,10 +1146,10 @@ ConfigManager& ConfigManager::Get() {
     return instance;
 }
 
-bool ConfigManager::Load(const std::string& configPath) {
+bool ConfigManager::Load(const std::filesystem::path& configPath) {
     std::ifstream file(configPath);
     if (!file.is_open()) {
-        CBR_LOG_WARN("Configuration file not found at %s. Using default settings.", configPath.c_str());
+        CBR_LOG_WARN("Configuration file not found at %s. Using default settings.", configPath.string().c_str());
         return false;
     }
 
@@ -1109,7 +1210,7 @@ bool ConfigManager::Load(const std::string& configPath) {
     }
 
     CBR_LOG_INFO("Configuration successfully loaded from %s (Target: %ux%u, API: %s, CBR Enabled: %s)",
-        configPath.c_str(),
+        configPath.string().c_str(),
         m_config.targetWidth,
         m_config.targetHeight,
         m_config.preferredApi == GraphicsApi::Vulkan ? "Vulkan" : "D3D12",
@@ -1118,10 +1219,10 @@ bool ConfigManager::Load(const std::string& configPath) {
     return true;
 }
 
-bool ConfigManager::Save(const std::string& configPath) {
+bool ConfigManager::Save(const std::filesystem::path& configPath) {
     std::ofstream file(configPath);
     if (!file.is_open()) {
-        CBR_LOG_ERROR("Failed to open %s for saving configuration.", configPath.c_str());
+        CBR_LOG_ERROR("Failed to open %s for saving configuration.", configPath.string().c_str());
         return false;
     }
 
@@ -1208,22 +1309,36 @@ typedef int   (*PFN_vkCreateSwapchainKHR)(void* device, const void* pCreateInfo,
 PFN_vkQueuePresentKHR    g_Original_vkQueuePresentKHR = nullptr;
 PFN_vkCreateSwapchainKHR g_Original_vkCreateSwapchainKHR = nullptr;
 
+// VK_ERROR_INITIALIZATION_FAILED: returned if a hook is ever invoked without a valid trampoline,
+// so the failure is visible to the caller instead of silently dropping frames / swapchains.
+constexpr int kVkErrorInitializationFailed = -3;
+
 int Hooked_vkQueuePresentKHR(void* queue, const void* pPresentInfo) {
-    CBREngine::Get().OnPrePresent(queue, pPresentInfo);
-    int result = 0;
-    if (g_Original_vkQueuePresentKHR) {
-        result = g_Original_vkQueuePresentKHR(queue, pPresentInfo);
+    if (!g_Original_vkQueuePresentKHR) {
+        return kVkErrorInitializationFailed;
     }
-    CBREngine::Get().OnPostPresent();
+
+    // Exceptions must never propagate into the game's render thread.
+    try {
+        CBREngine::Get().OnPrePresent(queue, pPresentInfo);
+    } catch (...) {
+    }
+
+    int result = g_Original_vkQueuePresentKHR(queue, pPresentInfo);
+
+    try {
+        CBREngine::Get().OnPostPresent();
+    } catch (...) {
+    }
     return result;
 }
 
 int Hooked_vkCreateSwapchainKHR(void* device, const void* pCreateInfo, const void* pAllocator, void* pSwapchain) {
-    CBR_LOG_INFO("Vulkan Swapchain creation intercepted.");
-    if (g_Original_vkCreateSwapchainKHR) {
-        return g_Original_vkCreateSwapchainKHR(device, pCreateInfo, pAllocator, pSwapchain);
+    if (!g_Original_vkCreateSwapchainKHR) {
+        return kVkErrorInitializationFailed;
     }
-    return 0;
+    CBR_LOG_INFO("Vulkan Swapchain creation intercepted.");
+    return g_Original_vkCreateSwapchainKHR(device, pCreateInfo, pAllocator, pSwapchain);
 }
 
 } // namespace
@@ -1246,9 +1361,10 @@ bool HookManager::InstallVulkanHooks() {
         return false;
     }
 
-    m_vulkanHooked = true;
-    CBR_LOG_INFO("Vulkan interception hooks successfully registered.");
-    return true;
+    // TODO: install real detours (e.g. MinHook) on vkQueuePresentKHR / vkCreateSwapchainKHR and store
+    // the trampolines in g_Original_*. Until then NO hook is active, so do not claim success.
+    CBR_LOG_WARN("Vulkan hook installation is not implemented yet; no hooks are active.");
+    return false;
 }
 
 void HookManager::UninstallVulkanHooks() {
@@ -1280,13 +1396,25 @@ namespace {
 typedef long (__stdcall *PFN_D3D12Present)(void* swapChain, unsigned int syncInterval, unsigned int flags);
 PFN_D3D12Present g_Original_D3D12Present = nullptr;
 
+constexpr long kHResultFail = static_cast<long>(0x80004005u); // E_FAIL
+
 long __stdcall Hooked_D3D12Present(void* swapChain, unsigned int syncInterval, unsigned int flags) {
-    CBREngine::Get().OnPrePresent(swapChain, nullptr);
-    long result = 0;
-    if (g_Original_D3D12Present) {
-        result = g_Original_D3D12Present(swapChain, syncInterval, flags);
+    if (!g_Original_D3D12Present) {
+        return kHResultFail;
     }
-    CBREngine::Get().OnPostPresent();
+
+    // Exceptions must never propagate into the game's render thread.
+    try {
+        CBREngine::Get().OnPrePresent(swapChain, nullptr);
+    } catch (...) {
+    }
+
+    long result = g_Original_D3D12Present(swapChain, syncInterval, flags);
+
+    try {
+        CBREngine::Get().OnPostPresent();
+    } catch (...) {
+    }
     return result;
 }
 
@@ -1301,9 +1429,10 @@ bool HookManager::InstallDX12Hooks() {
         return false;
     }
 
-    CBR_LOG_INFO("DX12 modules detected. Registering DXGI SwapChain VMT hooks...");
-    m_dx12Hooked = true;
-    return true;
+    // TODO: locate IDXGISwapChain::Present via a dummy swapchain, detour it, and store the
+    // trampoline in g_Original_D3D12Present. Until then NO hook is active.
+    CBR_LOG_WARN("DX12 hook installation is not implemented yet; no hooks are active.");
+    return false;
 }
 
 void HookManager::UninstallDX12Hooks() {
@@ -1392,6 +1521,7 @@ void JitterManager::RemoveJitterFromProjection(float* projMatrix4x4, bool isVulk
 ```cpp
 #include "cbr/logger.h"
 #include <chrono>
+#include <ctime>
 #include <iomanip>
 #include <sstream>
 
@@ -1402,12 +1532,13 @@ Logger& Logger::Get() {
     return instance;
 }
 
-void Logger::Initialize(const std::string& logFilePath) {
+void Logger::Initialize(const std::filesystem::path& logFilePath) {
     std::lock_guard<std::mutex> lock(m_mutex);
     if (m_initialized) {
         return;
     }
 
+    m_disabled = false;
     m_logFile.open(logFilePath, std::ios::out | std::ios::trunc);
     m_initialized = m_logFile.is_open();
 
@@ -1417,8 +1548,18 @@ void Logger::Initialize(const std::string& logFilePath) {
         m_logFile << " Maintainer: Shreyas Pawar                                       \n";
         m_logFile << " Target: NVIDIA GeForce GTX 1070 Ti & Vulkan / DX12              \n";
         m_logFile << "=================================================================\n";
+        for (const auto& line : m_pending) {
+            m_logFile << line;
+        }
         m_logFile.flush();
     }
+    m_pending.clear();
+}
+
+void Logger::Disable() {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_disabled = true;
+    m_pending.clear();
 }
 
 void Logger::Shutdown() {
@@ -1431,8 +1572,17 @@ void Logger::Shutdown() {
     m_initialized = false;
 }
 
+void Logger::SetMinLevel(LogLevel level) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_minLevel = level;
+}
+
 void Logger::Log(LogLevel level, const std::string& message) {
     std::lock_guard<std::mutex> lock(m_mutex);
+
+    if (level < m_minLevel) {
+        return;
+    }
 
     const char* levelStr = "INFO";
     switch (level) {
@@ -1444,6 +1594,8 @@ void Logger::Log(LogLevel level, const std::string& message) {
 
     auto now = std::chrono::system_clock::now();
     auto in_time_t = std::chrono::system_clock::to_time_t(now);
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
+
     std::tm timeInfo{};
 #if defined(_WIN32)
     localtime_s(&timeInfo, &in_time_t);
@@ -1461,6 +1613,8 @@ void Logger::Log(LogLevel level, const std::string& message) {
     if (m_initialized && m_logFile.is_open()) {
         m_logFile << formatted;
         m_logFile.flush();
+    } else if (!m_initialized && !m_disabled && m_pending.size() < kMaxPendingMessages) {
+        m_pending.push_back(formatted);
     }
 
 #if defined(_DEBUG)
@@ -1572,7 +1726,7 @@ void RenderTargetManager::Initialize(uint32_t width, uint32_t height) {
     m_dims.quarterWidth = width / 2;
     m_dims.quarterHeight = height / 2;
     m_dims.msaaSamples = 2;
-    m_historyPingPong = 0;
+    m_historyPingPong.store(0);
 
     // Calculate VRAM footprint:
     // 1. Quarter-Res 2x MSAA Color (RGBA16F = 8 bytes/sample * 2 samples):

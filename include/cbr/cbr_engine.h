@@ -2,8 +2,8 @@
 
 #include <cstdint>
 #include <atomic>
+#include <filesystem>
 #include <mutex>
-#include <string>
 #include "cbr/config.h"
 
 namespace cbr {
@@ -15,8 +15,8 @@ public:
     bool Initialize();
     void Shutdown(bool isProcessExit = false);
 
-    void SetModuleDirectory(const std::string& dir) { m_moduleDirectory = dir; }
-    const std::string& GetModuleDirectory() const { return m_moduleDirectory; }
+    void SetModuleDirectory(const std::filesystem::path& dir) { m_moduleDirectory = dir; }
+    const std::filesystem::path& GetModuleDirectory() const { return m_moduleDirectory; }
 
     // Frame lifecycle callbacks
     void OnBeginFrame();
@@ -44,7 +44,7 @@ private:
     std::atomic<uint32_t>      m_frameIndex{ 0 };
     std::atomic<float>         m_lastReconDurationMs{ 0.0f };
     std::atomic<GraphicsApi>   m_activeApi{ GraphicsApi::Vulkan };
-    std::string                m_moduleDirectory;
+    std::filesystem::path      m_moduleDirectory;
 };
 
 } // namespace cbr

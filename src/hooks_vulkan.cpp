@@ -20,22 +20,36 @@ typedef int   (*PFN_vkCreateSwapchainKHR)(void* device, const void* pCreateInfo,
 PFN_vkQueuePresentKHR    g_Original_vkQueuePresentKHR = nullptr;
 PFN_vkCreateSwapchainKHR g_Original_vkCreateSwapchainKHR = nullptr;
 
+// VK_ERROR_INITIALIZATION_FAILED: returned if a hook is ever invoked without a valid trampoline,
+// so the failure is visible to the caller instead of silently dropping frames / swapchains.
+constexpr int kVkErrorInitializationFailed = -3;
+
 int Hooked_vkQueuePresentKHR(void* queue, const void* pPresentInfo) {
-    CBREngine::Get().OnPrePresent(queue, pPresentInfo);
-    int result = 0;
-    if (g_Original_vkQueuePresentKHR) {
-        result = g_Original_vkQueuePresentKHR(queue, pPresentInfo);
+    if (!g_Original_vkQueuePresentKHR) {
+        return kVkErrorInitializationFailed;
     }
-    CBREngine::Get().OnPostPresent();
+
+    // Exceptions must never propagate into the game's render thread.
+    try {
+        CBREngine::Get().OnPrePresent(queue, pPresentInfo);
+    } catch (...) {
+    }
+
+    int result = g_Original_vkQueuePresentKHR(queue, pPresentInfo);
+
+    try {
+        CBREngine::Get().OnPostPresent();
+    } catch (...) {
+    }
     return result;
 }
 
 int Hooked_vkCreateSwapchainKHR(void* device, const void* pCreateInfo, const void* pAllocator, void* pSwapchain) {
-    CBR_LOG_INFO("Vulkan Swapchain creation intercepted.");
-    if (g_Original_vkCreateSwapchainKHR) {
-        return g_Original_vkCreateSwapchainKHR(device, pCreateInfo, pAllocator, pSwapchain);
+    if (!g_Original_vkCreateSwapchainKHR) {
+        return kVkErrorInitializationFailed;
     }
-    return 0;
+    CBR_LOG_INFO("Vulkan Swapchain creation intercepted.");
+    return g_Original_vkCreateSwapchainKHR(device, pCreateInfo, pAllocator, pSwapchain);
 }
 
 } // namespace
@@ -58,9 +72,10 @@ bool HookManager::InstallVulkanHooks() {
         return false;
     }
 
-    m_vulkanHooked = true;
-    CBR_LOG_INFO("Vulkan interception hooks successfully registered.");
-    return true;
+    // TODO: install real detours (e.g. MinHook) on vkQueuePresentKHR / vkCreateSwapchainKHR and store
+    // the trampolines in g_Original_*. Until then NO hook is active, so do not claim success.
+    CBR_LOG_WARN("Vulkan hook installation is not implemented yet; no hooks are active.");
+    return false;
 }
 
 void HookManager::UninstallVulkanHooks() {

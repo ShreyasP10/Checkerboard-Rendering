@@ -14,13 +14,25 @@ namespace {
 typedef long (__stdcall *PFN_D3D12Present)(void* swapChain, unsigned int syncInterval, unsigned int flags);
 PFN_D3D12Present g_Original_D3D12Present = nullptr;
 
+constexpr long kHResultFail = static_cast<long>(0x80004005u); // E_FAIL
+
 long __stdcall Hooked_D3D12Present(void* swapChain, unsigned int syncInterval, unsigned int flags) {
-    CBREngine::Get().OnPrePresent(swapChain, nullptr);
-    long result = 0;
-    if (g_Original_D3D12Present) {
-        result = g_Original_D3D12Present(swapChain, syncInterval, flags);
+    if (!g_Original_D3D12Present) {
+        return kHResultFail;
     }
-    CBREngine::Get().OnPostPresent();
+
+    // Exceptions must never propagate into the game's render thread.
+    try {
+        CBREngine::Get().OnPrePresent(swapChain, nullptr);
+    } catch (...) {
+    }
+
+    long result = g_Original_D3D12Present(swapChain, syncInterval, flags);
+
+    try {
+        CBREngine::Get().OnPostPresent();
+    } catch (...) {
+    }
     return result;
 }
 
@@ -35,9 +47,10 @@ bool HookManager::InstallDX12Hooks() {
         return false;
     }
 
-    CBR_LOG_INFO("DX12 modules detected. Registering DXGI SwapChain VMT hooks...");
-    m_dx12Hooked = true;
-    return true;
+    // TODO: locate IDXGISwapChain::Present via a dummy swapchain, detour it, and store the
+    // trampoline in g_Original_D3D12Present. Until then NO hook is active.
+    CBR_LOG_WARN("DX12 hook installation is not implemented yet; no hooks are active.");
+    return false;
 }
 
 void HookManager::UninstallDX12Hooks() {

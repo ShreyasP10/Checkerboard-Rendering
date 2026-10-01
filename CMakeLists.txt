@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
-project(RDR2_Checkerboard_Rendering VERSION 1.0.0 LANGUAGES C CXX)
+project(RDR2_Checkerboard_Rendering VERSION 1.0.0 LANGUAGES CXX)
+
+# Required for MSVC_RUNTIME_LIBRARY target property (static CRT below)
+cmake_policy(SET CMP0091 NEW)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -72,12 +75,13 @@ set_target_properties(rdr2-cbr PROPERTIES
 )
 
 # Windows specific definitions
+# (WIN32_LEAN_AND_MEAN / NOMINMAX are defined, guarded, in the sources that include windows.h)
 target_compile_definitions(rdr2-cbr PRIVATE
-    WIN32_LEAN_AND_MEAN
-    NOMINMAX
-    _CRT_SECURE_NO_WARNINGS
     CBR_EXPORTS
 )
+
+# Static CRT: the plugin must not depend on a redistributable that the game may not ship
+set_property(TARGET rdr2-cbr PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 # MSVC optimization and hardening flags
 if(MSVC)
@@ -103,11 +107,11 @@ find_package(Vulkan QUIET)
 if(Vulkan_FOUND)
     message(STATUS "Vulkan SDK headers found: ${Vulkan_INCLUDE_DIRS}")
     target_include_directories(rdr2-cbr PRIVATE ${Vulkan_INCLUDE_DIRS})
-    target_compile_definitions(rdr2-cbr PRIVATE CBR_VULKAN_SUPPORT=1)
 else()
-    message(STATUS "Vulkan SDK not found, using bundled/dynamic runtime headers.")
-    target_compile_definitions(rdr2-cbr PRIVATE CBR_VULKAN_SUPPORT=1)
+    message(STATUS "Vulkan SDK not found, using dynamic runtime function pointers only.")
 endif()
+# Vulkan support does not need the SDK at build time (functions are resolved at runtime)
+target_compile_definitions(rdr2-cbr PRIVATE CBR_VULKAN_SUPPORT=1)
 
 # DirectX 12 linking on Windows
 if(WIN32)
@@ -116,6 +120,43 @@ if(WIN32)
         dxgi.lib
     )
     target_compile_definitions(rdr2-cbr PRIVATE CBR_DX12_SUPPORT=1)
+endif()
+
+# Optional: compile shaders when the toolchain is available (UNTESTED on Windows; verify locally)
+find_program(CBR_GLSLANG glslangValidator HINTS $ENV{VULKAN_SDK}/Bin)
+find_program(CBR_DXC dxc HINTS $ENV{VULKAN_SDK}/Bin)
+set(CBR_SHADER_OUT_DIR "$<TARGET_FILE_DIR:rdr2-cbr>/shaders")
+set(CBR_COMPILED_SHADERS "")
+
+if(CBR_GLSLANG)
+    foreach(shader cbr_reconstruct cbr_resolve_simple)
+        add_custom_command(
+            OUTPUT ${CMAKE_BINARY_DIR}/shaders/${shader}.spv
+            COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/shaders
+            COMMAND ${CBR_GLSLANG} -V ${CBR_SHADER_DIR}/${shader}.comp -o ${CMAKE_BINARY_DIR}/shaders/${shader}.spv
+            DEPENDS ${CBR_SHADER_DIR}/${shader}.comp
+            COMMENT "Compiling ${shader}.comp to SPIR-V")
+        list(APPEND CBR_COMPILED_SHADERS ${CMAKE_BINARY_DIR}/shaders/${shader}.spv)
+    endforeach()
+else()
+    message(STATUS "glslangValidator not found: SPIR-V shaders will not be built.")
+endif()
+
+if(CBR_DXC)
+    add_custom_command(
+        OUTPUT ${CMAKE_BINARY_DIR}/shaders/cbr_reconstruct.dxil
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/shaders
+        COMMAND ${CBR_DXC} -T cs_6_0 -E CSMain ${CBR_SHADER_DIR}/cbr_reconstruct.hlsl -Fo ${CMAKE_BINARY_DIR}/shaders/cbr_reconstruct.dxil
+        DEPENDS ${CBR_SHADER_DIR}/cbr_reconstruct.hlsl
+        COMMENT "Compiling cbr_reconstruct.hlsl to DXIL")
+    list(APPEND CBR_COMPILED_SHADERS ${CMAKE_BINARY_DIR}/shaders/cbr_reconstruct.dxil)
+else()
+    message(STATUS "dxc not found: DXIL shaders will not be built.")
+endif()
+
+if(CBR_COMPILED_SHADERS)
+    add_custom_target(cbr_shaders ALL DEPENDS ${CBR_COMPILED_SHADERS})
+    add_dependencies(rdr2-cbr cbr_shaders)
 endif()
 
 # Copy sample configuration to output directory post-build

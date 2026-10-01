@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <string>
 
@@ -29,13 +30,13 @@ public:
     void DispatchVulkan(void* vkCommandBuffer, uint32_t frameIndex);
     void DispatchDX12(void* d3d12GraphicsCommandList, uint32_t frameIndex);
 
-    bool IsInitialized() const { return m_initialized; }
+    bool IsInitialized() const { return m_initialized.load(); }
 
 private:
     ReconstructionPass() = default;
     ~ReconstructionPass() = default;
 
-    bool m_initialized{ false };
+    std::atomic<bool> m_initialized{ false };
     bool m_isVulkan{ true };
 };
 

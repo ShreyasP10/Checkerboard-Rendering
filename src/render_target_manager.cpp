@@ -14,7 +14,7 @@ void RenderTargetManager::Initialize(uint32_t width, uint32_t height) {
     m_dims.quarterWidth = width / 2;
     m_dims.quarterHeight = height / 2;
     m_dims.msaaSamples = 2;
-    m_historyPingPong = 0;
+    m_historyPingPong.store(0);
 
     // Calculate VRAM footprint:
     // 1. Quarter-Res 2x MSAA Color (RGBA16F = 8 bytes/sample * 2 samples):

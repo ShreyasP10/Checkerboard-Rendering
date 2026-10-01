@@ -6,8 +6,24 @@
 #include "cbr/reconstruction_pass.h"
 #include "cbr/ui_overlay.h"
 #include "cbr/hooks.h"
+#include <cctype>
+#include <string>
 
 namespace cbr {
+
+namespace {
+
+LogLevel ParseLogLevel(const std::string& name) {
+    std::string s;
+    s.reserve(name.size());
+    for (unsigned char c : name) s.push_back(static_cast<char>(std::tolower(c)));
+    if (s == "debug")                   return LogLevel::Debug;
+    if (s == "warn" || s == "warning")  return LogLevel::Warning;
+    if (s == "error")                   return LogLevel::Error;
+    return LogLevel::Info;
+}
+
+} // namespace
 
 CBREngine& CBREngine::Get() {
     static CBREngine instance;
@@ -16,15 +32,18 @@ CBREngine& CBREngine::Get() {
 
 bool CBREngine::Initialize() {
     std::call_once(m_initOnce, [this]() {
-        // 1. Resolve configuration path relative to module directory
-        std::string configPath = m_moduleDirectory.empty() ? "cbr.ini" : (m_moduleDirectory + "\\cbr.ini");
-        ConfigManager::Get().Load(configPath);
+        // 1. Load configuration first. Messages logged while loading are buffered by the
+        //    Logger and flushed (or discarded) once the log destination is known.
+        const std::filesystem::path baseDir = m_moduleDirectory; // empty => current directory
+        ConfigManager::Get().Load(baseDir / "cbr.ini");
         const auto& config = ConfigManager::Get().GetConfig();
 
-        // 2. Initialize Logger if enabled in configuration
+        // 2. Configure logging from the loaded settings
+        Logger::Get().SetMinLevel(ParseLogLevel(config.logLevel));
         if (config.logToFile) {
-            std::string logPath = m_moduleDirectory.empty() ? "cbr.log" : (m_moduleDirectory + "\\cbr.log");
-            Logger::Get().Initialize(logPath);
+            Logger::Get().Initialize(baseDir / "cbr.log");
+        } else {
+            Logger::Get().Disable();
         }
 
         CBR_LOG_INFO("Initializing CBREngine for Red Dead Redemption 2...");
@@ -87,16 +106,18 @@ void CBREngine::OnPostRender() {
     // Geometry pass complete, intermediate quarter-res 2x MSAA buffer ready for resolve
 }
 
-void CBREngine::OnPrePresent(void* queueOrContext, const void* /*presentInfo*/) {
+void CBREngine::OnPrePresent(void* /*queueOrSwapchain*/, const void* /*presentInfo*/) {
     if (!m_enabled.load()) return;
 
     uint32_t currentFrame = m_frameIndex.load();
 
-    // Execute Reconstruction Compute Pass based on active API
+    // NOTE: the argument received here is a VkQueue (Vulkan) or IDXGISwapChain (DX12), NOT a
+    // command buffer / command list. The reconstruction pass must record into its own command
+    // buffer / list, so nullptr is passed until the real recording path exists.
     if (m_activeApi.load() == GraphicsApi::Vulkan) {
-        ReconstructionPass::Get().DispatchVulkan(queueOrContext, currentFrame);
+        ReconstructionPass::Get().DispatchVulkan(nullptr, currentFrame);
     } else {
-        ReconstructionPass::Get().DispatchDX12(queueOrContext, currentFrame);
+        ReconstructionPass::Get().DispatchDX12(nullptr, currentFrame);
     }
 
     // Swap history buffers (ping-pong double buffer)

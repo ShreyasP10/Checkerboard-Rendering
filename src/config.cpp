@@ -37,9 +37,12 @@ bool ParseBool(const std::string& val, bool defaultVal) {
 uint32_t ParseUInt(const std::string& val, uint32_t defaultVal, uint32_t minVal, uint32_t maxVal) {
     if (val.empty()) return defaultVal;
     try {
+        // std::stoul accepts a leading '-' (wrapping around) and ignores trailing text ("4k" -> 4);
+        // reject both so typos fall back to the default instead of becoming a bogus value.
+        if (val.front() == '-') return defaultVal;
         size_t idx = 0;
         unsigned long result = std::stoul(val, &idx);
-        if (idx == 0) return defaultVal;
+        if (idx == 0 || idx != val.size()) return defaultVal;
         if (result < minVal) result = minVal;
         if (result > maxVal) result = maxVal;
         return static_cast<uint32_t>(result);
@@ -53,7 +56,7 @@ float ParseFloat(const std::string& val, float defaultVal, float minVal, float m
     try {
         size_t idx = 0;
         float result = std::stof(val, &idx);
-        if (idx == 0 || std::isnan(result) || std::isinf(result)) return defaultVal;
+        if (idx == 0 || idx != val.size() || std::isnan(result) || std::isinf(result)) return defaultVal;
         if (result < minVal) result = minVal;
         if (result > maxVal) result = maxVal;
         return result;
@@ -69,10 +72,10 @@ ConfigManager& ConfigManager::Get() {
     return instance;
 }
 
-bool ConfigManager::Load(const std::string& configPath) {
+bool ConfigManager::Load(const std::filesystem::path& configPath) {
     std::ifstream file(configPath);
     if (!file.is_open()) {
-        CBR_LOG_WARN("Configuration file not found at %s. Using default settings.", configPath.c_str());
+        CBR_LOG_WARN("Configuration file not found at %s. Using default settings.", configPath.string().c_str());
         return false;
     }
 
@@ -133,7 +136,7 @@ bool ConfigManager::Load(const std::string& configPath) {
     }
 
     CBR_LOG_INFO("Configuration successfully loaded from %s (Target: %ux%u, API: %s, CBR Enabled: %s)",
-        configPath.c_str(),
+        configPath.string().c_str(),
         m_config.targetWidth,
         m_config.targetHeight,
         m_config.preferredApi == GraphicsApi::Vulkan ? "Vulkan" : "D3D12",
@@ -142,10 +145,10 @@ bool ConfigManager::Load(const std::string& configPath) {
     return true;
 }
 
-bool ConfigManager::Save(const std::string& configPath) {
+bool ConfigManager::Save(const std::filesystem::path& configPath) {
     std::ofstream file(configPath);
     if (!file.is_open()) {
-        CBR_LOG_ERROR("Failed to open %s for saving configuration.", configPath.c_str());
+        CBR_LOG_ERROR("Failed to open %s for saving configuration.", configPath.string().c_str());
         return false;
     }
 
