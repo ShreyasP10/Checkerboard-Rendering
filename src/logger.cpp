@@ -52,10 +52,15 @@ void Logger::Log(LogLevel level, const std::string& message) {
 
     auto now = std::chrono::system_clock::now();
     auto in_time_t = std::chrono::system_clock::to_time_t(now);
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
+    std::tm timeInfo{};
+#if defined(_WIN32)
+    localtime_s(&timeInfo, &in_time_t);
+#else
+    localtime_r(&in_time_t, &timeInfo);
+#endif
 
     std::stringstream ss;
-    ss << std::put_time(std::localtime(&in_time_t), "%Y-%m-%d %H:%M:%S")
+    ss << std::put_time(&timeInfo, "%Y-%m-%d %H:%M:%S")
        << '.' << std::setfill('0') << std::setw(3) << ms.count()
        << " [" << levelStr << "] " << message << "\n";
 

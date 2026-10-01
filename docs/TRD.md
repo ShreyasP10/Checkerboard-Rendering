@@ -81,13 +81,13 @@ On DX12, the mod hooks the VMT (Virtual Method Table) of:
 
 | Resource Identifier | Dimensions | Format | Usage / Flags | Memory Size |
 |---|---|---|---|---|
-| `QuarterColorMSAA` | 1920×1080 | `VK_FORMAT_R16G16B16A16_SFLOAT` (2× MSAA) | Color Attachment, Sampled | ~35.2 MB |
-| `QuarterDepthMSAA` | 1920×1080 | `VK_FORMAT_D32_SFLOAT` (2× MSAA) | Depth Attachment, Sampled | ~17.6 MB |
-| `HistoryColor_A` | 3840×2160 | `VK_FORMAT_R16G16B16A16_SFLOAT` | Storage Image, Sampled | ~66.4 MB |
-| `HistoryColor_B` | 3840×2160 | `VK_FORMAT_R16G16B16A16_SFLOAT` | Storage Image, Sampled | ~66.4 MB |
-| `HistoryDepth` | 3840×2160 | `VK_FORMAT_R32_SFLOAT` | Storage Image, Sampled | ~33.2 MB |
-| `ResolvedColorOut` | 3840×2160 | `VK_FORMAT_R16G16B16A16_SFLOAT` | Storage Image, Transfer Src | ~66.4 MB |
-| **Total Added VRAM** | | | | **~285.2 MB** |
+| `QuarterColorMSAA` | 1920×1080 | `VK_FORMAT_R16G16B16A16_SFLOAT` (2× MSAA) | Color Attachment, Sampled | ~31.64 MB |
+| `QuarterDepthMSAA` | 1920×1080 | `VK_FORMAT_D32_SFLOAT` (2× MSAA) | Depth Attachment, Sampled | ~15.82 MB |
+| `HistoryColor_A` | 3840×2160 | `VK_FORMAT_R16G16B16A16_SFLOAT` | Storage Image, Sampled | ~63.28 MB |
+| `HistoryColor_B` | 3840×2160 | `VK_FORMAT_R16G16B16A16_SFLOAT` | Storage Image, Sampled | ~63.28 MB |
+| `HistoryDepth` | 3840×2160 | `VK_FORMAT_R32_SFLOAT` | Storage Image, Sampled | ~31.64 MB |
+| `ResolvedColorOut` | 3840×2160 | `VK_FORMAT_R16G16B16A16_SFLOAT` | Storage Image, Transfer Src | ~63.28 MB |
+| **Total Added VRAM** | | | | **~268.95 MB** |
 
 *All memory is allocated via `VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT` using a dedicated sub-allocator.*
 

@@ -41,7 +41,6 @@ layout(push_constant) uniform CBRConstants {
     float u_MipLodBias;             // Texture LOD bias (-0.5)
 } pc;
 
-
 // =============================================================================
 // Color Space Conversions (YCoCg for artifact-free color clamping)
 // =============================================================================
@@ -86,8 +85,8 @@ void main() {
     uint frameParity = pc.u_FrameIndex & 1u;
     bool isCurrentSampleActive = (pixelParity == frameParity);
 
-    // In 2x MSAA quarter-resolution, each pixel contains 2 subpixel samples
-    int msaaSampleIndex = int((uint(pixelCoord.x) & 1u) ^ (uint(pixelCoord.y) & 1u));
+    // In a 2x2 quarter cell, the two active samples correspond to pixelCoord.x parity
+    int msaaSampleIndex = int(uint(pixelCoord.x) & 1u);
 
     // Fetch current frame sample
     vec4 currentSample = texelFetch(u_QuarterColorMSAA, quarterCoord, msaaSampleIndex);
@@ -96,7 +95,8 @@ void main() {
     // -------------------------------------------------------------------------
     // 2. Fetch Motion Vectors & Calculate Previous UV Coordinates
     // -------------------------------------------------------------------------
-    vec2 velocity = texture(u_Velocity, uv).xy;
+    // Explicit LOD 0.0 required for compute shaders
+    vec2 velocity = textureLod(u_Velocity, uv, 0.0).xy;
     vec2 historyUV = uv - velocity;
 
     // -------------------------------------------------------------------------
@@ -109,38 +109,43 @@ void main() {
         // Sample moved outside screen space
         isDisoccluded = true;
     } else {
-        float previousDepth = texture(u_HistoryDepth, historyUV).r;
+        // Nearest depth fetch from history
+        float previousDepth = textureLod(u_HistoryDepth, historyUV, 0.0).r;
         float depthDelta = abs(currentDepth - previousDepth) / max(currentDepth, 1e-5);
 
         if (depthDelta > pc.u_DepthTolerance) {
             isDisoccluded = true;
         } else {
-            historyColor = texture(u_HistoryColor, historyUV);
+            historyColor = textureLod(u_HistoryColor, historyUV, 0.0);
+            if (historyColor.a <= 0.0) {
+                // First frame or cleared history buffer
+                isDisoccluded = true;
+            }
         }
     }
 
     // -------------------------------------------------------------------------
     // 4. Neighborhood Statistics & YCoCg Clamping (Anti-Ghosting)
+    // Guarded to avoid 9 unnecessary memory fetches when disoccluded or disabled
     // -------------------------------------------------------------------------
-    vec3 colorMin = vec3(1e6);
-    vec3 colorMax = vec3(-1e6);
-
-    // Compute 3x3 local color bounding box
-    for (int dy = -1; dy <= 1; ++dy) {
-        for (int dx = -1; dx <= 1; ++dx) {
-            ivec2 neighborCoord = clamp(pixelCoord + ivec2(dx, dy), ivec2(0), targetSize - ivec2(1));
-            ivec2 neighborQuarter = neighborCoord / 2;
-            int neighborSample = int((uint(neighborCoord.x) & 1u) ^ (uint(neighborCoord.y) & 1u));
-            vec3 neighborColor = texelFetch(u_QuarterColorMSAA, neighborQuarter, neighborSample).rgb;
-
-            vec3 neighborYCoCg = RGBtoYCoCg(neighborColor);
-            colorMin = min(colorMin, neighborYCoCg);
-            colorMax = max(colorMax, neighborYCoCg);
-        }
-    }
-
-    // Clamp reprojected history
     if (!isDisoccluded && pc.u_EnableColorClamping != 0u) {
+        vec3 colorMin = vec3(1e6);
+        vec3 colorMax = vec3(-1e6);
+
+        // Compute 3x3 local color bounding box
+        for (int dy = -1; dy <= 1; ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                ivec2 neighborCoord = clamp(pixelCoord + ivec2(dx, dy), ivec2(0), targetSize - ivec2(1));
+                ivec2 neighborQuarter = neighborCoord / 2;
+                int neighborSample = int(uint(neighborCoord.x) & 1u);
+                vec3 neighborColor = texelFetch(u_QuarterColorMSAA, neighborQuarter, neighborSample).rgb;
+
+                vec3 neighborYCoCg = RGBtoYCoCg(neighborColor);
+                colorMin = min(colorMin, neighborYCoCg);
+                colorMax = max(colorMax, neighborYCoCg);
+            }
+        }
+
         vec3 historyYCoCg = RGBtoYCoCg(historyColor.rgb);
         historyYCoCg = clamp(historyYCoCg, colorMin, colorMax);
         historyColor.rgb = YCoCgtoRGB(historyYCoCg);
@@ -154,17 +159,17 @@ void main() {
     if (isCurrentSampleActive) {
         // Pixel was natively shaded this frame
         if (!isDisoccluded && historyColor.a > 0.0) {
-            // Blend slightly with history for anti-aliasing stability
-            finalColor = mix(currentSample.rgb, historyColor.rgb, 1.0 - pc.u_HistoryWeight);
+            // Blend with history for temporal stability (u_HistoryWeight controls history influence)
+            finalColor = mix(currentSample.rgb, historyColor.rgb, pc.u_HistoryWeight);
         } else {
             finalColor = currentSample.rgb;
         }
     } else {
         // Pixel is missing in current frame: reconstruct from history or spatial fallback
-        if (!isDisoccluded) {
+        if (!isDisoccluded && historyColor.a > 0.0) {
             finalColor = historyColor.rgb;
         } else {
-            // Spatial Cross-Bilateral Reconstruction from 4 diagonal current samples
+            // Spatial Cross-Bilateral Reconstruction from 4 cardinal active samples
             vec3  accumColor = vec3(0.0);
             float accumWeight = 0.0;
             const ivec2 offsets[4] = ivec2[](ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1));
@@ -172,21 +177,25 @@ void main() {
             for (int i = 0; i < 4; ++i) {
                 ivec2 sampleCoord = clamp(pixelCoord + offsets[i], ivec2(0), targetSize - ivec2(1));
                 ivec2 sQuarter = sampleCoord / 2;
-                int sIndex = int((uint(sampleCoord.x) & 1u) ^ (uint(sampleCoord.y) & 1u));
+                int sIndex = int(uint(sampleCoord.x) & 1u);
 
                 vec3 sCol = texelFetch(u_QuarterColorMSAA, sQuarter, sIndex).rgb;
                 float sDep = texelFetch(u_QuarterDepthMSAA, sQuarter, sIndex).r;
 
-                float spatialDist = 1.0;
                 float depthWeight = exp(-abs(currentDepth - sDep) * 100.0);
-                float weight = spatialDist * depthWeight;
-
-                accumColor += sCol * weight;
-                accumWeight += weight;
+                accumColor += sCol * depthWeight;
+                accumWeight += depthWeight;
             }
 
             finalColor = (accumWeight > 1e-4) ? (accumColor / accumWeight) : currentSample.rgb;
         }
+    }
+
+    // Guard against NaN/Inf pollution in temporal feedback loop
+    if (isnan(finalColor.r) || isinf(finalColor.r) ||
+        isnan(finalColor.g) || isinf(finalColor.g) ||
+        isnan(finalColor.b) || isinf(finalColor.b)) {
+        finalColor = currentSample.rgb;
     }
 
     // -------------------------------------------------------------------------
@@ -206,6 +215,6 @@ void main() {
         finalColor = currentSample.rgb;
     }
 
-    // Write final reconstructed pixel to output storage image
+    // Write final reconstructed pixel to output storage image (alpha = 1.0 for valid history)
     imageStore(u_OutputImage, pixelCoord, vec4(finalColor, 1.0));
 }

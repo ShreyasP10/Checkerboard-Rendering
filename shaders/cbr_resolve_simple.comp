@@ -29,7 +29,7 @@ void main() {
     uint pixelParity = (uint(pixelCoord.x) + uint(pixelCoord.y)) & 1u;
     uint frameParity = pc.u_FrameIndex & 1u;
 
-    int sampleIndex = int((uint(pixelCoord.x) & 1u) ^ (uint(pixelCoord.y) & 1u));
+    int sampleIndex = int(uint(pixelCoord.x) & 1u);
     vec4 sample0 = texelFetch(u_QuarterColorMSAA, quarterCoord, 0);
     vec4 sample1 = texelFetch(u_QuarterColorMSAA, quarterCoord, 1);
 

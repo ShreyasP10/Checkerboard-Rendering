@@ -18,10 +18,11 @@ A community-driven graphics modification implementing **Checkerboard Rendering (
 - [How It Works](#how-it-works)
 - [Key Features](#key-features)
 - [Architecture & Repository Structure](#architecture--repository-structure)
+- [Complete Source Codebase (Single Document)](CODEBASE.md)
 - [Engineering Documentation](#engineering-documentation)
 - [Reconstruction Shader Math](#reconstruction-shader-math)
 - [Hardware & Development Requirements](#hardware--development-requirements)
-- [Building](#building)
+- [How to Build, Install & Run](#-how-to-build-install--run)
 - [Configuration](#configuration)
 - [Contributing](#contributing)
 - [Collaborators & Maintainers](#collaborators--maintainers)
@@ -69,13 +70,14 @@ Output:      Full 3840×2160 4K Image
 
 - [x] Full architectural specification & requirements documentation (PRD, SRD, SRS, TRD, DEV_PLAN, RISK_REGISTER).
 - [x] Complete GLSL & HLSL reconstruction compute shaders with 2× MSAA unpack and subpixel parity testing.
-- [x] Temporal reprojection with velocity vector sampling and camera depth unprojection fallback.
+- [x] Temporal reprojection math with velocity vector sampling and camera depth unprojection fallback.
 - [x] Depth delta disocclusion detection with spatial cross-bilateral filter fallback.
 - [x] 3×3 neighborhood color bounding box clamping in YCoCg space to suppress ghosting.
 - [x] Pascal architecture optimization (GP104 warp size 32, shared memory tiling, low register pressure).
-- [x] MinHook-powered Vulkan & DirectX 12 interception layer.
-- [x] Runtime configuration via `cbr.ini` and in-game ImGui debug overlay.
+- [x] Runtime configuration via `cbr.ini` and in-game ImGui debug overlay architecture.
 - [x] Multi-mode debug visualizer (checkerboard grid mask, disocclusion heatmap, motion vector field).
+- [ ] Live Vulkan & DirectX 12 function hooking & engine command buffer interception (Pending RDR2 dynamic address offset resolution).
+- [ ] Automated game projection matrix offset injection (Pending RDR2 script hook / pattern scan integration).
 
 ---
 
@@ -86,6 +88,7 @@ Checkerboard-Rendering/
 ├── CMakeLists.txt              # CMake build script for rdr2-cbr.asi
 ├── LICENSE                     # MIT License
 ├── README.md                   # Project overview and instructions
+├── CODEBASE.md                 # Consolidated single document of all source code & shaders
 ├── CONTRIBUTING.md             # Contribution guidelines & coding standards
 ├── cbr.ini                     # Runtime configuration file
 ├── .gitignore                  # Git ignore rules
@@ -157,7 +160,7 @@ If the depth variance exceeds the tolerance threshold:
 
 $$\Delta Z = \frac{|Z_{\text{curr}} - Z_{\text{prev}}|}{\max(Z_{\text{curr}}, 10^{-5})} > \text{Threshold}$$
 
-The shader rejects the history sample and executes a spatial cross-bilateral filter from the current frame's four diagonally adjacent active samples:
+The shader rejects the history sample and executes a spatial cross-bilateral filter from the current frame's four orthogonal (cardinal: up, down, left, right) active samples:
 
 $$C_{\text{spatial}} = \frac{\sum_{k=1}^4 w_k C_k}{\sum_{k=1}^4 w_k}, \quad w_k = \exp\left(-\frac{\|p_k - p\|^2}{2\sigma_d^2}\right) \cdot \exp\left(-\frac{|Z_k - Z|^2}{2\sigma_z^2}\right)$$
 
@@ -168,7 +171,7 @@ $$C_{\text{spatial}} = \frac{\sum_{k=1}^4 w_k C_k}{\sum_{k=1}^4 w_k}, \quad w_k 
 | Component | Minimum Specification | Recommended (Target Baseline) | Role in CBR Pipeline |
 |---|---|---|---|
 | **GPU** | GTX 1060 (6 GB) / RX 580 (8 GB) | **NVIDIA GeForce GTX 1070 Ti (8 GB GDDR5)** | Compute shader capability (SM 5.0+), 2× MSAA rasterization, ≥250 GB/s bandwidth |
-| **GPU VRAM** | 6 GB | **8 GB GDDR5** | Accommodates ~285 MB dedicated VRAM for 4K ping-pong history and depth buffers |
+| **GPU VRAM** | 6 GB | **8 GB GDDR5** | Accommodates ~268.95 MB dedicated VRAM for 4K ping-pong history and depth buffers |
 | **CPU** | Quad-Core (i5-8400 / Ryzen 2600) | **6-Core / 12-Thread (i7 / Ryzen 3600+)** | Interception hooks add minimal overhead ($\le 0.05\,\mu\text{s}$ per draw call) |
 | **RAM** | 12 GB | **16 GB DDR4 Dual-Channel** | System memory stability during texture streaming |
 | **OS** | Windows 10 (64-bit, 19041+) | **Windows 10 / Windows 11 (64-bit)** | Native Vulkan 1.3 and DirectX 12 support |
@@ -176,6 +179,7 @@ $$C_{\text{spatial}} = \frac{\sum_{k=1}^4 w_k C_k}{\sum_{k=1}^4 w_k}, \quad w_k 
 
 ---
 
+<a id="building"></a>
 ## 🚀 How to Build, Install & Run
 
 ### Step 1: Software Prerequisites
@@ -252,7 +256,7 @@ Upon launching the game, open `cbr.log` in the RDR2 root directory to verify hoo
 [INFO] Configuration successfully loaded from cbr.ini (Target: 3840x2160, API: Vulkan, CBR Enabled: true)
 [INFO] RenderTargetManager initialized for target: 3840x2160
 [INFO] Quarter-Resolution 2x MSAA Buffer size: 1920x1080
-[INFO] Total CBR VRAM Footprint: 285.20 MB
+[INFO] Total CBR VRAM Footprint: 268.95 MB
 [INFO] Vulkan interception hooks successfully registered.
 [INFO] CBREngine initialized successfully. Ready for frame interception.
 ```
