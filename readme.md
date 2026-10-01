@@ -18,6 +18,7 @@ A community-driven graphics modification implementing **Checkerboard Rendering (
 - [How It Works](#how-it-works)
 - [Key Features](#key-features)
 - [Architecture & Repository Structure](#architecture--repository-structure)
+- [Complete Source Codebase (Single Document)](CODEBASE.md)
 - [Engineering Documentation](#engineering-documentation)
 - [Reconstruction Shader Math](#reconstruction-shader-math)
 - [Hardware & Development Requirements](#hardware--development-requirements)
@@ -86,6 +87,7 @@ Checkerboard-Rendering/
 ├── CMakeLists.txt              # CMake build script for rdr2-cbr.asi
 ├── LICENSE                     # MIT License
 ├── README.md                   # Project overview and instructions
+├── CODEBASE.md                 # Consolidated single document of all source code & shaders
 ├── CONTRIBUTING.md             # Contribution guidelines & coding standards
 ├── cbr.ini                     # Runtime configuration file
 ├── .gitignore                  # Git ignore rules
