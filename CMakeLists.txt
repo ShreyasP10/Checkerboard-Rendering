@@ -58,6 +58,9 @@ set(CBR_SHADERS
     ${CBR_SHADER_DIR}/cbr_resolve_simple.comp
 )
 
+# Prevent MSVC from attempting default FXC compilation on shaders in IDE
+set_source_files_properties(${CBR_SHADERS} PROPERTIES HEADER_FILE_ONLY TRUE)
+
 # Define shared library (ASI plugin is a renamed DLL)
 add_library(rdr2-cbr SHARED ${CBR_HEADERS} ${CBR_SOURCES} ${CBR_SHADERS})
 
@@ -76,29 +79,33 @@ target_compile_definitions(rdr2-cbr PRIVATE
     CBR_EXPORTS
 )
 
-# MSVC optimization flags
+# MSVC optimization and hardening flags
 if(MSVC)
     target_compile_options(rdr2-cbr PRIVATE
         /W4
         /MP
         /Oi
         /Ot
-        $<$<CONFIG:Release>:/O2 /GL /GS->
+        /guard:cf
+        /sdl
+        $<$<CONFIG:Release>:/O2 /GL /GS>
     )
     target_link_options(rdr2-cbr PRIVATE
-        $<$<CONFIG:Release>:/LTCG /OPT:REF /OPT:ICF>
+        /guard:cf
+        /DYNAMICBASE
+        /NXCOMPAT
+        $<$<CONFIG:Release>:/LTCG /OPT:REF /OPT:ICF /CETCOMPAT>
     )
 endif()
 
-# Find Vulkan if available
+# Find Vulkan headers if available (dynamic runtime resolution is used for function pointers)
 find_package(Vulkan QUIET)
 if(Vulkan_FOUND)
-    message(STATUS "Vulkan SDK found: ${Vulkan_INCLUDE_DIRS}")
+    message(STATUS "Vulkan SDK headers found: ${Vulkan_INCLUDE_DIRS}")
     target_include_directories(rdr2-cbr PRIVATE ${Vulkan_INCLUDE_DIRS})
-    target_link_libraries(rdr2-cbr PRIVATE ${Vulkan_LIBRARIES})
     target_compile_definitions(rdr2-cbr PRIVATE CBR_VULKAN_SUPPORT=1)
 else()
-    message(STATUS "Vulkan SDK not found, using dynamic runtime linking.")
+    message(STATUS "Vulkan SDK not found, using bundled/dynamic runtime headers.")
     target_compile_definitions(rdr2-cbr PRIVATE CBR_VULKAN_SUPPORT=1)
 endif()
 

@@ -19,11 +19,12 @@ Texture2D<float>    g_HistoryDepth     : register(t3);
 Texture2D<float2>   g_Velocity         : register(t4);
 
 SamplerState        g_LinearClampSampler : register(s0);
+SamplerState        g_PointClampSampler  : register(s1);
 
 RWTexture2D<float4> g_OutputImage      : register(u0);
 
 // =============================================================================
-// Constant Buffer
+// Constant Buffer (16-byte aligned)
 // =============================================================================
 cbuffer CBRConstants : register(b0)
 {
@@ -87,11 +88,12 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     uint frameParity = g_FrameIndex & 1u;
     bool isCurrentSampleActive = (pixelParity == frameParity);
 
-    // Subpixel MSAA sample index calculation
-    int msaaSampleIndex = int((uint(pixelCoord.x) & 1u) ^ (uint(pixelCoord.y) & 1u));
+    // In a 2x2 quarter cell, the two active samples correspond to pixelCoord.x parity
+    int msaaSampleIndex = int(uint(pixelCoord.x) & 1u);
 
-    float4 currentSample = g_QuarterColorMSAA.Load(int3(quarterCoord, 0), msaaSampleIndex);
-    float currentDepth   = g_QuarterDepthMSAA.Load(int3(quarterCoord, 0), msaaSampleIndex).r;
+    // In HLSL, Texture2DMS.Load takes (int2 Location, int SampleIndex)
+    float4 currentSample = g_QuarterColorMSAA.Load(quarterCoord, msaaSampleIndex);
+    float currentDepth   = g_QuarterDepthMSAA.Load(quarterCoord, msaaSampleIndex).r;
 
     // -------------------------------------------------------------------------
     // 2. Motion Vector Fetch & History Coordinate Calculation
@@ -111,7 +113,8 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     }
     else
     {
-        float previousDepth = g_HistoryDepth.SampleLevel(g_LinearClampSampler, historyUV, 0.0f).r;
+        // Point sampling for depth history avoids edge bleeding across discontinuities
+        float previousDepth = g_HistoryDepth.SampleLevel(g_PointClampSampler, historyUV, 0.0f).r;
         float depthDelta = abs(currentDepth - previousDepth) / max(currentDepth, 1e-5f);
 
         if (depthDelta > g_DepthTolerance)
@@ -121,32 +124,37 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
         else
         {
             historyColor = g_HistoryColor.SampleLevel(g_LinearClampSampler, historyUV, 0.0f);
+            if (historyColor.a <= 0.0f)
+            {
+                isDisoccluded = true;
+            }
         }
     }
 
     // -------------------------------------------------------------------------
     // 4. Neighborhood Clamping (YCoCg Space)
+    // Guarded to avoid unnecessary texture fetches when disoccluded or disabled
     // -------------------------------------------------------------------------
-    float3 colorMin = float3(1e6f, 1e6f, 1e6f);
-    float3 colorMax = float3(-1e6f, -1e6f, -1e6f);
-
-    for (int dy = -1; dy <= 1; ++dy)
-    {
-        for (int dx = -1; dx <= 1; ++dx)
-        {
-            int2 neighborCoord = clamp(pixelCoord + int2(dx, dy), int2(0, 0), targetSize - int2(1, 1));
-            int2 neighborQuarter = neighborCoord / 2;
-            int neighborSample = int((uint(neighborCoord.x) & 1u) ^ (uint(neighborCoord.y) & 1u));
-            float3 neighborColor = g_QuarterColorMSAA.Load(int3(neighborQuarter, 0), neighborSample).rgb;
-
-            float3 neighborYCoCg = RGBtoYCoCg(neighborColor);
-            colorMin = min(colorMin, neighborYCoCg);
-            colorMax = max(colorMax, neighborYCoCg);
-        }
-    }
-
     if (!isDisoccluded && g_EnableColorClamping != 0u)
     {
+        float3 colorMin = float3(1e6f, 1e6f, 1e6f);
+        float3 colorMax = float3(-1e6f, -1e6f, -1e6f);
+
+        for (int dy = -1; dy <= 1; ++dy)
+        {
+            for (int dx = -1; dx <= 1; ++dx)
+            {
+                int2 neighborCoord = clamp(pixelCoord + int2(dx, dy), int2(0, 0), targetSize - int2(1, 1));
+                int2 neighborQuarter = neighborCoord / 2;
+                int neighborSample = int(uint(neighborCoord.x) & 1u);
+                float3 neighborColor = g_QuarterColorMSAA.Load(neighborQuarter, neighborSample).rgb;
+
+                float3 neighborYCoCg = RGBtoYCoCg(neighborColor);
+                colorMin = min(colorMin, neighborYCoCg);
+                colorMax = max(colorMax, neighborYCoCg);
+            }
+        }
+
         float3 historyYCoCg = RGBtoYCoCg(historyColor.rgb);
         historyYCoCg = clamp(historyYCoCg, colorMin, colorMax);
         historyColor.rgb = YCoCgtoRGB(historyYCoCg);
@@ -161,7 +169,7 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     {
         if (!isDisoccluded && historyColor.a > 0.0f)
         {
-            finalColor = lerp(currentSample.rgb, historyColor.rgb, 1.0f - g_HistoryWeight);
+            finalColor = lerp(currentSample.rgb, historyColor.rgb, g_HistoryWeight);
         }
         else
         {
@@ -170,13 +178,13 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     }
     else
     {
-        if (!isDisoccluded)
+        if (!isDisoccluded && historyColor.a > 0.0f)
         {
             finalColor = historyColor.rgb;
         }
         else
         {
-            // Spatial cross-bilateral filter fallback
+            // Spatial cross-bilateral filter fallback from 4 cardinal neighbors
             float3 accumColor = float3(0.0f, 0.0f, 0.0f);
             float  accumWeight = 0.0f;
             const int2 offsets[4] = { int2(-1, 0), int2(1, 0), int2(0, -1), int2(0, 1) };
@@ -185,10 +193,10 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
             {
                 int2 sampleCoord = clamp(pixelCoord + offsets[i], int2(0, 0), targetSize - int2(1, 1));
                 int2 sQuarter = sampleCoord / 2;
-                int sIndex = int((uint(sampleCoord.x) & 1u) ^ (uint(sampleCoord.y) & 1u));
+                int sIndex = int(uint(sampleCoord.x) & 1u);
 
-                float3 sCol = g_QuarterColorMSAA.Load(int3(sQuarter, 0), sIndex).rgb;
-                float  sDep = g_QuarterDepthMSAA.Load(int3(sQuarter, 0), sIndex).r;
+                float3 sCol = g_QuarterColorMSAA.Load(sQuarter, sIndex).rgb;
+                float  sDep = g_QuarterDepthMSAA.Load(sQuarter, sIndex).r;
 
                 float depthWeight = exp(-abs(currentDepth - sDep) * 100.0f);
                 accumColor += sCol * depthWeight;
@@ -197,6 +205,14 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
 
             finalColor = (accumWeight > 1e-4f) ? (accumColor / accumWeight) : currentSample.rgb;
         }
+    }
+
+    // Guard against NaN/Inf pollution in temporal feedback
+    if (isnan(finalColor.r) || isinf(finalColor.r) ||
+        isnan(finalColor.g) || isinf(finalColor.g) ||
+        isnan(finalColor.b) || isinf(finalColor.b))
+    {
+        finalColor = currentSample.rgb;
     }
 
     // -------------------------------------------------------------------------

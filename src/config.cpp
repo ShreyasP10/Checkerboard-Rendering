@@ -3,6 +3,8 @@
 #include <fstream>
 #include <sstream>
 #include <algorithm>
+#include <cmath>
+#include <charconv>
 
 namespace cbr {
 
@@ -15,12 +17,49 @@ std::string Trim(const std::string& str) {
     return str.substr(first, (last - first + 1));
 }
 
+// Strip inline comments starting with ';' or '#'
+std::string StripComment(const std::string& str) {
+    auto pos = str.find_first_of(";#");
+    if (pos != std::string::npos) {
+        return str.substr(0, pos);
+    }
+    return str;
+}
+
 bool ParseBool(const std::string& val, bool defaultVal) {
     std::string s = val;
-    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     if (s == "true" || s == "1" || s == "yes" || s == "on") return true;
     if (s == "false" || s == "0" || s == "no" || s == "off") return false;
     return defaultVal;
+}
+
+uint32_t ParseUInt(const std::string& val, uint32_t defaultVal, uint32_t minVal, uint32_t maxVal) {
+    if (val.empty()) return defaultVal;
+    try {
+        size_t idx = 0;
+        unsigned long result = std::stoul(val, &idx);
+        if (idx == 0) return defaultVal;
+        if (result < minVal) result = minVal;
+        if (result > maxVal) result = maxVal;
+        return static_cast<uint32_t>(result);
+    } catch (...) {
+        return defaultVal;
+    }
+}
+
+float ParseFloat(const std::string& val, float defaultVal, float minVal, float maxVal) {
+    if (val.empty()) return defaultVal;
+    try {
+        size_t idx = 0;
+        float result = std::stof(val, &idx);
+        if (idx == 0 || std::isnan(result) || std::isinf(result)) return defaultVal;
+        if (result < minVal) result = minVal;
+        if (result > maxVal) result = maxVal;
+        return result;
+    } catch (...) {
+        return defaultVal;
+    }
 }
 
 } // namespace
@@ -54,35 +93,41 @@ bool ConfigManager::Load(const std::string& configPath) {
         auto eqPos = trimmed.find('=');
         if (eqPos != std::string::npos) {
             std::string key = Trim(trimmed.substr(0, eqPos));
-            std::string val = Trim(trimmed.substr(eqPos + 1));
+            std::string val = Trim(StripComment(trimmed.substr(eqPos + 1)));
 
             if (key == "Enabled") {
                 m_config.enabled = ParseBool(val, m_config.enabled);
             } else if (key == "TargetWidth") {
-                m_config.targetWidth = static_cast<uint32_t>(std::stoul(val));
+                m_config.targetWidth = ParseUInt(val, m_config.targetWidth, 720, 7680) & ~1u; // Ensure even width
             } else if (key == "TargetHeight") {
-                m_config.targetHeight = static_cast<uint32_t>(std::stoul(val));
+                m_config.targetHeight = ParseUInt(val, m_config.targetHeight, 480, 4320) & ~1u; // Ensure even height
             } else if (key == "PreferredApi") {
                 if (val == "Vulkan") m_config.preferredApi = GraphicsApi::Vulkan;
                 else if (val == "D3D12") m_config.preferredApi = GraphicsApi::D3D12;
             } else if (key == "MipLodBias") {
-                m_config.mipLodBias = std::stof(val);
+                m_config.mipLodBias = ParseFloat(val, m_config.mipLodBias, -4.0f, 4.0f);
             } else if (key == "DepthTolerance") {
-                m_config.depthTolerance = std::stof(val);
+                m_config.depthTolerance = ParseFloat(val, m_config.depthTolerance, 0.0001f, 1.0f);
             } else if (key == "EnableColorClamping") {
                 m_config.enableColorClamping = ParseBool(val, m_config.enableColorClamping);
             } else if (key == "ColorSpace") {
                 m_config.colorSpace = (val == "RGB") ? ColorSpace::RGB : ColorSpace::YCoCg;
             } else if (key == "HistoryWeight") {
-                m_config.historyWeight = std::stof(val);
+                m_config.historyWeight = ParseFloat(val, m_config.historyWeight, 0.0f, 1.0f);
             } else if (key == "EnableSpatialFallback") {
                 m_config.enableSpatialFallback = ParseBool(val, m_config.enableSpatialFallback);
+            } else if (key == "JitterPattern") {
+                m_config.jitterPattern = (val == "Halton") ? JitterPattern::Halton : JitterPattern::Checkerboard;
+            } else if (key == "JitterScale") {
+                m_config.jitterScale = ParseFloat(val, m_config.jitterScale, 0.1f, 4.0f);
             } else if (key == "DebugView") {
-                m_config.debugView = static_cast<uint32_t>(std::stoul(val));
+                m_config.debugView = ParseUInt(val, m_config.debugView, 0, 4);
             } else if (key == "ShowOverlay") {
                 m_config.showOverlay = ParseBool(val, m_config.showOverlay);
             } else if (key == "LogToFile") {
                 m_config.logToFile = ParseBool(val, m_config.logToFile);
+            } else if (key == "LogLevel") {
+                m_config.logLevel = val;
             }
         }
     }
@@ -119,10 +164,15 @@ bool ConfigManager::Save(const std::string& configPath) {
     file << "HistoryWeight = " << m_config.historyWeight << "\n";
     file << "EnableSpatialFallback = " << (m_config.enableSpatialFallback ? "true" : "false") << "\n\n";
 
+    file << "[Jitter]\n";
+    file << "JitterPattern = " << (m_config.jitterPattern == JitterPattern::Halton ? "Halton" : "Checkerboard") << "\n";
+    file << "JitterScale = " << m_config.jitterScale << "\n\n";
+
     file << "[Debug]\n";
     file << "ShowOverlay = " << (m_config.showOverlay ? "true" : "false") << "\n";
     file << "DebugView = " << m_config.debugView << "\n";
     file << "LogToFile = " << (m_config.logToFile ? "true" : "false") << "\n";
+    file << "LogLevel = " << m_config.logLevel << "\n";
 
     return true;
 }

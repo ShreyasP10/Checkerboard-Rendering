@@ -19,9 +19,13 @@ public:
 
     JitterOffset GetCurrentJitter() const { return m_currentJitter; }
     JitterOffset GetPreviousJitter() const { return m_previousJitter; }
+    JitterOffset GetJitterDelta() const {
+        return { m_currentJitter.x - m_previousJitter.x, m_currentJitter.y - m_previousJitter.y };
+    }
 
     // Computes subpixel jitter offset for a 4x4 projection matrix
     void ApplyJitterToProjection(float* projMatrix4x4, bool isVulkan) const;
+    void RemoveJitterFromProjection(float* projMatrix4x4, bool isVulkan) const;
 
 private:
     JitterManager() = default;
