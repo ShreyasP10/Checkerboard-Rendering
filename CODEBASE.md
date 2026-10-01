@@ -332,6 +332,8 @@ imgui.ini
 # Temporary / OS
 .DS_Store
 Thumbs.db
+temp/
+tmp/
 ```
 
 <a id="license"></a>
