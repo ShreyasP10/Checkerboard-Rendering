@@ -216,42 +216,113 @@ The build process outputs:
 - `build/bin/rdr2-cbr.asi` — The compiled ASI mod binary.
 - `build/bin/cbr.ini` — The default configuration file.
 
-### Step 3: Install into RDR2
-1. Locate your *Red Dead Redemption 2* game root directory (where `RDR2.exe` is found):
-   - **Steam:** `Steam\steamapps\common\Red Dead Redemption 2\`
-   - **Rockstar Games:** `Rockstar Games\Red Dead Redemption 2\`
-   - **Epic Games:** `Epic Games\Red Dead Redemption 2\`
-2. Copy the following files into the RDR2 root folder:
-   - `dinput8.dll` (ASI Loader)
-   - `rdr2-cbr.asi` (from `build/bin/`)
-   - `cbr.ini` (from `build/bin/`)
+### Step 3: Install into RDR2 from Scratch
 
+#### 3.1 Locate Your RDR2 Installation Directory
+Find the folder containing `RDR2.exe`:
+- **Steam:** Right-click *Red Dead Redemption 2* in your Steam Library > **Manage** > **Browse local files** (typically `C:\Program Files (x86)\Steam\steamapps\common\Red Dead Redemption 2\`).
+- **Rockstar Games Launcher:** Open Launcher > **Settings** > **My installed games** > **Red Dead Redemption 2** > **View installation folder** (typically `C:\Program Files\Rockstar Games\Red Dead Redemption 2\`).
+- **Epic Games Store:** Open Epic Launcher > Library > Click the three dots under RDR2 > **Manage** > Click the folder icon next to *Installation* (typically `C:\Program Files\Epic Games\Red Dead Redemption 2\`).
+
+#### 3.2 Install the ASI Loader
+An ASI loader is required to load custom `.asi` game modifications:
+1. Download `dinput8.dll` from the official [Script Hook RDR2](http://www.dev-c.com/rdr2/scripthookrdr2/) release by Alexander Blade or an authenticated open-source ASI loader.
+2. Place `dinput8.dll` directly into the RDR2 root folder (where `RDR2.exe` is located).
+
+#### 3.3 Deploy CBR Plugin & Configuration
+Copy the built mod files into your RDR2 root directory:
+1. Copy `rdr2-cbr.asi` into the RDR2 root folder.
+2. Copy `cbr.ini` into the RDR2 root folder.
+
+Your RDR2 folder structure should look like this:
 ```
 Red Dead Redemption 2/
-├── RDR2.exe
-├── dinput8.dll         <-- ASI Loader (executes .asi plugins)
-├── rdr2-cbr.asi        <-- CBR Mod Plugin
-└── cbr.ini             <-- CBR Configuration Settings
+├── RDR2.exe                  <-- Game executable
+├── dinput8.dll               <-- ASI Loader (executes .asi plugins)
+├── rdr2-cbr.asi              <-- Checkerboard Rendering Mod Plugin
+├── cbr.ini                   <-- Mod configuration settings
+└── ... (game data files)
 ```
 
-### Step 4: Recommended In-Game Settings
-Launch *Red Dead Redemption 2*, open **Settings > Graphics**, and configure:
-1. **Graphics API:** Set to **Vulkan** (Vulkan allows Pascal GPUs direct subpixel sample control).
-2. **Resolution:** Set to **3840×2160 (4K)** (or your target display resolution).
-3. **TAA (Temporal Anti-Aliasing):** Set to **Medium** or **High** (ensures internal velocity vectors are generated).
-4. **Resolution Scale:** Set to **Off / 1.0×** (the mod automatically handles quarter-resolution rendering and resolve).
+---
 
-### Step 5: In-Game Controls & Debug Modes
-- **Toggle Overlay:** *(planned)* F11 / Insert will toggle the ImGui control panel once the overlay is implemented. For now set `ShowOverlay` in `cbr.ini`.
-- **Debug Views (configurable in `cbr.ini` or ImGui):**
-  - `DebugView = 0`: Normal CBR Reconstructed 4K output.
-  - `DebugView = 1`: **Checkerboard Mask** — reveals active frame samples vs reconstructed pixels.
-  - `DebugView = 2`: **Disocclusion Heatmap** — **Green** indicates valid temporal history; **Red** highlights disoccluded geometry using spatial fallback.
-  - `DebugView = 3`: **Motion Vector Field** — visualizes screen-space velocity vectors.
-  - `DebugView = 4`: **Raw Buffer** — displays quarter-resolution unresolved image.
+### Step 4: Configure `cbr.ini` Before First Launch
 
-### Step 6: Verifying Installation via Logs
-Upon launching the game, open `cbr.log` in the RDR2 root directory to verify hook initialization:
+Open `cbr.ini` in Notepad or your preferred text editor and customize the parameters for your monitor and hardware:
+
+```ini
+[General]
+Enabled = true
+TargetWidth = 3840           ; Set to your display resolution width (e.g. 3840 for 4K, 2560 for 1440p)
+TargetHeight = 2160          ; Set to your display resolution height (e.g. 2160 for 4K, 1440 for 1440p)
+PreferredApi = Vulkan        ; "Vulkan" (strongly recommended for Pascal/GTX 1070 Ti), "D3D12", or "Auto"
+MipLodBias = -0.5            ; -0.5 preserves full 4K texture sharpness on 1080p geometry
+
+[Reconstruction]
+DepthTolerance = 0.010       ; Relative depth disocclusion sensitivity threshold
+EnableColorClamping = true   ; Enables variance clipping to eliminate temporal ghosting
+ColorSpace = YCoCg           ; YCoCg provides artifact-free color bounding box calculation
+HistoryWeight = 0.90         ; 0.90 retains 90% temporal history on static pixels
+EnableSpatialFallback = true ; Uses cross-bilateral filter when history is disoccluded
+
+[Jitter]
+JitterPattern = Checkerboard ; 2-phase subpixel complementary grid jitter
+JitterScale = 1.0            ; 1.0 = exact 0.5-pixel subpixel perturbation
+
+[Debug]
+ShowOverlay = false          ; Toggle in-game overlay
+DebugView = 0                ; 0=Reconstructed 4K, 1=CBR Mask, 2=Disocclusion Heatmap, 3=Motion Vectors, 4=Raw
+LogToFile = true             ; Writes cbr.log for installation diagnostic
+LogLevel = Info              ; Debug, Info, Warning, Error
+```
+
+---
+
+### Step 5: Recommended In-Game Graphics Settings (Complete Walkthrough)
+
+Launch *Red Dead Redemption 2*, open **Settings > Graphics**, and configure the options as detailed below:
+
+#### 1. Display & Window Settings
+* **Screen Type:** Set to **Fullscreen** (Windowed/Borderless can cause DWM scaling artifacts and input latency).
+* **Resolution:** Set to your target output resolution (e.g., **3840×2160** or **2560×1440**). *Must match `TargetWidth` and `TargetHeight` in `cbr.ini`.*
+* **Refresh Rate:** Set to your monitor's native refresh rate (e.g. 60Hz, 120Hz, 144Hz).
+* **V-Sync:** **On** (or use NVIDIA G-Sync / AMD FreeSync) to prevent presentation screen tearing.
+* **Triple Buffering:** **On** (smooths frame delivery and pacing when targeting 60 FPS).
+
+#### 2. Advanced Graphics API Setting (Critical!)
+* **Unlock Advanced Settings:** Set to **Unlocked**.
+* **Graphics API:** Set to **Vulkan** (*Crucial:* Vulkan offers direct subpixel sample control and lower CPU overhead on Pascal GP104 hardware. If switching from DirectX 12 to Vulkan, restart the game).
+* **Async Compute:** **On** (enables concurrent execution of compute reconstruction alongside rasterization passes).
+
+#### 3. Anti-Aliasing & Resolution Scaling (Critical!)
+* **Resolution Scale:** Set to **Off / 1.0×** (*CRITICAL:* Never set this to 0.75×, 0.85×, etc. In-game resolution scaling breaks 1:1 subpixel checkerboard parity mapping).
+* **TAA (Temporal Anti-Aliasing):** Set to **Medium** or **High** (*CRITICAL:* RDR2's internal motion/velocity vectors `u_Velocity` are only generated by the RAGE engine when TAA is enabled. CBR requires these vectors for temporal history reprojection).
+* **TAA Sharpening:** Adjust according to personal preference (typically 30%–50%).
+* **FXAA:** **Off** (redundant post-processing blur).
+* **MSAA:** **Off** (*CRITICAL:* Leave in-game MSAA disabled. CBR allocates its own dedicated 2× MSAA intermediate buffer).
+
+#### 4. Geometry & Texture Settings (Optimized for GTX 1070 Ti / Pascal 8 GB)
+* **Texture Quality:** **Ultra** (Textures sample at full 4K Nyquist resolution due to CBR's `-0.5` `MipLodBias`; fits comfortably in 8 GB VRAM with ~269 MB CBR overhead).
+* **Anisotropic Filtering:** **16×** (negligible performance cost on Pascal GPUs; keeps road and terrain textures sharp at oblique viewing angles).
+* **Lighting Quality:** **Medium** or **High**.
+* **Global Illumination Quality:** **High**.
+* **Shadow Quality:** **High**.
+* **Far Shadow Quality:** **Medium** or **High**.
+* **Screen Space Ambient Occlusion (SSAO):** **High**.
+* **Reflection Quality:** **Medium** (High/Ultra reflections are very expensive in RDR2).
+* **Mirror Quality:** **High**.
+* **Water Quality:** **Medium** (Custom / Water Physics: 2/4).
+* **Volumetrics Quality:** **Medium** (Raymarched volumetric fog is compute-heavy at 4K; Medium provides optimal 60 FPS headroom).
+* **Particle Quality:** **Medium**.
+* **Tessellation Quality:** **High** (keeps tree bark and ground snow tracks detailed).
+* **Motion Blur:** **Off** (recommended for cleanest checkerboard temporal stability).
+
+---
+
+### Step 6: Verifying Installation via Logs & Debug Modes
+
+#### 6.1 Check Initialization Log (`cbr.log`)
+Exit or Alt-Tab from the game and open `cbr.log` in the RDR2 root folder to verify that the mod was loaded:
 ```text
 =================================================================
  RDR2 Checkerboard Rendering Mod (CBR) Log Initialized           
@@ -266,6 +337,27 @@ Upon launching the game, open `cbr.log` in the RDR2 root directory to verify hoo
 [WARN] Vulkan hook installation is not implemented yet; no hooks are active.
 [INFO] CBREngine initialized successfully. Ready for frame interception.
 ```
+
+#### 6.2 Visual Inspection with Debug Views
+You can toggle diagnostic visualization modes in `cbr.ini` by modifying `DebugView`:
+- `DebugView = 0`: **Normal Reconstructed Output** (standard 4K CBR presentation).
+- `DebugView = 1`: **Checkerboard Subpixel Mask** — displays a 1:1 pixel mask. **White** pixels were natively shaded in the current frame; **Black** pixels were reconstructed from history.
+- `DebugView = 2`: **Disocclusion Heatmap** — **Green** indicates valid temporal reprojection; **Red** highlights disoccluded geometry using spatial cross-bilateral fallback.
+- `DebugView = 3`: **Motion Vector Field** — visualizes screen-space velocity vectors (R=horizontal motion, G=vertical motion).
+- `DebugView = 4`: **Raw Buffer** — displays the unresolved quarter-resolution native render.
+
+---
+
+### Step 7: Troubleshooting & FAQ
+
+* **Q: The game crashes immediately on startup.**
+  * *A:* Verify you installed a clean, compatible `dinput8.dll` ASI loader. Ensure Microsoft Visual C++ 2015–2022 Redistributable (x64) is installed. Check `cbr.log` for any error messages.
+* **Q: `cbr.log` is not created at all.**
+  * *A:* This means `dinput8.dll` is either missing, blocked by Windows SmartScreen/Antivirus, or located in the wrong directory. Ensure `dinput8.dll`, `rdr2-cbr.asi`, and `cbr.ini` are in the **same folder** as `RDR2.exe`.
+* **Q: The game looks blurry or pixelated.**
+  * *A:* Verify that **Resolution Scale** in the Graphics menu is set to **Off / 1.0×**, and that **TAA** is set to **Medium** or **High**.
+* **Q: Can I use this mod in Red Dead Online?**
+  * *A:* **No.** This mod is strictly designed and intended for single-player story mode. Never use modified game files or ASI loaders when connecting to Red Dead Online to avoid anti-cheat bans.
 
 ---
 
