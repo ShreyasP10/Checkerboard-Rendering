@@ -22,6 +22,8 @@ public:
     void OnBeginFrame();
     void OnPreRender();
     void OnPostRender();
+    // Mid-frame pass interception: called when main geometry pass completes, before post-processing / UI
+    void OnScenePassEnd(void* cmdBufferOrContext);
     void OnPrePresent(void* queueOrContext, const void* presentInfo);
     void OnPostPresent(void* presentTarget);
     // Call when the game (re)creates its swapchain: resets frame parity and history

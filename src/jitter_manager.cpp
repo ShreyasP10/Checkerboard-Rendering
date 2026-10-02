@@ -65,4 +65,24 @@ void JitterManager::RemoveJitterFromProjection(float* projMatrix4x4, bool isVulk
     projMatrix4x4[9] -= jitterNdcY;
 }
 
+void JitterManager::SetProjectionJitter(float* outMatrix4x4, const float* inUnjitteredMatrix4x4, bool isVulkan) const {
+    if (!outMatrix4x4 || !inUnjitteredMatrix4x4) return;
+
+    if (outMatrix4x4 != inUnjitteredMatrix4x4) {
+        for (int i = 0; i < 16; ++i) {
+            outMatrix4x4[i] = inUnjitteredMatrix4x4[i];
+        }
+    }
+
+    float jitterNdcX = 2.0f * m_currentJitter.x;
+    float jitterNdcY = 2.0f * m_currentJitter.y;
+
+    if (isVulkan) {
+        jitterNdcY = -jitterNdcY;
+    }
+
+    outMatrix4x4[8] = inUnjitteredMatrix4x4[8] + jitterNdcX;
+    outMatrix4x4[9] = inUnjitteredMatrix4x4[9] + jitterNdcY;
+}
+
 } // namespace cbr

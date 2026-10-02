@@ -1,5 +1,6 @@
 #include "cbr/reconstruction_pass.h"
 #include "cbr/config.h"
+#include "cbr/jitter_manager.h"
 #include "cbr/render_target_manager.h"
 #include "cbr/logger.h"
 #include <chrono>
@@ -35,6 +36,7 @@ void ReconstructionPass::DispatchVulkan(void* /*vkCommandBuffer*/, uint32_t fram
 
     const auto& config = ConfigManager::Get().GetConfig();
     const auto& dims = RenderTargetManager::Get().GetDimensions();
+    const auto jitterDelta = JitterManager::Get().GetJitterDelta();
 
     ReconstructionPushConstants pushConstants{};
     pushConstants.targetResolution[0] = static_cast<float>(dims.fullWidth);
@@ -49,6 +51,10 @@ void ReconstructionPass::DispatchVulkan(void* /*vkCommandBuffer*/, uint32_t fram
     pushConstants.mipLodBias = config.mipLodBias;
     pushConstants.colorSpace = (config.colorSpace == ColorSpace::RGB) ? 1u : 0u;
     pushConstants.enableSpatialFallback = config.enableSpatialFallback ? 1u : 0u;
+    pushConstants.jitterDelta[0] = jitterDelta.x;
+    pushConstants.jitterDelta[1] = jitterDelta.y;
+    pushConstants.padding[0] = 0.0f;
+    pushConstants.padding[1] = 0.0f;
 
     uint32_t groupCountX = (dims.fullWidth + 15u) / 16u;
     uint32_t groupCountY = (dims.fullHeight + 15u) / 16u;
@@ -65,12 +71,29 @@ void ReconstructionPass::DispatchDX12(void* /*d3d12GraphicsCommandList*/, uint32
 
     const auto& config = ConfigManager::Get().GetConfig();
     const auto& dims = RenderTargetManager::Get().GetDimensions();
+    const auto jitterDelta = JitterManager::Get().GetJitterDelta();
+
+    ReconstructionPushConstants pushConstants{};
+    pushConstants.targetResolution[0] = static_cast<float>(dims.fullWidth);
+    pushConstants.targetResolution[1] = static_cast<float>(dims.fullHeight);
+    pushConstants.invTargetResolution[0] = 1.0f / pushConstants.targetResolution[0];
+    pushConstants.invTargetResolution[1] = 1.0f / pushConstants.targetResolution[1];
+    pushConstants.frameIndex = frameIndex;
+    pushConstants.depthTolerance = config.depthTolerance;
+    pushConstants.historyWeight = config.historyWeight;
+    pushConstants.debugView = config.debugView;
+    pushConstants.enableColorClamping = config.enableColorClamping ? 1u : 0u;
+    pushConstants.mipLodBias = config.mipLodBias;
+    pushConstants.colorSpace = (config.colorSpace == ColorSpace::RGB) ? 1u : 0u;
+    pushConstants.enableSpatialFallback = config.enableSpatialFallback ? 1u : 0u;
+    pushConstants.jitterDelta[0] = jitterDelta.x;
+    pushConstants.jitterDelta[1] = jitterDelta.y;
+    pushConstants.padding[0] = 0.0f;
+    pushConstants.padding[1] = 0.0f;
 
     uint32_t groupCountX = (dims.fullWidth + 15u) / 16u;
     uint32_t groupCountY = (dims.fullHeight + 15u) / 16u;
 
-    (void)config;
-    (void)frameIndex;
     (void)groupCountX;
     (void)groupCountY;
     // In DX12, sets root signature, pipeline state, descriptor tables, and calls Dispatch(groupCountX, groupCountY, 1)

@@ -125,6 +125,13 @@ static void TestJitter() {
     j.ApplyJitterToProjection(m, true);
     j.RemoveJitterFromProjection(m, true);
     for (int i = 0; i < 16; ++i) CHECK(std::fabs(m[i] - orig[i]) < 1e-7f);
+
+    // SetProjectionJitter must be idempotent without compounding offsets
+    float out1[16];
+    float out2[16];
+    j.SetProjectionJitter(out1, orig, true);
+    j.SetProjectionJitter(out2, orig, true);
+    for (int i = 0; i < 16; ++i) CHECK(std::fabs(out1[i] - out2[i]) < 1e-7f);
 }
 
 static void TestRenderTargets() {
@@ -144,7 +151,7 @@ static void TestRenderTargets() {
 }
 
 static void TestPushConstantLayout() {
-    CHECK(sizeof(ReconstructionPushConstants) == 48);
+    CHECK(sizeof(ReconstructionPushConstants) == 64);
 }
 
 int main() {

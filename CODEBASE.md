@@ -463,6 +463,8 @@ public:
     void OnBeginFrame();
     void OnPreRender();
     void OnPostRender();
+    // Mid-frame pass interception: called when main geometry pass completes, before post-processing / UI
+    void OnScenePassEnd(void* cmdBufferOrContext);
     void OnPrePresent(void* queueOrContext, const void* presentInfo);
     void OnPostPresent(void* presentTarget);
     // Call when the game (re)creates its swapchain: resets frame parity and history
@@ -642,6 +644,9 @@ public:
     void ApplyJitterToProjection(float* projMatrix4x4, bool isVulkan) const;
     void RemoveJitterFromProjection(float* projMatrix4x4, bool isVulkan) const;
 
+    // Idempotent: sets jitter on outMatrix4x4 relative to inUnjitteredMatrix4x4 without accumulating
+    void SetProjectionJitter(float* outMatrix4x4, const float* inUnjitteredMatrix4x4, bool isVulkan) const;
+
 private:
     JitterManager() = default;
     ~JitterManager() = default;
@@ -755,10 +760,12 @@ struct ReconstructionPushConstants {
     float    mipLodBias;
     uint32_t colorSpace;            // 0 = YCoCg, 1 = RGB
     uint32_t enableSpatialFallback; // 1 = on
+    float    jitterDelta[2];        // subpixel projection jitter delta (jc - jp)
+    float    padding[2];            // 16-byte alignment padding
 };
 
 // Must match the push-constant block / cbuffer in shaders/cbr_reconstruct.{comp,hlsl}
-static_assert(sizeof(ReconstructionPushConstants) == 48, "push constant layout drifted from the shaders");
+static_assert(sizeof(ReconstructionPushConstants) == 64, "push constant layout drifted from the shaders");
 static_assert(sizeof(ReconstructionPushConstants) % 16 == 0, "cbuffer size must be a multiple of 16 bytes");
 
 class ReconstructionPass {
@@ -893,9 +900,19 @@ private:
 namespace {
 
 DWORD WINAPI CBRInitThread(LPVOID /*lpParam*/) {
-    // Delay slightly to allow game engine core and graphics runtime to settle
-    Sleep(1500);
+    // Bounded retry loop: poll every 250 ms for up to 60 s for graphics runtimes to settle
+    constexpr DWORD kIntervalMs = 250;
+    constexpr DWORD kMaxAttempts = 240; // 240 * 250 ms = 60 seconds
 
+    for (DWORD attempt = 0; attempt < kMaxAttempts; ++attempt) {
+        Sleep(kIntervalMs);
+        if (GetModuleHandleA("vulkan-1.dll") || GetModuleHandleA("d3d12.dll")) {
+            cbr::CBREngine::Get().Initialize();
+            return 0;
+        }
+    }
+
+    // Fallback initialize if neither runtime appeared before the timeout
     cbr::CBREngine::Get().Initialize();
     return 0;
 }
@@ -1083,28 +1100,31 @@ void CBREngine::OnPostRender() {
     // Geometry pass complete, intermediate quarter-res 2x MSAA buffer ready for resolve
 }
 
-void CBREngine::OnPrePresent(void* queueOrSwapchain, const void* /*presentInfo*/) {
+void CBREngine::OnScenePassEnd(void* cmdBufferOrContext) {
     if (!m_enabled.load()) return;
-
-    // Only the main output may run reconstruction / flip history
-    void* mainTarget = m_mainPresentTarget.load();
-    if (mainTarget != nullptr && queueOrSwapchain != mainTarget) return;
 
     uint32_t currentFrame = m_frameIndex.load();
 
-    // NOTE: the argument received here is a VkQueue (Vulkan) or IDXGISwapChain (DX12), NOT a
-    // command buffer / command list. The reconstruction pass must record into its own command
-    // buffer / list, so nullptr is passed until the real recording path exists.
+    // Mid-frame dispatch: reconstruct immediately when the quarter-resolution 2x MSAA
+    // geometry pass finishes, before post-processing and UI are composited.
     if (m_activeApi.load() == GraphicsApi::Vulkan) {
-        ReconstructionPass::Get().DispatchVulkan(nullptr, currentFrame);
+        ReconstructionPass::Get().DispatchVulkan(cmdBufferOrContext, currentFrame);
     } else {
-        ReconstructionPass::Get().DispatchDX12(nullptr, currentFrame);
+        ReconstructionPass::Get().DispatchDX12(cmdBufferOrContext, currentFrame);
     }
 
     // Swap history buffers (ping-pong double buffer)
     RenderTargetManager::Get().SwapHistoryBuffers();
+}
 
-    // Render ImGui overlay if toggled on
+void CBREngine::OnPrePresent(void* queueOrSwapchain, const void* /*presentInfo*/) {
+    if (!m_enabled.load()) return;
+
+    // Only the main output may handle presentation callbacks
+    void* mainTarget = m_mainPresentTarget.load();
+    if (mainTarget != nullptr && queueOrSwapchain != mainTarget) return;
+
+    // Render ImGui overlay if toggled on (Present is the correct timing for overlay drawing)
     UIOverlay::Get().Render();
 }
 
@@ -1604,6 +1624,26 @@ void JitterManager::RemoveJitterFromProjection(float* projMatrix4x4, bool isVulk
     projMatrix4x4[9] -= jitterNdcY;
 }
 
+void JitterManager::SetProjectionJitter(float* outMatrix4x4, const float* inUnjitteredMatrix4x4, bool isVulkan) const {
+    if (!outMatrix4x4 || !inUnjitteredMatrix4x4) return;
+
+    if (outMatrix4x4 != inUnjitteredMatrix4x4) {
+        for (int i = 0; i < 16; ++i) {
+            outMatrix4x4[i] = inUnjitteredMatrix4x4[i];
+        }
+    }
+
+    float jitterNdcX = 2.0f * m_currentJitter.x;
+    float jitterNdcY = 2.0f * m_currentJitter.y;
+
+    if (isVulkan) {
+        jitterNdcY = -jitterNdcY;
+    }
+
+    outMatrix4x4[8] = inUnjitteredMatrix4x4[8] + jitterNdcX;
+    outMatrix4x4[9] = inUnjitteredMatrix4x4[9] + jitterNdcY;
+}
+
 } // namespace cbr
 ```
 
@@ -1721,6 +1761,7 @@ void Logger::Log(LogLevel level, const std::string& message) {
 ```cpp
 #include "cbr/reconstruction_pass.h"
 #include "cbr/config.h"
+#include "cbr/jitter_manager.h"
 #include "cbr/render_target_manager.h"
 #include "cbr/logger.h"
 #include <chrono>
@@ -1756,6 +1797,7 @@ void ReconstructionPass::DispatchVulkan(void* /*vkCommandBuffer*/, uint32_t fram
 
     const auto& config = ConfigManager::Get().GetConfig();
     const auto& dims = RenderTargetManager::Get().GetDimensions();
+    const auto jitterDelta = JitterManager::Get().GetJitterDelta();
 
     ReconstructionPushConstants pushConstants{};
     pushConstants.targetResolution[0] = static_cast<float>(dims.fullWidth);
@@ -1770,6 +1812,10 @@ void ReconstructionPass::DispatchVulkan(void* /*vkCommandBuffer*/, uint32_t fram
     pushConstants.mipLodBias = config.mipLodBias;
     pushConstants.colorSpace = (config.colorSpace == ColorSpace::RGB) ? 1u : 0u;
     pushConstants.enableSpatialFallback = config.enableSpatialFallback ? 1u : 0u;
+    pushConstants.jitterDelta[0] = jitterDelta.x;
+    pushConstants.jitterDelta[1] = jitterDelta.y;
+    pushConstants.padding[0] = 0.0f;
+    pushConstants.padding[1] = 0.0f;
 
     uint32_t groupCountX = (dims.fullWidth + 15u) / 16u;
     uint32_t groupCountY = (dims.fullHeight + 15u) / 16u;
@@ -1786,12 +1832,29 @@ void ReconstructionPass::DispatchDX12(void* /*d3d12GraphicsCommandList*/, uint32
 
     const auto& config = ConfigManager::Get().GetConfig();
     const auto& dims = RenderTargetManager::Get().GetDimensions();
+    const auto jitterDelta = JitterManager::Get().GetJitterDelta();
+
+    ReconstructionPushConstants pushConstants{};
+    pushConstants.targetResolution[0] = static_cast<float>(dims.fullWidth);
+    pushConstants.targetResolution[1] = static_cast<float>(dims.fullHeight);
+    pushConstants.invTargetResolution[0] = 1.0f / pushConstants.targetResolution[0];
+    pushConstants.invTargetResolution[1] = 1.0f / pushConstants.targetResolution[1];
+    pushConstants.frameIndex = frameIndex;
+    pushConstants.depthTolerance = config.depthTolerance;
+    pushConstants.historyWeight = config.historyWeight;
+    pushConstants.debugView = config.debugView;
+    pushConstants.enableColorClamping = config.enableColorClamping ? 1u : 0u;
+    pushConstants.mipLodBias = config.mipLodBias;
+    pushConstants.colorSpace = (config.colorSpace == ColorSpace::RGB) ? 1u : 0u;
+    pushConstants.enableSpatialFallback = config.enableSpatialFallback ? 1u : 0u;
+    pushConstants.jitterDelta[0] = jitterDelta.x;
+    pushConstants.jitterDelta[1] = jitterDelta.y;
+    pushConstants.padding[0] = 0.0f;
+    pushConstants.padding[1] = 0.0f;
 
     uint32_t groupCountX = (dims.fullWidth + 15u) / 16u;
     uint32_t groupCountY = (dims.fullHeight + 15u) / 16u;
 
-    (void)config;
-    (void)frameIndex;
     (void)groupCountX;
     (void)groupCountY;
     // In DX12, sets root signature, pipeline state, descriptor tables, and calls Dispatch(groupCountX, groupCountY, 1)
@@ -1953,6 +2016,8 @@ layout(push_constant) uniform CBRConstants {
     float u_MipLodBias;             // Texture LOD bias (-0.5)
     uint  u_ColorSpace;             // 0 = YCoCg clamp, 1 = RGB clamp
     uint  u_EnableSpatialFallback;  // 1 = cross-bilateral fallback, 0 = use raw current sample
+    vec2  u_JitterDelta;            // Subpixel projection jitter delta (jc - jp)
+    vec2  u_Padding;                // 16-byte alignment padding
 } pc;
 
 // =============================================================================
@@ -2012,9 +2077,22 @@ void main() {
     // -------------------------------------------------------------------------
     // 2. Fetch Motion Vectors & Calculate Previous UV Coordinates
     // -------------------------------------------------------------------------
-    // Explicit LOD 0.0 required for compute shaders
-    vec2 velocity = textureLod(u_Velocity, uv, 0.0).xy;
-    vec2 historyUV = uv - velocity;
+    // 3x3 closest depth search for dilated motion vector (eliminates edge silhouette smearing)
+    float closestDepth = currentDepth;
+    ivec2 closestCoord = pixelCoord;
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            ivec2 nCoord = clamp(pixelCoord + ivec2(dx, dy), ivec2(0), targetSize - ivec2(1));
+            float d = texelFetch(u_QuarterDepthMSAA, nCoord / 2, int(uint(nCoord.x) & 1u)).r;
+            if (d < closestDepth) {
+                closestDepth = d;
+                closestCoord = nCoord;
+            }
+        }
+    }
+    vec2 dilatedUV = (vec2(closestCoord) + 0.5) * pc.u_InvTargetResolution;
+    vec2 velocity = textureLod(u_Velocity, dilatedUV, 0.0).xy;
+    vec2 historyUV = uv - velocity - pc.u_JitterDelta;
 
     // -------------------------------------------------------------------------
     // 3. Disocclusion & Depth Delta Testing
@@ -2044,14 +2122,16 @@ void main() {
     }
 
     // -------------------------------------------------------------------------
-    // 4. Neighborhood Statistics & YCoCg Clamping (Anti-Ghosting)
+    // 4. Neighborhood Statistics & Variance Clipping (Anti-Ghosting)
     // Guarded to avoid 9 unnecessary memory fetches when disoccluded or disabled
     // -------------------------------------------------------------------------
     if (!isDisoccluded && pc.u_EnableColorClamping != 0u) {
         vec3 colorMin = vec3(1e6);
         vec3 colorMax = vec3(-1e6);
+        vec3 m1 = vec3(0.0);
+        vec3 m2 = vec3(0.0);
 
-        // Compute 3x3 local color bounding box
+        // Compute 3x3 local color bounding box and statistical moments
         for (int dy = -1; dy <= 1; ++dy) {
             for (int dx = -1; dx <= 1; ++dx) {
                 ivec2 neighborCoord = clamp(pixelCoord + ivec2(dx, dy), ivec2(0), targetSize - ivec2(1));
@@ -2059,14 +2139,23 @@ void main() {
                 int neighborSample = int(uint(neighborCoord.x) & 1u);
                 vec3 neighborColor = texelFetch(u_QuarterColorMSAA, neighborQuarter, neighborSample).rgb;
 
-                vec3 neighborYCoCg = ToClampSpace(neighborColor);
-                colorMin = min(colorMin, neighborYCoCg);
-                colorMax = max(colorMax, neighborYCoCg);
+                vec3 neighborClampSpace = ToClampSpace(neighborColor);
+                colorMin = min(colorMin, neighborClampSpace);
+                colorMax = max(colorMax, neighborClampSpace);
+                m1 += neighborClampSpace;
+                m2 += neighborClampSpace * neighborClampSpace;
             }
         }
 
+        // Variance clipping: clamp history inside [mean - gamma * stdDev, mean + gamma * stdDev]
+        vec3 mean = m1 / 9.0;
+        vec3 stdDev = sqrt(max(vec3(0.0), (m2 / 9.0) - (mean * mean)));
+        float gamma = 1.25;
+        vec3 varianceMin = max(colorMin, mean - gamma * stdDev);
+        vec3 varianceMax = min(colorMax, mean + gamma * stdDev);
+
         vec3 historyClampSpace = ToClampSpace(historyColor.rgb);
-        historyClampSpace = clamp(historyClampSpace, colorMin, colorMax);
+        historyClampSpace = clamp(historyClampSpace, varianceMin, varianceMax);
         historyColor.rgb = FromClampSpace(historyClampSpace);
     }
 
@@ -2104,7 +2193,8 @@ void main() {
                 vec3 sCol = texelFetch(u_QuarterColorMSAA, sQuarter, sIndex).rgb;
                 float sDep = texelFetch(u_QuarterDepthMSAA, sQuarter, sIndex).r;
 
-                float depthWeight = exp(-abs(currentDepth - sDep) * 100.0);
+                // Relative depth weighting: robust across depth ranges and reversed-Z
+                float depthWeight = exp(-abs(currentDepth - sDep) / (max(currentDepth, 1e-5) * pc.u_DepthTolerance));
                 accumColor += sCol * depthWeight;
                 accumDepth += sDep * depthWeight;
                 accumWeight += depthWeight;
@@ -2199,6 +2289,8 @@ cbuffer CBRConstants : register(b0)
     float  g_MipLodBias;             // Texture LOD bias (-0.5f)
     uint   g_ColorSpace;             // 0 = YCoCg clamp, 1 = RGB clamp
     uint   g_EnableSpatialFallback;  // 1 = cross-bilateral fallback, 0 = raw current sample
+    float2 g_JitterDelta;            // subpixel projection jitter delta (jc - jp)
+    float2 g_Padding;                // 16-byte alignment padding
 };
 
 // =============================================================================
@@ -2263,8 +2355,25 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     // -------------------------------------------------------------------------
     // 2. Motion Vector Fetch & History Coordinate Calculation
     // -------------------------------------------------------------------------
-    float2 velocity = g_Velocity.SampleLevel(g_LinearClampSampler, uv, 0.0f).xy;
-    float2 historyUV = uv - velocity;
+    // 3x3 closest depth search for dilated motion vector (eliminates edge silhouette smearing)
+    float closestDepth = currentDepth;
+    int2 closestCoord = pixelCoord;
+    for (int dy = -1; dy <= 1; ++dy)
+    {
+        for (int dx = -1; dx <= 1; ++dx)
+        {
+            int2 nCoord = clamp(pixelCoord + int2(dx, dy), int2(0, 0), targetSize - int2(1, 1));
+            float d = g_QuarterDepthMSAA.Load(nCoord / 2, int(uint(nCoord.x) & 1u)).r;
+            if (d < closestDepth)
+            {
+                closestDepth = d;
+                closestCoord = nCoord;
+            }
+        }
+    }
+    float2 dilatedUV = (float2(closestCoord) + 0.5f) * g_InvTargetResolution;
+    float2 velocity = g_Velocity.SampleLevel(g_LinearClampSampler, dilatedUV, 0.0f).xy;
+    float2 historyUV = uv - velocity - g_JitterDelta;
 
     // -------------------------------------------------------------------------
     // 3. Disocclusion & Depth Delta Test
@@ -2298,13 +2407,15 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     }
 
     // -------------------------------------------------------------------------
-    // 4. Neighborhood Clamping (YCoCg Space)
+    // 4. Neighborhood Clamping (YCoCg Space & Variance Clipping)
     // Guarded to avoid unnecessary texture fetches when disoccluded or disabled
     // -------------------------------------------------------------------------
     if (!isDisoccluded && g_EnableColorClamping != 0u)
     {
         float3 colorMin = float3(1e6f, 1e6f, 1e6f);
         float3 colorMax = float3(-1e6f, -1e6f, -1e6f);
+        float3 m1 = float3(0.0f, 0.0f, 0.0f);
+        float3 m2 = float3(0.0f, 0.0f, 0.0f);
 
         for (int dy = -1; dy <= 1; ++dy)
         {
@@ -2315,14 +2426,23 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
                 int neighborSample = int(uint(neighborCoord.x) & 1u);
                 float3 neighborColor = g_QuarterColorMSAA.Load(neighborQuarter, neighborSample).rgb;
 
-                float3 neighborYCoCg = ToClampSpace(neighborColor);
-                colorMin = min(colorMin, neighborYCoCg);
-                colorMax = max(colorMax, neighborYCoCg);
+                float3 neighborClampSpace = ToClampSpace(neighborColor);
+                colorMin = min(colorMin, neighborClampSpace);
+                colorMax = max(colorMax, neighborClampSpace);
+                m1 += neighborClampSpace;
+                m2 += neighborClampSpace * neighborClampSpace;
             }
         }
 
+        // Variance clipping: clamp history inside [mean - gamma * stdDev, mean + gamma * stdDev]
+        float3 mean = m1 / 9.0f;
+        float3 stdDev = sqrt(max(float3(0.0f, 0.0f, 0.0f), (m2 / 9.0f) - (mean * mean)));
+        float gamma = 1.25f;
+        float3 varianceMin = max(colorMin, mean - gamma * stdDev);
+        float3 varianceMax = min(colorMax, mean + gamma * stdDev);
+
         float3 historyClampSpace = ToClampSpace(historyColor.rgb);
-        historyClampSpace = clamp(historyClampSpace, colorMin, colorMax);
+        historyClampSpace = clamp(historyClampSpace, varianceMin, varianceMax);
         historyColor.rgb = FromClampSpace(historyClampSpace);
     }
 
@@ -2367,7 +2487,8 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
                 float3 sCol = g_QuarterColorMSAA.Load(sQuarter, sIndex).rgb;
                 float  sDep = g_QuarterDepthMSAA.Load(sQuarter, sIndex).r;
 
-                float depthWeight = exp(-abs(currentDepth - sDep) * 100.0f);
+                // Relative depth weighting: robust across depth ranges and reversed-Z
+                float depthWeight = exp(-abs(currentDepth - sDep) / (max(currentDepth, 1e-5f) * g_DepthTolerance));
                 accumColor += sCol * depthWeight;
                 accumDepth += sDep * depthWeight;
                 accumWeight += depthWeight;
@@ -2604,6 +2725,13 @@ static void TestJitter() {
     j.ApplyJitterToProjection(m, true);
     j.RemoveJitterFromProjection(m, true);
     for (int i = 0; i < 16; ++i) CHECK(std::fabs(m[i] - orig[i]) < 1e-7f);
+
+    // SetProjectionJitter must be idempotent without compounding offsets
+    float out1[16];
+    float out2[16];
+    j.SetProjectionJitter(out1, orig, true);
+    j.SetProjectionJitter(out2, orig, true);
+    for (int i = 0; i < 16; ++i) CHECK(std::fabs(out1[i] - out2[i]) < 1e-7f);
 }
 
 static void TestRenderTargets() {
@@ -2623,7 +2751,7 @@ static void TestRenderTargets() {
 }
 
 static void TestPushConstantLayout() {
-    CHECK(sizeof(ReconstructionPushConstants) == 48);
+    CHECK(sizeof(ReconstructionPushConstants) == 64);
 }
 
 int main() {

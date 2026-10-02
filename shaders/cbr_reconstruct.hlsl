@@ -40,6 +40,8 @@ cbuffer CBRConstants : register(b0)
     float  g_MipLodBias;             // Texture LOD bias (-0.5f)
     uint   g_ColorSpace;             // 0 = YCoCg clamp, 1 = RGB clamp
     uint   g_EnableSpatialFallback;  // 1 = cross-bilateral fallback, 0 = raw current sample
+    float2 g_JitterDelta;            // subpixel projection jitter delta (jc - jp)
+    float2 g_Padding;                // 16-byte alignment padding
 };
 
 // =============================================================================
@@ -104,8 +106,25 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     // -------------------------------------------------------------------------
     // 2. Motion Vector Fetch & History Coordinate Calculation
     // -------------------------------------------------------------------------
-    float2 velocity = g_Velocity.SampleLevel(g_LinearClampSampler, uv, 0.0f).xy;
-    float2 historyUV = uv - velocity;
+    // 3x3 closest depth search for dilated motion vector (eliminates edge silhouette smearing)
+    float closestDepth = currentDepth;
+    int2 closestCoord = pixelCoord;
+    for (int dy = -1; dy <= 1; ++dy)
+    {
+        for (int dx = -1; dx <= 1; ++dx)
+        {
+            int2 nCoord = clamp(pixelCoord + int2(dx, dy), int2(0, 0), targetSize - int2(1, 1));
+            float d = g_QuarterDepthMSAA.Load(nCoord / 2, int(uint(nCoord.x) & 1u)).r;
+            if (d < closestDepth)
+            {
+                closestDepth = d;
+                closestCoord = nCoord;
+            }
+        }
+    }
+    float2 dilatedUV = (float2(closestCoord) + 0.5f) * g_InvTargetResolution;
+    float2 velocity = g_Velocity.SampleLevel(g_LinearClampSampler, dilatedUV, 0.0f).xy;
+    float2 historyUV = uv - velocity - g_JitterDelta;
 
     // -------------------------------------------------------------------------
     // 3. Disocclusion & Depth Delta Test
@@ -139,13 +158,15 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     }
 
     // -------------------------------------------------------------------------
-    // 4. Neighborhood Clamping (YCoCg Space)
+    // 4. Neighborhood Clamping (YCoCg Space & Variance Clipping)
     // Guarded to avoid unnecessary texture fetches when disoccluded or disabled
     // -------------------------------------------------------------------------
     if (!isDisoccluded && g_EnableColorClamping != 0u)
     {
         float3 colorMin = float3(1e6f, 1e6f, 1e6f);
         float3 colorMax = float3(-1e6f, -1e6f, -1e6f);
+        float3 m1 = float3(0.0f, 0.0f, 0.0f);
+        float3 m2 = float3(0.0f, 0.0f, 0.0f);
 
         for (int dy = -1; dy <= 1; ++dy)
         {
@@ -156,14 +177,23 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
                 int neighborSample = int(uint(neighborCoord.x) & 1u);
                 float3 neighborColor = g_QuarterColorMSAA.Load(neighborQuarter, neighborSample).rgb;
 
-                float3 neighborYCoCg = ToClampSpace(neighborColor);
-                colorMin = min(colorMin, neighborYCoCg);
-                colorMax = max(colorMax, neighborYCoCg);
+                float3 neighborClampSpace = ToClampSpace(neighborColor);
+                colorMin = min(colorMin, neighborClampSpace);
+                colorMax = max(colorMax, neighborClampSpace);
+                m1 += neighborClampSpace;
+                m2 += neighborClampSpace * neighborClampSpace;
             }
         }
 
+        // Variance clipping: clamp history inside [mean - gamma * stdDev, mean + gamma * stdDev]
+        float3 mean = m1 / 9.0f;
+        float3 stdDev = sqrt(max(float3(0.0f, 0.0f, 0.0f), (m2 / 9.0f) - (mean * mean)));
+        float gamma = 1.25f;
+        float3 varianceMin = max(colorMin, mean - gamma * stdDev);
+        float3 varianceMax = min(colorMax, mean + gamma * stdDev);
+
         float3 historyClampSpace = ToClampSpace(historyColor.rgb);
-        historyClampSpace = clamp(historyClampSpace, colorMin, colorMax);
+        historyClampSpace = clamp(historyClampSpace, varianceMin, varianceMax);
         historyColor.rgb = FromClampSpace(historyClampSpace);
     }
 
@@ -208,7 +238,8 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
                 float3 sCol = g_QuarterColorMSAA.Load(sQuarter, sIndex).rgb;
                 float  sDep = g_QuarterDepthMSAA.Load(sQuarter, sIndex).r;
 
-                float depthWeight = exp(-abs(currentDepth - sDep) * 100.0f);
+                // Relative depth weighting: robust across depth ranges and reversed-Z
+                float depthWeight = exp(-abs(currentDepth - sDep) / (max(currentDepth, 1e-5f) * g_DepthTolerance));
                 accumColor += sCol * depthWeight;
                 accumDepth += sDep * depthWeight;
                 accumWeight += depthWeight;

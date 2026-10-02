@@ -17,10 +17,12 @@ struct ReconstructionPushConstants {
     float    mipLodBias;
     uint32_t colorSpace;            // 0 = YCoCg, 1 = RGB
     uint32_t enableSpatialFallback; // 1 = on
+    float    jitterDelta[2];        // subpixel projection jitter delta (jc - jp)
+    float    padding[2];            // 16-byte alignment padding
 };
 
 // Must match the push-constant block / cbuffer in shaders/cbr_reconstruct.{comp,hlsl}
-static_assert(sizeof(ReconstructionPushConstants) == 48, "push constant layout drifted from the shaders");
+static_assert(sizeof(ReconstructionPushConstants) == 64, "push constant layout drifted from the shaders");
 static_assert(sizeof(ReconstructionPushConstants) % 16 == 0, "cbuffer size must be a multiple of 16 bytes");
 
 class ReconstructionPass {

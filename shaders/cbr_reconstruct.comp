@@ -44,6 +44,8 @@ layout(push_constant) uniform CBRConstants {
     float u_MipLodBias;             // Texture LOD bias (-0.5)
     uint  u_ColorSpace;             // 0 = YCoCg clamp, 1 = RGB clamp
     uint  u_EnableSpatialFallback;  // 1 = cross-bilateral fallback, 0 = use raw current sample
+    vec2  u_JitterDelta;            // Subpixel projection jitter delta (jc - jp)
+    vec2  u_Padding;                // 16-byte alignment padding
 } pc;
 
 // =============================================================================
@@ -103,9 +105,22 @@ void main() {
     // -------------------------------------------------------------------------
     // 2. Fetch Motion Vectors & Calculate Previous UV Coordinates
     // -------------------------------------------------------------------------
-    // Explicit LOD 0.0 required for compute shaders
-    vec2 velocity = textureLod(u_Velocity, uv, 0.0).xy;
-    vec2 historyUV = uv - velocity;
+    // 3x3 closest depth search for dilated motion vector (eliminates edge silhouette smearing)
+    float closestDepth = currentDepth;
+    ivec2 closestCoord = pixelCoord;
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            ivec2 nCoord = clamp(pixelCoord + ivec2(dx, dy), ivec2(0), targetSize - ivec2(1));
+            float d = texelFetch(u_QuarterDepthMSAA, nCoord / 2, int(uint(nCoord.x) & 1u)).r;
+            if (d < closestDepth) {
+                closestDepth = d;
+                closestCoord = nCoord;
+            }
+        }
+    }
+    vec2 dilatedUV = (vec2(closestCoord) + 0.5) * pc.u_InvTargetResolution;
+    vec2 velocity = textureLod(u_Velocity, dilatedUV, 0.0).xy;
+    vec2 historyUV = uv - velocity - pc.u_JitterDelta;
 
     // -------------------------------------------------------------------------
     // 3. Disocclusion & Depth Delta Testing
@@ -135,14 +150,16 @@ void main() {
     }
 
     // -------------------------------------------------------------------------
-    // 4. Neighborhood Statistics & YCoCg Clamping (Anti-Ghosting)
+    // 4. Neighborhood Statistics & Variance Clipping (Anti-Ghosting)
     // Guarded to avoid 9 unnecessary memory fetches when disoccluded or disabled
     // -------------------------------------------------------------------------
     if (!isDisoccluded && pc.u_EnableColorClamping != 0u) {
         vec3 colorMin = vec3(1e6);
         vec3 colorMax = vec3(-1e6);
+        vec3 m1 = vec3(0.0);
+        vec3 m2 = vec3(0.0);
 
-        // Compute 3x3 local color bounding box
+        // Compute 3x3 local color bounding box and statistical moments
         for (int dy = -1; dy <= 1; ++dy) {
             for (int dx = -1; dx <= 1; ++dx) {
                 ivec2 neighborCoord = clamp(pixelCoord + ivec2(dx, dy), ivec2(0), targetSize - ivec2(1));
@@ -150,14 +167,23 @@ void main() {
                 int neighborSample = int(uint(neighborCoord.x) & 1u);
                 vec3 neighborColor = texelFetch(u_QuarterColorMSAA, neighborQuarter, neighborSample).rgb;
 
-                vec3 neighborYCoCg = ToClampSpace(neighborColor);
-                colorMin = min(colorMin, neighborYCoCg);
-                colorMax = max(colorMax, neighborYCoCg);
+                vec3 neighborClampSpace = ToClampSpace(neighborColor);
+                colorMin = min(colorMin, neighborClampSpace);
+                colorMax = max(colorMax, neighborClampSpace);
+                m1 += neighborClampSpace;
+                m2 += neighborClampSpace * neighborClampSpace;
             }
         }
 
+        // Variance clipping: clamp history inside [mean - gamma * stdDev, mean + gamma * stdDev]
+        vec3 mean = m1 / 9.0;
+        vec3 stdDev = sqrt(max(vec3(0.0), (m2 / 9.0) - (mean * mean)));
+        float gamma = 1.25;
+        vec3 varianceMin = max(colorMin, mean - gamma * stdDev);
+        vec3 varianceMax = min(colorMax, mean + gamma * stdDev);
+
         vec3 historyClampSpace = ToClampSpace(historyColor.rgb);
-        historyClampSpace = clamp(historyClampSpace, colorMin, colorMax);
+        historyClampSpace = clamp(historyClampSpace, varianceMin, varianceMax);
         historyColor.rgb = FromClampSpace(historyClampSpace);
     }
 
@@ -195,7 +221,8 @@ void main() {
                 vec3 sCol = texelFetch(u_QuarterColorMSAA, sQuarter, sIndex).rgb;
                 float sDep = texelFetch(u_QuarterDepthMSAA, sQuarter, sIndex).r;
 
-                float depthWeight = exp(-abs(currentDepth - sDep) * 100.0);
+                // Relative depth weighting: robust across depth ranges and reversed-Z
+                float depthWeight = exp(-abs(currentDepth - sDep) / (max(currentDepth, 1e-5) * pc.u_DepthTolerance));
                 accumColor += sCol * depthWeight;
                 accumDepth += sDep * depthWeight;
                 accumWeight += depthWeight;

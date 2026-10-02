@@ -16,9 +16,19 @@
 namespace {
 
 DWORD WINAPI CBRInitThread(LPVOID /*lpParam*/) {
-    // Delay slightly to allow game engine core and graphics runtime to settle
-    Sleep(1500);
+    // Bounded retry loop: poll every 250 ms for up to 60 s for graphics runtimes to settle
+    constexpr DWORD kIntervalMs = 250;
+    constexpr DWORD kMaxAttempts = 240; // 240 * 250 ms = 60 seconds
 
+    for (DWORD attempt = 0; attempt < kMaxAttempts; ++attempt) {
+        Sleep(kIntervalMs);
+        if (GetModuleHandleA("vulkan-1.dll") || GetModuleHandleA("d3d12.dll")) {
+            cbr::CBREngine::Get().Initialize();
+            return 0;
+        }
+    }
+
+    // Fallback initialize if neither runtime appeared before the timeout
     cbr::CBREngine::Get().Initialize();
     return 0;
 }

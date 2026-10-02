@@ -111,28 +111,31 @@ void CBREngine::OnPostRender() {
     // Geometry pass complete, intermediate quarter-res 2x MSAA buffer ready for resolve
 }
 
-void CBREngine::OnPrePresent(void* queueOrSwapchain, const void* /*presentInfo*/) {
+void CBREngine::OnScenePassEnd(void* cmdBufferOrContext) {
     if (!m_enabled.load()) return;
-
-    // Only the main output may run reconstruction / flip history
-    void* mainTarget = m_mainPresentTarget.load();
-    if (mainTarget != nullptr && queueOrSwapchain != mainTarget) return;
 
     uint32_t currentFrame = m_frameIndex.load();
 
-    // NOTE: the argument received here is a VkQueue (Vulkan) or IDXGISwapChain (DX12), NOT a
-    // command buffer / command list. The reconstruction pass must record into its own command
-    // buffer / list, so nullptr is passed until the real recording path exists.
+    // Mid-frame dispatch: reconstruct immediately when the quarter-resolution 2x MSAA
+    // geometry pass finishes, before post-processing and UI are composited.
     if (m_activeApi.load() == GraphicsApi::Vulkan) {
-        ReconstructionPass::Get().DispatchVulkan(nullptr, currentFrame);
+        ReconstructionPass::Get().DispatchVulkan(cmdBufferOrContext, currentFrame);
     } else {
-        ReconstructionPass::Get().DispatchDX12(nullptr, currentFrame);
+        ReconstructionPass::Get().DispatchDX12(cmdBufferOrContext, currentFrame);
     }
 
     // Swap history buffers (ping-pong double buffer)
     RenderTargetManager::Get().SwapHistoryBuffers();
+}
 
-    // Render ImGui overlay if toggled on
+void CBREngine::OnPrePresent(void* queueOrSwapchain, const void* /*presentInfo*/) {
+    if (!m_enabled.load()) return;
+
+    // Only the main output may handle presentation callbacks
+    void* mainTarget = m_mainPresentTarget.load();
+    if (mainTarget != nullptr && queueOrSwapchain != mainTarget) return;
+
+    // Render ImGui overlay if toggled on (Present is the correct timing for overlay drawing)
     UIOverlay::Get().Render();
 }
 
