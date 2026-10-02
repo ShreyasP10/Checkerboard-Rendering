@@ -1,4 +1,5 @@
 #include "cbr/jitter_manager.h"
+#include "cbr/config.h"
 #include "cbr/logger.h"
 
 namespace cbr {
@@ -24,13 +25,14 @@ void JitterManager::Update(uint32_t frameIndex) {
     // Shifts alternating frames by (+0.5px, +0.5px) and (-0.5px, -0.5px)
     float pixelWidth = 1.0f / static_cast<float>(m_targetWidth);
     float pixelHeight = 1.0f / static_cast<float>(m_targetHeight);
+    const float amplitude = 0.5f * ConfigManager::Get().GetConfig().jitterScale;
 
     if (frameIndex & 1u) {
-        m_currentJitter.x = 0.5f * pixelWidth;
-        m_currentJitter.y = 0.5f * pixelHeight;
+        m_currentJitter.x = amplitude * pixelWidth;
+        m_currentJitter.y = amplitude * pixelHeight;
     } else {
-        m_currentJitter.x = -0.5f * pixelWidth;
-        m_currentJitter.y = -0.5f * pixelHeight;
+        m_currentJitter.x = -amplitude * pixelWidth;
+        m_currentJitter.y = -amplitude * pixelHeight;
     }
 }
 

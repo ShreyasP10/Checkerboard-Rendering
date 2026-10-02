@@ -15,8 +15,13 @@ struct ReconstructionPushConstants {
     uint32_t debugView;
     uint32_t enableColorClamping;
     float    mipLodBias;
-    float    padding[2];
+    uint32_t colorSpace;            // 0 = YCoCg, 1 = RGB
+    uint32_t enableSpatialFallback; // 1 = on
 };
+
+// Must match the push-constant block / cbuffer in shaders/cbr_reconstruct.{comp,hlsl}
+static_assert(sizeof(ReconstructionPushConstants) == 48, "push constant layout drifted from the shaders");
+static_assert(sizeof(ReconstructionPushConstants) % 16 == 0, "cbuffer size must be a multiple of 16 bytes");
 
 class ReconstructionPass {
 public:

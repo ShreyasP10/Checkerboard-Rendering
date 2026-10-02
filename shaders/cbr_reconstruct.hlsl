@@ -22,6 +22,8 @@ SamplerState        g_LinearClampSampler : register(s0);
 SamplerState        g_PointClampSampler  : register(s1);
 
 RWTexture2D<float4> g_OutputImage      : register(u0);
+// Full-resolution depth written for the next frame's disocclusion test (becomes g_HistoryDepth)
+RWTexture2D<float>  g_OutputDepth      : register(u1);
 
 // =============================================================================
 // Constant Buffer (16-byte aligned)
@@ -36,7 +38,8 @@ cbuffer CBRConstants : register(b0)
     uint   g_DebugView;              // 0=Normal, 1=Mask, 2=Disocclusion, 3=Motion, 4=Raw
     uint   g_EnableColorClamping;    // 1 = True, 0 = False
     float  g_MipLodBias;             // Texture LOD bias (-0.5f)
-    float2 g_Padding;                // 16-byte alignment padding
+    uint   g_ColorSpace;             // 0 = YCoCg clamp, 1 = RGB clamp
+    uint   g_EnableSpatialFallback;  // 1 = cross-bilateral fallback, 0 = raw current sample
 };
 
 // =============================================================================
@@ -61,6 +64,9 @@ float3 YCoCgtoRGB(float3 ycocg)
     float B  = Y - Co - Cg;
     return max(float3(0.0f, 0.0f, 0.0f), float3(R, G, B));
 }
+
+float3 ToClampSpace(float3 rgb)   { return (g_ColorSpace == 0u) ? RGBtoYCoCg(rgb) : rgb; }
+float3 FromClampSpace(float3 c)   { return (g_ColorSpace == 0u) ? YCoCgtoRGB(c) : max(float3(0.0f, 0.0f, 0.0f), c); }
 
 // =============================================================================
 // Compute Shader Entry Point
@@ -106,6 +112,7 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     // -------------------------------------------------------------------------
     bool isDisoccluded = false;
     float4 historyColor = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float previousDepth = currentDepth;
 
     if (historyUV.x < 0.0f || historyUV.x > 1.0f || historyUV.y < 0.0f || historyUV.y > 1.0f)
     {
@@ -114,7 +121,7 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     else
     {
         // Point sampling for depth history avoids edge bleeding across discontinuities
-        float previousDepth = g_HistoryDepth.SampleLevel(g_PointClampSampler, historyUV, 0.0f).r;
+        previousDepth = g_HistoryDepth.SampleLevel(g_PointClampSampler, historyUV, 0.0f).r;
         float depthDelta = abs(currentDepth - previousDepth) / max(currentDepth, 1e-5f);
 
         if (depthDelta > g_DepthTolerance)
@@ -149,21 +156,22 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
                 int neighborSample = int(uint(neighborCoord.x) & 1u);
                 float3 neighborColor = g_QuarterColorMSAA.Load(neighborQuarter, neighborSample).rgb;
 
-                float3 neighborYCoCg = RGBtoYCoCg(neighborColor);
+                float3 neighborYCoCg = ToClampSpace(neighborColor);
                 colorMin = min(colorMin, neighborYCoCg);
                 colorMax = max(colorMax, neighborYCoCg);
             }
         }
 
-        float3 historyYCoCg = RGBtoYCoCg(historyColor.rgb);
-        historyYCoCg = clamp(historyYCoCg, colorMin, colorMax);
-        historyColor.rgb = YCoCgtoRGB(historyYCoCg);
+        float3 historyClampSpace = ToClampSpace(historyColor.rgb);
+        historyClampSpace = clamp(historyClampSpace, colorMin, colorMax);
+        historyColor.rgb = FromClampSpace(historyClampSpace);
     }
 
     // -------------------------------------------------------------------------
     // 5. Final Reconstruction
     // -------------------------------------------------------------------------
     float3 finalColor;
+    float spatialDepth = currentDepth; // depth estimate for reconstructed pixels (fallback path)
 
     if (isCurrentSampleActive)
     {
@@ -186,10 +194,12 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
         {
             // Spatial cross-bilateral filter fallback from 4 cardinal neighbors
             float3 accumColor = float3(0.0f, 0.0f, 0.0f);
+            float  accumDepth  = 0.0f;
             float  accumWeight = 0.0f;
             const int2 offsets[4] = { int2(-1, 0), int2(1, 0), int2(0, -1), int2(0, 1) };
 
-            for (int i = 0; i < 4; ++i)
+            // Loop is skipped entirely when the fallback is disabled (accumWeight stays 0)
+            for (int i = 0; i < 4 && g_EnableSpatialFallback != 0u; ++i)
             {
                 int2 sampleCoord = clamp(pixelCoord + offsets[i], int2(0, 0), targetSize - int2(1, 1));
                 int2 sQuarter = sampleCoord / 2;
@@ -200,10 +210,15 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
 
                 float depthWeight = exp(-abs(currentDepth - sDep) * 100.0f);
                 accumColor += sCol * depthWeight;
+                accumDepth += sDep * depthWeight;
                 accumWeight += depthWeight;
             }
 
             finalColor = (accumWeight > 1e-4f) ? (accumColor / accumWeight) : currentSample.rgb;
+            if (accumWeight > 1e-4f)
+            {
+                spatialDepth = accumDepth / accumWeight;
+            }
         }
     }
 
@@ -236,4 +251,12 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     }
 
     g_OutputImage[pixelCoord] = float4(finalColor, 1.0f);
+
+    // History depth for the next frame (see GLSL version for rationale)
+    float outDepth = currentDepth;
+    if (!isCurrentSampleActive)
+    {
+        outDepth = isDisoccluded ? spatialDepth : previousDepth;
+    }
+    g_OutputDepth[pixelCoord] = outDepth;
 }

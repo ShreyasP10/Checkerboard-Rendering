@@ -47,6 +47,8 @@ void ReconstructionPass::DispatchVulkan(void* /*vkCommandBuffer*/, uint32_t fram
     pushConstants.debugView = config.debugView;
     pushConstants.enableColorClamping = config.enableColorClamping ? 1u : 0u;
     pushConstants.mipLodBias = config.mipLodBias;
+    pushConstants.colorSpace = (config.colorSpace == ColorSpace::RGB) ? 1u : 0u;
+    pushConstants.enableSpatialFallback = config.enableSpatialFallback ? 1u : 0u;
 
     uint32_t groupCountX = (dims.fullWidth + 15u) / 16u;
     uint32_t groupCountY = (dims.fullHeight + 15u) / 16u;

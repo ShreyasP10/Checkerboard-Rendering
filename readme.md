@@ -24,6 +24,7 @@ A community-driven graphics modification implementing **Checkerboard Rendering (
 - [Hardware & Development Requirements](#hardware--development-requirements)
 - [How to Build, Install & Run](#-how-to-build-install--run)
 - [Configuration](#configuration)
+- [Testing](#testing)
 - [Contributing](#contributing)
 - [Collaborators & Maintainers](#collaborators--maintainers)
 - [License](#license)
@@ -73,7 +74,9 @@ Output:      Full 3840×2160 4K Image
 - [x] Temporal reprojection math with velocity vector sampling.
 - [ ] Camera depth unprojection fallback (not implemented).
 - [x] Depth delta disocclusion detection with spatial cross-bilateral filter fallback.
-- [x] 3×3 neighborhood color bounding box clamping in YCoCg space to suppress ghosting.
+- [x] 3×3 neighborhood color bounding box clamping (YCoCg or RGB, selectable via `ColorSpace`) to suppress ghosting.
+- [x] Reconstruction pass writes a full-resolution history-depth target for the next frame's disocclusion test.
+- [x] Host-side unit tests (config, logger, jitter, VRAM accounting) and a CI workflow; shaders are validated with glslang.
 - [x] Pascal-oriented design (16×16 thread groups, guarded neighborhood fetches to cut bandwidth).
 - [ ] Shared-memory tiling (not implemented; neighborhood data is fetched directly from the MSAA targets).
 - [x] Runtime configuration via `cbr.ini`.
@@ -268,7 +271,7 @@ Upon launching the game, open `cbr.log` in the RDR2 root directory to verify hoo
 
 ## Configuration (`cbr.ini`)
 
-Settings can be customized before launch in `cbr.ini` or on the fly via the in-game overlay:
+Settings are customized in `cbr.ini` before launch (live editing via the in-game overlay is planned). `PreferredApi` accepts `Vulkan`, `D3D12` or `Auto`. `JitterPattern = Halton` is reserved and currently falls back to Checkerboard with a warning.
 
 ```ini
 [General]
@@ -284,6 +287,24 @@ EnableColorClamping = true
 ColorSpace = YCoCg
 HistoryWeight = 0.90
 EnableSpatialFallback = true
+```
+
+---
+
+## Testing
+
+```bash
+cmake -S . -B build-tests -DCBR_BUILD_TESTS=ON
+cmake --build build-tests --target cbr_tests
+ctest --test-dir build-tests --output-on-failure
+```
+
+The tests cover the portable code only (no Windows APIs or GPU). Validate shaders with:
+
+```bash
+glslangValidator -V shaders/cbr_reconstruct.comp -o /tmp/r.spv
+glslangValidator -V shaders/cbr_resolve_simple.comp -o /tmp/s.spv
+glslangValidator -D -e CSMain -S comp -V shaders/cbr_reconstruct.hlsl -o /tmp/h.spv
 ```
 
 ---

@@ -107,6 +107,8 @@ bool ConfigManager::Load(const std::filesystem::path& configPath) {
             } else if (key == "PreferredApi") {
                 if (val == "Vulkan") m_config.preferredApi = GraphicsApi::Vulkan;
                 else if (val == "D3D12") m_config.preferredApi = GraphicsApi::D3D12;
+                else if (val == "Auto")  m_config.preferredApi = GraphicsApi::Auto;
+                else CBR_LOG_WARN("Unknown PreferredApi '%s' (expected Vulkan, D3D12 or Auto); keeping default.", val.c_str());
             } else if (key == "MipLodBias") {
                 m_config.mipLodBias = ParseFloat(val, m_config.mipLodBias, -4.0f, 4.0f);
             } else if (key == "DepthTolerance") {
@@ -120,7 +122,10 @@ bool ConfigManager::Load(const std::filesystem::path& configPath) {
             } else if (key == "EnableSpatialFallback") {
                 m_config.enableSpatialFallback = ParseBool(val, m_config.enableSpatialFallback);
             } else if (key == "JitterPattern") {
-                m_config.jitterPattern = (val == "Halton") ? JitterPattern::Halton : JitterPattern::Checkerboard;
+                if (val == "Halton") {
+                    CBR_LOG_WARN("JitterPattern=Halton is not implemented yet; using Checkerboard.");
+                }
+                m_config.jitterPattern = JitterPattern::Checkerboard;
             } else if (key == "JitterScale") {
                 m_config.jitterScale = ParseFloat(val, m_config.jitterScale, 0.1f, 4.0f);
             } else if (key == "DebugView") {
@@ -139,7 +144,8 @@ bool ConfigManager::Load(const std::filesystem::path& configPath) {
         configPath.string().c_str(),
         m_config.targetWidth,
         m_config.targetHeight,
-        m_config.preferredApi == GraphicsApi::Vulkan ? "Vulkan" : "D3D12",
+        m_config.preferredApi == GraphicsApi::Vulkan ? "Vulkan"
+            : m_config.preferredApi == GraphicsApi::D3D12 ? "D3D12" : "Auto",
         m_config.enabled ? "true" : "false");
 
     return true;
@@ -157,7 +163,9 @@ bool ConfigManager::Save(const std::filesystem::path& configPath) {
     file << "Enabled = " << (m_config.enabled ? "true" : "false") << "\n";
     file << "TargetWidth = " << m_config.targetWidth << "\n";
     file << "TargetHeight = " << m_config.targetHeight << "\n";
-    file << "PreferredApi = " << (m_config.preferredApi == GraphicsApi::Vulkan ? "Vulkan" : "D3D12") << "\n";
+    file << "PreferredApi = "
+         << (m_config.preferredApi == GraphicsApi::Vulkan ? "Vulkan"
+           : m_config.preferredApi == GraphicsApi::D3D12 ? "D3D12" : "Auto") << "\n";
     file << "MipLodBias = " << m_config.mipLodBias << "\n\n";
 
     file << "[Reconstruction]\n";

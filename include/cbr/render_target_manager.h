@@ -29,6 +29,7 @@ public:
     uint32_t GetCurrentHistoryIndex() const { return m_historyPingPong.load(); }
     uint32_t GetPreviousHistoryIndex() const { return 1u - m_historyPingPong.load(); }
     void     SwapHistoryBuffers() { m_historyPingPong.fetch_xor(1u); }
+    void     ResetHistory() { m_historyPingPong.store(0u); }
 
     // Memory footprint tracking
     size_t GetTotalAllocatedVramBytes() const { return m_totalAllocatedVramBytes; }

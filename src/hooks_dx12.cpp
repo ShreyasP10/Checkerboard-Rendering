@@ -30,7 +30,7 @@ long __stdcall Hooked_D3D12Present(void* swapChain, unsigned int syncInterval, u
     long result = g_Original_D3D12Present(swapChain, syncInterval, flags);
 
     try {
-        CBREngine::Get().OnPostPresent();
+        CBREngine::Get().OnPostPresent(swapChain);
     } catch (...) {
     }
     return result;

@@ -38,7 +38,7 @@ int Hooked_vkQueuePresentKHR(void* queue, const void* pPresentInfo) {
     int result = g_Original_vkQueuePresentKHR(queue, pPresentInfo);
 
     try {
-        CBREngine::Get().OnPostPresent();
+        CBREngine::Get().OnPostPresent(queue);
     } catch (...) {
     }
     return result;
@@ -49,7 +49,11 @@ int Hooked_vkCreateSwapchainKHR(void* device, const void* pCreateInfo, const voi
         return kVkErrorInitializationFailed;
     }
     CBR_LOG_INFO("Vulkan Swapchain creation intercepted.");
-    return g_Original_vkCreateSwapchainKHR(device, pCreateInfo, pAllocator, pSwapchain);
+    const int result = g_Original_vkCreateSwapchainKHR(device, pCreateInfo, pAllocator, pSwapchain);
+    if (result == 0) { // VK_SUCCESS
+        try { CBREngine::Get().OnSwapchainRecreated(); } catch (...) {}
+    }
+    return result;
 }
 
 } // namespace

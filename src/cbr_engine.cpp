@@ -48,7 +48,12 @@ bool CBREngine::Initialize() {
 
         CBR_LOG_INFO("Initializing CBREngine for Red Dead Redemption 2...");
         m_enabled.store(config.enabled);
-        m_activeApi.store(config.preferredApi);
+        GraphicsApi api = config.preferredApi;
+        if (api == GraphicsApi::Auto) {
+            api = HookManager::Get().DetectLoadedApi();
+            CBR_LOG_INFO("PreferredApi=Auto resolved to %s.", api == GraphicsApi::Vulkan ? "Vulkan" : "D3D12");
+        }
+        m_activeApi.store(api);
 
         // 3. Initialize Render Target & Jitter Managers
         RenderTargetManager::Get().Initialize(config.targetWidth, config.targetHeight);
@@ -59,7 +64,7 @@ bool CBREngine::Initialize() {
 
         // 5. Install API Hooks
         HookManager::Get().Initialize();
-        if (config.preferredApi == GraphicsApi::Vulkan) {
+        if (api == GraphicsApi::Vulkan) {
             HookManager::Get().InstallVulkanHooks();
             ReconstructionPass::Get().InitializeVulkan(nullptr, nullptr);
         } else {
@@ -106,8 +111,12 @@ void CBREngine::OnPostRender() {
     // Geometry pass complete, intermediate quarter-res 2x MSAA buffer ready for resolve
 }
 
-void CBREngine::OnPrePresent(void* /*queueOrSwapchain*/, const void* /*presentInfo*/) {
+void CBREngine::OnPrePresent(void* queueOrSwapchain, const void* /*presentInfo*/) {
     if (!m_enabled.load()) return;
+
+    // Only the main output may run reconstruction / flip history
+    void* mainTarget = m_mainPresentTarget.load();
+    if (mainTarget != nullptr && queueOrSwapchain != mainTarget) return;
 
     uint32_t currentFrame = m_frameIndex.load();
 
@@ -127,8 +136,21 @@ void CBREngine::OnPrePresent(void* /*queueOrSwapchain*/, const void* /*presentIn
     UIOverlay::Get().Render();
 }
 
-void CBREngine::OnPostPresent() {
-    m_frameIndex.fetch_add(1);
+void CBREngine::OnPostPresent(void* presentTarget) {
+    // The first present seen after start-up / swapchain recreation defines the main target.
+    void* expected = nullptr;
+    m_mainPresentTarget.compare_exchange_strong(expected, presentTarget);
+
+    if (m_mainPresentTarget.load() == presentTarget) {
+        m_frameIndex.fetch_add(1);
+    }
+}
+
+void CBREngine::OnSwapchainRecreated() {
+    m_mainPresentTarget.store(nullptr);
+    m_frameIndex.store(0);
+    RenderTargetManager::Get().ResetHistory();
+    CBR_LOG_INFO("Swapchain recreated: frame parity and history reset.");
 }
 
 } // namespace cbr

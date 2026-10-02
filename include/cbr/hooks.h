@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include "cbr/config.h"
 
 namespace cbr {
 
@@ -11,6 +12,9 @@ public:
 
     bool Initialize();
     void Shutdown();
+
+    // Picks the graphics API whose runtime is already loaded in the host process (Vulkan preferred).
+    GraphicsApi DetectLoadedApi() const;
 
     bool InstallVulkanHooks();
     bool InstallDX12Hooks();

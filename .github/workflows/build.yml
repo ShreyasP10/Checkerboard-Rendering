@@ -1,0 +1,45 @@
+# NOTE: written but not executed by the author's tooling; verify on first push.
+name: build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  tests-and-shaders:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y cmake g++ glslang-tools
+      - name: Unit tests
+        run: |
+          cmake -S . -B build-tests -DCBR_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-tests --target cbr_tests
+          ctest --test-dir build-tests --output-on-failure
+      - name: Validate shaders
+        run: |
+          glslangValidator -V shaders/cbr_reconstruct.comp -o /tmp/r.spv
+          glslangValidator -V shaders/cbr_resolve_simple.comp -o /tmp/s.spv
+          glslangValidator -D -e CSMain -S comp -V shaders/cbr_reconstruct.hlsl -o /tmp/h.spv
+
+  windows-release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -A x64
+      - name: Build (Release, MSVC hardening flags)
+        run: cmake --build build --config Release
+      - name: SHA-256 of release artifacts
+        shell: pwsh
+        run: |
+          Get-FileHash build/bin/Release/rdr2-cbr.asi -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash)  rdr2-cbr.asi" } | Tee-Object build/bin/Release/SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rdr2-cbr-release
+          path: |
+            build/bin/Release/rdr2-cbr.asi
+            build/bin/Release/cbr.ini
+            build/bin/Release/SHA256SUMS.txt

@@ -23,7 +23,9 @@ public:
     void OnPreRender();
     void OnPostRender();
     void OnPrePresent(void* queueOrContext, const void* presentInfo);
-    void OnPostPresent();
+    void OnPostPresent(void* presentTarget);
+    // Call when the game (re)creates its swapchain: resets frame parity and history
+    void OnSwapchainRecreated();
 
     uint32_t    GetCurrentFrameIndex() const { return m_frameIndex.load(); }
     bool        IsEnabled() const { return m_enabled.load(); }
@@ -42,6 +44,9 @@ private:
     std::atomic<bool>          m_initialized{ false };
     std::atomic<bool>          m_enabled{ true };
     std::atomic<uint32_t>      m_frameIndex{ 0 };
+    // The present target (VkQueue / IDXGISwapChain) of the game's main output. Presents from any
+    // other target (overlays, loading screens, secondary windows) must not advance checkerboard parity.
+    std::atomic<void*>         m_mainPresentTarget{ nullptr };
     std::atomic<float>         m_lastReconDurationMs{ 0.0f };
     std::atomic<GraphicsApi>   m_activeApi{ GraphicsApi::Vulkan };
     std::filesystem::path      m_moduleDirectory;

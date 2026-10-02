@@ -159,6 +159,23 @@ if(CBR_COMPILED_SHADERS)
     add_dependencies(rdr2-cbr cbr_shaders)
 endif()
 
+# Host-side unit tests (portable code only; no Windows APIs or GPU required)
+#   cmake -S . -B build-tests -DCBR_BUILD_TESTS=ON
+#   cmake --build build-tests --target cbr_tests && ctest --test-dir build-tests --output-on-failure
+option(CBR_BUILD_TESTS "Build host-side unit tests" OFF)
+if(CBR_BUILD_TESTS)
+    enable_testing()
+    add_executable(cbr_tests
+        tests/test_core.cpp
+        ${CBR_SOURCE_DIR}/config.cpp
+        ${CBR_SOURCE_DIR}/logger.cpp
+        ${CBR_SOURCE_DIR}/jitter_manager.cpp
+        ${CBR_SOURCE_DIR}/render_target_manager.cpp
+    )
+    target_include_directories(cbr_tests PRIVATE ${CBR_INCLUDE_DIR})
+    add_test(NAME cbr_core COMMAND cbr_tests)
+endif()
+
 # Copy sample configuration to output directory post-build
 add_custom_command(TARGET rdr2-cbr POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different

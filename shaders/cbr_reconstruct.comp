@@ -27,6 +27,9 @@ layout(set = 0, binding = 4) uniform sampler2D   u_Velocity;
 // Full-resolution reconstructed output target (R16G16B16A16F / B10G11R11F)
 layout(set = 0, binding = 5, rgba16f) writeonly uniform image2D u_OutputImage;
 
+// Full-resolution depth written for the NEXT frame's disocclusion test (becomes u_HistoryDepth)
+layout(set = 0, binding = 6, r32f) writeonly uniform image2D u_OutputDepth;
+
 // =============================================================================
 // Push Constants / Uniforms
 // =============================================================================
@@ -39,6 +42,8 @@ layout(push_constant) uniform CBRConstants {
     uint  u_DebugView;              // 0=Normal, 1=Mask, 2=Disocclusion, 3=Motion, 4=Raw
     uint  u_EnableColorClamping;    // 1 = True, 0 = False
     float u_MipLodBias;             // Texture LOD bias (-0.5)
+    uint  u_ColorSpace;             // 0 = YCoCg clamp, 1 = RGB clamp
+    uint  u_EnableSpatialFallback;  // 1 = cross-bilateral fallback, 0 = use raw current sample
 } pc;
 
 // =============================================================================
@@ -61,6 +66,9 @@ vec3 YCoCgtoRGB(vec3 ycocg) {
     float B  = Y - Co - Cg;
     return max(vec3(0.0), vec3(R, G, B));
 }
+
+vec3 ToClampSpace(vec3 rgb)  { return (pc.u_ColorSpace == 0u) ? RGBtoYCoCg(rgb) : rgb; }
+vec3 FromClampSpace(vec3 c)  { return (pc.u_ColorSpace == 0u) ? YCoCgtoRGB(c) : max(vec3(0.0), c); }
 
 // =============================================================================
 // Main Shader Execution
@@ -104,13 +112,15 @@ void main() {
     // -------------------------------------------------------------------------
     bool isDisoccluded = false;
     vec4 historyColor = vec4(0.0);
+    float previousDepth = currentDepth;
 
     if (historyUV.x < 0.0 || historyUV.x > 1.0 || historyUV.y < 0.0 || historyUV.y > 1.0) {
         // Sample moved outside screen space
         isDisoccluded = true;
     } else {
-        // Nearest depth fetch from history
-        float previousDepth = textureLod(u_HistoryDepth, historyUV, 0.0).r;
+        // Exact texel fetch: independent of the bound sampler, so depth is never blended across edges
+        ivec2 historyCoord = clamp(ivec2(historyUV * pc.u_TargetResolution), ivec2(0), targetSize - ivec2(1));
+        previousDepth = texelFetch(u_HistoryDepth, historyCoord, 0).r;
         float depthDelta = abs(currentDepth - previousDepth) / max(currentDepth, 1e-5);
 
         if (depthDelta > pc.u_DepthTolerance) {
@@ -140,21 +150,22 @@ void main() {
                 int neighborSample = int(uint(neighborCoord.x) & 1u);
                 vec3 neighborColor = texelFetch(u_QuarterColorMSAA, neighborQuarter, neighborSample).rgb;
 
-                vec3 neighborYCoCg = RGBtoYCoCg(neighborColor);
+                vec3 neighborYCoCg = ToClampSpace(neighborColor);
                 colorMin = min(colorMin, neighborYCoCg);
                 colorMax = max(colorMax, neighborYCoCg);
             }
         }
 
-        vec3 historyYCoCg = RGBtoYCoCg(historyColor.rgb);
-        historyYCoCg = clamp(historyYCoCg, colorMin, colorMax);
-        historyColor.rgb = YCoCgtoRGB(historyYCoCg);
+        vec3 historyClampSpace = ToClampSpace(historyColor.rgb);
+        historyClampSpace = clamp(historyClampSpace, colorMin, colorMax);
+        historyColor.rgb = FromClampSpace(historyClampSpace);
     }
 
     // -------------------------------------------------------------------------
     // 5. Final Pixel Reconstruction
     // -------------------------------------------------------------------------
     vec3 finalColor;
+    float spatialDepth = currentDepth; // depth estimate for reconstructed pixels (fallback path)
 
     if (isCurrentSampleActive) {
         // Pixel was natively shaded this frame
@@ -171,10 +182,12 @@ void main() {
         } else {
             // Spatial Cross-Bilateral Reconstruction from 4 cardinal active samples
             vec3  accumColor = vec3(0.0);
+            float accumDepth = 0.0;
             float accumWeight = 0.0;
             const ivec2 offsets[4] = ivec2[](ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1));
 
-            for (int i = 0; i < 4; ++i) {
+            // Loop is skipped entirely when the fallback is disabled (accumWeight stays 0)
+            for (int i = 0; i < 4 && pc.u_EnableSpatialFallback != 0u; ++i) {
                 ivec2 sampleCoord = clamp(pixelCoord + offsets[i], ivec2(0), targetSize - ivec2(1));
                 ivec2 sQuarter = sampleCoord / 2;
                 int sIndex = int(uint(sampleCoord.x) & 1u);
@@ -184,10 +197,14 @@ void main() {
 
                 float depthWeight = exp(-abs(currentDepth - sDep) * 100.0);
                 accumColor += sCol * depthWeight;
+                accumDepth += sDep * depthWeight;
                 accumWeight += depthWeight;
             }
 
             finalColor = (accumWeight > 1e-4) ? (accumColor / accumWeight) : currentSample.rgb;
+            if (accumWeight > 1e-4) {
+                spatialDepth = accumDepth / accumWeight;
+            }
         }
     }
 
@@ -217,4 +234,12 @@ void main() {
 
     // Write final reconstructed pixel to output storage image (alpha = 1.0 for valid history)
     imageStore(u_OutputImage, pixelCoord, vec4(finalColor, 1.0));
+
+    // History depth for the next frame: native depth for shaded pixels; for reconstructed pixels
+    // carry the validated history depth, or the spatial estimate when history was rejected.
+    float outDepth = currentDepth;
+    if (!isCurrentSampleActive) {
+        outDepth = isDisoccluded ? spatialDepth : previousDepth;
+    }
+    imageStore(u_OutputDepth, pixelCoord, vec4(outDepth, 0.0, 0.0, 0.0));
 }

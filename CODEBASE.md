@@ -41,6 +41,9 @@ This document contains the complete, unabridged source code for every file in th
    - [`shaders/cbr_reconstruct.comp`](#shaderscbrreconstructcomp)
    - [`shaders/cbr_reconstruct.hlsl`](#shaderscbrreconstructhlsl)
    - [`shaders/cbr_resolve_simple.comp`](#shaderscbrresolvesimplecomp)
+5. [Tests & CI](#sec-tests)
+   - [`tests/test_core.cpp`](#teststestcorecpp)
+   - [`.github/workflows/build.yml`](#githubworkflowsbuildyml)
 
 ---
 
@@ -211,6 +214,23 @@ if(CBR_COMPILED_SHADERS)
     add_dependencies(rdr2-cbr cbr_shaders)
 endif()
 
+# Host-side unit tests (portable code only; no Windows APIs or GPU required)
+#   cmake -S . -B build-tests -DCBR_BUILD_TESTS=ON
+#   cmake --build build-tests --target cbr_tests && ctest --test-dir build-tests --output-on-failure
+option(CBR_BUILD_TESTS "Build host-side unit tests" OFF)
+if(CBR_BUILD_TESTS)
+    enable_testing()
+    add_executable(cbr_tests
+        tests/test_core.cpp
+        ${CBR_SOURCE_DIR}/config.cpp
+        ${CBR_SOURCE_DIR}/logger.cpp
+        ${CBR_SOURCE_DIR}/jitter_manager.cpp
+        ${CBR_SOURCE_DIR}/render_target_manager.cpp
+    )
+    target_include_directories(cbr_tests PRIVATE ${CBR_INCLUDE_DIR})
+    add_test(NAME cbr_core COMMAND cbr_tests)
+endif()
+
 # Copy sample configuration to output directory post-build
 add_custom_command(TARGET rdr2-cbr POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -237,7 +257,7 @@ Enabled = true
 TargetWidth = 3840
 TargetHeight = 2160
 
-; Target graphics API: Vulkan (recommended for Pascal) or D3D12
+; Target graphics API: Vulkan (recommended for Pascal), D3D12, or Auto (use whichever runtime is loaded)
 PreferredApi = Vulkan
 
 ; Texture Sampler MIP LOD Bias applied during quarter-resolution rendering
@@ -263,7 +283,7 @@ HistoryWeight = 0.90
 EnableSpatialFallback = true
 
 [Jitter]
-; Projection jitter pattern: Checkerboard (alternating 0.5px) or Halton
+; Projection jitter pattern: Checkerboard (alternating 0.5px). Halton is reserved/not implemented yet.
 JitterPattern = Checkerboard
 
 ; Jitter scale multiplier (default: 1.0)
@@ -444,7 +464,9 @@ public:
     void OnPreRender();
     void OnPostRender();
     void OnPrePresent(void* queueOrContext, const void* presentInfo);
-    void OnPostPresent();
+    void OnPostPresent(void* presentTarget);
+    // Call when the game (re)creates its swapchain: resets frame parity and history
+    void OnSwapchainRecreated();
 
     uint32_t    GetCurrentFrameIndex() const { return m_frameIndex.load(); }
     bool        IsEnabled() const { return m_enabled.load(); }
@@ -463,6 +485,9 @@ private:
     std::atomic<bool>          m_initialized{ false };
     std::atomic<bool>          m_enabled{ true };
     std::atomic<uint32_t>      m_frameIndex{ 0 };
+    // The present target (VkQueue / IDXGISwapChain) of the game's main output. Presents from any
+    // other target (overlays, loading screens, secondary windows) must not advance checkerboard parity.
+    std::atomic<void*>         m_mainPresentTarget{ nullptr };
     std::atomic<float>         m_lastReconDurationMs{ 0.0f };
     std::atomic<GraphicsApi>   m_activeApi{ GraphicsApi::Vulkan };
     std::filesystem::path      m_moduleDirectory;
@@ -551,6 +576,7 @@ private:
 
 #include <atomic>
 #include <cstdint>
+#include "cbr/config.h"
 
 namespace cbr {
 
@@ -560,6 +586,9 @@ public:
 
     bool Initialize();
     void Shutdown();
+
+    // Picks the graphics API whose runtime is already loaded in the host process (Vulkan preferred).
+    GraphicsApi DetectLoadedApi() const;
 
     bool InstallVulkanHooks();
     bool InstallDX12Hooks();
@@ -724,8 +753,13 @@ struct ReconstructionPushConstants {
     uint32_t debugView;
     uint32_t enableColorClamping;
     float    mipLodBias;
-    float    padding[2];
+    uint32_t colorSpace;            // 0 = YCoCg, 1 = RGB
+    uint32_t enableSpatialFallback; // 1 = on
 };
+
+// Must match the push-constant block / cbuffer in shaders/cbr_reconstruct.{comp,hlsl}
+static_assert(sizeof(ReconstructionPushConstants) == 48, "push constant layout drifted from the shaders");
+static_assert(sizeof(ReconstructionPushConstants) % 16 == 0, "cbuffer size must be a multiple of 16 bytes");
 
 class ReconstructionPass {
 public:
@@ -786,6 +820,7 @@ public:
     uint32_t GetCurrentHistoryIndex() const { return m_historyPingPong.load(); }
     uint32_t GetPreviousHistoryIndex() const { return 1u - m_historyPingPong.load(); }
     void     SwapHistoryBuffers() { m_historyPingPong.fetch_xor(1u); }
+    void     ResetHistory() { m_historyPingPong.store(0u); }
 
     // Memory footprint tracking
     size_t GetTotalAllocatedVramBytes() const { return m_totalAllocatedVramBytes; }
@@ -985,7 +1020,12 @@ bool CBREngine::Initialize() {
 
         CBR_LOG_INFO("Initializing CBREngine for Red Dead Redemption 2...");
         m_enabled.store(config.enabled);
-        m_activeApi.store(config.preferredApi);
+        GraphicsApi api = config.preferredApi;
+        if (api == GraphicsApi::Auto) {
+            api = HookManager::Get().DetectLoadedApi();
+            CBR_LOG_INFO("PreferredApi=Auto resolved to %s.", api == GraphicsApi::Vulkan ? "Vulkan" : "D3D12");
+        }
+        m_activeApi.store(api);
 
         // 3. Initialize Render Target & Jitter Managers
         RenderTargetManager::Get().Initialize(config.targetWidth, config.targetHeight);
@@ -996,7 +1036,7 @@ bool CBREngine::Initialize() {
 
         // 5. Install API Hooks
         HookManager::Get().Initialize();
-        if (config.preferredApi == GraphicsApi::Vulkan) {
+        if (api == GraphicsApi::Vulkan) {
             HookManager::Get().InstallVulkanHooks();
             ReconstructionPass::Get().InitializeVulkan(nullptr, nullptr);
         } else {
@@ -1043,8 +1083,12 @@ void CBREngine::OnPostRender() {
     // Geometry pass complete, intermediate quarter-res 2x MSAA buffer ready for resolve
 }
 
-void CBREngine::OnPrePresent(void* /*queueOrSwapchain*/, const void* /*presentInfo*/) {
+void CBREngine::OnPrePresent(void* queueOrSwapchain, const void* /*presentInfo*/) {
     if (!m_enabled.load()) return;
+
+    // Only the main output may run reconstruction / flip history
+    void* mainTarget = m_mainPresentTarget.load();
+    if (mainTarget != nullptr && queueOrSwapchain != mainTarget) return;
 
     uint32_t currentFrame = m_frameIndex.load();
 
@@ -1064,8 +1108,21 @@ void CBREngine::OnPrePresent(void* /*queueOrSwapchain*/, const void* /*presentIn
     UIOverlay::Get().Render();
 }
 
-void CBREngine::OnPostPresent() {
-    m_frameIndex.fetch_add(1);
+void CBREngine::OnPostPresent(void* presentTarget) {
+    // The first present seen after start-up / swapchain recreation defines the main target.
+    void* expected = nullptr;
+    m_mainPresentTarget.compare_exchange_strong(expected, presentTarget);
+
+    if (m_mainPresentTarget.load() == presentTarget) {
+        m_frameIndex.fetch_add(1);
+    }
+}
+
+void CBREngine::OnSwapchainRecreated() {
+    m_mainPresentTarget.store(nullptr);
+    m_frameIndex.store(0);
+    RenderTargetManager::Get().ResetHistory();
+    CBR_LOG_INFO("Swapchain recreated: frame parity and history reset.");
 }
 
 } // namespace cbr
@@ -1183,6 +1240,8 @@ bool ConfigManager::Load(const std::filesystem::path& configPath) {
             } else if (key == "PreferredApi") {
                 if (val == "Vulkan") m_config.preferredApi = GraphicsApi::Vulkan;
                 else if (val == "D3D12") m_config.preferredApi = GraphicsApi::D3D12;
+                else if (val == "Auto")  m_config.preferredApi = GraphicsApi::Auto;
+                else CBR_LOG_WARN("Unknown PreferredApi '%s' (expected Vulkan, D3D12 or Auto); keeping default.", val.c_str());
             } else if (key == "MipLodBias") {
                 m_config.mipLodBias = ParseFloat(val, m_config.mipLodBias, -4.0f, 4.0f);
             } else if (key == "DepthTolerance") {
@@ -1196,7 +1255,10 @@ bool ConfigManager::Load(const std::filesystem::path& configPath) {
             } else if (key == "EnableSpatialFallback") {
                 m_config.enableSpatialFallback = ParseBool(val, m_config.enableSpatialFallback);
             } else if (key == "JitterPattern") {
-                m_config.jitterPattern = (val == "Halton") ? JitterPattern::Halton : JitterPattern::Checkerboard;
+                if (val == "Halton") {
+                    CBR_LOG_WARN("JitterPattern=Halton is not implemented yet; using Checkerboard.");
+                }
+                m_config.jitterPattern = JitterPattern::Checkerboard;
             } else if (key == "JitterScale") {
                 m_config.jitterScale = ParseFloat(val, m_config.jitterScale, 0.1f, 4.0f);
             } else if (key == "DebugView") {
@@ -1215,7 +1277,8 @@ bool ConfigManager::Load(const std::filesystem::path& configPath) {
         configPath.string().c_str(),
         m_config.targetWidth,
         m_config.targetHeight,
-        m_config.preferredApi == GraphicsApi::Vulkan ? "Vulkan" : "D3D12",
+        m_config.preferredApi == GraphicsApi::Vulkan ? "Vulkan"
+            : m_config.preferredApi == GraphicsApi::D3D12 ? "D3D12" : "Auto",
         m_config.enabled ? "true" : "false");
 
     return true;
@@ -1233,7 +1296,9 @@ bool ConfigManager::Save(const std::filesystem::path& configPath) {
     file << "Enabled = " << (m_config.enabled ? "true" : "false") << "\n";
     file << "TargetWidth = " << m_config.targetWidth << "\n";
     file << "TargetHeight = " << m_config.targetHeight << "\n";
-    file << "PreferredApi = " << (m_config.preferredApi == GraphicsApi::Vulkan ? "Vulkan" : "D3D12") << "\n";
+    file << "PreferredApi = "
+         << (m_config.preferredApi == GraphicsApi::Vulkan ? "Vulkan"
+           : m_config.preferredApi == GraphicsApi::D3D12 ? "D3D12" : "Auto") << "\n";
     file << "MipLodBias = " << m_config.mipLodBias << "\n\n";
 
     file << "[Reconstruction]\n";
@@ -1265,11 +1330,29 @@ bool ConfigManager::Save(const std::filesystem::path& configPath) {
 #include "cbr/hooks.h"
 #include "cbr/logger.h"
 
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 namespace cbr {
 
 HookManager& HookManager::Get() {
     static HookManager instance;
     return instance;
+}
+
+GraphicsApi HookManager::DetectLoadedApi() const {
+#if defined(_WIN32)
+    if (GetModuleHandleA("vulkan-1.dll")) return GraphicsApi::Vulkan;
+    if (GetModuleHandleA("d3d12.dll"))    return GraphicsApi::D3D12;
+#endif
+    return GraphicsApi::Vulkan; // neither runtime is loaded yet: fall back to the documented default
 }
 
 bool HookManager::Initialize() {
@@ -1329,7 +1412,7 @@ int Hooked_vkQueuePresentKHR(void* queue, const void* pPresentInfo) {
     int result = g_Original_vkQueuePresentKHR(queue, pPresentInfo);
 
     try {
-        CBREngine::Get().OnPostPresent();
+        CBREngine::Get().OnPostPresent(queue);
     } catch (...) {
     }
     return result;
@@ -1340,7 +1423,11 @@ int Hooked_vkCreateSwapchainKHR(void* device, const void* pCreateInfo, const voi
         return kVkErrorInitializationFailed;
     }
     CBR_LOG_INFO("Vulkan Swapchain creation intercepted.");
-    return g_Original_vkCreateSwapchainKHR(device, pCreateInfo, pAllocator, pSwapchain);
+    const int result = g_Original_vkCreateSwapchainKHR(device, pCreateInfo, pAllocator, pSwapchain);
+    if (result == 0) { // VK_SUCCESS
+        try { CBREngine::Get().OnSwapchainRecreated(); } catch (...) {}
+    }
+    return result;
 }
 
 } // namespace
@@ -1414,7 +1501,7 @@ long __stdcall Hooked_D3D12Present(void* swapChain, unsigned int syncInterval, u
     long result = g_Original_D3D12Present(swapChain, syncInterval, flags);
 
     try {
-        CBREngine::Get().OnPostPresent();
+        CBREngine::Get().OnPostPresent(swapChain);
     } catch (...) {
     }
     return result;
@@ -1451,6 +1538,7 @@ void HookManager::UninstallDX12Hooks() {
 ### `src/jitter_manager.cpp`
 ```cpp
 #include "cbr/jitter_manager.h"
+#include "cbr/config.h"
 #include "cbr/logger.h"
 
 namespace cbr {
@@ -1476,13 +1564,14 @@ void JitterManager::Update(uint32_t frameIndex) {
     // Shifts alternating frames by (+0.5px, +0.5px) and (-0.5px, -0.5px)
     float pixelWidth = 1.0f / static_cast<float>(m_targetWidth);
     float pixelHeight = 1.0f / static_cast<float>(m_targetHeight);
+    const float amplitude = 0.5f * ConfigManager::Get().GetConfig().jitterScale;
 
     if (frameIndex & 1u) {
-        m_currentJitter.x = 0.5f * pixelWidth;
-        m_currentJitter.y = 0.5f * pixelHeight;
+        m_currentJitter.x = amplitude * pixelWidth;
+        m_currentJitter.y = amplitude * pixelHeight;
     } else {
-        m_currentJitter.x = -0.5f * pixelWidth;
-        m_currentJitter.y = -0.5f * pixelHeight;
+        m_currentJitter.x = -amplitude * pixelWidth;
+        m_currentJitter.y = -amplitude * pixelHeight;
     }
 }
 
@@ -1679,6 +1768,8 @@ void ReconstructionPass::DispatchVulkan(void* /*vkCommandBuffer*/, uint32_t fram
     pushConstants.debugView = config.debugView;
     pushConstants.enableColorClamping = config.enableColorClamping ? 1u : 0u;
     pushConstants.mipLodBias = config.mipLodBias;
+    pushConstants.colorSpace = (config.colorSpace == ColorSpace::RGB) ? 1u : 0u;
+    pushConstants.enableSpatialFallback = config.enableSpatialFallback ? 1u : 0u;
 
     uint32_t groupCountX = (dims.fullWidth + 15u) / 16u;
     uint32_t groupCountY = (dims.fullHeight + 15u) / 16u;
@@ -1845,6 +1936,9 @@ layout(set = 0, binding = 4) uniform sampler2D   u_Velocity;
 // Full-resolution reconstructed output target (R16G16B16A16F / B10G11R11F)
 layout(set = 0, binding = 5, rgba16f) writeonly uniform image2D u_OutputImage;
 
+// Full-resolution depth written for the NEXT frame's disocclusion test (becomes u_HistoryDepth)
+layout(set = 0, binding = 6, r32f) writeonly uniform image2D u_OutputDepth;
+
 // =============================================================================
 // Push Constants / Uniforms
 // =============================================================================
@@ -1857,6 +1951,8 @@ layout(push_constant) uniform CBRConstants {
     uint  u_DebugView;              // 0=Normal, 1=Mask, 2=Disocclusion, 3=Motion, 4=Raw
     uint  u_EnableColorClamping;    // 1 = True, 0 = False
     float u_MipLodBias;             // Texture LOD bias (-0.5)
+    uint  u_ColorSpace;             // 0 = YCoCg clamp, 1 = RGB clamp
+    uint  u_EnableSpatialFallback;  // 1 = cross-bilateral fallback, 0 = use raw current sample
 } pc;
 
 // =============================================================================
@@ -1879,6 +1975,9 @@ vec3 YCoCgtoRGB(vec3 ycocg) {
     float B  = Y - Co - Cg;
     return max(vec3(0.0), vec3(R, G, B));
 }
+
+vec3 ToClampSpace(vec3 rgb)  { return (pc.u_ColorSpace == 0u) ? RGBtoYCoCg(rgb) : rgb; }
+vec3 FromClampSpace(vec3 c)  { return (pc.u_ColorSpace == 0u) ? YCoCgtoRGB(c) : max(vec3(0.0), c); }
 
 // =============================================================================
 // Main Shader Execution
@@ -1922,13 +2021,15 @@ void main() {
     // -------------------------------------------------------------------------
     bool isDisoccluded = false;
     vec4 historyColor = vec4(0.0);
+    float previousDepth = currentDepth;
 
     if (historyUV.x < 0.0 || historyUV.x > 1.0 || historyUV.y < 0.0 || historyUV.y > 1.0) {
         // Sample moved outside screen space
         isDisoccluded = true;
     } else {
-        // Nearest depth fetch from history
-        float previousDepth = textureLod(u_HistoryDepth, historyUV, 0.0).r;
+        // Exact texel fetch: independent of the bound sampler, so depth is never blended across edges
+        ivec2 historyCoord = clamp(ivec2(historyUV * pc.u_TargetResolution), ivec2(0), targetSize - ivec2(1));
+        previousDepth = texelFetch(u_HistoryDepth, historyCoord, 0).r;
         float depthDelta = abs(currentDepth - previousDepth) / max(currentDepth, 1e-5);
 
         if (depthDelta > pc.u_DepthTolerance) {
@@ -1958,21 +2059,22 @@ void main() {
                 int neighborSample = int(uint(neighborCoord.x) & 1u);
                 vec3 neighborColor = texelFetch(u_QuarterColorMSAA, neighborQuarter, neighborSample).rgb;
 
-                vec3 neighborYCoCg = RGBtoYCoCg(neighborColor);
+                vec3 neighborYCoCg = ToClampSpace(neighborColor);
                 colorMin = min(colorMin, neighborYCoCg);
                 colorMax = max(colorMax, neighborYCoCg);
             }
         }
 
-        vec3 historyYCoCg = RGBtoYCoCg(historyColor.rgb);
-        historyYCoCg = clamp(historyYCoCg, colorMin, colorMax);
-        historyColor.rgb = YCoCgtoRGB(historyYCoCg);
+        vec3 historyClampSpace = ToClampSpace(historyColor.rgb);
+        historyClampSpace = clamp(historyClampSpace, colorMin, colorMax);
+        historyColor.rgb = FromClampSpace(historyClampSpace);
     }
 
     // -------------------------------------------------------------------------
     // 5. Final Pixel Reconstruction
     // -------------------------------------------------------------------------
     vec3 finalColor;
+    float spatialDepth = currentDepth; // depth estimate for reconstructed pixels (fallback path)
 
     if (isCurrentSampleActive) {
         // Pixel was natively shaded this frame
@@ -1989,10 +2091,12 @@ void main() {
         } else {
             // Spatial Cross-Bilateral Reconstruction from 4 cardinal active samples
             vec3  accumColor = vec3(0.0);
+            float accumDepth = 0.0;
             float accumWeight = 0.0;
             const ivec2 offsets[4] = ivec2[](ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1));
 
-            for (int i = 0; i < 4; ++i) {
+            // Loop is skipped entirely when the fallback is disabled (accumWeight stays 0)
+            for (int i = 0; i < 4 && pc.u_EnableSpatialFallback != 0u; ++i) {
                 ivec2 sampleCoord = clamp(pixelCoord + offsets[i], ivec2(0), targetSize - ivec2(1));
                 ivec2 sQuarter = sampleCoord / 2;
                 int sIndex = int(uint(sampleCoord.x) & 1u);
@@ -2002,10 +2106,14 @@ void main() {
 
                 float depthWeight = exp(-abs(currentDepth - sDep) * 100.0);
                 accumColor += sCol * depthWeight;
+                accumDepth += sDep * depthWeight;
                 accumWeight += depthWeight;
             }
 
             finalColor = (accumWeight > 1e-4) ? (accumColor / accumWeight) : currentSample.rgb;
+            if (accumWeight > 1e-4) {
+                spatialDepth = accumDepth / accumWeight;
+            }
         }
     }
 
@@ -2035,6 +2143,14 @@ void main() {
 
     // Write final reconstructed pixel to output storage image (alpha = 1.0 for valid history)
     imageStore(u_OutputImage, pixelCoord, vec4(finalColor, 1.0));
+
+    // History depth for the next frame: native depth for shaded pixels; for reconstructed pixels
+    // carry the validated history depth, or the spatial estimate when history was rejected.
+    float outDepth = currentDepth;
+    if (!isCurrentSampleActive) {
+        outDepth = isDisoccluded ? spatialDepth : previousDepth;
+    }
+    imageStore(u_OutputDepth, pixelCoord, vec4(outDepth, 0.0, 0.0, 0.0));
 }
 ```
 
@@ -2065,6 +2181,8 @@ SamplerState        g_LinearClampSampler : register(s0);
 SamplerState        g_PointClampSampler  : register(s1);
 
 RWTexture2D<float4> g_OutputImage      : register(u0);
+// Full-resolution depth written for the next frame's disocclusion test (becomes g_HistoryDepth)
+RWTexture2D<float>  g_OutputDepth      : register(u1);
 
 // =============================================================================
 // Constant Buffer (16-byte aligned)
@@ -2079,7 +2197,8 @@ cbuffer CBRConstants : register(b0)
     uint   g_DebugView;              // 0=Normal, 1=Mask, 2=Disocclusion, 3=Motion, 4=Raw
     uint   g_EnableColorClamping;    // 1 = True, 0 = False
     float  g_MipLodBias;             // Texture LOD bias (-0.5f)
-    float2 g_Padding;                // 16-byte alignment padding
+    uint   g_ColorSpace;             // 0 = YCoCg clamp, 1 = RGB clamp
+    uint   g_EnableSpatialFallback;  // 1 = cross-bilateral fallback, 0 = raw current sample
 };
 
 // =============================================================================
@@ -2104,6 +2223,9 @@ float3 YCoCgtoRGB(float3 ycocg)
     float B  = Y - Co - Cg;
     return max(float3(0.0f, 0.0f, 0.0f), float3(R, G, B));
 }
+
+float3 ToClampSpace(float3 rgb)   { return (g_ColorSpace == 0u) ? RGBtoYCoCg(rgb) : rgb; }
+float3 FromClampSpace(float3 c)   { return (g_ColorSpace == 0u) ? YCoCgtoRGB(c) : max(float3(0.0f, 0.0f, 0.0f), c); }
 
 // =============================================================================
 // Compute Shader Entry Point
@@ -2149,6 +2271,7 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     // -------------------------------------------------------------------------
     bool isDisoccluded = false;
     float4 historyColor = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float previousDepth = currentDepth;
 
     if (historyUV.x < 0.0f || historyUV.x > 1.0f || historyUV.y < 0.0f || historyUV.y > 1.0f)
     {
@@ -2157,7 +2280,7 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     else
     {
         // Point sampling for depth history avoids edge bleeding across discontinuities
-        float previousDepth = g_HistoryDepth.SampleLevel(g_PointClampSampler, historyUV, 0.0f).r;
+        previousDepth = g_HistoryDepth.SampleLevel(g_PointClampSampler, historyUV, 0.0f).r;
         float depthDelta = abs(currentDepth - previousDepth) / max(currentDepth, 1e-5f);
 
         if (depthDelta > g_DepthTolerance)
@@ -2192,21 +2315,22 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
                 int neighborSample = int(uint(neighborCoord.x) & 1u);
                 float3 neighborColor = g_QuarterColorMSAA.Load(neighborQuarter, neighborSample).rgb;
 
-                float3 neighborYCoCg = RGBtoYCoCg(neighborColor);
+                float3 neighborYCoCg = ToClampSpace(neighborColor);
                 colorMin = min(colorMin, neighborYCoCg);
                 colorMax = max(colorMax, neighborYCoCg);
             }
         }
 
-        float3 historyYCoCg = RGBtoYCoCg(historyColor.rgb);
-        historyYCoCg = clamp(historyYCoCg, colorMin, colorMax);
-        historyColor.rgb = YCoCgtoRGB(historyYCoCg);
+        float3 historyClampSpace = ToClampSpace(historyColor.rgb);
+        historyClampSpace = clamp(historyClampSpace, colorMin, colorMax);
+        historyColor.rgb = FromClampSpace(historyClampSpace);
     }
 
     // -------------------------------------------------------------------------
     // 5. Final Reconstruction
     // -------------------------------------------------------------------------
     float3 finalColor;
+    float spatialDepth = currentDepth; // depth estimate for reconstructed pixels (fallback path)
 
     if (isCurrentSampleActive)
     {
@@ -2229,10 +2353,12 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
         {
             // Spatial cross-bilateral filter fallback from 4 cardinal neighbors
             float3 accumColor = float3(0.0f, 0.0f, 0.0f);
+            float  accumDepth  = 0.0f;
             float  accumWeight = 0.0f;
             const int2 offsets[4] = { int2(-1, 0), int2(1, 0), int2(0, -1), int2(0, 1) };
 
-            for (int i = 0; i < 4; ++i)
+            // Loop is skipped entirely when the fallback is disabled (accumWeight stays 0)
+            for (int i = 0; i < 4 && g_EnableSpatialFallback != 0u; ++i)
             {
                 int2 sampleCoord = clamp(pixelCoord + offsets[i], int2(0, 0), targetSize - int2(1, 1));
                 int2 sQuarter = sampleCoord / 2;
@@ -2243,10 +2369,15 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
 
                 float depthWeight = exp(-abs(currentDepth - sDep) * 100.0f);
                 accumColor += sCol * depthWeight;
+                accumDepth += sDep * depthWeight;
                 accumWeight += depthWeight;
             }
 
             finalColor = (accumWeight > 1e-4f) ? (accumColor / accumWeight) : currentSample.rgb;
+            if (accumWeight > 1e-4f)
+            {
+                spatialDepth = accumDepth / accumWeight;
+            }
         }
     }
 
@@ -2279,6 +2410,14 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     }
 
     g_OutputImage[pixelCoord] = float4(finalColor, 1.0f);
+
+    // History depth for the next frame (see GLSL version for rationale)
+    float outDepth = currentDepth;
+    if (!isCurrentSampleActive)
+    {
+        outDepth = isDisoccluded ? spatialDepth : previousDepth;
+    }
+    g_OutputDepth[pixelCoord] = outDepth;
 }
 ```
 
@@ -2330,4 +2469,230 @@ void main() {
 
     imageStore(u_OutputImage, pixelCoord, vec4(finalColor, 1.0));
 }
+```
+
+<a id="sec-tests"></a>
+## 5. Tests & CI
+
+<a id="teststestcorecpp"></a>
+### `tests/test_core.cpp`
+```cpp
+// Host-side unit tests for the portable parts of the plugin (no Windows APIs, no GPU).
+// Uses a custom CHECK macro (not assert) so tests still run in Release builds (NDEBUG).
+#include "cbr/config.h"
+#include "cbr/jitter_manager.h"
+#include "cbr/logger.h"
+#include "cbr/reconstruction_pass.h"
+#include "cbr/render_target_manager.h"
+
+#include <cmath>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <sstream>
+
+using namespace cbr;
+namespace fs = std::filesystem;
+
+static int g_failures = 0;
+#define CHECK(cond)                                                              \
+    do {                                                                         \
+        if (!(cond)) {                                                           \
+            ++g_failures;                                                        \
+            std::cerr << "FAIL " << __FILE__ << ":" << __LINE__ << "  " #cond "\n"; \
+        }                                                                        \
+    } while (0)
+
+static void WriteFile(const fs::path& p, const std::string& text) {
+    std::ofstream f(p);
+    f << text;
+}
+
+static std::string ReadFile(const fs::path& p) {
+    std::ifstream f(p);
+    std::stringstream ss;
+    ss << f.rdbuf();
+    return ss.str();
+}
+
+static void TestConfigHardening(const fs::path& dir) {
+    const fs::path ini = dir / "bad.ini";
+    WriteFile(ini,
+        "[General]\n"
+        "TargetWidth = 4k\n"          // trailing garbage  -> default
+        "TargetHeight = -1\n"         // negative          -> default
+        "Enabled = true ; comment\n"  // inline comment
+        "PreferredApi = Auto\n"
+        "[Reconstruction]\n"
+        "HistoryWeight = nan\n"       // NaN               -> default
+        "DepthTolerance = 99999\n"    // out of range      -> clamped
+        "MipLodBias = abc\n"          // garbage           -> default
+        "[Jitter]\n"
+        "JitterPattern = Halton\n"    // unimplemented     -> Checkerboard
+        "[Debug]\n"
+        "DebugView = 77\n");          // out of range      -> clamped
+
+    CHECK(ConfigManager::Get().Load(ini));
+    const auto& c = ConfigManager::Get().GetConfig();
+    CHECK(c.targetWidth == 3840);
+    CHECK(c.targetHeight == 2160);
+    CHECK(c.enabled);
+    CHECK(c.preferredApi == GraphicsApi::Auto);
+    CHECK(c.historyWeight == 0.90f);
+    CHECK(c.depthTolerance == 1.0f);
+    CHECK(c.mipLodBias == -0.5f);
+    CHECK(c.jitterPattern == JitterPattern::Checkerboard);
+    CHECK(c.debugView == 4);
+}
+
+static void TestConfigMissingFileAndRoundTrip(const fs::path& dir) {
+    CHECK(!ConfigManager::Get().Load(dir / "does_not_exist.ini"));
+
+    const fs::path out = dir / "roundtrip.ini";
+    CHECK(ConfigManager::Get().Save(out));
+    const auto before = ConfigManager::Get().GetConfig();
+    CHECK(ConfigManager::Get().Load(out));
+    const auto& after = ConfigManager::Get().GetConfig();
+    CHECK(after.targetWidth == before.targetWidth);
+    CHECK(after.preferredApi == before.preferredApi);
+    CHECK(after.historyWeight == before.historyWeight);
+}
+
+static void TestLoggerBufferingAndLevel(const fs::path& dir) {
+    // Messages logged before Initialize() must be buffered and flushed, honoring the min level.
+    Logger::Get().SetMinLevel(LogLevel::Info);
+    CBR_LOG_INFO("early info %d", 1);
+    Logger::Get().SetMinLevel(LogLevel::Warning);
+    CBR_LOG_INFO("filtered info");
+    CBR_LOG_WARN("late warning %d", 2);
+
+    const fs::path log = dir / "test.log";
+    Logger::Get().Initialize(log);
+    Logger::Get().Shutdown();
+
+    const std::string text = ReadFile(log);
+    CHECK(text.find("early info 1") != std::string::npos);   // buffered before init
+    CHECK(text.find("late warning 2") != std::string::npos);
+    CHECK(text.find("filtered info") == std::string::npos);  // below min level
+}
+
+static void TestJitter() {
+    auto& cfg = ConfigManager::Get().GetMutableConfig();
+    cfg.jitterScale = 1.0f;
+
+    auto& j = JitterManager::Get();
+    j.Initialize(3840, 2160);
+    j.Update(0);
+    const JitterOffset even = j.GetCurrentJitter();
+    j.Update(1);
+    const JitterOffset odd = j.GetCurrentJitter();
+
+    CHECK(std::fabs(even.x + odd.x) < 1e-9f);                // alternating +/- phases
+    CHECK(std::fabs(odd.x - 0.5f / 3840.0f) < 1e-9f);
+    CHECK(std::fabs(odd.y - 0.5f / 2160.0f) < 1e-9f);
+    CHECK(std::fabs(j.GetJitterDelta().x - (odd.x - even.x)) < 1e-9f);
+
+    cfg.jitterScale = 2.0f;                                   // JitterScale must take effect
+    j.Update(1);
+    CHECK(std::fabs(j.GetCurrentJitter().x - 1.0f / 3840.0f) < 1e-9f);
+    cfg.jitterScale = 1.0f;
+
+    // Apply/Remove must be exact inverses
+    float m[16] = { 1, 0, 0, 0,  0, 1, 0, 0,  0.25f, 0.5f, 1, 0,  0, 0, 0, 1 };
+    float orig[16];
+    std::copy(m, m + 16, orig);
+    j.ApplyJitterToProjection(m, true);
+    j.RemoveJitterFromProjection(m, true);
+    for (int i = 0; i < 16; ++i) CHECK(std::fabs(m[i] - orig[i]) < 1e-7f);
+}
+
+static void TestRenderTargets() {
+    auto& r = RenderTargetManager::Get();
+    r.Initialize(3840, 2160);
+    // 268.95 MB as documented in the README
+    const double mb = static_cast<double>(r.GetTotalAllocatedVramBytes()) / (1024.0 * 1024.0);
+    CHECK(std::fabs(mb - 268.95) < 0.01);
+    CHECK(r.IsTargetInterceptCandidate(3840, 2160, 0));
+    CHECK(!r.IsTargetInterceptCandidate(1920, 1080, 0));
+
+    CHECK(r.GetCurrentHistoryIndex() == 0 && r.GetPreviousHistoryIndex() == 1);
+    r.SwapHistoryBuffers();
+    CHECK(r.GetCurrentHistoryIndex() == 1 && r.GetPreviousHistoryIndex() == 0);
+    r.ResetHistory();
+    CHECK(r.GetCurrentHistoryIndex() == 0);
+}
+
+static void TestPushConstantLayout() {
+    CHECK(sizeof(ReconstructionPushConstants) == 48);
+}
+
+int main() {
+    const fs::path dir = fs::temp_directory_path() / "cbr_tests";
+    fs::create_directories(dir);
+
+    TestConfigHardening(dir);
+    TestConfigMissingFileAndRoundTrip(dir);
+    TestLoggerBufferingAndLevel(dir);
+    TestJitter();
+    TestRenderTargets();
+    TestPushConstantLayout();
+
+    fs::remove_all(dir);
+    if (g_failures == 0) {
+        std::cout << "All tests passed.\n";
+        return 0;
+    }
+    std::cerr << g_failures << " check(s) failed.\n";
+    return 1;
+}
+```
+
+<a id="githubworkflowsbuildyml"></a>
+### `.github/workflows/build.yml`
+```yaml
+# NOTE: written but not executed by the author's tooling; verify on first push.
+name: build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  tests-and-shaders:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y cmake g++ glslang-tools
+      - name: Unit tests
+        run: |
+          cmake -S . -B build-tests -DCBR_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-tests --target cbr_tests
+          ctest --test-dir build-tests --output-on-failure
+      - name: Validate shaders
+        run: |
+          glslangValidator -V shaders/cbr_reconstruct.comp -o /tmp/r.spv
+          glslangValidator -V shaders/cbr_resolve_simple.comp -o /tmp/s.spv
+          glslangValidator -D -e CSMain -S comp -V shaders/cbr_reconstruct.hlsl -o /tmp/h.spv
+
+  windows-release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -A x64
+      - name: Build (Release, MSVC hardening flags)
+        run: cmake --build build --config Release
+      - name: SHA-256 of release artifacts
+        shell: pwsh
+        run: |
+          Get-FileHash build/bin/Release/rdr2-cbr.asi -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash)  rdr2-cbr.asi" } | Tee-Object build/bin/Release/SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rdr2-cbr-release
+          path: |
+            build/bin/Release/rdr2-cbr.asi
+            build/bin/Release/cbr.ini
+            build/bin/Release/SHA256SUMS.txt
 ```
