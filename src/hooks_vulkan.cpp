@@ -23,6 +23,8 @@ PFN_vkCreateSwapchainKHR g_Original_vkCreateSwapchainKHR = nullptr;
 
 // VK_ERROR_INITIALIZATION_FAILED: returned if a hook is ever invoked without a valid trampoline,
 // so the failure is visible to the caller instead of silently dropping frames / swapchains.
+constexpr int kVkErrorInitializationFailed = -3;
+
 // Minimal Vulkan struct layouts for headerless extraction of swapchain and extent
 struct MinimalVkExtent2D {
     uint32_t width;

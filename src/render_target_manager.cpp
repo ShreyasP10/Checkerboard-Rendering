@@ -23,8 +23,8 @@ void RenderTargetManager::Initialize(uint32_t width, uint32_t height) {
     size_t qDepth = static_cast<size_t>(m_dims.quarterWidth) * m_dims.quarterHeight * 4 * 2;
     // 3. Full-Res History A & B (RGBA16F = 8 bytes):
     size_t histColor = static_cast<size_t>(m_dims.fullWidth) * m_dims.fullHeight * 8 * 2;
-    // 4. Full-Res Depth History (R32F = 4 bytes):
-    size_t histDepth = static_cast<size_t>(m_dims.fullWidth) * m_dims.fullHeight * 4;
+    // 4. Full-Res Depth History A & B (R32F = 4 bytes * 2 buffers):
+    size_t histDepth = static_cast<size_t>(m_dims.fullWidth) * m_dims.fullHeight * 4 * 2;
     // 5. Full-Res Output Image (RGBA16F = 8 bytes):
     size_t outColor = static_cast<size_t>(m_dims.fullWidth) * m_dims.fullHeight * 8;
 

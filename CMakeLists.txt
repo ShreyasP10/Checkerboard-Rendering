@@ -30,7 +30,9 @@ include_directories(
 # Header files
 set(CBR_HEADERS
     ${CBR_INCLUDE_DIR}/cbr/cbr_engine.h
+    ${CBR_INCLUDE_DIR}/cbr/checkerboard_mapping.h
     ${CBR_INCLUDE_DIR}/cbr/config.h
+    ${CBR_INCLUDE_DIR}/cbr/depth_convention.h
     ${CBR_INCLUDE_DIR}/cbr/hooks.h
     ${CBR_INCLUDE_DIR}/cbr/jitter_manager.h
     ${CBR_INCLUDE_DIR}/cbr/logger.h

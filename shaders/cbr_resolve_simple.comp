@@ -1,9 +1,11 @@
 #version 450 core
-
 /**
  * RDR2 Checkerboard Rendering Mod (CBR) - Lightweight Spatial Fallback Resolve
  * Target: Vulkan SPIR-V
  * Author & Co-Owner: Shreyas Pawar
+ *
+ * Uses the same sample mapping as cbr_reconstruct.comp (see include/cbr/checkerboard_mapping.h).
+ * Reconstructed pixels are the average of their 4 natively shaded cardinal neighbours.
  */
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
@@ -15,7 +17,24 @@ layout(push_constant) uniform SpatialConstants {
     vec2 u_TargetResolution;
     vec2 u_InvTargetResolution;
     uint u_FrameIndex;
+    int  u_ShiftDirection; // +1 / -1, see include/cbr/checkerboard_mapping.h
 } pc;
+
+vec3 FetchMapped(ivec2 p, uint frameParity, out bool isActive) {
+    int yBit = p.y & 1;
+    isActive = (((uint(p.x) ^ uint(p.y)) & 1u) == frameParity);
+    int qx;
+    if (frameParity == 0u) {
+        qx = p.x >> 1;
+    } else if (pc.u_ShiftDirection >= 0) {
+        qx = max(p.x - yBit, 0) >> 1;
+    } else {
+        qx = (p.x + 1 - yBit) >> 1;
+    }
+    ivec2 qMax = ivec2(pc.u_TargetResolution * 0.5) - ivec2(1);
+    ivec2 quarter = ivec2(clamp(qx, 0, qMax.x), min(p.y >> 1, qMax.y));
+    return texelFetch(u_QuarterColorMSAA, quarter, 1 - yBit).rgb;
+}
 
 void main() {
     ivec2 pixelCoord = ivec2(gl_GlobalInvocationID.xy);
@@ -25,20 +44,22 @@ void main() {
         return;
     }
 
-    ivec2 quarterCoord = pixelCoord / 2;
-    uint pixelParity = (uint(pixelCoord.x) + uint(pixelCoord.y)) & 1u;
     uint frameParity = pc.u_FrameIndex & 1u;
+    bool isActive;
+    vec3 finalColor = FetchMapped(pixelCoord, frameParity, isActive);
 
-    int sampleIndex = int(uint(pixelCoord.y) & 1u);
-    vec4 activeSample = texelFetch(u_QuarterColorMSAA, quarterCoord, sampleIndex);
-
-    vec3 finalColor;
-    if (pixelParity == frameParity) {
-        finalColor = activeSample.rgb;
-    } else {
-        // Average the 2 subpixel samples for missing positions
-        vec4 otherSample = texelFetch(u_QuarterColorMSAA, quarterCoord, 1 - sampleIndex);
-        finalColor = 0.5 * (activeSample.rgb + otherSample.rgb);
+    if (!isActive) {
+        const ivec2 kCardinal[4] = ivec2[](ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1));
+        vec3 sum = vec3(0.0);
+        for (int i = 0; i < 4; ++i) {
+            ivec2 c = pixelCoord + kCardinal[i];
+            if (c.x < 0 || c.y < 0 || c.x >= targetSize.x || c.y >= targetSize.y) {
+                c = pixelCoord - kCardinal[i]; // mirror at the screen border
+            }
+            bool neighbourActive;
+            sum += FetchMapped(c, frameParity, neighbourActive);
+        }
+        finalColor = sum * 0.25;
     }
 
     imageStore(u_OutputImage, pixelCoord, vec4(finalColor, 1.0));

@@ -21,18 +21,19 @@ void JitterManager::Initialize(uint32_t targetWidth, uint32_t targetHeight) {
 void JitterManager::Update(uint32_t frameIndex) {
     m_previousJitter = m_currentJitter;
 
-    // 2-phase subpixel checkerboard jitter sequence:
-    // Shifts alternating frames horizontally by +0.5px and -0.5px (presentation pixels).
-    // Standard 2x MSAA diagonal sample geometry requires 1D horizontal shift only (delta Y = 0)
-    // to achieve 100% 4-quadrant geometric coverage across 2 frames (Intel 2018 White Paper).
-    float pixelWidth = 1.0f / static_cast<float>(m_targetWidth);
-    const float amplitude = 0.5f * ConfigManager::Get().GetConfig().jitterScale;
+    // 2-phase checkerboard jitter sequence:
+    // Even frames are unjittered (samples land on pixel centres).
+    // Odd frames are shifted horizontally by exactly one full-resolution pixel (shiftDirection * pixelWidth),
+    // giving 100% 4-quadrant geometric coverage across two frames with standard 2x MSAA sample locations.
+    const auto& config = ConfigManager::Get().GetConfig();
+    const float pixelWidth = 1.0f / static_cast<float>(m_targetWidth);
+    const float dir = (config.jitterDirection < 0) ? -1.0f : 1.0f;
 
     if (frameIndex & 1u) {
-        m_currentJitter.x = amplitude * pixelWidth;
+        m_currentJitter.x = dir * pixelWidth;
         m_currentJitter.y = 0.0f;
     } else {
-        m_currentJitter.x = -amplitude * pixelWidth;
+        m_currentJitter.x = 0.0f;
         m_currentJitter.y = 0.0f;
     }
 }

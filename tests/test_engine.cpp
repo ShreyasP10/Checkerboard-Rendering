@@ -110,6 +110,23 @@ static void RunVulkanTests() {
     CHECK(e.GetCurrentFrameIndex() == 1);
     e.OnPostPresent(&g_a);
     CHECK(e.GetCurrentFrameIndex() == 1);
+
+    // Swapchain extents are untrusted: odd sizes round up to even, implausible ones are ignored
+    e.OnSwapchainRecreated(1921, 1081);
+    CHECK(rt.GetDimensions().fullWidth == 1922 && rt.GetDimensions().fullHeight == 1082);
+    CHECK(rt.GetDimensions().quarterWidth == 961 && rt.GetDimensions().quarterHeight == 541);
+
+    e.OnSwapchainRecreated(0, 0); // minimised window
+    CHECK(rt.GetDimensions().fullWidth == 1922);
+
+    e.OnSwapchainRecreated(5, 5); // too small
+    CHECK(rt.GetDimensions().fullWidth == 1922);
+
+    e.OnSwapchainRecreated(100000, 100000); // absurd
+    CHECK(rt.GetDimensions().fullWidth == 1922 && rt.GetDimensions().fullHeight == 1082);
+
+    e.OnSwapchainRecreated(3840, 2160);
+    CHECK(rt.GetDimensions().fullWidth == 3840 && rt.GetDimensions().fullHeight == 2160);
 }
 
 static void RunAutoTests() {

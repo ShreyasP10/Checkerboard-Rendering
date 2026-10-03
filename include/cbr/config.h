@@ -19,6 +19,11 @@ enum class JitterPattern {
     Halton
 };
 
+enum class DepthConvention {
+    Standard,
+    Reversed
+};
+
 enum class ColorSpace {
     YCoCg,
     RGB
@@ -33,22 +38,24 @@ struct CBRConfig {
     float       mipLodBias{ -0.5f };
 
     // Reconstruction
-    float       depthTolerance{ 0.010f };
-    bool        enableColorClamping{ true };
-    ColorSpace  colorSpace{ ColorSpace::YCoCg };
-    float       historyWeight{ 0.90f };
-    bool        enableSpatialFallback{ true };
-    // 3x3 closest-depth motion-vector dilation. Costs 9 extra MSAA depth fetches per output pixel;
-    // disable on bandwidth-limited GPUs if silhouette smearing is acceptable.
-    bool        enableMotionDilation{ true };
+    float           depthTolerance{ 0.010f };
+    bool            enableColorClamping{ true };
+    ColorSpace      colorSpace{ ColorSpace::YCoCg };
+    float           historyWeight{ 0.90f };
+    bool            enableSpatialFallback{ true };
+    // 3x3 closest-depth motion-vector dilation over active samples.
+    bool            enableMotionDilation{ true };
+    DepthConvention depthConvention{ DepthConvention::Reversed };
+    float           depthNear{ 0.1f };
+    float           depthFar{ 0.0f }; // 0.0 = infinite far plane (Reversed only)
 
     // Jitter
     JitterPattern jitterPattern{ JitterPattern::Checkerboard };
     float         jitterScale{ 1.0f };
-    // Multiplier applied to the jitter delta when reprojecting history. 1 = subtract (jc - jp),
-    // -1 = opposite sign convention, 0 = off. The correct sign depends on the engine's projection
-    // convention and must be confirmed with DebugView on a static camera.
-    float         jitterCompensation{ 1.0f };
+    int32_t       jitterDirection{ 1 }; // +1 or -1
+    // Multiplier applied to the jitter delta when reprojecting history: default 0.0
+    // (whole-pixel coverage jitter is absorbed by the sample mapping, so history needs no compensation).
+    float         jitterCompensation{ 0.0f };
 
     // Debug
     bool        showOverlay{ false };
@@ -75,6 +82,11 @@ public:
     void UpdateConfig(const CBRConfig& config) {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_config = config;
+    }
+    template<typename Fn>
+    void Modify(Fn&& fn) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        fn(m_config);
     }
 
 private:

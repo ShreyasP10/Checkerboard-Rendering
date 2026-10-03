@@ -61,7 +61,7 @@ Output:      Full 3840×2160 4K Image
 ```
 
 1. **Target Interception:** Intercepts main scene color and depth attachments, routing them to quarter-resolution (1920×1080) targets configured with 2× MSAA.
-2. **Subpixel Projection Jitter:** Alternates the camera projection matrix by $\pm 0.5$ pixels every frame, shifting the 2× MSAA subpixel grid to cover complementary checkerboard coordinates.
+2. **Projection Jitter:** Alternates the camera projection matrix horizontally by 1 full-resolution pixel on odd frames (0 on even frames), shifting the 2× MSAA subpixel grid to achieve 100% 4-quadrant geometric coverage across two frames.
 3. **MIP LOD Bias Injection:** Injects a $-0.5$ LOD bias into scene texture samplers, ensuring high-frequency textures sample at full 4K Nyquist clarity despite reduced geometry resolution.
 4. **Compute Shader Reconstruction:** Runs a compute shader (`cbr_reconstruct.comp` / `cbr_reconstruct.hlsl`) that evaluates pixel parity, reprojects history using motion vectors, tests depth for disocclusion, and clamps against the 3×3 color neighborhood.
 
@@ -180,7 +180,7 @@ $$C_{\text{spatial}} = \frac{\sum_{k=1}^4 w_k C_k}{\sum_{k=1}^4 w_k}, \quad w_k 
 | Component | Minimum Specification | Recommended (Target Discrete) | Recommended (Target APU / Integrated) | Role in CBR Pipeline |
 |---|---|---|---|---|
 | **GPU** | GTX 1060 (6 GB) / RX 580 (8 GB) | **NVIDIA GeForce GTX 1070 Ti (8 GB GDDR5)** | **AMD Radeon Vega 7 (Ryzen 5 4600G/5600G/5700U APU)** | Wave32 (Pascal) / Wave64 (Vega) compute shader execution, 2× MSAA rasterization |
-| **GPU VRAM** | 1 GB (for 1080p CBR) / 6 GB (for 4K) | **8 GB GDDR5** (~268.95 MB CBR footprint at 4K) | **512 MB – 2 GB Shared UMA DDR4** (~78.79 MB CBR footprint at 1080p) | Stores ping-pong history and intermediate MSAA targets |
+| **GPU VRAM** | 1 GB (for 1080p CBR) / 6 GB (for 4K) | **8 GB GDDR5** (~300.58 MiB / 315.19 MB CBR footprint at 4K) | **512 MB – 2 GB Shared UMA DDR4** (~78.80 MB CBR footprint at 1080p) | Stores ping-pong history and intermediate MSAA targets |
 | **CPU** | Quad-Core (i5-8400 / Ryzen 2600) | **6-Core / 12-Thread (i7 / Ryzen 3600+)** | **AMD Ryzen 5 4600G / 5600G (6C / 12T APU)** | Frame pacing and intercept dispatch |
 | **RAM** | 8 GB Dual-Channel | **16 GB DDR4 Dual-Channel** | **16 GB Dual-Channel DDR4-3200+** | Critical on APUs for shared GPU/CPU memory bandwidth |
 | **OS** | Windows 10 (64-bit, 19041+) | **Windows 10 / Windows 11 (64-bit)** | **Windows 10 / Windows 11 (64-bit)** | Native Vulkan 1.3 and DirectX 12 support |
@@ -267,12 +267,16 @@ EnableColorClamping = true   ; Enables variance clipping to eliminate temporal g
 ColorSpace = YCoCg           ; YCoCg provides artifact-free color bounding box calculation
 HistoryWeight = 0.90         ; 0.90 retains 90% temporal history on static pixels
 EnableSpatialFallback = true ; Uses cross-bilateral filter when history is disoccluded
-EnableMotionDilation = true  ; 3x3 closest-depth motion dilation (cleaner silhouettes; costs 9 extra depth fetches per pixel)
+EnableMotionDilation = true  ; 3x3 closest-depth motion dilation over active samples
+DepthConvention = Reversed   ; RDR2 reversed-Z depth (1 near .. 0 far) or Standard (0 near .. 1 far)
+DepthNear = 0.1              ; Near plane in metres (used for linear depth disocclusion tests)
+DepthFar = 0.0               ; Far plane in metres (0.0 = infinite far plane for Reversed)
 
 [Jitter]
-JitterPattern = Checkerboard ; 2-phase subpixel complementary grid jitter
-JitterScale = 1.0            ; 1.0 = exact 0.5-pixel subpixel perturbation
-JitterCompensation = 1.0     ; History reprojection jitter sign: 1 = subtract delta, -1 = opposite, 0 = off (confirm with a static camera)
+JitterPattern = Checkerboard ; 2-phase complementary grid jitter (whole-pixel horizontal shift)
+JitterScale = 1.0            ; Jitter scale (1.0 = exact whole-pixel coverage shift)
+JitterDirection = 1          ; Odd-frame horizontal shift direction: +1 or -1
+JitterCompensation = 0.0     ; History reprojection jitter sign (default 0.0: whole-pixel shift is absorbed by sample mapping)
 
 [Debug]
 ShowOverlay = false          ; Toggle in-game overlay
@@ -309,7 +313,7 @@ Launch *Red Dead Redemption 2*, open **Settings > Graphics**, and configure the 
 * **MSAA:** **Off** (leave in-game MSAA disabled; the planned design has CBR allocate its own dedicated 2× MSAA intermediate buffer, which is not implemented yet).
 
 #### 4. Geometry & Texture Settings (Optimized for GTX 1070 Ti / Pascal 8 GB)
-* **Texture Quality:** **Ultra** (the CBR buffers themselves need ~269 MB; whether Ultra textures plus those fit in 8 GB at 4K is unverified, so lower this first if you run out of VRAM).
+* **Texture Quality:** **Ultra** (the CBR buffers themselves need ~315.19 MB; whether Ultra textures plus those fit in 8 GB at 4K is unverified, so lower this first if you run out of VRAM).
 * **Anisotropic Filtering:** **16×** (negligible performance cost on Pascal GPUs; keeps road and terrain textures sharp at oblique viewing angles).
 * **Lighting Quality:** **Medium** or **High**.
 * **Global Illumination Quality:** **High**.
@@ -340,7 +344,7 @@ Exit or Alt-Tab from the game and open `cbr.log` in the RDR2 root folder to veri
 [INFO] Configuration successfully loaded from cbr.ini (Target: 3840x2160, API: Vulkan, CBR Enabled: true)
 [INFO] RenderTargetManager initialized for target: 3840x2160
 [INFO] Quarter-Resolution 2x MSAA Buffer size: 1920x1080
-[INFO] Total CBR VRAM Footprint: 268.95 MB
+[INFO] Total CBR VRAM Footprint: 315.19 MB
 [WARN] Vulkan hook installation is not implemented yet; no hooks are active.
 [INFO] CBREngine initialized successfully. Ready for frame interception.
 ```

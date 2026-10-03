@@ -130,6 +130,15 @@ bool ConfigManager::Load(const std::filesystem::path& configPath) {
                 m_config.enableSpatialFallback = ParseBool(val, m_config.enableSpatialFallback);
             } else if (key == "EnableMotionDilation") {
                 m_config.enableMotionDilation = ParseBool(val, m_config.enableMotionDilation);
+            } else if (key == "DepthConvention") {
+                std::string dc = ToUpper(val);
+                if (dc == "STANDARD") m_config.depthConvention = DepthConvention::Standard;
+                else if (dc == "REVERSED") m_config.depthConvention = DepthConvention::Reversed;
+                else CBR_LOG_WARN("Unknown DepthConvention '%s' (expected Standard or Reversed); keeping previous.", val.c_str());
+            } else if (key == "DepthNear") {
+                m_config.depthNear = ParseFloat(val, m_config.depthNear, 0.001f, 100.0f);
+            } else if (key == "DepthFar") {
+                m_config.depthFar = ParseFloat(val, m_config.depthFar, 0.0f, 1000000.0f);
             } else if (key == "JitterPattern") {
                 if (ToUpper(val) == "HALTON") {
                     CBR_LOG_WARN("JitterPattern=Halton is not implemented yet; using Checkerboard.");
@@ -137,6 +146,20 @@ bool ConfigManager::Load(const std::filesystem::path& configPath) {
                 m_config.jitterPattern = JitterPattern::Checkerboard;
             } else if (key == "JitterScale") {
                 m_config.jitterScale = ParseFloat(val, m_config.jitterScale, 0.1f, 4.0f);
+                if (m_config.jitterScale != 1.0f) {
+                    CBR_LOG_WARN("JitterScale != 1.0 is ignored for 2x MSAA checkerboard geometry; coverage requires exactly one pixel.");
+                }
+            } else if (key == "JitterDirection") {
+                try {
+                    int d = std::stoi(val);
+                    if (d == 1 || d == -1) {
+                        m_config.jitterDirection = d;
+                    } else {
+                        CBR_LOG_WARN("Invalid JitterDirection '%s' (expected +1 or -1); keeping previous.", val.c_str());
+                    }
+                } catch (...) {
+                    CBR_LOG_WARN("Invalid JitterDirection '%s'; keeping previous.", val.c_str());
+                }
             } else if (key == "JitterCompensation") {
                 m_config.jitterCompensation = ParseFloat(val, m_config.jitterCompensation, -1.0f, 1.0f);
             } else if (key == "DebugView") {
@@ -186,11 +209,15 @@ bool ConfigManager::Save(const std::filesystem::path& configPath) {
     file << "ColorSpace = " << (m_config.colorSpace == ColorSpace::RGB ? "RGB" : "YCoCg") << "\n";
     file << "HistoryWeight = " << m_config.historyWeight << "\n";
     file << "EnableSpatialFallback = " << (m_config.enableSpatialFallback ? "true" : "false") << "\n";
-    file << "EnableMotionDilation = " << (m_config.enableMotionDilation ? "true" : "false") << "\n\n";
+    file << "EnableMotionDilation = " << (m_config.enableMotionDilation ? "true" : "false") << "\n";
+    file << "DepthConvention = " << (m_config.depthConvention == DepthConvention::Standard ? "Standard" : "Reversed") << "\n";
+    file << "DepthNear = " << m_config.depthNear << "\n";
+    file << "DepthFar = " << m_config.depthFar << "\n\n";
 
     file << "[Jitter]\n";
     file << "JitterPattern = " << (m_config.jitterPattern == JitterPattern::Halton ? "Halton" : "Checkerboard") << "\n";
     file << "JitterScale = " << m_config.jitterScale << "\n";
+    file << "JitterDirection = " << m_config.jitterDirection << "\n";
     file << "JitterCompensation = " << m_config.jitterCompensation << "\n\n";
 
     file << "[Debug]\n";
