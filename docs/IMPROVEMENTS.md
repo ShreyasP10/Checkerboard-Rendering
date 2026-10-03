@@ -104,14 +104,20 @@ historyUV = uv + (jc - jp) * s - velocity
 
 Also fix `Apply/RemoveJitterFromProjection`: they use `+=`/`-=`, so calling `Apply` twice in one frame doubles the jitter. Prefer `SetProjectionJitter(matrix, unjitteredMatrix)` or keep a per-matrix applied flag.
 
-### 3.2 MSAA sample ↔ pixel mapping needs a real derivation
+### 3.2 MSAA sample ↔ pixel mapping derivation (Resolved via Intel 2018 White Paper)
 
-The shaders use `msaaSampleIndex = pixelCoord.x & 1` for every frame. That is only correct if the engine's 2× MSAA sample positions line up with that rule. With the standard 2× sample positions (diagonal: `(+¼,+¼)` and `(−¼,−¼)` from the pixel centre, in both D3D and Vulkan standard locations):
+The standard 2× MSAA sample positions (D3D12 and Vulkan standard diagonal locations: `(-4/16, -4/16)` [Sample 0, top-left] and `(+4/16, +4/16)` [Sample 1, bottom-right]) and their temporal tiling geometry are formally derived in the Intel white paper (*Mcferron & Lake, 2018*, detailed in [`docs/INTEL_CBR_REFERENCE.md`](INTEL_CBR_REFERENCE.md)):
 
-- In one 2×2 block, the two diagonal samples land on the **(0,0) and (1,1)** target pixels, which is the `(x+y)&1 == 0` set, and sample 0 maps to the **(1,1)** pixel, so `x & 1` has the sample indices swapped for this frame.
-- The complementary diagonal `(1,0)/(0,1)` for odd frames is **not reachable by a ±0.5-target-pixel diagonal jitter**. A half *render*-pixel shift on one axis (= 1 target pixel) swaps the diagonal, but one of the two samples then belongs to the **neighbouring** render pixel.
+1. **Unjittered Frame (N-1):**
+   - Sample 0 covers Quadrant $(0, 0)$ (top-left full-res pixel).
+   - Sample 1 covers Quadrant $(1, 1)$ (bottom-right full-res pixel).
+   - Quadrants $(1, 0)$ and $(0, 1)$ are left unshaded.
+2. **Horizontal 1-Pixel Jittered Frame (N):**
+   - Shifting the viewport by $+1.0$ presentation pixel to the right ($+0.5$ quarter-resolution texel, $+8/16$) moves Sample 0 to $(+4/16, -4/16)$, exactly covering **Quadrant $(1, 0)$ (top-right)**.
+   - Sample 1 shifts to $(+12/16, +4/16)$, which wraps into **Quadrant $(0, 1)$ (bottom-left)** of the adjacent cell.
+3. Together across two alternating frames, this 1D horizontal shift achieves 100% full-resolution geometric coverage with exact sample locations.
 
-So: confirm the sample positions the game actually uses (`VK_EXT_sample_locations` or the D3D12 programmable sample positions), then make the mapping a small, unit-tested function (`SampleForPixel(x, y, frameParity)` returning *(quarterCoord, sampleIndex)*) shared by clamp, fallback and resolve code, and re-derive the jitter amplitude from it. This is the single biggest correctness risk in the shader math, so treat it before tuning visuals.
+See [`docs/INTEL_CBR_REFERENCE.md`](INTEL_CBR_REFERENCE.md) for the complete mathematical proof, quadrant lookup tables, and Shade Resolve Target (SRT) format.
 
 ### 3.3 Quality upgrades (once the above is right)
 

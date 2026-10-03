@@ -149,6 +149,7 @@ Detailed specifications are maintained in the [`docs/`](docs/) directory:
 - 📄 [**Technical Requirements Document (TRD)**](docs/TRD.md) – Vulkan/DX12 hook mechanics, buffer formats, and Pascal GPU optimizations.
 - 📄 [**Development Plan (DEV_PLAN)**](docs/DEV_PLAN.md) – 8-phase roadmap, milestones, and deliverable schedules.
 - 📄 [**Risk Register (RISK_REGISTER)**](docs/RISK_REGISTER.md) – Assessment of motion vector extraction, Pascal bandwidth, and mitigations.
+- 📄 [**Intel CBR Reference Analysis (INTEL_CBR_REFERENCE)**](docs/INTEL_CBR_REFERENCE.md) – Reference breakdown of Mcferron & Lake (Intel 2018): 2× MSAA 4-quadrant geometry, Shade Resolve Targets (SRT), and linear depth disocclusion.
 
 ---
 
