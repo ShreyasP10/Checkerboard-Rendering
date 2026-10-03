@@ -2,11 +2,14 @@
 
 /**
  * RDR2 Checkerboard Rendering Mod (CBR) - Reconstruction Compute Shader
- * Architecture: Optimized for NVIDIA Pascal (GP104 / GTX 1070 Ti) & Modern GPUs
+ * Architecture: Optimized for NVIDIA Pascal (GP104 / Wave32) & AMD Radeon Vega (GCN 5.0 / Wave64)
  * Target: Vulkan SPIR-V
  * Author & Co-Owner: Shreyas Pawar
  */
 
+// 16x16 = 256 threads per workgroup:
+// - NVIDIA Pascal (GP104): 8 warps x 32 threads = 100% warp occupancy
+// - AMD Radeon Vega (GCN 5.0 / Vega 7): 4 wavefronts x 64 threads = 100% Wave64 occupancy
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
 // =============================================================================

@@ -45,7 +45,8 @@ This mod targets Pascal-era and mid-range PC hardware—specifically the **NVIDI
 | Persona | Description | Primary Hardware | Use Case |
 |---|---|---|---|
 | **Enthusiast Gamer** | Plays RDR2 on a 4K TV or high-res monitor using older hardware. | GTX 1070 Ti, GTX 1080, RX 590 | Desires 4K presentation with smooth 45–60 FPS. |
-| **Graphics Modder / Researcher** | Graphics engineers, modders, and computer vision students. | Pascal, Turing, RDNA2 | Benchmarking temporal reconstruction vs FSR/DLSS. |
+| **APU / Budget Gamer** | Plays RDR2 on laptops or budget PCs with integrated graphics. | AMD Radeon Vega 7 (Ryzen 5 4600G/5600G/5700U), Vega 8 | Desires 1080p 48–60 FPS reconstructed from 540p. |
+| **Graphics Modder / Researcher** | Graphics engineers, modders, and computer vision students. | Pascal, Turing, RDNA2, GCN 5.0 | Benchmarking temporal reconstruction vs FSR/DLSS. |
 | **Console Purist** | Players wanting the authentic PS4 Pro aesthetic on PC. | Any Vulkan/DX12 GPU | Nostalgic/authentic visual recreation. |
 
 ---

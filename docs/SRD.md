@@ -108,7 +108,19 @@ The system intercepts render target allocations, alters viewport and projection 
 
 ## 5. Hardware & Platform Baseline
 
-- **Operating System:** Windows 10 (64-bit, Build 19041+) / Windows 11.
-- **Reference GPU:** NVIDIA GeForce GTX 1070 Ti (8 GB GDDR5, 256-bit bus, 256 GB/s bandwidth, Pascal GP104).
+### 5.1 Primary Discrete Baseline (4K Reconstruction)
+- **Reference GPU:** NVIDIA GeForce GTX 1070 Ti (8 GB GDDR5, 256-bit bus, 256.3 GB/s bandwidth, Pascal GP104).
 - **Driver Baseline:** NVIDIA Game Ready Driver 512.15 or newer.
+- **Target Resolution:** 4K (3840×2160) reconstructed from 1080p quarter-resolution 2× MSAA.
+- **Memory Overhead:** ~268.95 MB dedicated VRAM.
+
+### 5.2 Primary Integrated / APU Baseline (1080p Reconstruction)
+- **Reference APU:** AMD Radeon Vega 7 (Ryzen 5 4600G / 5600G / 4700U / 5700U, GCN 5.0 Architecture, 7 CUs, 448 Stream Processors).
+- **Memory Architecture:** Unified Memory Architecture (UMA) on Dual-Channel DDR4-3200 (~45–51.2 GB/s bandwidth).
+- **Target Resolution:** 1080p (1920×1080) reconstructed from 540p ($960 \times 540$) quarter-resolution 2× MSAA.
+- **Memory Overhead:** ~78.79 MB shared VRAM footprint.
+- **Bandwidth Optimization:** Enforces ASO (Assume Shading Occluded) mode (`EnableMotionDilation = false`) to bypass 3×3 dilation depth fetches, conserving DDR4 bus bandwidth. Detailed in [`docs/AMD_VEGA_OPTIMIZATION.md`](AMD_VEGA_OPTIMIZATION.md).
+
+### 5.3 System & Software
+- **Operating System:** Windows 10 (64-bit, Build 19041+) / Windows 11.
 - **Target Game Build:** *Red Dead Redemption 2* version 1436.28 and later.

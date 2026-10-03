@@ -1,7 +1,7 @@
 # Complete Codebase: RDR2 Checkerboard Rendering Mod (CBR)
 
 **Author & Co-Owner:** Shreyas Pawar  
-**Target Hardware:** NVIDIA GeForce GTX 1070 Ti (Pascal GP104, 8 GB GDDR5) & Modern GPUs  
+**Target Hardware:** NVIDIA GeForce GTX 1070 Ti (Pascal GP104) & AMD Radeon Vega / Vega 7 (GCN 5.0)  
 **Supported APIs:** Vulkan 1.3 / DirectX 12  
 **License:** MIT License  
 
@@ -259,7 +259,9 @@ add_custom_command(TARGET rdr2-cbr POST_BUILD
 ```ini
 ; ==============================================================================
 ; RDR2 Checkerboard Rendering Mod (CBR) Configuration
-; Target GPU: NVIDIA GeForce GTX 1070 Ti / Pascal & Modern Graphics Hardware
+; Target Hardware:
+;   - Discrete: NVIDIA GeForce GTX 1070 Ti / Pascal (4K Target: 3840x2160)
+;   - APU / Integrated: AMD Radeon Vega 7 / Vega 8 (1080p Target: 1920x1080)
 ; Maintainer: Shreyas Pawar
 ; ==============================================================================
 
@@ -267,7 +269,9 @@ add_custom_command(TARGET rdr2-cbr POST_BUILD
 ; Enable or disable the entire checkerboard rendering pipeline at runtime
 Enabled = true
 
-; Target reconstructed output resolution: 3840x2160 (4K), 2560x1440 (1440p)
+; Target reconstructed output resolution:
+;   - 3840x2160 (4K): Recommended for GTX 1070 Ti (reconstructed from 1080p 2x MSAA)
+;   - 1920x1080 (1080p): Recommended for AMD Radeon Vega 7 APUs (reconstructed from 540p 2x MSAA)
 TargetWidth = 3840
 TargetHeight = 2160
 
@@ -2071,11 +2075,14 @@ void UIOverlay::Render() {
 
 /**
  * RDR2 Checkerboard Rendering Mod (CBR) - Reconstruction Compute Shader
- * Architecture: Optimized for NVIDIA Pascal (GP104 / GTX 1070 Ti) & Modern GPUs
+ * Architecture: Optimized for NVIDIA Pascal (GP104 / Wave32) & AMD Radeon Vega (GCN 5.0 / Wave64)
  * Target: Vulkan SPIR-V
  * Author & Co-Owner: Shreyas Pawar
  */
 
+// 16x16 = 256 threads per workgroup:
+// - NVIDIA Pascal (GP104): 8 warps x 32 threads = 100% warp occupancy
+// - AMD Radeon Vega (GCN 5.0 / Vega 7): 4 wavefronts x 64 threads = 100% Wave64 occupancy
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
 // =============================================================================
@@ -2349,11 +2356,14 @@ void main() {
 ```hlsl
 /**
  * RDR2 Checkerboard Rendering Mod (CBR) - Reconstruction Compute Shader
- * Architecture: Optimized for NVIDIA Pascal (GP104 / GTX 1070 Ti) & Modern GPUs
+ * Architecture: Optimized for NVIDIA Pascal (GP104 / Wave32) & AMD Radeon Vega (GCN 5.0 / Wave64)
  * Target: DirectX 12 HLSL (CS 5.0 / CS 6.0)
  * Author & Co-Owner: Shreyas Pawar
  */
 
+// 16x16 = 256 threads per threadgroup:
+// - NVIDIA Pascal (GP104): 8 warps x 32 threads = 100% warp occupancy
+// - AMD Radeon Vega (GCN 5.0 / Vega 7): 4 wavefronts x 64 threads = 100% Wave64 occupancy
 #define THREADGROUP_SIZE_X 16
 #define THREADGROUP_SIZE_Y 16
 

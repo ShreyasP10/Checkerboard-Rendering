@@ -150,6 +150,7 @@ Detailed specifications are maintained in the [`docs/`](docs/) directory:
 - 📄 [**Development Plan (DEV_PLAN)**](docs/DEV_PLAN.md) – 8-phase roadmap, milestones, and deliverable schedules.
 - 📄 [**Risk Register (RISK_REGISTER)**](docs/RISK_REGISTER.md) – Assessment of motion vector extraction, Pascal bandwidth, and mitigations.
 - 📄 [**Intel CBR Reference Analysis (INTEL_CBR_REFERENCE)**](docs/INTEL_CBR_REFERENCE.md) – Reference breakdown of Mcferron & Lake (Intel 2018): 2× MSAA 4-quadrant geometry, Shade Resolve Targets (SRT), and linear depth disocclusion.
+- 📄 [**AMD Radeon Vega & Vega 7 Optimization Guide (AMD_VEGA_OPTIMIZATION)**](docs/AMD_VEGA_OPTIMIZATION.md) – Hardware profile for AMD Radeon Vega 7 APUs: GCN 5.0 Wave64 scheduling, Rapid Packed Math (FP16), DDR4 memory bandwidth throttling (ASO mode), and 1080p preset.
 
 ---
 
@@ -176,14 +177,14 @@ $$C_{\text{spatial}} = \frac{\sum_{k=1}^4 w_k C_k}{\sum_{k=1}^4 w_k}, \quad w_k 
 
 ## Hardware & Development Requirements
 
-| Component | Minimum Specification | Recommended (Target Baseline) | Role in CBR Pipeline |
-|---|---|---|---|
-| **GPU** | GTX 1060 (6 GB) / RX 580 (8 GB) | **NVIDIA GeForce GTX 1070 Ti (8 GB GDDR5)** | Compute shader capability (SM 5.0+), 2× MSAA rasterization, ≥250 GB/s bandwidth |
-| **GPU VRAM** | 6 GB | **8 GB GDDR5** | Accommodates ~268.95 MB dedicated VRAM for 4K ping-pong history and depth buffers |
-| **CPU** | Quad-Core (i5-8400 / Ryzen 2600) | **6-Core / 12-Thread (i7 / Ryzen 3600+)** | Hook overhead to be measured once live hooks exist |
-| **RAM** | 12 GB | **16 GB DDR4 Dual-Channel** | System memory stability during texture streaming |
-| **OS** | Windows 10 (64-bit, 19041+) | **Windows 10 / Windows 11 (64-bit)** | Native Vulkan 1.3 and DirectX 12 support |
-| **Display** | 1080p (with DSR 4K) | **Native 1440p or 4K (3840×2160) Monitor / TV** | Presentation resolution for reconstructed output |
+| Component | Minimum Specification | Recommended (Target Discrete) | Recommended (Target APU / Integrated) | Role in CBR Pipeline |
+|---|---|---|---|---|
+| **GPU** | GTX 1060 (6 GB) / RX 580 (8 GB) | **NVIDIA GeForce GTX 1070 Ti (8 GB GDDR5)** | **AMD Radeon Vega 7 (Ryzen 5 4600G/5600G/5700U APU)** | Wave32 (Pascal) / Wave64 (Vega) compute shader execution, 2× MSAA rasterization |
+| **GPU VRAM** | 1 GB (for 1080p CBR) / 6 GB (for 4K) | **8 GB GDDR5** (~268.95 MB CBR footprint at 4K) | **512 MB – 2 GB Shared UMA DDR4** (~78.79 MB CBR footprint at 1080p) | Stores ping-pong history and intermediate MSAA targets |
+| **CPU** | Quad-Core (i5-8400 / Ryzen 2600) | **6-Core / 12-Thread (i7 / Ryzen 3600+)** | **AMD Ryzen 5 4600G / 5600G (6C / 12T APU)** | Frame pacing and intercept dispatch |
+| **RAM** | 8 GB Dual-Channel | **16 GB DDR4 Dual-Channel** | **16 GB Dual-Channel DDR4-3200+** | Critical on APUs for shared GPU/CPU memory bandwidth |
+| **OS** | Windows 10 (64-bit, 19041+) | **Windows 10 / Windows 11 (64-bit)** | **Windows 10 / Windows 11 (64-bit)** | Native Vulkan 1.3 and DirectX 12 support |
+| **Target Presentation** | 1080p | **Native 4K (3840×2160)** reconstructed from 1080p 2× MSAA | **Native 1080p (1920×1080)** reconstructed from 540p 2× MSAA | Output resolution |
 
 ---
 
