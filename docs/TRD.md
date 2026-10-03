@@ -156,3 +156,13 @@ Converted back to RGB before final write.
   - Vulkan SDK (1.3.268+)
   - Dear ImGui (v1.90+ Docking branch)
   - GLSLangValidator or shaderc for compiling GLSL to SPIR-V bytecode.
+
+---
+
+## 7. Industry References & Prior Art
+
+1. **Intel Corporation (2018):** Trapper Mcferron & Adam Lake. *Checkerboard Rendering for Real-Time Upscaling on Intel® Integrated Graphics*. Whitepaper & DirectX 12 Mini-Engine sample code. Formally derives the 2× MSAA 4-quadrant sample coverage theorem, Shade Resolve Target (SRT) for deferred pipelines, Check Shading Occlusion (CSO) vs. Assume Shading Occluded (ASO), and MipLODBias = -0.5f. Detailed in [`docs/INTEL_CBR_REFERENCE.md`](INTEL_CBR_REFERENCE.md).
+2. **Ubisoft (2016):** Jalal El Mansouri. *Rendering Rainbow Six Siege*. GDC 2016. Quarter-resolution 2× MSAA with temporal anti-aliasing resolve.
+3. **Guerrilla Games & Kojima Productions (2017):** Giliam de Carpentier & Kohei Ishiyama. *Decima: Advances in Lighting and AA*. SIGGRAPH 2017. 45-degree rotation grid alignment for post-processing anti-aliasing.
+4. **EA DICE (2017):** Graham Wihlidal. *4K Checkerboard in Battlefield 1 and Mass Effect: Andromeda (Frostbite)*. GDC 2017. G-Buffer checkerboarding with EQAA integration.
+5. **Sony Interactive Entertainment (2016):** Mark Cerny. *Inside PlayStation 4 Pro*. Hardware-level checkerboard ID buffer and custom resolve units.

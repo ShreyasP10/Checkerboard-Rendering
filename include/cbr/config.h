@@ -1,7 +1,10 @@
 #pragma once
 
-#include <string>
 #include <cstdint>
+#include <filesystem>
+#include <string>
+
+#include <mutex>
 
 namespace cbr {
 
@@ -35,10 +38,17 @@ struct CBRConfig {
     ColorSpace  colorSpace{ ColorSpace::YCoCg };
     float       historyWeight{ 0.90f };
     bool        enableSpatialFallback{ true };
+    // 3x3 closest-depth motion-vector dilation. Costs 9 extra MSAA depth fetches per output pixel;
+    // disable on bandwidth-limited GPUs if silhouette smearing is acceptable.
+    bool        enableMotionDilation{ true };
 
     // Jitter
     JitterPattern jitterPattern{ JitterPattern::Checkerboard };
     float         jitterScale{ 1.0f };
+    // Multiplier applied to the jitter delta when reprojecting history. 1 = subtract (jc - jp),
+    // -1 = opposite sign convention, 0 = off. The correct sign depends on the engine's projection
+    // convention and must be confirmed with DebugView on a static camera.
+    float         jitterCompensation{ 1.0f };
 
     // Debug
     bool        showOverlay{ false };
@@ -51,16 +61,27 @@ class ConfigManager {
 public:
     static ConfigManager& Get();
 
-    bool Load(const std::string& configPath);
-    bool Save(const std::string& configPath);
+    bool Load(const std::filesystem::path& configPath);
+    bool Save(const std::filesystem::path& configPath);
 
-    const CBRConfig& GetConfig() const { return m_config; }
-    CBRConfig& GetMutableConfig() { return m_config; }
+    CBRConfig GetConfig() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_config;
+    }
+    CBRConfig& GetMutableConfig() {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_config;
+    }
+    void UpdateConfig(const CBRConfig& config) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_config = config;
+    }
 
 private:
     ConfigManager() = default;
     ~ConfigManager() = default;
 
+    mutable std::mutex m_mutex;
     CBRConfig m_config;
 };
 

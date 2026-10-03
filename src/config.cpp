@@ -37,9 +37,12 @@ bool ParseBool(const std::string& val, bool defaultVal) {
 uint32_t ParseUInt(const std::string& val, uint32_t defaultVal, uint32_t minVal, uint32_t maxVal) {
     if (val.empty()) return defaultVal;
     try {
+        // std::stoul accepts a leading '-' (wrapping around) and ignores trailing text ("4k" -> 4);
+        // reject both so typos fall back to the default instead of becoming a bogus value.
+        if (val.front() == '-') return defaultVal;
         size_t idx = 0;
         unsigned long result = std::stoul(val, &idx);
-        if (idx == 0) return defaultVal;
+        if (idx == 0 || idx != val.size()) return defaultVal;
         if (result < minVal) result = minVal;
         if (result > maxVal) result = maxVal;
         return static_cast<uint32_t>(result);
@@ -53,13 +56,18 @@ float ParseFloat(const std::string& val, float defaultVal, float minVal, float m
     try {
         size_t idx = 0;
         float result = std::stof(val, &idx);
-        if (idx == 0 || std::isnan(result) || std::isinf(result)) return defaultVal;
+        if (idx == 0 || idx != val.size() || std::isnan(result) || std::isinf(result)) return defaultVal;
         if (result < minVal) result = minVal;
         if (result > maxVal) result = maxVal;
         return result;
     } catch (...) {
         return defaultVal;
     }
+}
+
+std::string ToUpper(std::string s) {
+    for (char& c : s) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    return s;
 }
 
 } // namespace
@@ -69,10 +77,11 @@ ConfigManager& ConfigManager::Get() {
     return instance;
 }
 
-bool ConfigManager::Load(const std::string& configPath) {
+bool ConfigManager::Load(const std::filesystem::path& configPath) {
+    std::lock_guard<std::mutex> lock(m_mutex);
     std::ifstream file(configPath);
     if (!file.is_open()) {
-        CBR_LOG_WARN("Configuration file not found at %s. Using default settings.", configPath.c_str());
+        CBR_LOG_WARN("Configuration file not found at %s. Using default settings.", configPath.string().c_str());
         return false;
     }
 
@@ -102,8 +111,11 @@ bool ConfigManager::Load(const std::string& configPath) {
             } else if (key == "TargetHeight") {
                 m_config.targetHeight = ParseUInt(val, m_config.targetHeight, 480, 4320) & ~1u; // Ensure even height
             } else if (key == "PreferredApi") {
-                if (val == "Vulkan") m_config.preferredApi = GraphicsApi::Vulkan;
-                else if (val == "D3D12") m_config.preferredApi = GraphicsApi::D3D12;
+                std::string apiUpper = ToUpper(val);
+                if (apiUpper == "VULKAN") m_config.preferredApi = GraphicsApi::Vulkan;
+                else if (apiUpper == "D3D12") m_config.preferredApi = GraphicsApi::D3D12;
+                else if (apiUpper == "AUTO")  m_config.preferredApi = GraphicsApi::Auto;
+                else CBR_LOG_WARN("Unknown PreferredApi '%s' (expected Vulkan, D3D12 or Auto); keeping default.", val.c_str());
             } else if (key == "MipLodBias") {
                 m_config.mipLodBias = ParseFloat(val, m_config.mipLodBias, -4.0f, 4.0f);
             } else if (key == "DepthTolerance") {
@@ -111,15 +123,22 @@ bool ConfigManager::Load(const std::string& configPath) {
             } else if (key == "EnableColorClamping") {
                 m_config.enableColorClamping = ParseBool(val, m_config.enableColorClamping);
             } else if (key == "ColorSpace") {
-                m_config.colorSpace = (val == "RGB") ? ColorSpace::RGB : ColorSpace::YCoCg;
+                m_config.colorSpace = (ToUpper(val) == "RGB") ? ColorSpace::RGB : ColorSpace::YCoCg;
             } else if (key == "HistoryWeight") {
                 m_config.historyWeight = ParseFloat(val, m_config.historyWeight, 0.0f, 1.0f);
             } else if (key == "EnableSpatialFallback") {
                 m_config.enableSpatialFallback = ParseBool(val, m_config.enableSpatialFallback);
+            } else if (key == "EnableMotionDilation") {
+                m_config.enableMotionDilation = ParseBool(val, m_config.enableMotionDilation);
             } else if (key == "JitterPattern") {
-                m_config.jitterPattern = (val == "Halton") ? JitterPattern::Halton : JitterPattern::Checkerboard;
+                if (ToUpper(val) == "HALTON") {
+                    CBR_LOG_WARN("JitterPattern=Halton is not implemented yet; using Checkerboard.");
+                }
+                m_config.jitterPattern = JitterPattern::Checkerboard;
             } else if (key == "JitterScale") {
                 m_config.jitterScale = ParseFloat(val, m_config.jitterScale, 0.1f, 4.0f);
+            } else if (key == "JitterCompensation") {
+                m_config.jitterCompensation = ParseFloat(val, m_config.jitterCompensation, -1.0f, 1.0f);
             } else if (key == "DebugView") {
                 m_config.debugView = ParseUInt(val, m_config.debugView, 0, 4);
             } else if (key == "ShowOverlay") {
@@ -133,19 +152,21 @@ bool ConfigManager::Load(const std::string& configPath) {
     }
 
     CBR_LOG_INFO("Configuration successfully loaded from %s (Target: %ux%u, API: %s, CBR Enabled: %s)",
-        configPath.c_str(),
+        configPath.string().c_str(),
         m_config.targetWidth,
         m_config.targetHeight,
-        m_config.preferredApi == GraphicsApi::Vulkan ? "Vulkan" : "D3D12",
+        m_config.preferredApi == GraphicsApi::Vulkan ? "Vulkan"
+            : m_config.preferredApi == GraphicsApi::D3D12 ? "D3D12" : "Auto",
         m_config.enabled ? "true" : "false");
 
     return true;
 }
 
-bool ConfigManager::Save(const std::string& configPath) {
+bool ConfigManager::Save(const std::filesystem::path& configPath) {
+    std::lock_guard<std::mutex> lock(m_mutex);
     std::ofstream file(configPath);
     if (!file.is_open()) {
-        CBR_LOG_ERROR("Failed to open %s for saving configuration.", configPath.c_str());
+        CBR_LOG_ERROR("Failed to open %s for saving configuration.", configPath.string().c_str());
         return false;
     }
 
@@ -154,7 +175,9 @@ bool ConfigManager::Save(const std::string& configPath) {
     file << "Enabled = " << (m_config.enabled ? "true" : "false") << "\n";
     file << "TargetWidth = " << m_config.targetWidth << "\n";
     file << "TargetHeight = " << m_config.targetHeight << "\n";
-    file << "PreferredApi = " << (m_config.preferredApi == GraphicsApi::Vulkan ? "Vulkan" : "D3D12") << "\n";
+    file << "PreferredApi = "
+         << (m_config.preferredApi == GraphicsApi::Vulkan ? "Vulkan"
+           : m_config.preferredApi == GraphicsApi::D3D12 ? "D3D12" : "Auto") << "\n";
     file << "MipLodBias = " << m_config.mipLodBias << "\n\n";
 
     file << "[Reconstruction]\n";
@@ -162,11 +185,13 @@ bool ConfigManager::Save(const std::string& configPath) {
     file << "EnableColorClamping = " << (m_config.enableColorClamping ? "true" : "false") << "\n";
     file << "ColorSpace = " << (m_config.colorSpace == ColorSpace::RGB ? "RGB" : "YCoCg") << "\n";
     file << "HistoryWeight = " << m_config.historyWeight << "\n";
-    file << "EnableSpatialFallback = " << (m_config.enableSpatialFallback ? "true" : "false") << "\n\n";
+    file << "EnableSpatialFallback = " << (m_config.enableSpatialFallback ? "true" : "false") << "\n";
+    file << "EnableMotionDilation = " << (m_config.enableMotionDilation ? "true" : "false") << "\n\n";
 
     file << "[Jitter]\n";
     file << "JitterPattern = " << (m_config.jitterPattern == JitterPattern::Halton ? "Halton" : "Checkerboard") << "\n";
-    file << "JitterScale = " << m_config.jitterScale << "\n\n";
+    file << "JitterScale = " << m_config.jitterScale << "\n";
+    file << "JitterCompensation = " << m_config.jitterCompensation << "\n\n";
 
     file << "[Debug]\n";
     file << "ShowOverlay = " << (m_config.showOverlay ? "true" : "false") << "\n";

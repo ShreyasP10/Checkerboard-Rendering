@@ -1,10 +1,14 @@
 #pragma once
 
-#include <string>
+#include <cstdio>
+#include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <mutex>
 #include <sstream>
-#include <iostream>
+#include <string>
+#include <type_traits>
+#include <vector>
 
 namespace cbr {
 
@@ -19,8 +23,13 @@ class Logger {
 public:
     static Logger& Get();
 
-    void Initialize(const std::string& logFilePath);
+    // Opens the log file and flushes any messages buffered before this call.
+    void Initialize(const std::filesystem::path& logFilePath);
+    // Discards buffered messages and stops buffering (used when LogToFile = false).
+    void Disable();
     void Shutdown();
+
+    void SetMinLevel(LogLevel level);
 
     void Log(LogLevel level, const std::string& message);
 
@@ -30,8 +39,13 @@ public:
 
     template<typename... Args>
     void LogFmt(LogLevel level, const char* format, Args... args) {
+        // std::string / std::wstring passed through C varargs is undefined behaviour.
+        static_assert((!std::is_same_v<std::decay_t<Args>, std::string> && ...),
+                      "Pass std::string arguments as .c_str() to CBR_LOG_* macros");
+        static_assert((!std::is_same_v<std::decay_t<Args>, std::wstring> && ...),
+                      "Wide strings are not supported by CBR_LOG_* macros");
         char buffer[1024];
-        snprintf(buffer, sizeof(buffer), format, args...);
+        std::snprintf(buffer, sizeof(buffer), format, args...);
         Log(level, std::string(buffer));
     }
 
@@ -41,9 +55,14 @@ private:
     Logger(const Logger&) = delete;
     Logger& operator=(const Logger&) = delete;
 
-    std::ofstream m_logFile;
-    std::mutex    m_mutex;
-    bool          m_initialized{ false };
+    static constexpr size_t kMaxPendingMessages = 256;
+
+    std::ofstream            m_logFile;
+    std::mutex               m_mutex;
+    bool                     m_initialized{ false };
+    bool                     m_disabled{ false };
+    LogLevel                 m_minLevel{ LogLevel::Info };
+    std::vector<std::string> m_pending; // messages logged before Initialize()/Disable()
 };
 
 } // namespace cbr

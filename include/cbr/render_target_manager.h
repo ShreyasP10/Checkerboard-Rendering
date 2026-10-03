@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <vector>
 
@@ -23,11 +24,13 @@ public:
     const TargetDimensions& GetDimensions() const { return m_dims; }
 
     bool IsTargetInterceptCandidate(uint32_t width, uint32_t height, uint32_t format) const;
+    bool IsQuarterPassCandidate(uint32_t width, uint32_t height) const;
 
     // Ping-pong history buffer index management
-    uint32_t GetCurrentHistoryIndex() const { return m_historyPingPong; }
-    uint32_t GetPreviousHistoryIndex() const { return 1 - m_historyPingPong; }
-    void     SwapHistoryBuffers() { m_historyPingPong = 1 - m_historyPingPong; }
+    uint32_t GetCurrentHistoryIndex() const { return m_historyPingPong.load(); }
+    uint32_t GetPreviousHistoryIndex() const { return 1u - m_historyPingPong.load(); }
+    void     SwapHistoryBuffers() { m_historyPingPong.fetch_xor(1u); }
+    void     ResetHistory() { m_historyPingPong.store(0u); }
 
     // Memory footprint tracking
     size_t GetTotalAllocatedVramBytes() const { return m_totalAllocatedVramBytes; }
@@ -37,9 +40,9 @@ private:
     ~RenderTargetManager() = default;
 
     TargetDimensions m_dims;
-    uint32_t         m_historyPingPong{ 0 };
+    std::atomic<uint32_t> m_historyPingPong{ 0 };
     size_t           m_totalAllocatedVramBytes{ 0 };
-    bool             m_initialized{ false };
+    std::atomic<bool> m_initialized{ false };
 };
 
 } // namespace cbr

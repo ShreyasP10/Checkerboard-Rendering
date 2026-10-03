@@ -1,7 +1,7 @@
 # Complete Codebase: RDR2 Checkerboard Rendering Mod (CBR)
 
 **Author & Co-Owner:** Shreyas Pawar  
-**Target Hardware:** NVIDIA GeForce GTX 1070 Ti (Pascal GP104, 8 GB GDDR5) & Modern GPUs  
+**Target Hardware:** NVIDIA GeForce GTX 1070 Ti (Pascal GP104) & AMD Radeon Vega / Vega 7 (GCN 5.0)  
 **Supported APIs:** Vulkan 1.3 / DirectX 12  
 **License:** MIT License  
 
@@ -41,6 +41,10 @@ This document contains the complete, unabridged source code for every file in th
    - [`shaders/cbr_reconstruct.comp`](#shaderscbrreconstructcomp)
    - [`shaders/cbr_reconstruct.hlsl`](#shaderscbrreconstructhlsl)
    - [`shaders/cbr_resolve_simple.comp`](#shaderscbrresolvesimplecomp)
+5. [Tests & CI](#sec-tests)
+   - [`tests/test_core.cpp`](#teststestcorecpp)
+   - [`tests/test_engine.cpp`](#teststestenginecpp)
+   - [`.github/workflows/build.yml`](#githubworkflowsbuildyml)
 
 ---
 
@@ -51,7 +55,10 @@ This document contains the complete, unabridged source code for every file in th
 ### `CMakeLists.txt`
 ```cmake
 cmake_minimum_required(VERSION 3.20)
-project(RDR2_Checkerboard_Rendering VERSION 1.0.0 LANGUAGES C CXX)
+project(RDR2_Checkerboard_Rendering VERSION 1.0.0 LANGUAGES CXX)
+
+# Required for MSVC_RUNTIME_LIBRARY target property (static CRT below)
+cmake_policy(SET CMP0091 NEW)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -124,12 +131,13 @@ set_target_properties(rdr2-cbr PROPERTIES
 )
 
 # Windows specific definitions
+# (WIN32_LEAN_AND_MEAN / NOMINMAX are defined, guarded, in the sources that include windows.h)
 target_compile_definitions(rdr2-cbr PRIVATE
-    WIN32_LEAN_AND_MEAN
-    NOMINMAX
-    _CRT_SECURE_NO_WARNINGS
     CBR_EXPORTS
 )
+
+# Static CRT: the plugin must not depend on a redistributable that the game may not ship
+set_property(TARGET rdr2-cbr PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 # MSVC optimization and hardening flags
 if(MSVC)
@@ -155,11 +163,11 @@ find_package(Vulkan QUIET)
 if(Vulkan_FOUND)
     message(STATUS "Vulkan SDK headers found: ${Vulkan_INCLUDE_DIRS}")
     target_include_directories(rdr2-cbr PRIVATE ${Vulkan_INCLUDE_DIRS})
-    target_compile_definitions(rdr2-cbr PRIVATE CBR_VULKAN_SUPPORT=1)
 else()
-    message(STATUS "Vulkan SDK not found, using bundled/dynamic runtime headers.")
-    target_compile_definitions(rdr2-cbr PRIVATE CBR_VULKAN_SUPPORT=1)
+    message(STATUS "Vulkan SDK not found, using dynamic runtime function pointers only.")
 endif()
+# Vulkan support does not need the SDK at build time (functions are resolved at runtime)
+target_compile_definitions(rdr2-cbr PRIVATE CBR_VULKAN_SUPPORT=1)
 
 # DirectX 12 linking on Windows
 if(WIN32)
@@ -170,6 +178,73 @@ if(WIN32)
     target_compile_definitions(rdr2-cbr PRIVATE CBR_DX12_SUPPORT=1)
 endif()
 
+# Optional: compile shaders when the toolchain is available (UNTESTED on Windows; verify locally)
+find_program(CBR_GLSLANG glslangValidator HINTS $ENV{VULKAN_SDK}/Bin)
+find_program(CBR_DXC dxc HINTS $ENV{VULKAN_SDK}/Bin)
+set(CBR_SHADER_OUT_DIR "$<TARGET_FILE_DIR:rdr2-cbr>/shaders")
+set(CBR_COMPILED_SHADERS "")
+
+if(CBR_GLSLANG)
+    foreach(shader cbr_reconstruct cbr_resolve_simple)
+        add_custom_command(
+            OUTPUT ${CMAKE_BINARY_DIR}/shaders/${shader}.spv
+            COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/shaders
+            COMMAND ${CBR_GLSLANG} -V ${CBR_SHADER_DIR}/${shader}.comp -o ${CMAKE_BINARY_DIR}/shaders/${shader}.spv
+            DEPENDS ${CBR_SHADER_DIR}/${shader}.comp
+            COMMENT "Compiling ${shader}.comp to SPIR-V")
+        list(APPEND CBR_COMPILED_SHADERS ${CMAKE_BINARY_DIR}/shaders/${shader}.spv)
+    endforeach()
+else()
+    message(STATUS "glslangValidator not found: SPIR-V shaders will not be built.")
+endif()
+
+if(CBR_DXC)
+    add_custom_command(
+        OUTPUT ${CMAKE_BINARY_DIR}/shaders/cbr_reconstruct.dxil
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/shaders
+        COMMAND ${CBR_DXC} -T cs_6_0 -E CSMain ${CBR_SHADER_DIR}/cbr_reconstruct.hlsl -Fo ${CMAKE_BINARY_DIR}/shaders/cbr_reconstruct.dxil
+        DEPENDS ${CBR_SHADER_DIR}/cbr_reconstruct.hlsl
+        COMMENT "Compiling cbr_reconstruct.hlsl to DXIL")
+    list(APPEND CBR_COMPILED_SHADERS ${CMAKE_BINARY_DIR}/shaders/cbr_reconstruct.dxil)
+else()
+    message(STATUS "dxc not found: DXIL shaders will not be built.")
+endif()
+
+if(CBR_COMPILED_SHADERS)
+    add_custom_target(cbr_shaders ALL DEPENDS ${CBR_COMPILED_SHADERS})
+    add_dependencies(rdr2-cbr cbr_shaders)
+endif()
+
+# Host-side unit tests (portable code only; no Windows APIs or GPU required)
+#   cmake -S . -B build-tests -DCBR_BUILD_TESTS=ON
+#   cmake --build build-tests --target cbr_tests && ctest --test-dir build-tests --output-on-failure
+option(CBR_BUILD_TESTS "Build host-side unit tests" OFF)
+if(CBR_BUILD_TESTS)
+    enable_testing()
+    set(CBR_TEST_CORE_SOURCES
+        ${CBR_SOURCE_DIR}/config.cpp
+        ${CBR_SOURCE_DIR}/logger.cpp
+        ${CBR_SOURCE_DIR}/jitter_manager.cpp
+        ${CBR_SOURCE_DIR}/render_target_manager.cpp
+        ${CBR_SOURCE_DIR}/reconstruction_pass.cpp
+    )
+    add_executable(cbr_tests tests/test_core.cpp ${CBR_TEST_CORE_SOURCES})
+    target_include_directories(cbr_tests PRIVATE ${CBR_INCLUDE_DIR})
+    add_test(NAME cbr_core COMMAND cbr_tests)
+
+    # Engine tests use fake hook installers (the real ones are Windows-only), one mode per process
+    add_executable(cbr_engine_tests
+        tests/test_engine.cpp
+        ${CBR_TEST_CORE_SOURCES}
+        ${CBR_SOURCE_DIR}/cbr_engine.cpp
+        ${CBR_SOURCE_DIR}/hooks.cpp
+        ${CBR_SOURCE_DIR}/ui_overlay.cpp
+    )
+    target_include_directories(cbr_engine_tests PRIVATE ${CBR_INCLUDE_DIR})
+    add_test(NAME cbr_engine      COMMAND cbr_engine_tests)
+    add_test(NAME cbr_engine_auto COMMAND cbr_engine_tests auto)
+endif()
+
 # Copy sample configuration to output directory post-build
 add_custom_command(TARGET rdr2-cbr POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -177,6 +252,15 @@ add_custom_command(TARGET rdr2-cbr POST_BUILD
     "$<TARGET_FILE_DIR:rdr2-cbr>/cbr.ini"
     COMMENT "Copying cbr.ini to target build directory"
 )
+
+if(CBR_COMPILED_SHADERS)
+    add_custom_command(TARGET rdr2-cbr POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${CMAKE_BINARY_DIR}/shaders"
+        "$<TARGET_FILE_DIR:rdr2-cbr>/shaders"
+        COMMENT "Copying compiled shaders to target build directory"
+    )
+endif()
 ```
 
 <a id="cbrini"></a>
@@ -184,7 +268,9 @@ add_custom_command(TARGET rdr2-cbr POST_BUILD
 ```ini
 ; ==============================================================================
 ; RDR2 Checkerboard Rendering Mod (CBR) Configuration
-; Target GPU: NVIDIA GeForce GTX 1070 Ti / Pascal & Modern Graphics Hardware
+; Target Hardware:
+;   - Discrete: NVIDIA GeForce GTX 1070 Ti / Pascal (4K Target: 3840x2160)
+;   - APU / Integrated: AMD Radeon Vega 7 / Vega 8 (1080p Target: 1920x1080)
 ; Maintainer: Shreyas Pawar
 ; ==============================================================================
 
@@ -192,11 +278,13 @@ add_custom_command(TARGET rdr2-cbr POST_BUILD
 ; Enable or disable the entire checkerboard rendering pipeline at runtime
 Enabled = true
 
-; Target reconstructed output resolution: 3840x2160 (4K), 2560x1440 (1440p)
+; Target reconstructed output resolution:
+;   - 3840x2160 (4K): Recommended for GTX 1070 Ti (reconstructed from 1080p 2x MSAA)
+;   - 1920x1080 (1080p): Recommended for AMD Radeon Vega 7 APUs (reconstructed from 540p 2x MSAA)
 TargetWidth = 3840
 TargetHeight = 2160
 
-; Target graphics API: Vulkan (recommended for Pascal) or D3D12
+; Target graphics API: Vulkan (recommended for Pascal), D3D12, or Auto (use whichever runtime is loaded)
 PreferredApi = Vulkan
 
 ; Texture Sampler MIP LOD Bias applied during quarter-resolution rendering
@@ -221,12 +309,20 @@ HistoryWeight = 0.90
 ; Enable spatial cross-bilateral filter for disoccluded pixels
 EnableSpatialFallback = true
 
+; 3x3 closest-depth motion-vector dilation (cleaner moving silhouettes).
+; Costs 9 extra MSAA depth fetches per pixel: set false on bandwidth-limited GPUs.
+EnableMotionDilation = true
+
 [Jitter]
-; Projection jitter pattern: Checkerboard (alternating 0.5px) or Halton
+; Projection jitter pattern: Checkerboard (alternating 0.5px). Halton is reserved/not implemented yet.
 JitterPattern = Checkerboard
 
 ; Jitter scale multiplier (default: 1.0)
 JitterScale = 1.0
+
+; Jitter compensation applied when reprojecting history: 1 = subtract jitter delta, -1 = opposite sign,
+; 0 = off. Confirm the correct sign with DebugView on a static camera (no shimmering = correct).
+JitterCompensation = 1.0
 
 [Debug]
 ; Show in-game ImGui overlay (Toggle key: F11 or Insert)
@@ -291,6 +387,8 @@ imgui.ini
 # Temporary / OS
 .DS_Store
 Thumbs.db
+temp/
+tmp/
 ```
 
 <a id="license"></a>
@@ -348,7 +446,7 @@ Thank you for your interest in contributing to the **RDR2 Checkerboard Rendering
 ## 📋 Code Guidelines & Style
 
 - **Language Standard:** C++20.
-- **Shaders:** GLSL 4.60 (Vulkan SPIR-V) and HLSL (Shader Model 6.0).
+- **Shaders:** GLSL 4.50 / `#version 450` (Vulkan SPIR-V) and HLSL (Shader Model 6.0).
 - **Naming Conventions:**
   - Classes and Structs: `PascalCase` (e.g., `RenderTargetManager`)
   - Functions and Methods: `PascalCase` or `camelCase` (consistent within modules)
@@ -380,8 +478,8 @@ Thank you for your interest in contributing to the **RDR2 Checkerboard Rendering
 
 #include <cstdint>
 #include <atomic>
+#include <filesystem>
 #include <mutex>
-#include <string>
 #include "cbr/config.h"
 
 namespace cbr {
@@ -390,18 +488,28 @@ class CBREngine {
 public:
     static CBREngine& Get();
 
+    // One-time setup (config, logging, buffers, overlay). Does NOT depend on the graphics runtime being loaded.
     bool Initialize();
+    // Attempts to install the graphics hooks for the active API. Safe to call repeatedly (e.g. from a
+    // retry loop while the game loads its graphics runtime); returns true once hooks are installed.
+    bool TryInstallHooks();
     void Shutdown(bool isProcessExit = false);
 
-    void SetModuleDirectory(const std::string& dir) { m_moduleDirectory = dir; }
-    const std::string& GetModuleDirectory() const { return m_moduleDirectory; }
+    void SetModuleDirectory(const std::filesystem::path& dir) { m_moduleDirectory = dir; }
+    const std::filesystem::path& GetModuleDirectory() const { return m_moduleDirectory; }
 
     // Frame lifecycle callbacks
     void OnBeginFrame();
     void OnPreRender();
     void OnPostRender();
+    // Mid-frame pass interception: called when the main geometry pass completes, before post-processing / UI.
+    // Runs the reconstruction AT MOST ONCE per frame: extra matching passes in the same frame
+    // (reflections, mirrors, cubemaps) are ignored, so history ping-pong cannot desynchronize.
+    void OnScenePassEnd(void* cmdBufferOrContext);
     void OnPrePresent(void* queueOrContext, const void* presentInfo);
-    void OnPostPresent();
+    void OnPostPresent(void* presentTarget);
+    // Call when the game (re)creates its swapchain: resets frame parity, history, and updates dimensions if provided
+    void OnSwapchainRecreated(uint32_t width = 0, uint32_t height = 0);
 
     uint32_t    GetCurrentFrameIndex() const { return m_frameIndex.load(); }
     bool        IsEnabled() const { return m_enabled.load(); }
@@ -417,12 +525,21 @@ private:
     ~CBREngine() = default;
 
     std::once_flag             m_initOnce;
+    std::mutex                 m_hookMutex; // serializes TryInstallHooks (init thread vs CBR_PluginInit)
     std::atomic<bool>          m_initialized{ false };
     std::atomic<bool>          m_enabled{ true };
     std::atomic<uint32_t>      m_frameIndex{ 0 };
+    // The present target (VkQueue / IDXGISwapChain) of the game's main output. Presents from any
+    // other target (overlays, loading screens, secondary windows) must not advance checkerboard parity.
+    std::atomic<void*>         m_mainPresentTarget{ nullptr };
+    // Frame index for which the reconstruction last ran (kNoFrame = none yet)
+    static constexpr uint32_t  kNoFrame = 0xFFFFFFFFu;
+    std::atomic<uint32_t>      m_lastDispatchedFrame{ kNoFrame };
+    // PreferredApi = Auto and no runtime was loaded yet: re-detect on each hook attempt
+    std::atomic<bool>          m_apiPending{ false };
     std::atomic<float>         m_lastReconDurationMs{ 0.0f };
     std::atomic<GraphicsApi>   m_activeApi{ GraphicsApi::Vulkan };
-    std::string                m_moduleDirectory;
+    std::filesystem::path      m_moduleDirectory;
 };
 
 } // namespace cbr
@@ -433,8 +550,11 @@ private:
 ```cpp
 #pragma once
 
-#include <string>
 #include <cstdint>
+#include <filesystem>
+#include <string>
+
+#include <mutex>
 
 namespace cbr {
 
@@ -468,10 +588,17 @@ struct CBRConfig {
     ColorSpace  colorSpace{ ColorSpace::YCoCg };
     float       historyWeight{ 0.90f };
     bool        enableSpatialFallback{ true };
+    // 3x3 closest-depth motion-vector dilation. Costs 9 extra MSAA depth fetches per output pixel;
+    // disable on bandwidth-limited GPUs if silhouette smearing is acceptable.
+    bool        enableMotionDilation{ true };
 
     // Jitter
     JitterPattern jitterPattern{ JitterPattern::Checkerboard };
     float         jitterScale{ 1.0f };
+    // Multiplier applied to the jitter delta when reprojecting history. 1 = subtract (jc - jp),
+    // -1 = opposite sign convention, 0 = off. The correct sign depends on the engine's projection
+    // convention and must be confirmed with DebugView on a static camera.
+    float         jitterCompensation{ 1.0f };
 
     // Debug
     bool        showOverlay{ false };
@@ -484,16 +611,27 @@ class ConfigManager {
 public:
     static ConfigManager& Get();
 
-    bool Load(const std::string& configPath);
-    bool Save(const std::string& configPath);
+    bool Load(const std::filesystem::path& configPath);
+    bool Save(const std::filesystem::path& configPath);
 
-    const CBRConfig& GetConfig() const { return m_config; }
-    CBRConfig& GetMutableConfig() { return m_config; }
+    CBRConfig GetConfig() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_config;
+    }
+    CBRConfig& GetMutableConfig() {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_config;
+    }
+    void UpdateConfig(const CBRConfig& config) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_config = config;
+    }
 
 private:
     ConfigManager() = default;
     ~ConfigManager() = default;
 
+    mutable std::mutex m_mutex;
     CBRConfig m_config;
 };
 
@@ -505,7 +643,9 @@ private:
 ```cpp
 #pragma once
 
+#include <atomic>
 #include <cstdint>
+#include "cbr/config.h"
 
 namespace cbr {
 
@@ -516,21 +656,25 @@ public:
     bool Initialize();
     void Shutdown();
 
+    // Picks the graphics API whose runtime is already loaded in the host process (Vulkan preferred).
+    // Returns GraphicsApi::Auto when neither runtime is loaded yet.
+    GraphicsApi DetectLoadedApi() const;
+
     bool InstallVulkanHooks();
     bool InstallDX12Hooks();
 
     void UninstallVulkanHooks();
     void UninstallDX12Hooks();
 
-    bool IsVulkanHooked() const { return m_vulkanHooked; }
-    bool IsDX12Hooked() const { return m_dx12Hooked; }
+    bool IsVulkanHooked() const { return m_vulkanHooked.load(); }
+    bool IsDX12Hooked() const { return m_dx12Hooked.load(); }
 
 private:
     HookManager() = default;
     ~HookManager() = default;
 
-    bool m_vulkanHooked{ false };
-    bool m_dx12Hooked{ false };
+    std::atomic<bool> m_vulkanHooked{ false };
+    std::atomic<bool> m_dx12Hooked{ false };
 };
 
 } // namespace cbr
@@ -568,6 +712,11 @@ public:
     void ApplyJitterToProjection(float* projMatrix4x4, bool isVulkan) const;
     void RemoveJitterFromProjection(float* projMatrix4x4, bool isVulkan) const;
 
+    // Idempotent: sets jitter on outMatrix4x4 relative to inUnjitteredMatrix4x4 without accumulating.
+    // IMPORTANT: inUnjitteredMatrix4x4 must really be the unjittered source. Passing the same pointer
+    // for both and calling twice re-applies the offset (use a separate output buffer).
+    void SetProjectionJitter(float* outMatrix4x4, const float* inUnjitteredMatrix4x4, bool isVulkan) const;
+
 private:
     JitterManager() = default;
     ~JitterManager() = default;
@@ -586,11 +735,15 @@ private:
 ```cpp
 #pragma once
 
-#include <string>
+#include <cstdio>
+#include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <mutex>
 #include <sstream>
-#include <iostream>
+#include <string>
+#include <type_traits>
+#include <vector>
 
 namespace cbr {
 
@@ -605,8 +758,13 @@ class Logger {
 public:
     static Logger& Get();
 
-    void Initialize(const std::string& logFilePath);
+    // Opens the log file and flushes any messages buffered before this call.
+    void Initialize(const std::filesystem::path& logFilePath);
+    // Discards buffered messages and stops buffering (used when LogToFile = false).
+    void Disable();
     void Shutdown();
+
+    void SetMinLevel(LogLevel level);
 
     void Log(LogLevel level, const std::string& message);
 
@@ -616,8 +774,13 @@ public:
 
     template<typename... Args>
     void LogFmt(LogLevel level, const char* format, Args... args) {
+        // std::string / std::wstring passed through C varargs is undefined behaviour.
+        static_assert((!std::is_same_v<std::decay_t<Args>, std::string> && ...),
+                      "Pass std::string arguments as .c_str() to CBR_LOG_* macros");
+        static_assert((!std::is_same_v<std::decay_t<Args>, std::wstring> && ...),
+                      "Wide strings are not supported by CBR_LOG_* macros");
         char buffer[1024];
-        snprintf(buffer, sizeof(buffer), format, args...);
+        std::snprintf(buffer, sizeof(buffer), format, args...);
         Log(level, std::string(buffer));
     }
 
@@ -627,9 +790,14 @@ private:
     Logger(const Logger&) = delete;
     Logger& operator=(const Logger&) = delete;
 
-    std::ofstream m_logFile;
-    std::mutex    m_mutex;
-    bool          m_initialized{ false };
+    static constexpr size_t kMaxPendingMessages = 256;
+
+    std::ofstream            m_logFile;
+    std::mutex               m_mutex;
+    bool                     m_initialized{ false };
+    bool                     m_disabled{ false };
+    LogLevel                 m_minLevel{ LogLevel::Info };
+    std::vector<std::string> m_pending; // messages logged before Initialize()/Disable()
 };
 
 } // namespace cbr
@@ -645,6 +813,7 @@ private:
 ```cpp
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <string>
 
@@ -659,8 +828,20 @@ struct ReconstructionPushConstants {
     uint32_t debugView;
     uint32_t enableColorClamping;
     float    mipLodBias;
-    float    padding[2];
+    uint32_t colorSpace;            // 0 = YCoCg, 1 = RGB
+    uint32_t enableSpatialFallback; // 1 = on
+    float    jitterDelta[2];        // subpixel projection jitter delta (jc - jp)
+    uint32_t enableMotionDilation;  // 1 = 3x3 closest-depth motion dilation
+    float    jitterCompensation;    // multiplier on jitterDelta (1, -1 or 0)
 };
+
+// Must match the push-constant block / cbuffer in shaders/cbr_reconstruct.{comp,hlsl}
+static_assert(sizeof(ReconstructionPushConstants) == 64, "push constant layout drifted from the shaders");
+static_assert(sizeof(ReconstructionPushConstants) % 16 == 0, "cbuffer size must be a multiple of 16 bytes");
+
+// Builds the push-constant / cbuffer payload from the current config, jitter state and target size.
+// Shared by the Vulkan and DX12 dispatch paths so they cannot diverge.
+ReconstructionPushConstants BuildReconstructionPushConstants(uint32_t frameIndex);
 
 class ReconstructionPass {
 public:
@@ -674,13 +855,13 @@ public:
     void DispatchVulkan(void* vkCommandBuffer, uint32_t frameIndex);
     void DispatchDX12(void* d3d12GraphicsCommandList, uint32_t frameIndex);
 
-    bool IsInitialized() const { return m_initialized; }
+    bool IsInitialized() const { return m_initialized.load(); }
 
 private:
     ReconstructionPass() = default;
     ~ReconstructionPass() = default;
 
-    bool m_initialized{ false };
+    std::atomic<bool> m_initialized{ false };
     bool m_isVulkan{ true };
 };
 
@@ -692,6 +873,7 @@ private:
 ```cpp
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <vector>
 
@@ -715,11 +897,13 @@ public:
     const TargetDimensions& GetDimensions() const { return m_dims; }
 
     bool IsTargetInterceptCandidate(uint32_t width, uint32_t height, uint32_t format) const;
+    bool IsQuarterPassCandidate(uint32_t width, uint32_t height) const;
 
     // Ping-pong history buffer index management
-    uint32_t GetCurrentHistoryIndex() const { return m_historyPingPong; }
-    uint32_t GetPreviousHistoryIndex() const { return 1 - m_historyPingPong; }
-    void     SwapHistoryBuffers() { m_historyPingPong = 1 - m_historyPingPong; }
+    uint32_t GetCurrentHistoryIndex() const { return m_historyPingPong.load(); }
+    uint32_t GetPreviousHistoryIndex() const { return 1u - m_historyPingPong.load(); }
+    void     SwapHistoryBuffers() { m_historyPingPong.fetch_xor(1u); }
+    void     ResetHistory() { m_historyPingPong.store(0u); }
 
     // Memory footprint tracking
     size_t GetTotalAllocatedVramBytes() const { return m_totalAllocatedVramBytes; }
@@ -729,9 +913,9 @@ private:
     ~RenderTargetManager() = default;
 
     TargetDimensions m_dims;
-    uint32_t         m_historyPingPong{ 0 };
+    std::atomic<uint32_t> m_historyPingPong{ 0 };
     size_t           m_totalAllocatedVramBytes{ 0 };
-    bool             m_initialized{ false };
+    std::atomic<bool> m_initialized{ false };
 };
 
 } // namespace cbr
@@ -778,34 +962,61 @@ private:
 #include "cbr/logger.h"
 
 #if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
+
+#include <filesystem>
 #include <string>
 
 namespace {
 
-HANDLE g_hInitThread = nullptr;
-
 DWORD WINAPI CBRInitThread(LPVOID /*lpParam*/) {
-    // Delay slightly to allow game engine core and graphics runtime to settle
-    Sleep(1500);
+    // Config, logging and buffers do not depend on the graphics runtime, so set up immediately.
+    auto& engine = cbr::CBREngine::Get();
+    if (!engine.Initialize()) {
+        return 0;
+    }
 
-    cbr::CBREngine::Get().Initialize();
+    // Retry the hook installation itself (not just the trigger): the runtime for the configured
+    // API may load well after this plugin. Poll every 250 ms for up to 60 s, then give up quietly.
+    constexpr DWORD kIntervalMs = 250;
+    constexpr DWORD kMaxAttempts = 240; // 240 * 250 ms = 60 seconds
+
+    for (DWORD attempt = 0; attempt < kMaxAttempts; ++attempt) {
+        if (engine.TryInstallHooks()) {
+            CBR_LOG_INFO("Graphics hooks installed after %lu attempt(s).", static_cast<unsigned long>(attempt + 1));
+            return 0;
+        }
+        Sleep(kIntervalMs);
+    }
+
+    CBR_LOG_WARN("Graphics hooks could not be installed within 60 s; CBR stays inactive.");
     return 0;
 }
 
-std::string GetModuleDirectoryPath(HMODULE hModule) {
-    char path[MAX_PATH];
-    DWORD len = GetModuleFileNameA(hModule, path, MAX_PATH);
-    if (len == 0 || len == MAX_PATH) {
-        return "";
+// Directory containing this module (wide-char API: safe for non-ASCII and long paths)
+std::filesystem::path GetModuleDirectoryPath(HMODULE hModule) {
+    std::wstring buffer(MAX_PATH, L'\0');
+    for (;;) {
+        DWORD len = GetModuleFileNameW(hModule, buffer.data(), static_cast<DWORD>(buffer.size()));
+        if (len == 0) {
+            return {};
+        }
+        if (len < buffer.size()) {
+            buffer.resize(len);
+            break;
+        }
+        if (buffer.size() >= 32768) { // longest possible NT path
+            return {};
+        }
+        buffer.resize(buffer.size() * 2);
     }
-    std::string fullPath(path);
-    auto lastSlash = fullPath.find_last_of("\\/");
-    if (lastSlash != std::string::npos) {
-        return fullPath.substr(0, lastSlash);
-    }
-    return "";
+    return std::filesystem::path(buffer).parent_path();
 }
 
 } // namespace
@@ -813,36 +1024,39 @@ std::string GetModuleDirectoryPath(HMODULE hModule) {
 // Exported symbol ensuring the ASI plugin has an export table entry in PE header
 extern "C" __declspec(dllexport) void CBR_PluginInit() {
     cbr::CBREngine::Get().Initialize();
+    cbr::CBREngine::Get().TryInstallHooks();
 }
 
-BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID /*lpReserved*/) {
     switch (ul_reason_for_call) {
         case DLL_PROCESS_ATTACH: {
             DisableThreadLibraryCalls(hModule);
 
+            // Pin this module so it can never be unmapped while the init thread or any
+            // installed hook is still executing code inside it. ASI plugins are not meant
+            // to be unloaded, and this removes the need to wait on a thread from DllMain.
+            HMODULE pinned = nullptr;
+            GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                reinterpret_cast<LPCWSTR>(&CBR_PluginInit),
+                &pinned);
+
             // Record module directory for resolving cbr.ini and cbr.log relative to the DLL
             cbr::CBREngine::Get().SetModuleDirectory(GetModuleDirectoryPath(hModule));
 
-            // Launch initialization in background thread to avoid blocking process startup
-            g_hInitThread = CreateThread(nullptr, 0, CBRInitThread, nullptr, 0, nullptr);
+            // Launch initialization in a background thread to avoid blocking process startup.
+            // The handle is not needed afterwards, and the module is pinned, so close it now.
+            HANDLE hThread = CreateThread(nullptr, 0, CBRInitThread, nullptr, 0, nullptr);
+            if (hThread) {
+                CloseHandle(hThread);
+            }
             break;
         }
-        case DLL_PROCESS_DETACH: {
-            bool isProcessExit = (lpReserved != nullptr);
-
-            if (!isProcessExit && g_hInitThread) {
-                // If dynamically unloaded via FreeLibrary, wait up to 2 seconds for init thread to terminate
-                WaitForSingleObject(g_hInitThread, 2000);
-            }
-
-            if (g_hInitThread) {
-                CloseHandle(g_hInitThread);
-                g_hInitThread = nullptr;
-            }
-
-            cbr::CBREngine::Get().Shutdown(isProcessExit);
+        case DLL_PROCESS_DETACH:
+            // Intentionally empty. Under the loader lock (and, on process exit, after other
+            // threads have already been terminated) it is unsafe to take locks, join threads,
+            // or tear down graphics hooks. The OS reclaims all resources at process exit.
             break;
-        }
         case DLL_THREAD_ATTACH:
         case DLL_THREAD_DETACH:
             break;
@@ -864,8 +1078,24 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
 #include "cbr/reconstruction_pass.h"
 #include "cbr/ui_overlay.h"
 #include "cbr/hooks.h"
+#include <cctype>
+#include <string>
 
 namespace cbr {
+
+namespace {
+
+LogLevel ParseLogLevel(const std::string& name) {
+    std::string s;
+    s.reserve(name.size());
+    for (unsigned char c : name) s.push_back(static_cast<char>(std::tolower(c)));
+    if (s == "debug")                   return LogLevel::Debug;
+    if (s == "warn" || s == "warning")  return LogLevel::Warning;
+    if (s == "error")                   return LogLevel::Error;
+    return LogLevel::Info;
+}
+
+} // namespace
 
 CBREngine& CBREngine::Get() {
     static CBREngine instance;
@@ -874,20 +1104,36 @@ CBREngine& CBREngine::Get() {
 
 bool CBREngine::Initialize() {
     std::call_once(m_initOnce, [this]() {
-        // 1. Resolve configuration path relative to module directory
-        std::string configPath = m_moduleDirectory.empty() ? "cbr.ini" : (m_moduleDirectory + "\\cbr.ini");
-        ConfigManager::Get().Load(configPath);
+        // 1. Load configuration first. Messages logged while loading are buffered by the
+        //    Logger and flushed (or discarded) once the log destination is known.
+        const std::filesystem::path baseDir = m_moduleDirectory; // empty => current directory
+        ConfigManager::Get().Load(baseDir / "cbr.ini");
         const auto& config = ConfigManager::Get().GetConfig();
 
-        // 2. Initialize Logger if enabled in configuration
+        // 2. Configure logging from the loaded settings
+        Logger::Get().SetMinLevel(ParseLogLevel(config.logLevel));
         if (config.logToFile) {
-            std::string logPath = m_moduleDirectory.empty() ? "cbr.log" : (m_moduleDirectory + "\\cbr.log");
-            Logger::Get().Initialize(logPath);
+            Logger::Get().Initialize(baseDir / "cbr.log");
+        } else {
+            Logger::Get().Disable();
         }
 
         CBR_LOG_INFO("Initializing CBREngine for Red Dead Redemption 2...");
         m_enabled.store(config.enabled);
-        m_activeApi.store(config.preferredApi);
+        GraphicsApi api = config.preferredApi;
+        if (api == GraphicsApi::Auto) {
+            const GraphicsApi detected = HookManager::Get().DetectLoadedApi();
+            if (detected == GraphicsApi::Auto) {
+                // No runtime loaded yet: default to Vulkan for now and re-detect on every hook attempt
+                api = GraphicsApi::Vulkan;
+                m_apiPending.store(true);
+                CBR_LOG_INFO("PreferredApi=Auto: no graphics runtime loaded yet; will re-detect.");
+            } else {
+                api = detected;
+                CBR_LOG_INFO("PreferredApi=Auto resolved to %s.", api == GraphicsApi::Vulkan ? "Vulkan" : "D3D12");
+            }
+        }
+        m_activeApi.store(api);
 
         // 3. Initialize Render Target & Jitter Managers
         RenderTargetManager::Get().Initialize(config.targetWidth, config.targetHeight);
@@ -896,21 +1142,43 @@ bool CBREngine::Initialize() {
         // 4. Initialize Overlay
         UIOverlay::Get().Initialize();
 
-        // 5. Install API Hooks
+        // 5. Prepare the reconstruction pass for the active API
         HookManager::Get().Initialize();
-        if (config.preferredApi == GraphicsApi::Vulkan) {
-            HookManager::Get().InstallVulkanHooks();
+        if (api == GraphicsApi::Vulkan) {
             ReconstructionPass::Get().InitializeVulkan(nullptr, nullptr);
         } else {
-            HookManager::Get().InstallDX12Hooks();
             ReconstructionPass::Get().InitializeDX12(nullptr);
         }
 
         m_initialized.store(true);
-        CBR_LOG_INFO("CBREngine initialized successfully. Ready for frame interception.");
+        CBR_LOG_INFO("CBREngine initialized successfully. Waiting for graphics hooks.");
     });
 
     return m_initialized.load();
+}
+
+bool CBREngine::TryInstallHooks() {
+    if (!m_initialized.load()) return false;
+
+    std::lock_guard<std::mutex> lock(m_hookMutex);
+
+    // Auto mode with no runtime at init time: pick whichever runtime has appeared since
+    if (m_apiPending.load()) {
+        const GraphicsApi detected = HookManager::Get().DetectLoadedApi();
+        if (detected == GraphicsApi::Auto) return false; // still nothing to hook
+        if (detected != m_activeApi.load()) {
+            m_activeApi.store(detected);
+            if (detected == GraphicsApi::Vulkan) ReconstructionPass::Get().InitializeVulkan(nullptr, nullptr);
+            else                                 ReconstructionPass::Get().InitializeDX12(nullptr);
+        }
+        m_apiPending.store(false);
+        CBR_LOG_INFO("PreferredApi=Auto resolved to %s.", detected == GraphicsApi::Vulkan ? "Vulkan" : "D3D12");
+    }
+
+    if (m_activeApi.load() == GraphicsApi::Vulkan) {
+        return HookManager::Get().IsVulkanHooked() || HookManager::Get().InstallVulkanHooks();
+    }
+    return HookManager::Get().IsDX12Hooked() || HookManager::Get().InstallDX12Hooks();
 }
 
 void CBREngine::Shutdown(bool isProcessExit) {
@@ -945,27 +1213,60 @@ void CBREngine::OnPostRender() {
     // Geometry pass complete, intermediate quarter-res 2x MSAA buffer ready for resolve
 }
 
-void CBREngine::OnPrePresent(void* queueOrContext, const void* /*presentInfo*/) {
+void CBREngine::OnScenePassEnd(void* cmdBufferOrContext) {
     if (!m_enabled.load()) return;
 
-    uint32_t currentFrame = m_frameIndex.load();
+    const uint32_t currentFrame = m_frameIndex.load();
 
-    // Execute Reconstruction Compute Pass based on active API
+    // At most one reconstruction (and one history swap) per frame. exchange() makes this race-free
+    // if the hook ever fires from more than one thread.
+    if (m_lastDispatchedFrame.exchange(currentFrame) == currentFrame) return;
+
+    // Mid-frame dispatch: reconstruct immediately when the quarter-resolution 2x MSAA
+    // geometry pass finishes, before post-processing and UI are composited.
     if (m_activeApi.load() == GraphicsApi::Vulkan) {
-        ReconstructionPass::Get().DispatchVulkan(queueOrContext, currentFrame);
+        ReconstructionPass::Get().DispatchVulkan(cmdBufferOrContext, currentFrame);
     } else {
-        ReconstructionPass::Get().DispatchDX12(queueOrContext, currentFrame);
+        ReconstructionPass::Get().DispatchDX12(cmdBufferOrContext, currentFrame);
     }
 
     // Swap history buffers (ping-pong double buffer)
     RenderTargetManager::Get().SwapHistoryBuffers();
+}
 
-    // Render ImGui overlay if toggled on
+void CBREngine::OnPrePresent(void* queueOrSwapchain, const void* /*presentInfo*/) {
+    if (!m_enabled.load()) return;
+
+    // Only the main output may handle presentation callbacks
+    void* mainTarget = m_mainPresentTarget.load();
+    if (mainTarget != nullptr && queueOrSwapchain != mainTarget) return;
+
+    // Render ImGui overlay if toggled on (Present is the correct timing for overlay drawing)
     UIOverlay::Get().Render();
 }
 
-void CBREngine::OnPostPresent() {
-    m_frameIndex.fetch_add(1);
+void CBREngine::OnPostPresent(void* presentTarget) {
+    // The first present seen after start-up / swapchain recreation defines the main target.
+    void* expected = nullptr;
+    m_mainPresentTarget.compare_exchange_strong(expected, presentTarget);
+
+    if (m_mainPresentTarget.load() == presentTarget) {
+        m_frameIndex.fetch_add(1);
+    }
+}
+
+void CBREngine::OnSwapchainRecreated(uint32_t width, uint32_t height) {
+    m_mainPresentTarget.store(nullptr);
+    m_frameIndex.store(0);
+    m_lastDispatchedFrame.store(kNoFrame);
+    if (width > 0 && height > 0) {
+        RenderTargetManager::Get().Initialize(width, height);
+        JitterManager::Get().Initialize(width, height);
+        CBR_LOG_INFO("Swapchain recreated with new resolution %ux%u: frame parity and history reset.", width, height);
+    } else {
+        RenderTargetManager::Get().ResetHistory();
+        CBR_LOG_INFO("Swapchain recreated: frame parity and history reset.");
+    }
 }
 
 } // namespace cbr
@@ -1013,9 +1314,12 @@ bool ParseBool(const std::string& val, bool defaultVal) {
 uint32_t ParseUInt(const std::string& val, uint32_t defaultVal, uint32_t minVal, uint32_t maxVal) {
     if (val.empty()) return defaultVal;
     try {
+        // std::stoul accepts a leading '-' (wrapping around) and ignores trailing text ("4k" -> 4);
+        // reject both so typos fall back to the default instead of becoming a bogus value.
+        if (val.front() == '-') return defaultVal;
         size_t idx = 0;
         unsigned long result = std::stoul(val, &idx);
-        if (idx == 0) return defaultVal;
+        if (idx == 0 || idx != val.size()) return defaultVal;
         if (result < minVal) result = minVal;
         if (result > maxVal) result = maxVal;
         return static_cast<uint32_t>(result);
@@ -1029,13 +1333,18 @@ float ParseFloat(const std::string& val, float defaultVal, float minVal, float m
     try {
         size_t idx = 0;
         float result = std::stof(val, &idx);
-        if (idx == 0 || std::isnan(result) || std::isinf(result)) return defaultVal;
+        if (idx == 0 || idx != val.size() || std::isnan(result) || std::isinf(result)) return defaultVal;
         if (result < minVal) result = minVal;
         if (result > maxVal) result = maxVal;
         return result;
     } catch (...) {
         return defaultVal;
     }
+}
+
+std::string ToUpper(std::string s) {
+    for (char& c : s) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    return s;
 }
 
 } // namespace
@@ -1045,10 +1354,11 @@ ConfigManager& ConfigManager::Get() {
     return instance;
 }
 
-bool ConfigManager::Load(const std::string& configPath) {
+bool ConfigManager::Load(const std::filesystem::path& configPath) {
+    std::lock_guard<std::mutex> lock(m_mutex);
     std::ifstream file(configPath);
     if (!file.is_open()) {
-        CBR_LOG_WARN("Configuration file not found at %s. Using default settings.", configPath.c_str());
+        CBR_LOG_WARN("Configuration file not found at %s. Using default settings.", configPath.string().c_str());
         return false;
     }
 
@@ -1078,8 +1388,11 @@ bool ConfigManager::Load(const std::string& configPath) {
             } else if (key == "TargetHeight") {
                 m_config.targetHeight = ParseUInt(val, m_config.targetHeight, 480, 4320) & ~1u; // Ensure even height
             } else if (key == "PreferredApi") {
-                if (val == "Vulkan") m_config.preferredApi = GraphicsApi::Vulkan;
-                else if (val == "D3D12") m_config.preferredApi = GraphicsApi::D3D12;
+                std::string apiUpper = ToUpper(val);
+                if (apiUpper == "VULKAN") m_config.preferredApi = GraphicsApi::Vulkan;
+                else if (apiUpper == "D3D12") m_config.preferredApi = GraphicsApi::D3D12;
+                else if (apiUpper == "AUTO")  m_config.preferredApi = GraphicsApi::Auto;
+                else CBR_LOG_WARN("Unknown PreferredApi '%s' (expected Vulkan, D3D12 or Auto); keeping default.", val.c_str());
             } else if (key == "MipLodBias") {
                 m_config.mipLodBias = ParseFloat(val, m_config.mipLodBias, -4.0f, 4.0f);
             } else if (key == "DepthTolerance") {
@@ -1087,15 +1400,22 @@ bool ConfigManager::Load(const std::string& configPath) {
             } else if (key == "EnableColorClamping") {
                 m_config.enableColorClamping = ParseBool(val, m_config.enableColorClamping);
             } else if (key == "ColorSpace") {
-                m_config.colorSpace = (val == "RGB") ? ColorSpace::RGB : ColorSpace::YCoCg;
+                m_config.colorSpace = (ToUpper(val) == "RGB") ? ColorSpace::RGB : ColorSpace::YCoCg;
             } else if (key == "HistoryWeight") {
                 m_config.historyWeight = ParseFloat(val, m_config.historyWeight, 0.0f, 1.0f);
             } else if (key == "EnableSpatialFallback") {
                 m_config.enableSpatialFallback = ParseBool(val, m_config.enableSpatialFallback);
+            } else if (key == "EnableMotionDilation") {
+                m_config.enableMotionDilation = ParseBool(val, m_config.enableMotionDilation);
             } else if (key == "JitterPattern") {
-                m_config.jitterPattern = (val == "Halton") ? JitterPattern::Halton : JitterPattern::Checkerboard;
+                if (ToUpper(val) == "HALTON") {
+                    CBR_LOG_WARN("JitterPattern=Halton is not implemented yet; using Checkerboard.");
+                }
+                m_config.jitterPattern = JitterPattern::Checkerboard;
             } else if (key == "JitterScale") {
                 m_config.jitterScale = ParseFloat(val, m_config.jitterScale, 0.1f, 4.0f);
+            } else if (key == "JitterCompensation") {
+                m_config.jitterCompensation = ParseFloat(val, m_config.jitterCompensation, -1.0f, 1.0f);
             } else if (key == "DebugView") {
                 m_config.debugView = ParseUInt(val, m_config.debugView, 0, 4);
             } else if (key == "ShowOverlay") {
@@ -1109,19 +1429,21 @@ bool ConfigManager::Load(const std::string& configPath) {
     }
 
     CBR_LOG_INFO("Configuration successfully loaded from %s (Target: %ux%u, API: %s, CBR Enabled: %s)",
-        configPath.c_str(),
+        configPath.string().c_str(),
         m_config.targetWidth,
         m_config.targetHeight,
-        m_config.preferredApi == GraphicsApi::Vulkan ? "Vulkan" : "D3D12",
+        m_config.preferredApi == GraphicsApi::Vulkan ? "Vulkan"
+            : m_config.preferredApi == GraphicsApi::D3D12 ? "D3D12" : "Auto",
         m_config.enabled ? "true" : "false");
 
     return true;
 }
 
-bool ConfigManager::Save(const std::string& configPath) {
+bool ConfigManager::Save(const std::filesystem::path& configPath) {
+    std::lock_guard<std::mutex> lock(m_mutex);
     std::ofstream file(configPath);
     if (!file.is_open()) {
-        CBR_LOG_ERROR("Failed to open %s for saving configuration.", configPath.c_str());
+        CBR_LOG_ERROR("Failed to open %s for saving configuration.", configPath.string().c_str());
         return false;
     }
 
@@ -1130,7 +1452,9 @@ bool ConfigManager::Save(const std::string& configPath) {
     file << "Enabled = " << (m_config.enabled ? "true" : "false") << "\n";
     file << "TargetWidth = " << m_config.targetWidth << "\n";
     file << "TargetHeight = " << m_config.targetHeight << "\n";
-    file << "PreferredApi = " << (m_config.preferredApi == GraphicsApi::Vulkan ? "Vulkan" : "D3D12") << "\n";
+    file << "PreferredApi = "
+         << (m_config.preferredApi == GraphicsApi::Vulkan ? "Vulkan"
+           : m_config.preferredApi == GraphicsApi::D3D12 ? "D3D12" : "Auto") << "\n";
     file << "MipLodBias = " << m_config.mipLodBias << "\n\n";
 
     file << "[Reconstruction]\n";
@@ -1138,11 +1462,13 @@ bool ConfigManager::Save(const std::string& configPath) {
     file << "EnableColorClamping = " << (m_config.enableColorClamping ? "true" : "false") << "\n";
     file << "ColorSpace = " << (m_config.colorSpace == ColorSpace::RGB ? "RGB" : "YCoCg") << "\n";
     file << "HistoryWeight = " << m_config.historyWeight << "\n";
-    file << "EnableSpatialFallback = " << (m_config.enableSpatialFallback ? "true" : "false") << "\n\n";
+    file << "EnableSpatialFallback = " << (m_config.enableSpatialFallback ? "true" : "false") << "\n";
+    file << "EnableMotionDilation = " << (m_config.enableMotionDilation ? "true" : "false") << "\n\n";
 
     file << "[Jitter]\n";
     file << "JitterPattern = " << (m_config.jitterPattern == JitterPattern::Halton ? "Halton" : "Checkerboard") << "\n";
-    file << "JitterScale = " << m_config.jitterScale << "\n\n";
+    file << "JitterScale = " << m_config.jitterScale << "\n";
+    file << "JitterCompensation = " << m_config.jitterCompensation << "\n\n";
 
     file << "[Debug]\n";
     file << "ShowOverlay = " << (m_config.showOverlay ? "true" : "false") << "\n";
@@ -1162,11 +1488,29 @@ bool ConfigManager::Save(const std::string& configPath) {
 #include "cbr/hooks.h"
 #include "cbr/logger.h"
 
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 namespace cbr {
 
 HookManager& HookManager::Get() {
     static HookManager instance;
     return instance;
+}
+
+GraphicsApi HookManager::DetectLoadedApi() const {
+#if defined(_WIN32)
+    if (GetModuleHandleA("vulkan-1.dll")) return GraphicsApi::Vulkan;
+    if (GetModuleHandleA("d3d12.dll"))    return GraphicsApi::D3D12;
+#endif
+    return GraphicsApi::Auto; // neither runtime is loaded (yet)
 }
 
 bool HookManager::Initialize() {
@@ -1187,6 +1531,7 @@ void HookManager::Shutdown() {
 ### `src/hooks_vulkan.cpp`
 ```cpp
 #include "cbr/hooks.h"
+#include <atomic>
 #include "cbr/cbr_engine.h"
 #include "cbr/logger.h"
 
@@ -1208,22 +1553,80 @@ typedef int   (*PFN_vkCreateSwapchainKHR)(void* device, const void* pCreateInfo,
 PFN_vkQueuePresentKHR    g_Original_vkQueuePresentKHR = nullptr;
 PFN_vkCreateSwapchainKHR g_Original_vkCreateSwapchainKHR = nullptr;
 
+// VK_ERROR_INITIALIZATION_FAILED: returned if a hook is ever invoked without a valid trampoline,
+// so the failure is visible to the caller instead of silently dropping frames / swapchains.
+// Minimal Vulkan struct layouts for headerless extraction of swapchain and extent
+struct MinimalVkExtent2D {
+    uint32_t width;
+    uint32_t height;
+};
+
+struct MinimalVkSwapchainCreateInfoKHR {
+    uint32_t          sType;
+    const void*       pNext;
+    uint32_t          flags;
+    uint64_t          surface;
+    uint32_t          minImageCount;
+    int32_t           imageFormat;
+    int32_t           imageColorSpace;
+    MinimalVkExtent2D imageExtent;
+};
+
+struct MinimalVkPresentInfoKHR {
+    uint32_t     sType;
+    const void*  pNext;
+    uint32_t     waitSemaphoreCount;
+    const void*  pWaitSemaphores;
+    uint32_t     swapchainCount;
+    const void** pSwapchains;
+    const uint32_t* pImageIndices;
+    int*         pResults;
+};
+
 int Hooked_vkQueuePresentKHR(void* queue, const void* pPresentInfo) {
-    CBREngine::Get().OnPrePresent(queue, pPresentInfo);
-    int result = 0;
-    if (g_Original_vkQueuePresentKHR) {
-        result = g_Original_vkQueuePresentKHR(queue, pPresentInfo);
+    if (!g_Original_vkQueuePresentKHR) {
+        return kVkErrorInitializationFailed;
     }
-    CBREngine::Get().OnPostPresent();
+
+    void* presentTarget = queue;
+    if (pPresentInfo) {
+        const auto* info = reinterpret_cast<const MinimalVkPresentInfoKHR*>(pPresentInfo);
+        if (info->swapchainCount > 0 && info->pSwapchains) {
+            presentTarget = const_cast<void*>(info->pSwapchains[0]);
+        }
+    }
+
+    // Exceptions must never propagate into the game's render thread.
+    try {
+        CBREngine::Get().OnPrePresent(presentTarget, pPresentInfo);
+    } catch (...) {
+    }
+
+    int result = g_Original_vkQueuePresentKHR(queue, pPresentInfo);
+
+    try {
+        CBREngine::Get().OnPostPresent(presentTarget);
+    } catch (...) {
+    }
     return result;
 }
 
 int Hooked_vkCreateSwapchainKHR(void* device, const void* pCreateInfo, const void* pAllocator, void* pSwapchain) {
-    CBR_LOG_INFO("Vulkan Swapchain creation intercepted.");
-    if (g_Original_vkCreateSwapchainKHR) {
-        return g_Original_vkCreateSwapchainKHR(device, pCreateInfo, pAllocator, pSwapchain);
+    if (!g_Original_vkCreateSwapchainKHR) {
+        return kVkErrorInitializationFailed;
     }
-    return 0;
+    CBR_LOG_INFO("Vulkan Swapchain creation intercepted.");
+    const int result = g_Original_vkCreateSwapchainKHR(device, pCreateInfo, pAllocator, pSwapchain);
+    if (result == 0) { // VK_SUCCESS
+        uint32_t w = 0, h = 0;
+        if (pCreateInfo) {
+            const auto* info = reinterpret_cast<const MinimalVkSwapchainCreateInfoKHR*>(pCreateInfo);
+            w = info->imageExtent.width;
+            h = info->imageExtent.height;
+        }
+        try { CBREngine::Get().OnSwapchainRecreated(w, h); } catch (...) {}
+    }
+    return result;
 }
 
 } // namespace
@@ -1246,9 +1649,14 @@ bool HookManager::InstallVulkanHooks() {
         return false;
     }
 
-    m_vulkanHooked = true;
-    CBR_LOG_INFO("Vulkan interception hooks successfully registered.");
-    return true;
+    // TODO: install real detours (e.g. MinHook) on vkQueuePresentKHR / vkCreateSwapchainKHR and store
+    // the trampolines in g_Original_*. Until then NO hook is active, so do not claim success.
+    // Logged once only: this function is retried from a polling loop.
+    static std::atomic<bool> s_warned{ false };
+    if (!s_warned.exchange(true)) {
+        CBR_LOG_WARN("Vulkan hook installation is not implemented yet; no hooks are active.");
+    }
+    return false;
 }
 
 void HookManager::UninstallVulkanHooks() {
@@ -1265,6 +1673,7 @@ void HookManager::UninstallVulkanHooks() {
 ### `src/hooks_dx12.cpp`
 ```cpp
 #include "cbr/hooks.h"
+#include <atomic>
 #include "cbr/cbr_engine.h"
 #include "cbr/logger.h"
 
@@ -1280,13 +1689,25 @@ namespace {
 typedef long (__stdcall *PFN_D3D12Present)(void* swapChain, unsigned int syncInterval, unsigned int flags);
 PFN_D3D12Present g_Original_D3D12Present = nullptr;
 
+constexpr long kHResultFail = static_cast<long>(0x80004005u); // E_FAIL
+
 long __stdcall Hooked_D3D12Present(void* swapChain, unsigned int syncInterval, unsigned int flags) {
-    CBREngine::Get().OnPrePresent(swapChain, nullptr);
-    long result = 0;
-    if (g_Original_D3D12Present) {
-        result = g_Original_D3D12Present(swapChain, syncInterval, flags);
+    if (!g_Original_D3D12Present) {
+        return kHResultFail;
     }
-    CBREngine::Get().OnPostPresent();
+
+    // Exceptions must never propagate into the game's render thread.
+    try {
+        CBREngine::Get().OnPrePresent(swapChain, nullptr);
+    } catch (...) {
+    }
+
+    long result = g_Original_D3D12Present(swapChain, syncInterval, flags);
+
+    try {
+        CBREngine::Get().OnPostPresent(swapChain);
+    } catch (...) {
+    }
     return result;
 }
 
@@ -1301,9 +1722,14 @@ bool HookManager::InstallDX12Hooks() {
         return false;
     }
 
-    CBR_LOG_INFO("DX12 modules detected. Registering DXGI SwapChain VMT hooks...");
-    m_dx12Hooked = true;
-    return true;
+    // TODO: locate IDXGISwapChain::Present via a dummy swapchain, detour it, and store the
+    // trampoline in g_Original_D3D12Present. Until then NO hook is active.
+    // Logged once only: this function is retried from a polling loop.
+    static std::atomic<bool> s_warned{ false };
+    if (!s_warned.exchange(true)) {
+        CBR_LOG_WARN("DX12 hook installation is not implemented yet; no hooks are active.");
+    }
+    return false;
 }
 
 void HookManager::UninstallDX12Hooks() {
@@ -1320,6 +1746,7 @@ void HookManager::UninstallDX12Hooks() {
 ### `src/jitter_manager.cpp`
 ```cpp
 #include "cbr/jitter_manager.h"
+#include "cbr/config.h"
 #include "cbr/logger.h"
 
 namespace cbr {
@@ -1341,17 +1768,19 @@ void JitterManager::Initialize(uint32_t targetWidth, uint32_t targetHeight) {
 void JitterManager::Update(uint32_t frameIndex) {
     m_previousJitter = m_currentJitter;
 
-    // 2-phase subpixel checkerboard jitter sequence
-    // Shifts alternating frames by (+0.5px, +0.5px) and (-0.5px, -0.5px)
+    // 2-phase subpixel checkerboard jitter sequence:
+    // Shifts alternating frames horizontally by +0.5px and -0.5px (presentation pixels).
+    // Standard 2x MSAA diagonal sample geometry requires 1D horizontal shift only (delta Y = 0)
+    // to achieve 100% 4-quadrant geometric coverage across 2 frames (Intel 2018 White Paper).
     float pixelWidth = 1.0f / static_cast<float>(m_targetWidth);
-    float pixelHeight = 1.0f / static_cast<float>(m_targetHeight);
+    const float amplitude = 0.5f * ConfigManager::Get().GetConfig().jitterScale;
 
     if (frameIndex & 1u) {
-        m_currentJitter.x = 0.5f * pixelWidth;
-        m_currentJitter.y = 0.5f * pixelHeight;
+        m_currentJitter.x = amplitude * pixelWidth;
+        m_currentJitter.y = 0.0f;
     } else {
-        m_currentJitter.x = -0.5f * pixelWidth;
-        m_currentJitter.y = -0.5f * pixelHeight;
+        m_currentJitter.x = -amplitude * pixelWidth;
+        m_currentJitter.y = 0.0f;
     }
 }
 
@@ -1384,6 +1813,26 @@ void JitterManager::RemoveJitterFromProjection(float* projMatrix4x4, bool isVulk
     projMatrix4x4[9] -= jitterNdcY;
 }
 
+void JitterManager::SetProjectionJitter(float* outMatrix4x4, const float* inUnjitteredMatrix4x4, bool isVulkan) const {
+    if (!outMatrix4x4 || !inUnjitteredMatrix4x4) return;
+
+    if (outMatrix4x4 != inUnjitteredMatrix4x4) {
+        for (int i = 0; i < 16; ++i) {
+            outMatrix4x4[i] = inUnjitteredMatrix4x4[i];
+        }
+    }
+
+    float jitterNdcX = 2.0f * m_currentJitter.x;
+    float jitterNdcY = 2.0f * m_currentJitter.y;
+
+    if (isVulkan) {
+        jitterNdcY = -jitterNdcY;
+    }
+
+    outMatrix4x4[8] = inUnjitteredMatrix4x4[8] + jitterNdcX;
+    outMatrix4x4[9] = inUnjitteredMatrix4x4[9] + jitterNdcY;
+}
+
 } // namespace cbr
 ```
 
@@ -1392,6 +1841,7 @@ void JitterManager::RemoveJitterFromProjection(float* projMatrix4x4, bool isVulk
 ```cpp
 #include "cbr/logger.h"
 #include <chrono>
+#include <ctime>
 #include <iomanip>
 #include <sstream>
 
@@ -1402,12 +1852,13 @@ Logger& Logger::Get() {
     return instance;
 }
 
-void Logger::Initialize(const std::string& logFilePath) {
+void Logger::Initialize(const std::filesystem::path& logFilePath) {
     std::lock_guard<std::mutex> lock(m_mutex);
     if (m_initialized) {
         return;
     }
 
+    m_disabled = false;
     m_logFile.open(logFilePath, std::ios::out | std::ios::trunc);
     m_initialized = m_logFile.is_open();
 
@@ -1417,8 +1868,18 @@ void Logger::Initialize(const std::string& logFilePath) {
         m_logFile << " Maintainer: Shreyas Pawar                                       \n";
         m_logFile << " Target: NVIDIA GeForce GTX 1070 Ti & Vulkan / DX12              \n";
         m_logFile << "=================================================================\n";
+        for (const auto& line : m_pending) {
+            m_logFile << line;
+        }
         m_logFile.flush();
     }
+    m_pending.clear();
+}
+
+void Logger::Disable() {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_disabled = true;
+    m_pending.clear();
 }
 
 void Logger::Shutdown() {
@@ -1429,10 +1890,21 @@ void Logger::Shutdown() {
         m_logFile.close();
     }
     m_initialized = false;
+    m_disabled = true;
+    m_pending.clear();
+}
+
+void Logger::SetMinLevel(LogLevel level) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_minLevel = level;
 }
 
 void Logger::Log(LogLevel level, const std::string& message) {
     std::lock_guard<std::mutex> lock(m_mutex);
+
+    if (level < m_minLevel) {
+        return;
+    }
 
     const char* levelStr = "INFO";
     switch (level) {
@@ -1444,6 +1916,8 @@ void Logger::Log(LogLevel level, const std::string& message) {
 
     auto now = std::chrono::system_clock::now();
     auto in_time_t = std::chrono::system_clock::to_time_t(now);
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
+
     std::tm timeInfo{};
 #if defined(_WIN32)
     localtime_s(&timeInfo, &in_time_t);
@@ -1461,6 +1935,8 @@ void Logger::Log(LogLevel level, const std::string& message) {
     if (m_initialized && m_logFile.is_open()) {
         m_logFile << formatted;
         m_logFile.flush();
+    } else if (!m_initialized && !m_disabled && m_pending.size() < kMaxPendingMessages) {
+        m_pending.push_back(formatted);
     }
 
 #if defined(_DEBUG)
@@ -1476,6 +1952,7 @@ void Logger::Log(LogLevel level, const std::string& message) {
 ```cpp
 #include "cbr/reconstruction_pass.h"
 #include "cbr/config.h"
+#include "cbr/jitter_manager.h"
 #include "cbr/render_target_manager.h"
 #include "cbr/logger.h"
 #include <chrono>
@@ -1506,30 +1983,44 @@ void ReconstructionPass::Shutdown() {
     CBR_LOG_INFO("ReconstructionPass shut down.");
 }
 
+ReconstructionPushConstants BuildReconstructionPushConstants(uint32_t frameIndex) {
+    const auto& config = ConfigManager::Get().GetConfig();
+    const auto& dims = RenderTargetManager::Get().GetDimensions();
+    const auto jitterDelta = JitterManager::Get().GetJitterDelta();
+
+    ReconstructionPushConstants pc{};
+    pc.targetResolution[0] = static_cast<float>(dims.fullWidth);
+    pc.targetResolution[1] = static_cast<float>(dims.fullHeight);
+    pc.invTargetResolution[0] = 1.0f / pc.targetResolution[0];
+    pc.invTargetResolution[1] = 1.0f / pc.targetResolution[1];
+    pc.frameIndex = frameIndex;
+    pc.depthTolerance = config.depthTolerance;
+    pc.historyWeight = config.historyWeight;
+    pc.debugView = config.debugView;
+    pc.enableColorClamping = config.enableColorClamping ? 1u : 0u;
+    pc.mipLodBias = config.mipLodBias;
+    pc.colorSpace = (config.colorSpace == ColorSpace::RGB) ? 1u : 0u;
+    pc.enableSpatialFallback = config.enableSpatialFallback ? 1u : 0u;
+    pc.jitterDelta[0] = jitterDelta.x;
+    pc.jitterDelta[1] = jitterDelta.y;
+    pc.enableMotionDilation = config.enableMotionDilation ? 1u : 0u;
+    pc.jitterCompensation = config.jitterCompensation;
+    return pc;
+}
+
 void ReconstructionPass::DispatchVulkan(void* /*vkCommandBuffer*/, uint32_t frameIndex) {
     if (!m_initialized) return;
 
-    const auto& config = ConfigManager::Get().GetConfig();
+    const ReconstructionPushConstants pushConstants = BuildReconstructionPushConstants(frameIndex);
     const auto& dims = RenderTargetManager::Get().GetDimensions();
 
-    ReconstructionPushConstants pushConstants{};
-    pushConstants.targetResolution[0] = static_cast<float>(dims.fullWidth);
-    pushConstants.targetResolution[1] = static_cast<float>(dims.fullHeight);
-    pushConstants.invTargetResolution[0] = 1.0f / pushConstants.targetResolution[0];
-    pushConstants.invTargetResolution[1] = 1.0f / pushConstants.targetResolution[1];
-    pushConstants.frameIndex = frameIndex;
-    pushConstants.depthTolerance = config.depthTolerance;
-    pushConstants.historyWeight = config.historyWeight;
-    pushConstants.debugView = config.debugView;
-    pushConstants.enableColorClamping = config.enableColorClamping ? 1u : 0u;
-    pushConstants.mipLodBias = config.mipLodBias;
+    const uint32_t groupCountX = (dims.fullWidth + 15u) / 16u;
+    const uint32_t groupCountY = (dims.fullHeight + 15u) / 16u;
 
-    uint32_t groupCountX = (dims.fullWidth + 15u) / 16u;
-    uint32_t groupCountY = (dims.fullHeight + 15u) / 16u;
-
-    // In a live Vulkan context, this binds the compute pipeline, pushes constants,
+    // In a live Vulkan context, this binds the compute pipeline, pushes `pushConstants`,
     // and calls vkCmdDispatch(cmdBuffer, groupCountX, groupCountY, 1);
     // Followed by a memory barrier transitioning the reconstructed image for sampling.
+    (void)pushConstants;
     (void)groupCountX;
     (void)groupCountY;
 }
@@ -1537,17 +2028,17 @@ void ReconstructionPass::DispatchVulkan(void* /*vkCommandBuffer*/, uint32_t fram
 void ReconstructionPass::DispatchDX12(void* /*d3d12GraphicsCommandList*/, uint32_t frameIndex) {
     if (!m_initialized) return;
 
-    const auto& config = ConfigManager::Get().GetConfig();
+    const ReconstructionPushConstants pushConstants = BuildReconstructionPushConstants(frameIndex);
     const auto& dims = RenderTargetManager::Get().GetDimensions();
 
-    uint32_t groupCountX = (dims.fullWidth + 15u) / 16u;
-    uint32_t groupCountY = (dims.fullHeight + 15u) / 16u;
+    const uint32_t groupCountX = (dims.fullWidth + 15u) / 16u;
+    const uint32_t groupCountY = (dims.fullHeight + 15u) / 16u;
 
-    (void)config;
-    (void)frameIndex;
+    // In DX12, sets root signature, pipeline state, descriptor tables, uploads `pushConstants`
+    // as root constants, and calls Dispatch(groupCountX, groupCountY, 1)
+    (void)pushConstants;
     (void)groupCountX;
     (void)groupCountY;
-    // In DX12, sets root signature, pipeline state, descriptor tables, and calls Dispatch(groupCountX, groupCountY, 1)
 }
 
 } // namespace cbr
@@ -1572,7 +2063,7 @@ void RenderTargetManager::Initialize(uint32_t width, uint32_t height) {
     m_dims.quarterWidth = width / 2;
     m_dims.quarterHeight = height / 2;
     m_dims.msaaSamples = 2;
-    m_historyPingPong = 0;
+    m_historyPingPong.store(0);
 
     // Calculate VRAM footprint:
     // 1. Quarter-Res 2x MSAA Color (RGBA16F = 8 bytes/sample * 2 samples):
@@ -1608,6 +2099,11 @@ bool RenderTargetManager::IsTargetInterceptCandidate(uint32_t width, uint32_t he
     bool matchesHeight = (height == m_dims.fullHeight);
 
     return matchesWidth && matchesHeight;
+}
+
+bool RenderTargetManager::IsQuarterPassCandidate(uint32_t width, uint32_t height) const {
+    if (!m_initialized) return false;
+    return (width == m_dims.quarterWidth && height == m_dims.quarterHeight);
 }
 
 } // namespace cbr
@@ -1664,11 +2160,14 @@ void UIOverlay::Render() {
 
 /**
  * RDR2 Checkerboard Rendering Mod (CBR) - Reconstruction Compute Shader
- * Architecture: Optimized for NVIDIA Pascal (GP104 / GTX 1070 Ti) & Modern GPUs
+ * Architecture: Optimized for NVIDIA Pascal (GP104 / Wave32) & AMD Radeon Vega (GCN 5.0 / Wave64)
  * Target: Vulkan SPIR-V
  * Author & Co-Owner: Shreyas Pawar
  */
 
+// 16x16 = 256 threads per workgroup:
+// - NVIDIA Pascal (GP104): 8 warps x 32 threads = 100% warp occupancy
+// - AMD Radeon Vega (GCN 5.0 / Vega 7): 4 wavefronts x 64 threads = 100% Wave64 occupancy
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
 // =============================================================================
@@ -1689,6 +2188,9 @@ layout(set = 0, binding = 4) uniform sampler2D   u_Velocity;
 // Full-resolution reconstructed output target (R16G16B16A16F / B10G11R11F)
 layout(set = 0, binding = 5, rgba16f) writeonly uniform image2D u_OutputImage;
 
+// Full-resolution depth written for the NEXT frame's disocclusion test (becomes u_HistoryDepth)
+layout(set = 0, binding = 6, r32f) writeonly uniform image2D u_OutputDepth;
+
 // =============================================================================
 // Push Constants / Uniforms
 // =============================================================================
@@ -1701,6 +2203,11 @@ layout(push_constant) uniform CBRConstants {
     uint  u_DebugView;              // 0=Normal, 1=Mask, 2=Disocclusion, 3=Motion, 4=Raw
     uint  u_EnableColorClamping;    // 1 = True, 0 = False
     float u_MipLodBias;             // Texture LOD bias (-0.5)
+    uint  u_ColorSpace;             // 0 = YCoCg clamp, 1 = RGB clamp
+    uint  u_EnableSpatialFallback;  // 1 = cross-bilateral fallback, 0 = use raw current sample
+    vec2  u_JitterDelta;            // Subpixel projection jitter delta (jc - jp)
+    uint  u_EnableMotionDilation;   // 1 = 3x3 closest-depth motion dilation
+    float u_JitterCompensation;     // Multiplier on u_JitterDelta (1, -1 or 0)
 } pc;
 
 // =============================================================================
@@ -1723,6 +2230,9 @@ vec3 YCoCgtoRGB(vec3 ycocg) {
     float B  = Y - Co - Cg;
     return max(vec3(0.0), vec3(R, G, B));
 }
+
+vec3 ToClampSpace(vec3 rgb)  { return (pc.u_ColorSpace == 0u) ? RGBtoYCoCg(rgb) : rgb; }
+vec3 FromClampSpace(vec3 c)  { return (pc.u_ColorSpace == 0u) ? YCoCgtoRGB(c) : max(vec3(0.0), c); }
 
 // =============================================================================
 // Main Shader Execution
@@ -1747,8 +2257,8 @@ void main() {
     uint frameParity = pc.u_FrameIndex & 1u;
     bool isCurrentSampleActive = (pixelParity == frameParity);
 
-    // In a 2x2 quarter cell, the two active samples correspond to pixelCoord.x parity
-    int msaaSampleIndex = int(uint(pixelCoord.x) & 1u);
+    // In a 2x2 quarter cell, Sample 0 is top row (y even) and Sample 1 is bottom row (y odd)
+    int msaaSampleIndex = int(uint(pixelCoord.y) & 1u);
 
     // Fetch current frame sample
     vec4 currentSample = texelFetch(u_QuarterColorMSAA, quarterCoord, msaaSampleIndex);
@@ -1757,23 +2267,42 @@ void main() {
     // -------------------------------------------------------------------------
     // 2. Fetch Motion Vectors & Calculate Previous UV Coordinates
     // -------------------------------------------------------------------------
-    // Explicit LOD 0.0 required for compute shaders
-    vec2 velocity = textureLod(u_Velocity, uv, 0.0).xy;
-    vec2 historyUV = uv - velocity;
+    // 3x3 closest depth search for dilated motion vector (eliminates edge silhouette smearing)
+    // RDR2 uses reversed-Z depth (near=1.0, far=0.0): greater depth value means closer to camera.
+    // Skipped entirely when disabled (saves 9 MSAA depth fetches per pixel).
+    float closestDepth = currentDepth;
+    ivec2 closestCoord = pixelCoord;
+    if (pc.u_EnableMotionDilation != 0u) {
+        for (int dy = -1; dy <= 1; ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                ivec2 nCoord = clamp(pixelCoord + ivec2(dx, dy), ivec2(0), targetSize - ivec2(1));
+                float d = texelFetch(u_QuarterDepthMSAA, nCoord / 2, int(uint(nCoord.y) & 1u)).r;
+                if (d > closestDepth) { // Reversed-Z: greater = nearer to camera
+                    closestDepth = d;
+                    closestCoord = nCoord;
+                }
+            }
+        }
+    }
+    vec2 dilatedUV = (vec2(closestCoord) + 0.5) * pc.u_InvTargetResolution;
+    vec2 velocity = textureLod(u_Velocity, dilatedUV, 0.0).xy;
+    vec2 historyUV = uv - velocity - pc.u_JitterDelta * pc.u_JitterCompensation;
 
     // -------------------------------------------------------------------------
     // 3. Disocclusion & Depth Delta Testing
     // -------------------------------------------------------------------------
     bool isDisoccluded = false;
     vec4 historyColor = vec4(0.0);
+    float previousDepth = currentDepth;
 
     if (historyUV.x < 0.0 || historyUV.x > 1.0 || historyUV.y < 0.0 || historyUV.y > 1.0) {
         // Sample moved outside screen space
         isDisoccluded = true;
     } else {
-        // Nearest depth fetch from history
-        float previousDepth = textureLod(u_HistoryDepth, historyUV, 0.0).r;
-        float depthDelta = abs(currentDepth - previousDepth) / max(currentDepth, 1e-5);
+        // Exact texel fetch: independent of the bound sampler, so depth is never blended across edges
+        ivec2 historyCoord = clamp(ivec2(historyUV * pc.u_TargetResolution), ivec2(0), targetSize - ivec2(1));
+        previousDepth = texelFetch(u_HistoryDepth, historyCoord, 0).r;
+        float depthDelta = abs(currentDepth - previousDepth);
 
         if (depthDelta > pc.u_DepthTolerance) {
             isDisoccluded = true;
@@ -1787,36 +2316,48 @@ void main() {
     }
 
     // -------------------------------------------------------------------------
-    // 4. Neighborhood Statistics & YCoCg Clamping (Anti-Ghosting)
+    // 4. Neighborhood Statistics & Variance Clipping (Anti-Ghosting)
     // Guarded to avoid 9 unnecessary memory fetches when disoccluded or disabled
     // -------------------------------------------------------------------------
     if (!isDisoccluded && pc.u_EnableColorClamping != 0u) {
         vec3 colorMin = vec3(1e6);
         vec3 colorMax = vec3(-1e6);
+        vec3 m1 = vec3(0.0);
+        vec3 m2 = vec3(0.0);
 
-        // Compute 3x3 local color bounding box
+        // Compute 3x3 local color bounding box and statistical moments
         for (int dy = -1; dy <= 1; ++dy) {
             for (int dx = -1; dx <= 1; ++dx) {
                 ivec2 neighborCoord = clamp(pixelCoord + ivec2(dx, dy), ivec2(0), targetSize - ivec2(1));
                 ivec2 neighborQuarter = neighborCoord / 2;
-                int neighborSample = int(uint(neighborCoord.x) & 1u);
+                int neighborSample = int(uint(neighborCoord.y) & 1u);
                 vec3 neighborColor = texelFetch(u_QuarterColorMSAA, neighborQuarter, neighborSample).rgb;
 
-                vec3 neighborYCoCg = RGBtoYCoCg(neighborColor);
-                colorMin = min(colorMin, neighborYCoCg);
-                colorMax = max(colorMax, neighborYCoCg);
+                vec3 neighborClampSpace = ToClampSpace(neighborColor);
+                colorMin = min(colorMin, neighborClampSpace);
+                colorMax = max(colorMax, neighborClampSpace);
+                m1 += neighborClampSpace;
+                m2 += neighborClampSpace * neighborClampSpace;
             }
         }
 
-        vec3 historyYCoCg = RGBtoYCoCg(historyColor.rgb);
-        historyYCoCg = clamp(historyYCoCg, colorMin, colorMax);
-        historyColor.rgb = YCoCgtoRGB(historyYCoCg);
+        // Variance clipping: clamp history inside [mean - gamma * stdDev, mean + gamma * stdDev]
+        vec3 mean = m1 / 9.0;
+        vec3 stdDev = sqrt(max(vec3(0.0), (m2 / 9.0) - (mean * mean)));
+        float gamma = 1.25;
+        vec3 varianceMin = max(colorMin, mean - gamma * stdDev);
+        vec3 varianceMax = min(colorMax, mean + gamma * stdDev);
+
+        vec3 historyClampSpace = ToClampSpace(historyColor.rgb);
+        historyClampSpace = clamp(historyClampSpace, varianceMin, varianceMax);
+        historyColor.rgb = FromClampSpace(historyClampSpace);
     }
 
     // -------------------------------------------------------------------------
     // 5. Final Pixel Reconstruction
     // -------------------------------------------------------------------------
     vec3 finalColor;
+    float spatialDepth = currentDepth; // depth estimate for reconstructed pixels (fallback path)
 
     if (isCurrentSampleActive) {
         // Pixel was natively shaded this frame
@@ -1833,23 +2374,30 @@ void main() {
         } else {
             // Spatial Cross-Bilateral Reconstruction from 4 cardinal active samples
             vec3  accumColor = vec3(0.0);
+            float accumDepth = 0.0;
             float accumWeight = 0.0;
             const ivec2 offsets[4] = ivec2[](ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1));
 
-            for (int i = 0; i < 4; ++i) {
+            // Loop is skipped entirely when the fallback is disabled (accumWeight stays 0)
+            for (int i = 0; i < 4 && pc.u_EnableSpatialFallback != 0u; ++i) {
                 ivec2 sampleCoord = clamp(pixelCoord + offsets[i], ivec2(0), targetSize - ivec2(1));
                 ivec2 sQuarter = sampleCoord / 2;
-                int sIndex = int(uint(sampleCoord.x) & 1u);
+                int sIndex = int(uint(sampleCoord.y) & 1u);
 
                 vec3 sCol = texelFetch(u_QuarterColorMSAA, sQuarter, sIndex).rgb;
                 float sDep = texelFetch(u_QuarterDepthMSAA, sQuarter, sIndex).r;
 
-                float depthWeight = exp(-abs(currentDepth - sDep) * 100.0);
+                // Relative depth weighting: robust across depth ranges and reversed-Z
+                float depthWeight = exp(-abs(currentDepth - sDep) / max(pc.u_DepthTolerance, 1e-4));
                 accumColor += sCol * depthWeight;
+                accumDepth += sDep * depthWeight;
                 accumWeight += depthWeight;
             }
 
             finalColor = (accumWeight > 1e-4) ? (accumColor / accumWeight) : currentSample.rgb;
+            if (accumWeight > 1e-4) {
+                spatialDepth = accumDepth / accumWeight;
+            }
         }
     }
 
@@ -1879,6 +2427,14 @@ void main() {
 
     // Write final reconstructed pixel to output storage image (alpha = 1.0 for valid history)
     imageStore(u_OutputImage, pixelCoord, vec4(finalColor, 1.0));
+
+    // History depth for the next frame: native depth for shaded pixels; for reconstructed pixels
+    // carry the validated history depth, or the spatial estimate when history was rejected.
+    float outDepth = currentDepth;
+    if (!isCurrentSampleActive) {
+        outDepth = isDisoccluded ? spatialDepth : previousDepth;
+    }
+    imageStore(u_OutputDepth, pixelCoord, vec4(outDepth, 0.0, 0.0, 0.0));
 }
 ```
 
@@ -1887,11 +2443,14 @@ void main() {
 ```hlsl
 /**
  * RDR2 Checkerboard Rendering Mod (CBR) - Reconstruction Compute Shader
- * Architecture: Optimized for NVIDIA Pascal (GP104 / GTX 1070 Ti) & Modern GPUs
+ * Architecture: Optimized for NVIDIA Pascal (GP104 / Wave32) & AMD Radeon Vega (GCN 5.0 / Wave64)
  * Target: DirectX 12 HLSL (CS 5.0 / CS 6.0)
  * Author & Co-Owner: Shreyas Pawar
  */
 
+// 16x16 = 256 threads per threadgroup:
+// - NVIDIA Pascal (GP104): 8 warps x 32 threads = 100% warp occupancy
+// - AMD Radeon Vega (GCN 5.0 / Vega 7): 4 wavefronts x 64 threads = 100% Wave64 occupancy
 #define THREADGROUP_SIZE_X 16
 #define THREADGROUP_SIZE_Y 16
 
@@ -1909,6 +2468,8 @@ SamplerState        g_LinearClampSampler : register(s0);
 SamplerState        g_PointClampSampler  : register(s1);
 
 RWTexture2D<float4> g_OutputImage      : register(u0);
+// Full-resolution depth written for the next frame's disocclusion test (becomes g_HistoryDepth)
+RWTexture2D<float>  g_OutputDepth      : register(u1);
 
 // =============================================================================
 // Constant Buffer (16-byte aligned)
@@ -1923,7 +2484,11 @@ cbuffer CBRConstants : register(b0)
     uint   g_DebugView;              // 0=Normal, 1=Mask, 2=Disocclusion, 3=Motion, 4=Raw
     uint   g_EnableColorClamping;    // 1 = True, 0 = False
     float  g_MipLodBias;             // Texture LOD bias (-0.5f)
-    float2 g_Padding;                // 16-byte alignment padding
+    uint   g_ColorSpace;             // 0 = YCoCg clamp, 1 = RGB clamp
+    uint   g_EnableSpatialFallback;  // 1 = cross-bilateral fallback, 0 = raw current sample
+    float2 g_JitterDelta;            // subpixel projection jitter delta (jc - jp)
+    uint   g_EnableMotionDilation;   // 1 = 3x3 closest-depth motion dilation
+    float  g_JitterCompensation;     // multiplier on g_JitterDelta (1, -1 or 0)
 };
 
 // =============================================================================
@@ -1948,6 +2513,9 @@ float3 YCoCgtoRGB(float3 ycocg)
     float B  = Y - Co - Cg;
     return max(float3(0.0f, 0.0f, 0.0f), float3(R, G, B));
 }
+
+float3 ToClampSpace(float3 rgb)   { return (g_ColorSpace == 0u) ? RGBtoYCoCg(rgb) : rgb; }
+float3 FromClampSpace(float3 c)   { return (g_ColorSpace == 0u) ? YCoCgtoRGB(c) : max(float3(0.0f, 0.0f, 0.0f), c); }
 
 // =============================================================================
 // Compute Shader Entry Point
@@ -1975,8 +2543,8 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     uint frameParity = g_FrameIndex & 1u;
     bool isCurrentSampleActive = (pixelParity == frameParity);
 
-    // In a 2x2 quarter cell, the two active samples correspond to pixelCoord.x parity
-    int msaaSampleIndex = int(uint(pixelCoord.x) & 1u);
+    // In a 2x2 quarter cell, Sample 0 is top row (y even) and Sample 1 is bottom row (y odd)
+    int msaaSampleIndex = int(uint(pixelCoord.y) & 1u);
 
     // In HLSL, Texture2DMS.Load takes (int2 Location, int SampleIndex)
     float4 currentSample = g_QuarterColorMSAA.Load(quarterCoord, msaaSampleIndex);
@@ -1985,14 +2553,37 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     // -------------------------------------------------------------------------
     // 2. Motion Vector Fetch & History Coordinate Calculation
     // -------------------------------------------------------------------------
-    float2 velocity = g_Velocity.SampleLevel(g_LinearClampSampler, uv, 0.0f).xy;
-    float2 historyUV = uv - velocity;
+    // 3x3 closest depth search for dilated motion vector (eliminates edge silhouette smearing)
+    // RDR2 uses reversed-Z depth (near=1.0, far=0.0): greater depth value means closer to camera.
+    // Skipped entirely when disabled (saves 9 MSAA depth fetches per pixel).
+    float closestDepth = currentDepth;
+    int2 closestCoord = pixelCoord;
+    if (g_EnableMotionDilation != 0u)
+    {
+        for (int dy = -1; dy <= 1; ++dy)
+        {
+            for (int dx = -1; dx <= 1; ++dx)
+            {
+                int2 nCoord = clamp(pixelCoord + int2(dx, dy), int2(0, 0), targetSize - int2(1, 1));
+                float d = g_QuarterDepthMSAA.Load(nCoord / 2, int(uint(nCoord.y) & 1u)).r;
+                if (d > closestDepth) // Reversed-Z: greater = nearer to camera
+                {
+                    closestDepth = d;
+                    closestCoord = nCoord;
+                }
+            }
+        }
+    }
+    float2 dilatedUV = (float2(closestCoord) + 0.5f) * g_InvTargetResolution;
+    float2 velocity = g_Velocity.SampleLevel(g_LinearClampSampler, dilatedUV, 0.0f).xy;
+    float2 historyUV = uv - velocity - g_JitterDelta * g_JitterCompensation;
 
     // -------------------------------------------------------------------------
     // 3. Disocclusion & Depth Delta Test
     // -------------------------------------------------------------------------
     bool isDisoccluded = false;
     float4 historyColor = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float previousDepth = currentDepth;
 
     if (historyUV.x < 0.0f || historyUV.x > 1.0f || historyUV.y < 0.0f || historyUV.y > 1.0f)
     {
@@ -2001,8 +2592,8 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     else
     {
         // Point sampling for depth history avoids edge bleeding across discontinuities
-        float previousDepth = g_HistoryDepth.SampleLevel(g_PointClampSampler, historyUV, 0.0f).r;
-        float depthDelta = abs(currentDepth - previousDepth) / max(currentDepth, 1e-5f);
+        previousDepth = g_HistoryDepth.SampleLevel(g_PointClampSampler, historyUV, 0.0f).r;
+        float depthDelta = abs(currentDepth - previousDepth);
 
         if (depthDelta > g_DepthTolerance)
         {
@@ -2019,13 +2610,15 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     }
 
     // -------------------------------------------------------------------------
-    // 4. Neighborhood Clamping (YCoCg Space)
+    // 4. Neighborhood Clamping (YCoCg Space & Variance Clipping)
     // Guarded to avoid unnecessary texture fetches when disoccluded or disabled
     // -------------------------------------------------------------------------
     if (!isDisoccluded && g_EnableColorClamping != 0u)
     {
         float3 colorMin = float3(1e6f, 1e6f, 1e6f);
         float3 colorMax = float3(-1e6f, -1e6f, -1e6f);
+        float3 m1 = float3(0.0f, 0.0f, 0.0f);
+        float3 m2 = float3(0.0f, 0.0f, 0.0f);
 
         for (int dy = -1; dy <= 1; ++dy)
         {
@@ -2033,24 +2626,34 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
             {
                 int2 neighborCoord = clamp(pixelCoord + int2(dx, dy), int2(0, 0), targetSize - int2(1, 1));
                 int2 neighborQuarter = neighborCoord / 2;
-                int neighborSample = int(uint(neighborCoord.x) & 1u);
+                int neighborSample = int(uint(neighborCoord.y) & 1u);
                 float3 neighborColor = g_QuarterColorMSAA.Load(neighborQuarter, neighborSample).rgb;
 
-                float3 neighborYCoCg = RGBtoYCoCg(neighborColor);
-                colorMin = min(colorMin, neighborYCoCg);
-                colorMax = max(colorMax, neighborYCoCg);
+                float3 neighborClampSpace = ToClampSpace(neighborColor);
+                colorMin = min(colorMin, neighborClampSpace);
+                colorMax = max(colorMax, neighborClampSpace);
+                m1 += neighborClampSpace;
+                m2 += neighborClampSpace * neighborClampSpace;
             }
         }
 
-        float3 historyYCoCg = RGBtoYCoCg(historyColor.rgb);
-        historyYCoCg = clamp(historyYCoCg, colorMin, colorMax);
-        historyColor.rgb = YCoCgtoRGB(historyYCoCg);
+        // Variance clipping: clamp history inside [mean - gamma * stdDev, mean + gamma * stdDev]
+        float3 mean = m1 / 9.0f;
+        float3 stdDev = sqrt(max(float3(0.0f, 0.0f, 0.0f), (m2 / 9.0f) - (mean * mean)));
+        float gamma = 1.25f;
+        float3 varianceMin = max(colorMin, mean - gamma * stdDev);
+        float3 varianceMax = min(colorMax, mean + gamma * stdDev);
+
+        float3 historyClampSpace = ToClampSpace(historyColor.rgb);
+        historyClampSpace = clamp(historyClampSpace, varianceMin, varianceMax);
+        historyColor.rgb = FromClampSpace(historyClampSpace);
     }
 
     // -------------------------------------------------------------------------
     // 5. Final Reconstruction
     // -------------------------------------------------------------------------
     float3 finalColor;
+    float spatialDepth = currentDepth; // depth estimate for reconstructed pixels (fallback path)
 
     if (isCurrentSampleActive)
     {
@@ -2073,24 +2676,32 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
         {
             // Spatial cross-bilateral filter fallback from 4 cardinal neighbors
             float3 accumColor = float3(0.0f, 0.0f, 0.0f);
+            float  accumDepth  = 0.0f;
             float  accumWeight = 0.0f;
             const int2 offsets[4] = { int2(-1, 0), int2(1, 0), int2(0, -1), int2(0, 1) };
 
-            for (int i = 0; i < 4; ++i)
+            // Loop is skipped entirely when the fallback is disabled (accumWeight stays 0)
+            for (int i = 0; i < 4 && g_EnableSpatialFallback != 0u; ++i)
             {
                 int2 sampleCoord = clamp(pixelCoord + offsets[i], int2(0, 0), targetSize - int2(1, 1));
                 int2 sQuarter = sampleCoord / 2;
-                int sIndex = int(uint(sampleCoord.x) & 1u);
+                int sIndex = int(uint(sampleCoord.y) & 1u);
 
                 float3 sCol = g_QuarterColorMSAA.Load(sQuarter, sIndex).rgb;
                 float  sDep = g_QuarterDepthMSAA.Load(sQuarter, sIndex).r;
 
-                float depthWeight = exp(-abs(currentDepth - sDep) * 100.0f);
+                // Relative depth weighting: robust across depth ranges and reversed-Z
+                float depthWeight = exp(-abs(currentDepth - sDep) / max(g_DepthTolerance, 1e-4f));
                 accumColor += sCol * depthWeight;
+                accumDepth += sDep * depthWeight;
                 accumWeight += depthWeight;
             }
 
             finalColor = (accumWeight > 1e-4f) ? (accumColor / accumWeight) : currentSample.rgb;
+            if (accumWeight > 1e-4f)
+            {
+                spatialDepth = accumDepth / accumWeight;
+            }
         }
     }
 
@@ -2123,6 +2734,14 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     }
 
     g_OutputImage[pixelCoord] = float4(finalColor, 1.0f);
+
+    // History depth for the next frame (see GLSL version for rationale)
+    float outDepth = currentDepth;
+    if (!isCurrentSampleActive)
+    {
+        outDepth = isDisoccluded ? spatialDepth : previousDepth;
+    }
+    g_OutputDepth[pixelCoord] = outDepth;
 }
 ```
 
@@ -2160,18 +2779,455 @@ void main() {
     uint pixelParity = (uint(pixelCoord.x) + uint(pixelCoord.y)) & 1u;
     uint frameParity = pc.u_FrameIndex & 1u;
 
-    int sampleIndex = int(uint(pixelCoord.x) & 1u);
-    vec4 sample0 = texelFetch(u_QuarterColorMSAA, quarterCoord, 0);
-    vec4 sample1 = texelFetch(u_QuarterColorMSAA, quarterCoord, 1);
+    int sampleIndex = int(uint(pixelCoord.y) & 1u);
+    vec4 activeSample = texelFetch(u_QuarterColorMSAA, quarterCoord, sampleIndex);
 
     vec3 finalColor;
     if (pixelParity == frameParity) {
-        finalColor = (sampleIndex == 0) ? sample0.rgb : sample1.rgb;
+        finalColor = activeSample.rgb;
     } else {
         // Average the 2 subpixel samples for missing positions
-        finalColor = 0.5 * (sample0.rgb + sample1.rgb);
+        vec4 otherSample = texelFetch(u_QuarterColorMSAA, quarterCoord, 1 - sampleIndex);
+        finalColor = 0.5 * (activeSample.rgb + otherSample.rgb);
     }
 
     imageStore(u_OutputImage, pixelCoord, vec4(finalColor, 1.0));
 }
+```
+
+<a id="sec-tests"></a>
+## 5. Tests & CI
+
+<a id="teststestcorecpp"></a>
+### `tests/test_core.cpp`
+```cpp
+// Host-side unit tests for the portable parts of the plugin (no Windows APIs, no GPU).
+// Uses a custom CHECK macro (not assert) so tests still run in Release builds (NDEBUG).
+#include "cbr/config.h"
+#include "cbr/jitter_manager.h"
+#include "cbr/logger.h"
+#include "cbr/reconstruction_pass.h"
+#include "cbr/render_target_manager.h"
+
+#include <cmath>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <sstream>
+
+using namespace cbr;
+namespace fs = std::filesystem;
+
+static int g_failures = 0;
+#define CHECK(cond)                                                              \
+    do {                                                                         \
+        if (!(cond)) {                                                           \
+            ++g_failures;                                                        \
+            std::cerr << "FAIL " << __FILE__ << ":" << __LINE__ << "  " #cond "\n"; \
+        }                                                                        \
+    } while (0)
+
+static void WriteFile(const fs::path& p, const std::string& text) {
+    std::ofstream f(p);
+    f << text;
+}
+
+static std::string ReadFile(const fs::path& p) {
+    std::ifstream f(p);
+    std::stringstream ss;
+    ss << f.rdbuf();
+    return ss.str();
+}
+
+static void TestConfigHardening(const fs::path& dir) {
+    const fs::path ini = dir / "bad.ini";
+    WriteFile(ini,
+        "[General]\n"
+        "TargetWidth = 4k\n"          // trailing garbage  -> default
+        "TargetHeight = -1\n"         // negative          -> default
+        "Enabled = true ; comment\n"  // inline comment
+        "PreferredApi = Auto\n"
+        "[Reconstruction]\n"
+        "EnableMotionDilation = false\n"
+        "HistoryWeight = nan\n"       // NaN               -> default
+        "DepthTolerance = 99999\n"    // out of range      -> clamped
+        "MipLodBias = abc\n"          // garbage           -> default
+        "[Jitter]\n"
+        "JitterPattern = Halton\n"    // unimplemented     -> Checkerboard
+        "JitterCompensation = -5\n"   // out of range      -> clamped to -1
+        "[Debug]\n"
+        "DebugView = 77\n");          // out of range      -> clamped
+
+    CHECK(ConfigManager::Get().Load(ini));
+    const auto& c = ConfigManager::Get().GetConfig();
+    CHECK(c.targetWidth == 3840);
+    CHECK(c.targetHeight == 2160);
+    CHECK(c.enabled);
+    CHECK(c.preferredApi == GraphicsApi::Auto);
+    CHECK(c.historyWeight == 0.90f);
+    CHECK(c.depthTolerance == 1.0f);
+    CHECK(c.mipLodBias == -0.5f);
+    CHECK(c.jitterPattern == JitterPattern::Checkerboard);
+    CHECK(c.debugView == 4);
+    CHECK(!c.enableMotionDilation);
+    CHECK(c.jitterCompensation == -1.0f);
+}
+
+static void TestConfigMissingFileAndRoundTrip(const fs::path& dir) {
+    CHECK(!ConfigManager::Get().Load(dir / "does_not_exist.ini"));
+
+    const fs::path out = dir / "roundtrip.ini";
+    CHECK(ConfigManager::Get().Save(out));
+    const auto before = ConfigManager::Get().GetConfig();
+    CHECK(ConfigManager::Get().Load(out));
+    const auto& after = ConfigManager::Get().GetConfig();
+    CHECK(after.targetWidth == before.targetWidth);
+    CHECK(after.preferredApi == before.preferredApi);
+    CHECK(after.historyWeight == before.historyWeight);
+    CHECK(after.enableMotionDilation == before.enableMotionDilation);
+    CHECK(after.jitterCompensation == before.jitterCompensation);
+}
+
+static void TestLoggerBufferingAndLevel(const fs::path& dir) {
+    // Messages logged before Initialize() must be buffered and flushed, honoring the min level.
+    Logger::Get().SetMinLevel(LogLevel::Info);
+    CBR_LOG_INFO("early info %d", 1);
+    Logger::Get().SetMinLevel(LogLevel::Warning);
+    CBR_LOG_INFO("filtered info");
+    CBR_LOG_WARN("late warning %d", 2);
+
+    const fs::path log = dir / "test.log";
+    Logger::Get().Initialize(log);
+    Logger::Get().Shutdown();
+
+    const std::string text = ReadFile(log);
+    CHECK(text.find("early info 1") != std::string::npos);   // buffered before init
+    CHECK(text.find("late warning 2") != std::string::npos);
+    CHECK(text.find("filtered info") == std::string::npos);  // below min level
+}
+
+static void TestJitter() {
+    auto& cfg = ConfigManager::Get().GetMutableConfig();
+    cfg.jitterScale = 1.0f;
+
+    auto& j = JitterManager::Get();
+    j.Initialize(3840, 2160);
+    j.Update(0);
+    const JitterOffset even = j.GetCurrentJitter();
+    j.Update(1);
+    const JitterOffset odd = j.GetCurrentJitter();
+
+    CHECK(std::fabs(even.x + odd.x) < 1e-9f);                // alternating +/- phases
+    CHECK(std::fabs(odd.x - 0.5f / 3840.0f) < 1e-9f);
+    CHECK(std::fabs(odd.y) < 1e-9f);                         // 1D horizontal jitter (delta y = 0) per Intel CBR spec
+    CHECK(std::fabs(even.y) < 1e-9f);
+    CHECK(std::fabs(j.GetJitterDelta().x - (odd.x - even.x)) < 1e-9f);
+
+    cfg.jitterScale = 2.0f;                                   // JitterScale must take effect
+    j.Update(1);
+    CHECK(std::fabs(j.GetCurrentJitter().x - 1.0f / 3840.0f) < 1e-9f);
+    cfg.jitterScale = 1.0f;
+
+    // Apply/Remove must be exact inverses
+    float m[16] = { 1, 0, 0, 0,  0, 1, 0, 0,  0.25f, 0.5f, 1, 0,  0, 0, 0, 1 };
+    float orig[16];
+    std::copy(m, m + 16, orig);
+    j.ApplyJitterToProjection(m, true);
+    j.RemoveJitterFromProjection(m, true);
+    for (int i = 0; i < 16; ++i) CHECK(std::fabs(m[i] - orig[i]) < 1e-7f);
+
+    // SetProjectionJitter must be idempotent without compounding offsets
+    float out1[16];
+    float out2[16];
+    float snapshot[16];
+    std::copy(orig, orig + 16, snapshot);
+    j.SetProjectionJitter(out1, orig, true);
+    j.SetProjectionJitter(out2, orig, true);
+    for (int i = 0; i < 16; ++i) CHECK(std::fabs(out1[i] - out2[i]) < 1e-7f);
+
+    // ...and must produce exactly what Apply produces from the same unjittered matrix
+    float viaApply[16];
+    std::copy(orig, orig + 16, viaApply);
+    j.ApplyJitterToProjection(viaApply, true);
+    for (int i = 0; i < 16; ++i) CHECK(std::fabs(out1[i] - viaApply[i]) < 1e-7f);
+
+    // Non-aliased output leaves the unjittered source untouched
+    for (int i = 0; i < 16; ++i) CHECK(orig[i] == snapshot[i]);
+}
+
+static void TestPushConstantBuilder() {
+    auto& cfg = ConfigManager::Get().GetMutableConfig();
+    cfg.depthTolerance = 0.02f;
+    cfg.historyWeight = 0.8f;
+    cfg.colorSpace = ColorSpace::RGB;
+    cfg.enableSpatialFallback = false;
+    cfg.enableMotionDilation = false;
+    cfg.jitterCompensation = -1.0f;
+    cfg.jitterScale = 1.0f;
+
+    RenderTargetManager::Get().Initialize(3840, 2160);
+    JitterManager::Get().Initialize(3840, 2160);
+    JitterManager::Get().Update(0);
+    JitterManager::Get().Update(1);
+
+    const ReconstructionPushConstants pc = BuildReconstructionPushConstants(7);
+    CHECK(pc.targetResolution[0] == 3840.0f && pc.targetResolution[1] == 2160.0f);
+    CHECK(std::fabs(pc.invTargetResolution[0] - 1.0f / 3840.0f) < 1e-12f);
+    CHECK(pc.frameIndex == 7);
+    CHECK(pc.depthTolerance == 0.02f && pc.historyWeight == 0.8f);
+    CHECK(pc.colorSpace == 1u);
+    CHECK(pc.enableSpatialFallback == 0u);
+    CHECK(pc.enableMotionDilation == 0u);
+    CHECK(pc.jitterCompensation == -1.0f);
+    CHECK(std::fabs(pc.jitterDelta[0] - JitterManager::Get().GetJitterDelta().x) < 1e-12f);
+
+    cfg.enableSpatialFallback = true;
+    cfg.enableMotionDilation = true;
+    cfg.colorSpace = ColorSpace::YCoCg;
+    cfg.jitterCompensation = 1.0f;
+    const ReconstructionPushConstants pc2 = BuildReconstructionPushConstants(0);
+    CHECK(pc2.enableSpatialFallback == 1u && pc2.enableMotionDilation == 1u && pc2.colorSpace == 0u);
+}
+
+static void TestRenderTargets() {
+    auto& r = RenderTargetManager::Get();
+    r.Initialize(3840, 2160);
+    // 268.95 MB as documented in the README
+    const double mb = static_cast<double>(r.GetTotalAllocatedVramBytes()) / (1024.0 * 1024.0);
+    CHECK(std::fabs(mb - 268.95) < 0.01);
+    CHECK(r.IsTargetInterceptCandidate(3840, 2160, 0));
+    CHECK(!r.IsTargetInterceptCandidate(1920, 1080, 0));
+
+    CHECK(r.GetCurrentHistoryIndex() == 0 && r.GetPreviousHistoryIndex() == 1);
+    r.SwapHistoryBuffers();
+    CHECK(r.GetCurrentHistoryIndex() == 1 && r.GetPreviousHistoryIndex() == 0);
+    r.ResetHistory();
+    CHECK(r.GetCurrentHistoryIndex() == 0);
+}
+
+static void TestPushConstantLayout() {
+    CHECK(sizeof(ReconstructionPushConstants) == 64);
+}
+
+int main() {
+    const fs::path dir = fs::temp_directory_path() / "cbr_tests";
+    fs::create_directories(dir);
+
+    TestConfigHardening(dir);
+    TestConfigMissingFileAndRoundTrip(dir);
+    TestLoggerBufferingAndLevel(dir);
+    TestJitter();
+    TestPushConstantBuilder();
+    TestRenderTargets();
+    TestPushConstantLayout();
+
+    fs::remove_all(dir);
+    if (g_failures == 0) {
+        std::cout << "All tests passed.\n";
+        return 0;
+    }
+    std::cerr << g_failures << " check(s) failed.\n";
+    return 1;
+}
+```
+
+<a id="teststestenginecpp"></a>
+### `tests/test_engine.cpp`
+```cpp
+// Engine-level tests: hook-install retry, once-per-frame dispatch, frame-parity gating.
+// The real hook installers are Windows-only, so this file supplies fakes for them.
+//
+//   cbr_engine_tests            -> PreferredApi = Vulkan
+//   cbr_engine_tests auto       -> PreferredApi = Auto (no graphics runtime present on the host)
+//
+// The engine is a process-wide singleton with a one-shot Initialize(), hence one mode per process.
+#include "cbr/cbr_engine.h"
+#include "cbr/config.h"
+#include "cbr/hooks.h"
+#include "cbr/render_target_manager.h"
+
+#include <atomic>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+
+using namespace cbr;
+namespace fs = std::filesystem;
+
+static int g_failures = 0;
+#define CHECK(cond)                                                              \
+    do {                                                                         \
+        if (!(cond)) {                                                           \
+            ++g_failures;                                                        \
+            std::cerr << "FAIL " << __FILE__ << ":" << __LINE__ << "  " #cond "\n"; \
+        }                                                                        \
+    } while (0)
+
+// ---- Fake hook installers (replace hooks_vulkan.cpp / hooks_dx12.cpp for host tests) ----
+static std::atomic<int> g_vulkanAttempts{ 0 };
+static std::atomic<int> g_dx12Attempts{ 0 };
+static std::atomic<int> g_vulkanFailuresRemaining{ 0 };
+
+namespace cbr {
+bool HookManager::InstallVulkanHooks() {
+    ++g_vulkanAttempts;
+    if (g_vulkanFailuresRemaining.load() > 0) {
+        --g_vulkanFailuresRemaining;
+        return false;
+    }
+    m_vulkanHooked.store(true);
+    return true;
+}
+bool HookManager::InstallDX12Hooks() { ++g_dx12Attempts; m_dx12Hooked.store(true); return true; }
+void HookManager::UninstallVulkanHooks() { m_vulkanHooked.store(false); }
+void HookManager::UninstallDX12Hooks()   { m_dx12Hooked.store(false); }
+} // namespace cbr
+
+static int g_a = 0, g_b = 0; // distinct addresses used as fake present targets
+
+static void RunVulkanTests() {
+    auto& e = CBREngine::Get();
+    auto& rt = RenderTargetManager::Get();
+
+    CHECK(e.Initialize());
+    CHECK(e.GetActiveApi() == GraphicsApi::Vulkan);
+    CHECK(g_vulkanAttempts.load() == 0);                  // Initialize() must not install hooks itself
+
+    // Hook install is retried until it succeeds, then never repeated
+    g_vulkanFailuresRemaining = 3;
+    CHECK(!e.TryInstallHooks());
+    CHECK(!e.TryInstallHooks());
+    CHECK(!e.TryInstallHooks());
+    CHECK(e.TryInstallHooks());
+    CHECK(g_vulkanAttempts.load() == 4);
+    CHECK(e.TryInstallHooks());
+    CHECK(g_vulkanAttempts.load() == 4);                  // already hooked: no further attempts
+    CHECK(g_dx12Attempts.load() == 0);
+
+    // Reconstruction + history swap happen at most once per frame
+    CHECK(e.GetCurrentFrameIndex() == 0);
+    CHECK(rt.GetCurrentHistoryIndex() == 0);
+    e.OnScenePassEnd(nullptr);
+    CHECK(rt.GetCurrentHistoryIndex() == 1);
+    // One duplicate call: an unguarded engine would swap twice and land back on index 0. (An odd
+    // number of duplicates would pass by parity luck, so keep the total number of calls even.)
+    e.OnScenePassEnd(nullptr);                            // second matching pass in the same frame
+    CHECK(rt.GetCurrentHistoryIndex() == 1);
+
+    // Parity only advances for the main present target
+    e.OnPostPresent(&g_a);                                // first present defines the main target
+    CHECK(e.GetCurrentFrameIndex() == 1);
+    e.OnPostPresent(&g_b);                                // overlay / secondary swapchain
+    CHECK(e.GetCurrentFrameIndex() == 1);
+    e.OnPostPresent(&g_a);
+    CHECK(e.GetCurrentFrameIndex() == 2);
+
+    // New frame -> one more swap allowed
+    e.OnScenePassEnd(nullptr);
+    CHECK(rt.GetCurrentHistoryIndex() == 0);
+    e.OnScenePassEnd(nullptr);
+    CHECK(rt.GetCurrentHistoryIndex() == 0);
+
+    // Disabled engine does nothing
+    e.SetEnabled(false);
+    e.OnPostPresent(&g_a);                                // frame advances, but...
+    e.OnScenePassEnd(nullptr);
+    CHECK(rt.GetCurrentHistoryIndex() == 0);              // ...no swap while disabled
+    e.SetEnabled(true);
+
+    // Swapchain recreation resets parity, history and the once-per-frame guard
+    e.OnSwapchainRecreated();
+    CHECK(e.GetCurrentFrameIndex() == 0);
+    CHECK(rt.GetCurrentHistoryIndex() == 0);
+    e.OnScenePassEnd(nullptr);
+    CHECK(rt.GetCurrentHistoryIndex() == 1);              // frame 0 is dispatchable again
+    e.OnPostPresent(&g_b);                                // a different target may become the main one
+    CHECK(e.GetCurrentFrameIndex() == 1);
+    e.OnPostPresent(&g_a);
+    CHECK(e.GetCurrentFrameIndex() == 1);
+}
+
+static void RunAutoTests() {
+    auto& e = CBREngine::Get();
+    CHECK(e.Initialize());
+    // No graphics runtime is loaded on the host: Auto must stay pending and attempt NO installs
+    CHECK(!e.TryInstallHooks());
+    CHECK(!e.TryInstallHooks());
+    CHECK(g_vulkanAttempts.load() == 0);
+    CHECK(g_dx12Attempts.load() == 0);
+}
+
+int main(int argc, char** argv) {
+    const bool autoMode = (argc > 1 && std::strcmp(argv[1], "auto") == 0);
+
+    const fs::path dir = fs::temp_directory_path() / (autoMode ? "cbr_engine_tests_auto" : "cbr_engine_tests");
+    fs::create_directories(dir);
+    {
+        std::ofstream f(dir / "cbr.ini");
+        f << "[General]\nEnabled = true\nTargetWidth = 3840\nTargetHeight = 2160\n"
+          << "PreferredApi = " << (autoMode ? "Auto" : "Vulkan") << "\n[Debug]\nLogToFile = false\n";
+    }
+    CBREngine::Get().SetModuleDirectory(dir);
+
+    if (autoMode) RunAutoTests(); else RunVulkanTests();
+
+    fs::remove_all(dir);
+    if (g_failures == 0) {
+        std::cout << (autoMode ? "Engine (auto) tests passed.\n" : "Engine tests passed.\n");
+        return 0;
+    }
+    std::cerr << g_failures << " check(s) failed.\n";
+    return 1;
+}
+```
+
+<a id="githubworkflowsbuildyml"></a>
+### `.github/workflows/build.yml`
+```yaml
+# NOTE: written but not executed by the author's tooling; verify on first push.
+name: build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  tests-and-shaders:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y cmake g++ glslang-tools
+      - name: Unit tests
+        run: |
+          cmake -S . -B build-tests -DCBR_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-tests --target cbr_tests cbr_engine_tests
+          ctest --test-dir build-tests --output-on-failure
+      - name: Validate shaders
+        run: |
+          glslangValidator -V shaders/cbr_reconstruct.comp -o /tmp/r.spv
+          glslangValidator -V shaders/cbr_resolve_simple.comp -o /tmp/s.spv
+          glslangValidator -D -e CSMain -S comp -V shaders/cbr_reconstruct.hlsl -o /tmp/h.spv
+
+  windows-release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -A x64
+      - name: Build (Release, MSVC hardening flags)
+        run: cmake --build build --config Release
+      - name: SHA-256 of release artifacts
+        shell: pwsh
+        run: |
+          Get-FileHash build/bin/Release/rdr2-cbr.asi -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash)  rdr2-cbr.asi" } | Tee-Object build/bin/Release/SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rdr2-cbr-release
+          path: |
+            build/bin/Release/rdr2-cbr.asi
+            build/bin/Release/cbr.ini
+            build/bin/Release/SHA256SUMS.txt
 ```

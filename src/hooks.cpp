@@ -1,11 +1,29 @@
 #include "cbr/hooks.h"
 #include "cbr/logger.h"
 
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 namespace cbr {
 
 HookManager& HookManager::Get() {
     static HookManager instance;
     return instance;
+}
+
+GraphicsApi HookManager::DetectLoadedApi() const {
+#if defined(_WIN32)
+    if (GetModuleHandleA("vulkan-1.dll")) return GraphicsApi::Vulkan;
+    if (GetModuleHandleA("d3d12.dll"))    return GraphicsApi::D3D12;
+#endif
+    return GraphicsApi::Auto; // neither runtime is loaded (yet)
 }
 
 bool HookManager::Initialize() {

@@ -14,7 +14,7 @@ void RenderTargetManager::Initialize(uint32_t width, uint32_t height) {
     m_dims.quarterWidth = width / 2;
     m_dims.quarterHeight = height / 2;
     m_dims.msaaSamples = 2;
-    m_historyPingPong = 0;
+    m_historyPingPong.store(0);
 
     // Calculate VRAM footprint:
     // 1. Quarter-Res 2x MSAA Color (RGBA16F = 8 bytes/sample * 2 samples):
@@ -50,6 +50,11 @@ bool RenderTargetManager::IsTargetInterceptCandidate(uint32_t width, uint32_t he
     bool matchesHeight = (height == m_dims.fullHeight);
 
     return matchesWidth && matchesHeight;
+}
+
+bool RenderTargetManager::IsQuarterPassCandidate(uint32_t width, uint32_t height) const {
+    if (!m_initialized) return false;
+    return (width == m_dims.quarterWidth && height == m_dims.quarterHeight);
 }
 
 } // namespace cbr

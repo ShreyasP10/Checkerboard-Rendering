@@ -27,6 +27,11 @@ public:
     void ApplyJitterToProjection(float* projMatrix4x4, bool isVulkan) const;
     void RemoveJitterFromProjection(float* projMatrix4x4, bool isVulkan) const;
 
+    // Idempotent: sets jitter on outMatrix4x4 relative to inUnjitteredMatrix4x4 without accumulating.
+    // IMPORTANT: inUnjitteredMatrix4x4 must really be the unjittered source. Passing the same pointer
+    // for both and calling twice re-applies the offset (use a separate output buffer).
+    void SetProjectionJitter(float* outMatrix4x4, const float* inUnjitteredMatrix4x4, bool isVulkan) const;
+
 private:
     JitterManager() = default;
     ~JitterManager() = default;

@@ -24,7 +24,7 @@ Thank you for your interest in contributing to the **RDR2 Checkerboard Rendering
 ## 📋 Code Guidelines & Style
 
 - **Language Standard:** C++20.
-- **Shaders:** GLSL 4.60 (Vulkan SPIR-V) and HLSL (Shader Model 6.0).
+- **Shaders:** GLSL 4.50 / `#version 450` (Vulkan SPIR-V) and HLSL (Shader Model 6.0).
 - **Naming Conventions:**
   - Classes and Structs: `PascalCase` (e.g., `RenderTargetManager`)
   - Functions and Methods: `PascalCase` or `camelCase` (consistent within modules)
