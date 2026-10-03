@@ -9,7 +9,7 @@
 A community-driven graphics modification implementing **Checkerboard Rendering (CBR)** in *Red Dead Redemption 2* (PC), bringing the PlayStation 4 Pro's hardware-assisted temporal reconstruction technique to modern PC GPUs—specifically targeting the **NVIDIA GeForce GTX 1070 Ti** and Pascal-architecture hardware.
 
 > **⚠️ Project Status: Prototyping & Pipeline Architecture Phase**  
-> We have reverse-engineered the rendering pipeline concepts, completed the engineering specifications, authored the reconstruction compute shaders, and established the Vulkan/DX12 hook layer. Public release builds will be packaged following game integration validation.
+> The engineering specifications, reconstruction compute shaders, configuration system, logging and unit tests are written. **The graphics hooks are not implemented yet, so the mod currently has no effect in-game** (it loads, reads `cbr.ini`, writes `cbr.log` and then waits for hooks that do not exist). The install and in-game-settings steps below describe the intended setup once game integration lands. Public release builds will follow game integration validation.
 
 ---
 
@@ -23,7 +23,7 @@ A community-driven graphics modification implementing **Checkerboard Rendering (
 - [Reconstruction Shader Math](#reconstruction-shader-math)
 - [Hardware & Development Requirements](#hardware--development-requirements)
 - [How to Build, Install & Run](#-how-to-build-install--run)
-- [Configuration](#configuration)
+- [Configuration](#configuration-cbrini)
 - [Testing](#testing)
 - [Contributing](#contributing)
 - [Collaborators & Maintainers](#collaborators--maintainers)
@@ -76,6 +76,7 @@ Output:      Full 3840×2160 4K Image
 - [x] Depth delta disocclusion detection with spatial cross-bilateral filter fallback.
 - [x] 3×3 neighborhood color bounding box clamping (YCoCg or RGB, selectable via `ColorSpace`) to suppress ghosting.
 - [x] Reconstruction pass writes a full-resolution history-depth target for the next frame's disocclusion test.
+- [x] Closest-depth motion-vector dilation, variance clipping and jitter-compensated history reprojection in the shaders (validated by compilation and unit-tested plumbing only; the jitter sign convention is configurable via `JitterCompensation` and must be confirmed in-game).
 - [x] Host-side unit tests (config, logger, jitter, VRAM accounting) and a CI workflow; shaders are validated with glslang.
 - [x] Pascal-oriented design (16×16 thread groups, guarded neighborhood fetches to cut bandwidth).
 - [ ] Shared-memory tiling (not implemented; neighborhood data is fetched directly from the MSAA targets).
@@ -226,7 +227,7 @@ Find the folder containing `RDR2.exe`:
 
 #### 3.2 Install the ASI Loader
 An ASI loader is required to load custom `.asi` game modifications:
-1. Download `dinput8.dll` from the official [Script Hook RDR2](http://www.dev-c.com/rdr2/scripthookrdr2/) release by Alexander Blade or an authenticated open-source ASI loader.
+1. Download `dinput8.dll` from the official [Script Hook RDR2](https://www.dev-c.com/rdr2/scripthookrdr2/) release by Alexander Blade (confirm the page loads over a valid HTTPS connection), or from an ASI loader project's official release page. Verify any published checksum before use.
 2. Place `dinput8.dll` directly into the RDR2 root folder (where `RDR2.exe` is located).
 
 #### 3.3 Deploy CBR Plugin & Configuration
@@ -256,7 +257,7 @@ Enabled = true
 TargetWidth = 3840           ; Set to your display resolution width (e.g. 3840 for 4K, 2560 for 1440p)
 TargetHeight = 2160          ; Set to your display resolution height (e.g. 2160 for 4K, 1440 for 1440p)
 PreferredApi = Vulkan        ; "Vulkan" (strongly recommended for Pascal/GTX 1070 Ti), "D3D12", or "Auto"
-MipLodBias = -0.5            ; -0.5 preserves full 4K texture sharpness on 1080p geometry
+MipLodBias = -0.5            ; Reserved: not applied yet (will bias scene texture sampling once the geometry pass is hooked)
 
 [Reconstruction]
 DepthTolerance = 0.010       ; Relative depth disocclusion sensitivity threshold
@@ -264,10 +265,12 @@ EnableColorClamping = true   ; Enables variance clipping to eliminate temporal g
 ColorSpace = YCoCg           ; YCoCg provides artifact-free color bounding box calculation
 HistoryWeight = 0.90         ; 0.90 retains 90% temporal history on static pixels
 EnableSpatialFallback = true ; Uses cross-bilateral filter when history is disoccluded
+EnableMotionDilation = true  ; 3x3 closest-depth motion dilation (cleaner silhouettes; costs 9 extra depth fetches per pixel)
 
 [Jitter]
 JitterPattern = Checkerboard ; 2-phase subpixel complementary grid jitter
 JitterScale = 1.0            ; 1.0 = exact 0.5-pixel subpixel perturbation
+JitterCompensation = 1.0     ; History reprojection jitter sign: 1 = subtract delta, -1 = opposite, 0 = off (confirm with a static camera)
 
 [Debug]
 ShowOverlay = false          ; Toggle in-game overlay
@@ -280,6 +283,8 @@ LogLevel = Info              ; Debug, Info, Warning, Error
 
 ### Step 5: Recommended In-Game Graphics Settings (Complete Walkthrough)
 
+> **Note:** these are the *intended* settings for when integration lands. They have not been verified in-game, and claims about engine behavior (velocity vectors, MSAA, VRAM headroom) are working assumptions from the design, to be confirmed by reverse engineering.
+
 Launch *Red Dead Redemption 2*, open **Settings > Graphics**, and configure the options as detailed below:
 
 #### 1. Display & Window Settings
@@ -291,18 +296,18 @@ Launch *Red Dead Redemption 2*, open **Settings > Graphics**, and configure the 
 
 #### 2. Advanced Graphics API Setting (Critical!)
 * **Unlock Advanced Settings:** Set to **Unlocked**.
-* **Graphics API:** Set to **Vulkan** (*Crucial:* Vulkan offers direct subpixel sample control and lower CPU overhead on Pascal GP104 hardware. If switching from DirectX 12 to Vulkan, restart the game).
-* **Async Compute:** **On** (enables concurrent execution of compute reconstruction alongside rasterization passes).
+* **Graphics API:** Set to **Vulkan** (the planned primary target for Pascal GP104 hardware; the expected benefit is finer control over sample positions, to be confirmed. If switching from DirectX 12 to Vulkan, restart the game).
+* **Async Compute:** **On** (untested with this mod).
 
 #### 3. Anti-Aliasing & Resolution Scaling (Critical!)
 * **Resolution Scale:** Set to **Off / 1.0×** (*CRITICAL:* Never set this to 0.75×, 0.85×, etc. In-game resolution scaling breaks 1:1 subpixel checkerboard parity mapping).
-* **TAA (Temporal Anti-Aliasing):** Set to **Medium** or **High** (*CRITICAL:* RDR2's internal motion/velocity vectors `u_Velocity` are only generated by the RAGE engine when TAA is enabled. CBR requires these vectors for temporal history reprojection).
+* **TAA (Temporal Anti-Aliasing):** Set to **Medium** or **High** (*Assumption to verify:* the engine's velocity vectors (`u_Velocity`) are expected to be produced only while TAA is enabled, and CBR needs them for temporal history reprojection).
 * **TAA Sharpening:** Adjust according to personal preference (typically 30%–50%).
 * **FXAA:** **Off** (redundant post-processing blur).
-* **MSAA:** **Off** (*CRITICAL:* Leave in-game MSAA disabled. CBR allocates its own dedicated 2× MSAA intermediate buffer).
+* **MSAA:** **Off** (leave in-game MSAA disabled; the planned design has CBR allocate its own dedicated 2× MSAA intermediate buffer, which is not implemented yet).
 
 #### 4. Geometry & Texture Settings (Optimized for GTX 1070 Ti / Pascal 8 GB)
-* **Texture Quality:** **Ultra** (Textures sample at full 4K Nyquist resolution due to CBR's `-0.5` `MipLodBias`; fits comfortably in 8 GB VRAM with ~269 MB CBR overhead).
+* **Texture Quality:** **Ultra** (the CBR buffers themselves need ~269 MB; whether Ultra textures plus those fit in 8 GB at 4K is unverified, so lower this first if you run out of VRAM).
 * **Anisotropic Filtering:** **16×** (negligible performance cost on Pascal GPUs; keeps road and terrain textures sharp at oblique viewing angles).
 * **Lighting Quality:** **Medium** or **High**.
 * **Global Illumination Quality:** **High**.
@@ -351,7 +356,7 @@ You can toggle diagnostic visualization modes in `cbr.ini` by modifying `DebugVi
 ### Step 7: Troubleshooting & FAQ
 
 * **Q: The game crashes immediately on startup.**
-  * *A:* Verify you installed a clean, compatible `dinput8.dll` ASI loader. Ensure Microsoft Visual C++ 2015–2022 Redistributable (x64) is installed. Check `cbr.log` for any error messages.
+  * *A:* Verify you installed a clean, compatible `dinput8.dll` ASI loader. The plugin is built with a static CRT, so no Visual C++ redistributable is required for it. Check `cbr.log` for any error messages.
 * **Q: `cbr.log` is not created at all.**
   * *A:* This means `dinput8.dll` is either missing, blocked by Windows SmartScreen/Antivirus, or located in the wrong directory. Ensure `dinput8.dll`, `rdr2-cbr.asi`, and `cbr.ini` are in the **same folder** as `RDR2.exe`.
 * **Q: The game looks blurry or pixelated.**
@@ -379,6 +384,11 @@ EnableColorClamping = true
 ColorSpace = YCoCg
 HistoryWeight = 0.90
 EnableSpatialFallback = true
+EnableMotionDilation = true
+
+[Jitter]
+JitterScale = 1.0
+JitterCompensation = 1.0
 ```
 
 ---
@@ -387,11 +397,11 @@ EnableSpatialFallback = true
 
 ```bash
 cmake -S . -B build-tests -DCBR_BUILD_TESTS=ON
-cmake --build build-tests --target cbr_tests
+cmake --build build-tests --target cbr_tests cbr_engine_tests
 ctest --test-dir build-tests --output-on-failure
 ```
 
-The tests cover the portable code only (no Windows APIs or GPU). Validate shaders with:
+The tests cover the portable code only (no Windows APIs or GPU): config, logger, jitter, push-constant layout, and the engine's hook-retry, once-per-frame dispatch and frame-parity logic (using fake hook installers). Validate shaders with:
 
 ```bash
 glslangValidator -V shaders/cbr_reconstruct.comp -o /tmp/r.spv

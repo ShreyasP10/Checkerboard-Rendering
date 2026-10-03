@@ -16,20 +16,26 @@
 namespace {
 
 DWORD WINAPI CBRInitThread(LPVOID /*lpParam*/) {
-    // Bounded retry loop: poll every 250 ms for up to 60 s for graphics runtimes to settle
+    // Config, logging and buffers do not depend on the graphics runtime, so set up immediately.
+    auto& engine = cbr::CBREngine::Get();
+    if (!engine.Initialize()) {
+        return 0;
+    }
+
+    // Retry the hook installation itself (not just the trigger): the runtime for the configured
+    // API may load well after this plugin. Poll every 250 ms for up to 60 s, then give up quietly.
     constexpr DWORD kIntervalMs = 250;
     constexpr DWORD kMaxAttempts = 240; // 240 * 250 ms = 60 seconds
 
     for (DWORD attempt = 0; attempt < kMaxAttempts; ++attempt) {
-        Sleep(kIntervalMs);
-        if (GetModuleHandleA("vulkan-1.dll") || GetModuleHandleA("d3d12.dll")) {
-            cbr::CBREngine::Get().Initialize();
+        if (engine.TryInstallHooks()) {
+            CBR_LOG_INFO("Graphics hooks installed after %lu attempt(s).", static_cast<unsigned long>(attempt + 1));
             return 0;
         }
+        Sleep(kIntervalMs);
     }
 
-    // Fallback initialize if neither runtime appeared before the timeout
-    cbr::CBREngine::Get().Initialize();
+    CBR_LOG_WARN("Graphics hooks could not be installed within 60 s; CBR stays inactive.");
     return 0;
 }
 
@@ -58,6 +64,7 @@ std::filesystem::path GetModuleDirectoryPath(HMODULE hModule) {
 // Exported symbol ensuring the ASI plugin has an export table entry in PE header
 extern "C" __declspec(dllexport) void CBR_PluginInit() {
     cbr::CBREngine::Get().Initialize();
+    cbr::CBREngine::Get().TryInstallHooks();
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID /*lpReserved*/) {

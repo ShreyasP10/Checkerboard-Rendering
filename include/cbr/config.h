@@ -36,10 +36,17 @@ struct CBRConfig {
     ColorSpace  colorSpace{ ColorSpace::YCoCg };
     float       historyWeight{ 0.90f };
     bool        enableSpatialFallback{ true };
+    // 3x3 closest-depth motion-vector dilation. Costs 9 extra MSAA depth fetches per output pixel;
+    // disable on bandwidth-limited GPUs if silhouette smearing is acceptable.
+    bool        enableMotionDilation{ true };
 
     // Jitter
     JitterPattern jitterPattern{ JitterPattern::Checkerboard };
     float         jitterScale{ 1.0f };
+    // Multiplier applied to the jitter delta when reprojecting history. 1 = subtract (jc - jp),
+    // -1 = opposite sign convention, 0 = off. The correct sign depends on the engine's projection
+    // convention and must be confirmed with DebugView on a static camera.
+    float         jitterCompensation{ 1.0f };
 
     // Debug
     bool        showOverlay{ false };

@@ -1,4 +1,5 @@
 #include "cbr/hooks.h"
+#include <atomic>
 #include "cbr/cbr_engine.h"
 #include "cbr/logger.h"
 
@@ -78,7 +79,11 @@ bool HookManager::InstallVulkanHooks() {
 
     // TODO: install real detours (e.g. MinHook) on vkQueuePresentKHR / vkCreateSwapchainKHR and store
     // the trampolines in g_Original_*. Until then NO hook is active, so do not claim success.
-    CBR_LOG_WARN("Vulkan hook installation is not implemented yet; no hooks are active.");
+    // Logged once only: this function is retried from a polling loop.
+    static std::atomic<bool> s_warned{ false };
+    if (!s_warned.exchange(true)) {
+        CBR_LOG_WARN("Vulkan hook installation is not implemented yet; no hooks are active.");
+    }
     return false;
 }
 

@@ -14,6 +14,7 @@ public:
     void Shutdown();
 
     // Picks the graphics API whose runtime is already loaded in the host process (Vulkan preferred).
+    // Returns GraphicsApi::Auto when neither runtime is loaded yet.
     GraphicsApi DetectLoadedApi() const;
 
     bool InstallVulkanHooks();

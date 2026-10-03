@@ -31,37 +31,44 @@ void ReconstructionPass::Shutdown() {
     CBR_LOG_INFO("ReconstructionPass shut down.");
 }
 
-void ReconstructionPass::DispatchVulkan(void* /*vkCommandBuffer*/, uint32_t frameIndex) {
-    if (!m_initialized) return;
-
+ReconstructionPushConstants BuildReconstructionPushConstants(uint32_t frameIndex) {
     const auto& config = ConfigManager::Get().GetConfig();
     const auto& dims = RenderTargetManager::Get().GetDimensions();
     const auto jitterDelta = JitterManager::Get().GetJitterDelta();
 
-    ReconstructionPushConstants pushConstants{};
-    pushConstants.targetResolution[0] = static_cast<float>(dims.fullWidth);
-    pushConstants.targetResolution[1] = static_cast<float>(dims.fullHeight);
-    pushConstants.invTargetResolution[0] = 1.0f / pushConstants.targetResolution[0];
-    pushConstants.invTargetResolution[1] = 1.0f / pushConstants.targetResolution[1];
-    pushConstants.frameIndex = frameIndex;
-    pushConstants.depthTolerance = config.depthTolerance;
-    pushConstants.historyWeight = config.historyWeight;
-    pushConstants.debugView = config.debugView;
-    pushConstants.enableColorClamping = config.enableColorClamping ? 1u : 0u;
-    pushConstants.mipLodBias = config.mipLodBias;
-    pushConstants.colorSpace = (config.colorSpace == ColorSpace::RGB) ? 1u : 0u;
-    pushConstants.enableSpatialFallback = config.enableSpatialFallback ? 1u : 0u;
-    pushConstants.jitterDelta[0] = jitterDelta.x;
-    pushConstants.jitterDelta[1] = jitterDelta.y;
-    pushConstants.padding[0] = 0.0f;
-    pushConstants.padding[1] = 0.0f;
+    ReconstructionPushConstants pc{};
+    pc.targetResolution[0] = static_cast<float>(dims.fullWidth);
+    pc.targetResolution[1] = static_cast<float>(dims.fullHeight);
+    pc.invTargetResolution[0] = 1.0f / pc.targetResolution[0];
+    pc.invTargetResolution[1] = 1.0f / pc.targetResolution[1];
+    pc.frameIndex = frameIndex;
+    pc.depthTolerance = config.depthTolerance;
+    pc.historyWeight = config.historyWeight;
+    pc.debugView = config.debugView;
+    pc.enableColorClamping = config.enableColorClamping ? 1u : 0u;
+    pc.mipLodBias = config.mipLodBias;
+    pc.colorSpace = (config.colorSpace == ColorSpace::RGB) ? 1u : 0u;
+    pc.enableSpatialFallback = config.enableSpatialFallback ? 1u : 0u;
+    pc.jitterDelta[0] = jitterDelta.x;
+    pc.jitterDelta[1] = jitterDelta.y;
+    pc.enableMotionDilation = config.enableMotionDilation ? 1u : 0u;
+    pc.jitterCompensation = config.jitterCompensation;
+    return pc;
+}
 
-    uint32_t groupCountX = (dims.fullWidth + 15u) / 16u;
-    uint32_t groupCountY = (dims.fullHeight + 15u) / 16u;
+void ReconstructionPass::DispatchVulkan(void* /*vkCommandBuffer*/, uint32_t frameIndex) {
+    if (!m_initialized) return;
 
-    // In a live Vulkan context, this binds the compute pipeline, pushes constants,
+    const ReconstructionPushConstants pushConstants = BuildReconstructionPushConstants(frameIndex);
+    const auto& dims = RenderTargetManager::Get().GetDimensions();
+
+    const uint32_t groupCountX = (dims.fullWidth + 15u) / 16u;
+    const uint32_t groupCountY = (dims.fullHeight + 15u) / 16u;
+
+    // In a live Vulkan context, this binds the compute pipeline, pushes `pushConstants`,
     // and calls vkCmdDispatch(cmdBuffer, groupCountX, groupCountY, 1);
     // Followed by a memory barrier transitioning the reconstructed image for sampling.
+    (void)pushConstants;
     (void)groupCountX;
     (void)groupCountY;
 }
@@ -69,34 +76,17 @@ void ReconstructionPass::DispatchVulkan(void* /*vkCommandBuffer*/, uint32_t fram
 void ReconstructionPass::DispatchDX12(void* /*d3d12GraphicsCommandList*/, uint32_t frameIndex) {
     if (!m_initialized) return;
 
-    const auto& config = ConfigManager::Get().GetConfig();
+    const ReconstructionPushConstants pushConstants = BuildReconstructionPushConstants(frameIndex);
     const auto& dims = RenderTargetManager::Get().GetDimensions();
-    const auto jitterDelta = JitterManager::Get().GetJitterDelta();
 
-    ReconstructionPushConstants pushConstants{};
-    pushConstants.targetResolution[0] = static_cast<float>(dims.fullWidth);
-    pushConstants.targetResolution[1] = static_cast<float>(dims.fullHeight);
-    pushConstants.invTargetResolution[0] = 1.0f / pushConstants.targetResolution[0];
-    pushConstants.invTargetResolution[1] = 1.0f / pushConstants.targetResolution[1];
-    pushConstants.frameIndex = frameIndex;
-    pushConstants.depthTolerance = config.depthTolerance;
-    pushConstants.historyWeight = config.historyWeight;
-    pushConstants.debugView = config.debugView;
-    pushConstants.enableColorClamping = config.enableColorClamping ? 1u : 0u;
-    pushConstants.mipLodBias = config.mipLodBias;
-    pushConstants.colorSpace = (config.colorSpace == ColorSpace::RGB) ? 1u : 0u;
-    pushConstants.enableSpatialFallback = config.enableSpatialFallback ? 1u : 0u;
-    pushConstants.jitterDelta[0] = jitterDelta.x;
-    pushConstants.jitterDelta[1] = jitterDelta.y;
-    pushConstants.padding[0] = 0.0f;
-    pushConstants.padding[1] = 0.0f;
+    const uint32_t groupCountX = (dims.fullWidth + 15u) / 16u;
+    const uint32_t groupCountY = (dims.fullHeight + 15u) / 16u;
 
-    uint32_t groupCountX = (dims.fullWidth + 15u) / 16u;
-    uint32_t groupCountY = (dims.fullHeight + 15u) / 16u;
-
+    // In DX12, sets root signature, pipeline state, descriptor tables, uploads `pushConstants`
+    // as root constants, and calls Dispatch(groupCountX, groupCountY, 1)
+    (void)pushConstants;
     (void)groupCountX;
     (void)groupCountY;
-    // In DX12, sets root signature, pipeline state, descriptor tables, and calls Dispatch(groupCountX, groupCountY, 1)
 }
 
 } // namespace cbr

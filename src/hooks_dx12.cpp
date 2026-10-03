@@ -1,4 +1,5 @@
 #include "cbr/hooks.h"
+#include <atomic>
 #include "cbr/cbr_engine.h"
 #include "cbr/logger.h"
 
@@ -49,7 +50,11 @@ bool HookManager::InstallDX12Hooks() {
 
     // TODO: locate IDXGISwapChain::Present via a dummy swapchain, detour it, and store the
     // trampoline in g_Original_D3D12Present. Until then NO hook is active.
-    CBR_LOG_WARN("DX12 hook installation is not implemented yet; no hooks are active.");
+    // Logged once only: this function is retried from a polling loop.
+    static std::atomic<bool> s_warned{ false };
+    if (!s_warned.exchange(true)) {
+        CBR_LOG_WARN("DX12 hook installation is not implemented yet; no hooks are active.");
+    }
     return false;
 }
 

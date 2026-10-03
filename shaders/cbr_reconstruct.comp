@@ -45,7 +45,8 @@ layout(push_constant) uniform CBRConstants {
     uint  u_ColorSpace;             // 0 = YCoCg clamp, 1 = RGB clamp
     uint  u_EnableSpatialFallback;  // 1 = cross-bilateral fallback, 0 = use raw current sample
     vec2  u_JitterDelta;            // Subpixel projection jitter delta (jc - jp)
-    vec2  u_Padding;                // 16-byte alignment padding
+    uint  u_EnableMotionDilation;   // 1 = 3x3 closest-depth motion dilation
+    float u_JitterCompensation;     // Multiplier on u_JitterDelta (1, -1 or 0)
 } pc;
 
 // =============================================================================
@@ -106,9 +107,11 @@ void main() {
     // 2. Fetch Motion Vectors & Calculate Previous UV Coordinates
     // -------------------------------------------------------------------------
     // 3x3 closest depth search for dilated motion vector (eliminates edge silhouette smearing)
+    // NOTE: assumes conventional depth (smaller = nearer); invert the comparison for reversed-Z.
+    // Skipped entirely when disabled (saves 9 MSAA depth fetches per pixel).
     float closestDepth = currentDepth;
     ivec2 closestCoord = pixelCoord;
-    for (int dy = -1; dy <= 1; ++dy) {
+    for (int dy = -1; dy <= 1 && pc.u_EnableMotionDilation != 0u; ++dy) {
         for (int dx = -1; dx <= 1; ++dx) {
             ivec2 nCoord = clamp(pixelCoord + ivec2(dx, dy), ivec2(0), targetSize - ivec2(1));
             float d = texelFetch(u_QuarterDepthMSAA, nCoord / 2, int(uint(nCoord.x) & 1u)).r;
@@ -120,7 +123,7 @@ void main() {
     }
     vec2 dilatedUV = (vec2(closestCoord) + 0.5) * pc.u_InvTargetResolution;
     vec2 velocity = textureLod(u_Velocity, dilatedUV, 0.0).xy;
-    vec2 historyUV = uv - velocity - pc.u_JitterDelta;
+    vec2 historyUV = uv - velocity - pc.u_JitterDelta * pc.u_JitterCompensation;
 
     // -------------------------------------------------------------------------
     // 3. Disocclusion & Depth Delta Testing

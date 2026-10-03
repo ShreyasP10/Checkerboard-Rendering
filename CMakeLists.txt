@@ -165,15 +165,28 @@ endif()
 option(CBR_BUILD_TESTS "Build host-side unit tests" OFF)
 if(CBR_BUILD_TESTS)
     enable_testing()
-    add_executable(cbr_tests
-        tests/test_core.cpp
+    set(CBR_TEST_CORE_SOURCES
         ${CBR_SOURCE_DIR}/config.cpp
         ${CBR_SOURCE_DIR}/logger.cpp
         ${CBR_SOURCE_DIR}/jitter_manager.cpp
         ${CBR_SOURCE_DIR}/render_target_manager.cpp
+        ${CBR_SOURCE_DIR}/reconstruction_pass.cpp
     )
+    add_executable(cbr_tests tests/test_core.cpp ${CBR_TEST_CORE_SOURCES})
     target_include_directories(cbr_tests PRIVATE ${CBR_INCLUDE_DIR})
     add_test(NAME cbr_core COMMAND cbr_tests)
+
+    # Engine tests use fake hook installers (the real ones are Windows-only), one mode per process
+    add_executable(cbr_engine_tests
+        tests/test_engine.cpp
+        ${CBR_TEST_CORE_SOURCES}
+        ${CBR_SOURCE_DIR}/cbr_engine.cpp
+        ${CBR_SOURCE_DIR}/hooks.cpp
+        ${CBR_SOURCE_DIR}/ui_overlay.cpp
+    )
+    target_include_directories(cbr_engine_tests PRIVATE ${CBR_INCLUDE_DIR})
+    add_test(NAME cbr_engine      COMMAND cbr_engine_tests)
+    add_test(NAME cbr_engine_auto COMMAND cbr_engine_tests auto)
 endif()
 
 # Copy sample configuration to output directory post-build

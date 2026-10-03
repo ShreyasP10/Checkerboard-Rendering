@@ -45,11 +45,13 @@ static void TestConfigHardening(const fs::path& dir) {
         "Enabled = true ; comment\n"  // inline comment
         "PreferredApi = Auto\n"
         "[Reconstruction]\n"
+        "EnableMotionDilation = false\n"
         "HistoryWeight = nan\n"       // NaN               -> default
         "DepthTolerance = 99999\n"    // out of range      -> clamped
         "MipLodBias = abc\n"          // garbage           -> default
         "[Jitter]\n"
         "JitterPattern = Halton\n"    // unimplemented     -> Checkerboard
+        "JitterCompensation = -5\n"   // out of range      -> clamped to -1
         "[Debug]\n"
         "DebugView = 77\n");          // out of range      -> clamped
 
@@ -64,6 +66,8 @@ static void TestConfigHardening(const fs::path& dir) {
     CHECK(c.mipLodBias == -0.5f);
     CHECK(c.jitterPattern == JitterPattern::Checkerboard);
     CHECK(c.debugView == 4);
+    CHECK(!c.enableMotionDilation);
+    CHECK(c.jitterCompensation == -1.0f);
 }
 
 static void TestConfigMissingFileAndRoundTrip(const fs::path& dir) {
@@ -77,6 +81,8 @@ static void TestConfigMissingFileAndRoundTrip(const fs::path& dir) {
     CHECK(after.targetWidth == before.targetWidth);
     CHECK(after.preferredApi == before.preferredApi);
     CHECK(after.historyWeight == before.historyWeight);
+    CHECK(after.enableMotionDilation == before.enableMotionDilation);
+    CHECK(after.jitterCompensation == before.jitterCompensation);
 }
 
 static void TestLoggerBufferingAndLevel(const fs::path& dir) {
@@ -129,9 +135,54 @@ static void TestJitter() {
     // SetProjectionJitter must be idempotent without compounding offsets
     float out1[16];
     float out2[16];
+    float snapshot[16];
+    std::copy(orig, orig + 16, snapshot);
     j.SetProjectionJitter(out1, orig, true);
     j.SetProjectionJitter(out2, orig, true);
     for (int i = 0; i < 16; ++i) CHECK(std::fabs(out1[i] - out2[i]) < 1e-7f);
+
+    // ...and must produce exactly what Apply produces from the same unjittered matrix
+    float viaApply[16];
+    std::copy(orig, orig + 16, viaApply);
+    j.ApplyJitterToProjection(viaApply, true);
+    for (int i = 0; i < 16; ++i) CHECK(std::fabs(out1[i] - viaApply[i]) < 1e-7f);
+
+    // Non-aliased output leaves the unjittered source untouched
+    for (int i = 0; i < 16; ++i) CHECK(orig[i] == snapshot[i]);
+}
+
+static void TestPushConstantBuilder() {
+    auto& cfg = ConfigManager::Get().GetMutableConfig();
+    cfg.depthTolerance = 0.02f;
+    cfg.historyWeight = 0.8f;
+    cfg.colorSpace = ColorSpace::RGB;
+    cfg.enableSpatialFallback = false;
+    cfg.enableMotionDilation = false;
+    cfg.jitterCompensation = -1.0f;
+    cfg.jitterScale = 1.0f;
+
+    RenderTargetManager::Get().Initialize(3840, 2160);
+    JitterManager::Get().Initialize(3840, 2160);
+    JitterManager::Get().Update(0);
+    JitterManager::Get().Update(1);
+
+    const ReconstructionPushConstants pc = BuildReconstructionPushConstants(7);
+    CHECK(pc.targetResolution[0] == 3840.0f && pc.targetResolution[1] == 2160.0f);
+    CHECK(std::fabs(pc.invTargetResolution[0] - 1.0f / 3840.0f) < 1e-12f);
+    CHECK(pc.frameIndex == 7);
+    CHECK(pc.depthTolerance == 0.02f && pc.historyWeight == 0.8f);
+    CHECK(pc.colorSpace == 1u);
+    CHECK(pc.enableSpatialFallback == 0u);
+    CHECK(pc.enableMotionDilation == 0u);
+    CHECK(pc.jitterCompensation == -1.0f);
+    CHECK(std::fabs(pc.jitterDelta[0] - JitterManager::Get().GetJitterDelta().x) < 1e-12f);
+
+    cfg.enableSpatialFallback = true;
+    cfg.enableMotionDilation = true;
+    cfg.colorSpace = ColorSpace::YCoCg;
+    cfg.jitterCompensation = 1.0f;
+    const ReconstructionPushConstants pc2 = BuildReconstructionPushConstants(0);
+    CHECK(pc2.enableSpatialFallback == 1u && pc2.enableMotionDilation == 1u && pc2.colorSpace == 0u);
 }
 
 static void TestRenderTargets() {
@@ -162,6 +213,7 @@ int main() {
     TestConfigMissingFileAndRoundTrip(dir);
     TestLoggerBufferingAndLevel(dir);
     TestJitter();
+    TestPushConstantBuilder();
     TestRenderTargets();
     TestPushConstantLayout();
 

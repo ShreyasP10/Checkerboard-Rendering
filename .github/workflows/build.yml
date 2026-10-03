@@ -15,7 +15,7 @@ jobs:
       - name: Unit tests
         run: |
           cmake -S . -B build-tests -DCBR_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release
-          cmake --build build-tests --target cbr_tests
+          cmake --build build-tests --target cbr_tests cbr_engine_tests
           ctest --test-dir build-tests --output-on-failure
       - name: Validate shaders
         run: |

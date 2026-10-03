@@ -23,7 +23,7 @@ GraphicsApi HookManager::DetectLoadedApi() const {
     if (GetModuleHandleA("vulkan-1.dll")) return GraphicsApi::Vulkan;
     if (GetModuleHandleA("d3d12.dll"))    return GraphicsApi::D3D12;
 #endif
-    return GraphicsApi::Vulkan; // neither runtime is loaded yet: fall back to the documented default
+    return GraphicsApi::Auto; // neither runtime is loaded (yet)
 }
 
 bool HookManager::Initialize() {

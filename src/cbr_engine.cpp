@@ -50,8 +50,16 @@ bool CBREngine::Initialize() {
         m_enabled.store(config.enabled);
         GraphicsApi api = config.preferredApi;
         if (api == GraphicsApi::Auto) {
-            api = HookManager::Get().DetectLoadedApi();
-            CBR_LOG_INFO("PreferredApi=Auto resolved to %s.", api == GraphicsApi::Vulkan ? "Vulkan" : "D3D12");
+            const GraphicsApi detected = HookManager::Get().DetectLoadedApi();
+            if (detected == GraphicsApi::Auto) {
+                // No runtime loaded yet: default to Vulkan for now and re-detect on every hook attempt
+                api = GraphicsApi::Vulkan;
+                m_apiPending.store(true);
+                CBR_LOG_INFO("PreferredApi=Auto: no graphics runtime loaded yet; will re-detect.");
+            } else {
+                api = detected;
+                CBR_LOG_INFO("PreferredApi=Auto resolved to %s.", api == GraphicsApi::Vulkan ? "Vulkan" : "D3D12");
+            }
         }
         m_activeApi.store(api);
 
@@ -62,21 +70,43 @@ bool CBREngine::Initialize() {
         // 4. Initialize Overlay
         UIOverlay::Get().Initialize();
 
-        // 5. Install API Hooks
+        // 5. Prepare the reconstruction pass for the active API
         HookManager::Get().Initialize();
         if (api == GraphicsApi::Vulkan) {
-            HookManager::Get().InstallVulkanHooks();
             ReconstructionPass::Get().InitializeVulkan(nullptr, nullptr);
         } else {
-            HookManager::Get().InstallDX12Hooks();
             ReconstructionPass::Get().InitializeDX12(nullptr);
         }
 
         m_initialized.store(true);
-        CBR_LOG_INFO("CBREngine initialized successfully. Ready for frame interception.");
+        CBR_LOG_INFO("CBREngine initialized successfully. Waiting for graphics hooks.");
     });
 
     return m_initialized.load();
+}
+
+bool CBREngine::TryInstallHooks() {
+    if (!m_initialized.load()) return false;
+
+    std::lock_guard<std::mutex> lock(m_hookMutex);
+
+    // Auto mode with no runtime at init time: pick whichever runtime has appeared since
+    if (m_apiPending.load()) {
+        const GraphicsApi detected = HookManager::Get().DetectLoadedApi();
+        if (detected == GraphicsApi::Auto) return false; // still nothing to hook
+        if (detected != m_activeApi.load()) {
+            m_activeApi.store(detected);
+            if (detected == GraphicsApi::Vulkan) ReconstructionPass::Get().InitializeVulkan(nullptr, nullptr);
+            else                                 ReconstructionPass::Get().InitializeDX12(nullptr);
+        }
+        m_apiPending.store(false);
+        CBR_LOG_INFO("PreferredApi=Auto resolved to %s.", detected == GraphicsApi::Vulkan ? "Vulkan" : "D3D12");
+    }
+
+    if (m_activeApi.load() == GraphicsApi::Vulkan) {
+        return HookManager::Get().IsVulkanHooked() || HookManager::Get().InstallVulkanHooks();
+    }
+    return HookManager::Get().IsDX12Hooked() || HookManager::Get().InstallDX12Hooks();
 }
 
 void CBREngine::Shutdown(bool isProcessExit) {
@@ -114,7 +144,11 @@ void CBREngine::OnPostRender() {
 void CBREngine::OnScenePassEnd(void* cmdBufferOrContext) {
     if (!m_enabled.load()) return;
 
-    uint32_t currentFrame = m_frameIndex.load();
+    const uint32_t currentFrame = m_frameIndex.load();
+
+    // At most one reconstruction (and one history swap) per frame. exchange() makes this race-free
+    // if the hook ever fires from more than one thread.
+    if (m_lastDispatchedFrame.exchange(currentFrame) == currentFrame) return;
 
     // Mid-frame dispatch: reconstruct immediately when the quarter-resolution 2x MSAA
     // geometry pass finishes, before post-processing and UI are composited.
@@ -152,6 +186,7 @@ void CBREngine::OnPostPresent(void* presentTarget) {
 void CBREngine::OnSwapchainRecreated() {
     m_mainPresentTarget.store(nullptr);
     m_frameIndex.store(0);
+    m_lastDispatchedFrame.store(kNoFrame);
     RenderTargetManager::Get().ResetHistory();
     CBR_LOG_INFO("Swapchain recreated: frame parity and history reset.");
 }

@@ -41,7 +41,8 @@ cbuffer CBRConstants : register(b0)
     uint   g_ColorSpace;             // 0 = YCoCg clamp, 1 = RGB clamp
     uint   g_EnableSpatialFallback;  // 1 = cross-bilateral fallback, 0 = raw current sample
     float2 g_JitterDelta;            // subpixel projection jitter delta (jc - jp)
-    float2 g_Padding;                // 16-byte alignment padding
+    uint   g_EnableMotionDilation;   // 1 = 3x3 closest-depth motion dilation
+    float  g_JitterCompensation;     // multiplier on g_JitterDelta (1, -1 or 0)
 };
 
 // =============================================================================
@@ -107,9 +108,11 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     // 2. Motion Vector Fetch & History Coordinate Calculation
     // -------------------------------------------------------------------------
     // 3x3 closest depth search for dilated motion vector (eliminates edge silhouette smearing)
+    // NOTE: assumes conventional depth (smaller = nearer); invert the comparison for reversed-Z.
+    // Skipped entirely when disabled (saves 9 MSAA depth fetches per pixel).
     float closestDepth = currentDepth;
     int2 closestCoord = pixelCoord;
-    for (int dy = -1; dy <= 1; ++dy)
+    for (int dy = -1; dy <= 1 && g_EnableMotionDilation != 0u; ++dy)
     {
         for (int dx = -1; dx <= 1; ++dx)
         {
@@ -124,7 +127,7 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     }
     float2 dilatedUV = (float2(closestCoord) + 0.5f) * g_InvTargetResolution;
     float2 velocity = g_Velocity.SampleLevel(g_LinearClampSampler, dilatedUV, 0.0f).xy;
-    float2 historyUV = uv - velocity - g_JitterDelta;
+    float2 historyUV = uv - velocity - g_JitterDelta * g_JitterCompensation;
 
     // -------------------------------------------------------------------------
     // 3. Disocclusion & Depth Delta Test
