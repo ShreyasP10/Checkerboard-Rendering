@@ -29,16 +29,16 @@ void main() {
     uint pixelParity = (uint(pixelCoord.x) + uint(pixelCoord.y)) & 1u;
     uint frameParity = pc.u_FrameIndex & 1u;
 
-    int sampleIndex = int(uint(pixelCoord.x) & 1u);
-    vec4 sample0 = texelFetch(u_QuarterColorMSAA, quarterCoord, 0);
-    vec4 sample1 = texelFetch(u_QuarterColorMSAA, quarterCoord, 1);
+    int sampleIndex = int(uint(pixelCoord.y) & 1u);
+    vec4 activeSample = texelFetch(u_QuarterColorMSAA, quarterCoord, sampleIndex);
 
     vec3 finalColor;
     if (pixelParity == frameParity) {
-        finalColor = (sampleIndex == 0) ? sample0.rgb : sample1.rgb;
+        finalColor = activeSample.rgb;
     } else {
         // Average the 2 subpixel samples for missing positions
-        finalColor = 0.5 * (sample0.rgb + sample1.rgb);
+        vec4 otherSample = texelFetch(u_QuarterColorMSAA, quarterCoord, 1 - sampleIndex);
+        finalColor = 0.5 * (activeSample.rgb + otherSample.rgb);
     }
 
     imageStore(u_OutputImage, pixelCoord, vec4(finalColor, 1.0));

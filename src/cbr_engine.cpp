@@ -183,12 +183,18 @@ void CBREngine::OnPostPresent(void* presentTarget) {
     }
 }
 
-void CBREngine::OnSwapchainRecreated() {
+void CBREngine::OnSwapchainRecreated(uint32_t width, uint32_t height) {
     m_mainPresentTarget.store(nullptr);
     m_frameIndex.store(0);
     m_lastDispatchedFrame.store(kNoFrame);
-    RenderTargetManager::Get().ResetHistory();
-    CBR_LOG_INFO("Swapchain recreated: frame parity and history reset.");
+    if (width > 0 && height > 0) {
+        RenderTargetManager::Get().Initialize(width, height);
+        JitterManager::Get().Initialize(width, height);
+        CBR_LOG_INFO("Swapchain recreated with new resolution %ux%u: frame parity and history reset.", width, height);
+    } else {
+        RenderTargetManager::Get().ResetHistory();
+        CBR_LOG_INFO("Swapchain recreated: frame parity and history reset.");
+    }
 }
 
 } // namespace cbr

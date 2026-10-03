@@ -23,23 +23,57 @@ PFN_vkCreateSwapchainKHR g_Original_vkCreateSwapchainKHR = nullptr;
 
 // VK_ERROR_INITIALIZATION_FAILED: returned if a hook is ever invoked without a valid trampoline,
 // so the failure is visible to the caller instead of silently dropping frames / swapchains.
-constexpr int kVkErrorInitializationFailed = -3;
+// Minimal Vulkan struct layouts for headerless extraction of swapchain and extent
+struct MinimalVkExtent2D {
+    uint32_t width;
+    uint32_t height;
+};
+
+struct MinimalVkSwapchainCreateInfoKHR {
+    uint32_t          sType;
+    const void*       pNext;
+    uint32_t          flags;
+    uint64_t          surface;
+    uint32_t          minImageCount;
+    int32_t           imageFormat;
+    int32_t           imageColorSpace;
+    MinimalVkExtent2D imageExtent;
+};
+
+struct MinimalVkPresentInfoKHR {
+    uint32_t     sType;
+    const void*  pNext;
+    uint32_t     waitSemaphoreCount;
+    const void*  pWaitSemaphores;
+    uint32_t     swapchainCount;
+    const void** pSwapchains;
+    const uint32_t* pImageIndices;
+    int*         pResults;
+};
 
 int Hooked_vkQueuePresentKHR(void* queue, const void* pPresentInfo) {
     if (!g_Original_vkQueuePresentKHR) {
         return kVkErrorInitializationFailed;
     }
 
+    void* presentTarget = queue;
+    if (pPresentInfo) {
+        const auto* info = reinterpret_cast<const MinimalVkPresentInfoKHR*>(pPresentInfo);
+        if (info->swapchainCount > 0 && info->pSwapchains) {
+            presentTarget = const_cast<void*>(info->pSwapchains[0]);
+        }
+    }
+
     // Exceptions must never propagate into the game's render thread.
     try {
-        CBREngine::Get().OnPrePresent(queue, pPresentInfo);
+        CBREngine::Get().OnPrePresent(presentTarget, pPresentInfo);
     } catch (...) {
     }
 
     int result = g_Original_vkQueuePresentKHR(queue, pPresentInfo);
 
     try {
-        CBREngine::Get().OnPostPresent(queue);
+        CBREngine::Get().OnPostPresent(presentTarget);
     } catch (...) {
     }
     return result;
@@ -52,7 +86,13 @@ int Hooked_vkCreateSwapchainKHR(void* device, const void* pCreateInfo, const voi
     CBR_LOG_INFO("Vulkan Swapchain creation intercepted.");
     const int result = g_Original_vkCreateSwapchainKHR(device, pCreateInfo, pAllocator, pSwapchain);
     if (result == 0) { // VK_SUCCESS
-        try { CBREngine::Get().OnSwapchainRecreated(); } catch (...) {}
+        uint32_t w = 0, h = 0;
+        if (pCreateInfo) {
+            const auto* info = reinterpret_cast<const MinimalVkSwapchainCreateInfoKHR*>(pCreateInfo);
+            w = info->imageExtent.width;
+            h = info->imageExtent.height;
+        }
+        try { CBREngine::Get().OnSwapchainRecreated(w, h); } catch (...) {}
     }
     return result;
 }

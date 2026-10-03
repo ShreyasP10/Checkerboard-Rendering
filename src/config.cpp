@@ -65,6 +65,11 @@ float ParseFloat(const std::string& val, float defaultVal, float minVal, float m
     }
 }
 
+std::string ToUpper(std::string s) {
+    for (char& c : s) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    return s;
+}
+
 } // namespace
 
 ConfigManager& ConfigManager::Get() {
@@ -73,6 +78,7 @@ ConfigManager& ConfigManager::Get() {
 }
 
 bool ConfigManager::Load(const std::filesystem::path& configPath) {
+    std::lock_guard<std::mutex> lock(m_mutex);
     std::ifstream file(configPath);
     if (!file.is_open()) {
         CBR_LOG_WARN("Configuration file not found at %s. Using default settings.", configPath.string().c_str());
@@ -105,9 +111,10 @@ bool ConfigManager::Load(const std::filesystem::path& configPath) {
             } else if (key == "TargetHeight") {
                 m_config.targetHeight = ParseUInt(val, m_config.targetHeight, 480, 4320) & ~1u; // Ensure even height
             } else if (key == "PreferredApi") {
-                if (val == "Vulkan") m_config.preferredApi = GraphicsApi::Vulkan;
-                else if (val == "D3D12") m_config.preferredApi = GraphicsApi::D3D12;
-                else if (val == "Auto")  m_config.preferredApi = GraphicsApi::Auto;
+                std::string apiUpper = ToUpper(val);
+                if (apiUpper == "VULKAN") m_config.preferredApi = GraphicsApi::Vulkan;
+                else if (apiUpper == "D3D12") m_config.preferredApi = GraphicsApi::D3D12;
+                else if (apiUpper == "AUTO")  m_config.preferredApi = GraphicsApi::Auto;
                 else CBR_LOG_WARN("Unknown PreferredApi '%s' (expected Vulkan, D3D12 or Auto); keeping default.", val.c_str());
             } else if (key == "MipLodBias") {
                 m_config.mipLodBias = ParseFloat(val, m_config.mipLodBias, -4.0f, 4.0f);
@@ -116,7 +123,7 @@ bool ConfigManager::Load(const std::filesystem::path& configPath) {
             } else if (key == "EnableColorClamping") {
                 m_config.enableColorClamping = ParseBool(val, m_config.enableColorClamping);
             } else if (key == "ColorSpace") {
-                m_config.colorSpace = (val == "RGB") ? ColorSpace::RGB : ColorSpace::YCoCg;
+                m_config.colorSpace = (ToUpper(val) == "RGB") ? ColorSpace::RGB : ColorSpace::YCoCg;
             } else if (key == "HistoryWeight") {
                 m_config.historyWeight = ParseFloat(val, m_config.historyWeight, 0.0f, 1.0f);
             } else if (key == "EnableSpatialFallback") {
@@ -124,7 +131,7 @@ bool ConfigManager::Load(const std::filesystem::path& configPath) {
             } else if (key == "EnableMotionDilation") {
                 m_config.enableMotionDilation = ParseBool(val, m_config.enableMotionDilation);
             } else if (key == "JitterPattern") {
-                if (val == "Halton") {
+                if (ToUpper(val) == "HALTON") {
                     CBR_LOG_WARN("JitterPattern=Halton is not implemented yet; using Checkerboard.");
                 }
                 m_config.jitterPattern = JitterPattern::Checkerboard;
@@ -156,6 +163,7 @@ bool ConfigManager::Load(const std::filesystem::path& configPath) {
 }
 
 bool ConfigManager::Save(const std::filesystem::path& configPath) {
+    std::lock_guard<std::mutex> lock(m_mutex);
     std::ofstream file(configPath);
     if (!file.is_open()) {
         CBR_LOG_ERROR("Failed to open %s for saving configuration.", configPath.string().c_str());

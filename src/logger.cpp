@@ -49,6 +49,8 @@ void Logger::Shutdown() {
         m_logFile.close();
     }
     m_initialized = false;
+    m_disabled = true;
+    m_pending.clear();
 }
 
 void Logger::SetMinLevel(LogLevel level) {

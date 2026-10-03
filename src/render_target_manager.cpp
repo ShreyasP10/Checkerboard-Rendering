@@ -52,4 +52,9 @@ bool RenderTargetManager::IsTargetInterceptCandidate(uint32_t width, uint32_t he
     return matchesWidth && matchesHeight;
 }
 
+bool RenderTargetManager::IsQuarterPassCandidate(uint32_t width, uint32_t height) const {
+    if (!m_initialized) return false;
+    return (width == m_dims.quarterWidth && height == m_dims.quarterHeight);
+}
+
 } // namespace cbr

@@ -196,3 +196,12 @@ add_custom_command(TARGET rdr2-cbr POST_BUILD
     "$<TARGET_FILE_DIR:rdr2-cbr>/cbr.ini"
     COMMENT "Copying cbr.ini to target build directory"
 )
+
+if(CBR_COMPILED_SHADERS)
+    add_custom_command(TARGET rdr2-cbr POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${CMAKE_BINARY_DIR}/shaders"
+        "$<TARGET_FILE_DIR:rdr2-cbr>/shaders"
+        COMMENT "Copying compiled shaders to target build directory"
+    )
+endif()

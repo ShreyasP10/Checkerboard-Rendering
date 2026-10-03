@@ -116,7 +116,8 @@ static void TestJitter() {
 
     CHECK(std::fabs(even.x + odd.x) < 1e-9f);                // alternating +/- phases
     CHECK(std::fabs(odd.x - 0.5f / 3840.0f) < 1e-9f);
-    CHECK(std::fabs(odd.y - 0.5f / 2160.0f) < 1e-9f);
+    CHECK(std::fabs(odd.y) < 1e-9f);                         // 1D horizontal jitter (delta y = 0) per Intel CBR spec
+    CHECK(std::fabs(even.y) < 1e-9f);
     CHECK(std::fabs(j.GetJitterDelta().x - (odd.x - even.x)) < 1e-9f);
 
     cfg.jitterScale = 2.0f;                                   // JitterScale must take effect

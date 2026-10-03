@@ -32,8 +32,8 @@ public:
     void OnScenePassEnd(void* cmdBufferOrContext);
     void OnPrePresent(void* queueOrContext, const void* presentInfo);
     void OnPostPresent(void* presentTarget);
-    // Call when the game (re)creates its swapchain: resets frame parity and history
-    void OnSwapchainRecreated();
+    // Call when the game (re)creates its swapchain: resets frame parity, history, and updates dimensions if provided
+    void OnSwapchainRecreated(uint32_t width = 0, uint32_t height = 0);
 
     uint32_t    GetCurrentFrameIndex() const { return m_frameIndex.load(); }
     bool        IsEnabled() const { return m_enabled.load(); }

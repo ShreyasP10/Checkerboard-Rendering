@@ -252,6 +252,15 @@ add_custom_command(TARGET rdr2-cbr POST_BUILD
     "$<TARGET_FILE_DIR:rdr2-cbr>/cbr.ini"
     COMMENT "Copying cbr.ini to target build directory"
 )
+
+if(CBR_COMPILED_SHADERS)
+    add_custom_command(TARGET rdr2-cbr POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${CMAKE_BINARY_DIR}/shaders"
+        "$<TARGET_FILE_DIR:rdr2-cbr>/shaders"
+        COMMENT "Copying compiled shaders to target build directory"
+    )
+endif()
 ```
 
 <a id="cbrini"></a>
@@ -499,8 +508,8 @@ public:
     void OnScenePassEnd(void* cmdBufferOrContext);
     void OnPrePresent(void* queueOrContext, const void* presentInfo);
     void OnPostPresent(void* presentTarget);
-    // Call when the game (re)creates its swapchain: resets frame parity and history
-    void OnSwapchainRecreated();
+    // Call when the game (re)creates its swapchain: resets frame parity, history, and updates dimensions if provided
+    void OnSwapchainRecreated(uint32_t width = 0, uint32_t height = 0);
 
     uint32_t    GetCurrentFrameIndex() const { return m_frameIndex.load(); }
     bool        IsEnabled() const { return m_enabled.load(); }
@@ -544,6 +553,8 @@ private:
 #include <cstdint>
 #include <filesystem>
 #include <string>
+
+#include <mutex>
 
 namespace cbr {
 
@@ -603,13 +614,24 @@ public:
     bool Load(const std::filesystem::path& configPath);
     bool Save(const std::filesystem::path& configPath);
 
-    const CBRConfig& GetConfig() const { return m_config; }
-    CBRConfig& GetMutableConfig() { return m_config; }
+    CBRConfig GetConfig() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_config;
+    }
+    CBRConfig& GetMutableConfig() {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_config;
+    }
+    void UpdateConfig(const CBRConfig& config) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_config = config;
+    }
 
 private:
     ConfigManager() = default;
     ~ConfigManager() = default;
 
+    mutable std::mutex m_mutex;
     CBRConfig m_config;
 };
 
@@ -875,6 +897,7 @@ public:
     const TargetDimensions& GetDimensions() const { return m_dims; }
 
     bool IsTargetInterceptCandidate(uint32_t width, uint32_t height, uint32_t format) const;
+    bool IsQuarterPassCandidate(uint32_t width, uint32_t height) const;
 
     // Ping-pong history buffer index management
     uint32_t GetCurrentHistoryIndex() const { return m_historyPingPong.load(); }
@@ -1232,12 +1255,18 @@ void CBREngine::OnPostPresent(void* presentTarget) {
     }
 }
 
-void CBREngine::OnSwapchainRecreated() {
+void CBREngine::OnSwapchainRecreated(uint32_t width, uint32_t height) {
     m_mainPresentTarget.store(nullptr);
     m_frameIndex.store(0);
     m_lastDispatchedFrame.store(kNoFrame);
-    RenderTargetManager::Get().ResetHistory();
-    CBR_LOG_INFO("Swapchain recreated: frame parity and history reset.");
+    if (width > 0 && height > 0) {
+        RenderTargetManager::Get().Initialize(width, height);
+        JitterManager::Get().Initialize(width, height);
+        CBR_LOG_INFO("Swapchain recreated with new resolution %ux%u: frame parity and history reset.", width, height);
+    } else {
+        RenderTargetManager::Get().ResetHistory();
+        CBR_LOG_INFO("Swapchain recreated: frame parity and history reset.");
+    }
 }
 
 } // namespace cbr
@@ -1313,6 +1342,11 @@ float ParseFloat(const std::string& val, float defaultVal, float minVal, float m
     }
 }
 
+std::string ToUpper(std::string s) {
+    for (char& c : s) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    return s;
+}
+
 } // namespace
 
 ConfigManager& ConfigManager::Get() {
@@ -1321,6 +1355,7 @@ ConfigManager& ConfigManager::Get() {
 }
 
 bool ConfigManager::Load(const std::filesystem::path& configPath) {
+    std::lock_guard<std::mutex> lock(m_mutex);
     std::ifstream file(configPath);
     if (!file.is_open()) {
         CBR_LOG_WARN("Configuration file not found at %s. Using default settings.", configPath.string().c_str());
@@ -1353,9 +1388,10 @@ bool ConfigManager::Load(const std::filesystem::path& configPath) {
             } else if (key == "TargetHeight") {
                 m_config.targetHeight = ParseUInt(val, m_config.targetHeight, 480, 4320) & ~1u; // Ensure even height
             } else if (key == "PreferredApi") {
-                if (val == "Vulkan") m_config.preferredApi = GraphicsApi::Vulkan;
-                else if (val == "D3D12") m_config.preferredApi = GraphicsApi::D3D12;
-                else if (val == "Auto")  m_config.preferredApi = GraphicsApi::Auto;
+                std::string apiUpper = ToUpper(val);
+                if (apiUpper == "VULKAN") m_config.preferredApi = GraphicsApi::Vulkan;
+                else if (apiUpper == "D3D12") m_config.preferredApi = GraphicsApi::D3D12;
+                else if (apiUpper == "AUTO")  m_config.preferredApi = GraphicsApi::Auto;
                 else CBR_LOG_WARN("Unknown PreferredApi '%s' (expected Vulkan, D3D12 or Auto); keeping default.", val.c_str());
             } else if (key == "MipLodBias") {
                 m_config.mipLodBias = ParseFloat(val, m_config.mipLodBias, -4.0f, 4.0f);
@@ -1364,7 +1400,7 @@ bool ConfigManager::Load(const std::filesystem::path& configPath) {
             } else if (key == "EnableColorClamping") {
                 m_config.enableColorClamping = ParseBool(val, m_config.enableColorClamping);
             } else if (key == "ColorSpace") {
-                m_config.colorSpace = (val == "RGB") ? ColorSpace::RGB : ColorSpace::YCoCg;
+                m_config.colorSpace = (ToUpper(val) == "RGB") ? ColorSpace::RGB : ColorSpace::YCoCg;
             } else if (key == "HistoryWeight") {
                 m_config.historyWeight = ParseFloat(val, m_config.historyWeight, 0.0f, 1.0f);
             } else if (key == "EnableSpatialFallback") {
@@ -1372,7 +1408,7 @@ bool ConfigManager::Load(const std::filesystem::path& configPath) {
             } else if (key == "EnableMotionDilation") {
                 m_config.enableMotionDilation = ParseBool(val, m_config.enableMotionDilation);
             } else if (key == "JitterPattern") {
-                if (val == "Halton") {
+                if (ToUpper(val) == "HALTON") {
                     CBR_LOG_WARN("JitterPattern=Halton is not implemented yet; using Checkerboard.");
                 }
                 m_config.jitterPattern = JitterPattern::Checkerboard;
@@ -1404,6 +1440,7 @@ bool ConfigManager::Load(const std::filesystem::path& configPath) {
 }
 
 bool ConfigManager::Save(const std::filesystem::path& configPath) {
+    std::lock_guard<std::mutex> lock(m_mutex);
     std::ofstream file(configPath);
     if (!file.is_open()) {
         CBR_LOG_ERROR("Failed to open %s for saving configuration.", configPath.string().c_str());
@@ -1518,23 +1555,57 @@ PFN_vkCreateSwapchainKHR g_Original_vkCreateSwapchainKHR = nullptr;
 
 // VK_ERROR_INITIALIZATION_FAILED: returned if a hook is ever invoked without a valid trampoline,
 // so the failure is visible to the caller instead of silently dropping frames / swapchains.
-constexpr int kVkErrorInitializationFailed = -3;
+// Minimal Vulkan struct layouts for headerless extraction of swapchain and extent
+struct MinimalVkExtent2D {
+    uint32_t width;
+    uint32_t height;
+};
+
+struct MinimalVkSwapchainCreateInfoKHR {
+    uint32_t          sType;
+    const void*       pNext;
+    uint32_t          flags;
+    uint64_t          surface;
+    uint32_t          minImageCount;
+    int32_t           imageFormat;
+    int32_t           imageColorSpace;
+    MinimalVkExtent2D imageExtent;
+};
+
+struct MinimalVkPresentInfoKHR {
+    uint32_t     sType;
+    const void*  pNext;
+    uint32_t     waitSemaphoreCount;
+    const void*  pWaitSemaphores;
+    uint32_t     swapchainCount;
+    const void** pSwapchains;
+    const uint32_t* pImageIndices;
+    int*         pResults;
+};
 
 int Hooked_vkQueuePresentKHR(void* queue, const void* pPresentInfo) {
     if (!g_Original_vkQueuePresentKHR) {
         return kVkErrorInitializationFailed;
     }
 
+    void* presentTarget = queue;
+    if (pPresentInfo) {
+        const auto* info = reinterpret_cast<const MinimalVkPresentInfoKHR*>(pPresentInfo);
+        if (info->swapchainCount > 0 && info->pSwapchains) {
+            presentTarget = const_cast<void*>(info->pSwapchains[0]);
+        }
+    }
+
     // Exceptions must never propagate into the game's render thread.
     try {
-        CBREngine::Get().OnPrePresent(queue, pPresentInfo);
+        CBREngine::Get().OnPrePresent(presentTarget, pPresentInfo);
     } catch (...) {
     }
 
     int result = g_Original_vkQueuePresentKHR(queue, pPresentInfo);
 
     try {
-        CBREngine::Get().OnPostPresent(queue);
+        CBREngine::Get().OnPostPresent(presentTarget);
     } catch (...) {
     }
     return result;
@@ -1547,7 +1618,13 @@ int Hooked_vkCreateSwapchainKHR(void* device, const void* pCreateInfo, const voi
     CBR_LOG_INFO("Vulkan Swapchain creation intercepted.");
     const int result = g_Original_vkCreateSwapchainKHR(device, pCreateInfo, pAllocator, pSwapchain);
     if (result == 0) { // VK_SUCCESS
-        try { CBREngine::Get().OnSwapchainRecreated(); } catch (...) {}
+        uint32_t w = 0, h = 0;
+        if (pCreateInfo) {
+            const auto* info = reinterpret_cast<const MinimalVkSwapchainCreateInfoKHR*>(pCreateInfo);
+            w = info->imageExtent.width;
+            h = info->imageExtent.height;
+        }
+        try { CBREngine::Get().OnSwapchainRecreated(w, h); } catch (...) {}
     }
     return result;
 }
@@ -1691,18 +1768,19 @@ void JitterManager::Initialize(uint32_t targetWidth, uint32_t targetHeight) {
 void JitterManager::Update(uint32_t frameIndex) {
     m_previousJitter = m_currentJitter;
 
-    // 2-phase subpixel checkerboard jitter sequence
-    // Shifts alternating frames by (+0.5px, +0.5px) and (-0.5px, -0.5px)
+    // 2-phase subpixel checkerboard jitter sequence:
+    // Shifts alternating frames horizontally by +0.5px and -0.5px (presentation pixels).
+    // Standard 2x MSAA diagonal sample geometry requires 1D horizontal shift only (delta Y = 0)
+    // to achieve 100% 4-quadrant geometric coverage across 2 frames (Intel 2018 White Paper).
     float pixelWidth = 1.0f / static_cast<float>(m_targetWidth);
-    float pixelHeight = 1.0f / static_cast<float>(m_targetHeight);
     const float amplitude = 0.5f * ConfigManager::Get().GetConfig().jitterScale;
 
     if (frameIndex & 1u) {
         m_currentJitter.x = amplitude * pixelWidth;
-        m_currentJitter.y = amplitude * pixelHeight;
+        m_currentJitter.y = 0.0f;
     } else {
         m_currentJitter.x = -amplitude * pixelWidth;
-        m_currentJitter.y = -amplitude * pixelHeight;
+        m_currentJitter.y = 0.0f;
     }
 }
 
@@ -1812,6 +1890,8 @@ void Logger::Shutdown() {
         m_logFile.close();
     }
     m_initialized = false;
+    m_disabled = true;
+    m_pending.clear();
 }
 
 void Logger::SetMinLevel(LogLevel level) {
@@ -2021,6 +2101,11 @@ bool RenderTargetManager::IsTargetInterceptCandidate(uint32_t width, uint32_t he
     return matchesWidth && matchesHeight;
 }
 
+bool RenderTargetManager::IsQuarterPassCandidate(uint32_t width, uint32_t height) const {
+    if (!m_initialized) return false;
+    return (width == m_dims.quarterWidth && height == m_dims.quarterHeight);
+}
+
 } // namespace cbr
 ```
 
@@ -2172,8 +2257,8 @@ void main() {
     uint frameParity = pc.u_FrameIndex & 1u;
     bool isCurrentSampleActive = (pixelParity == frameParity);
 
-    // In a 2x2 quarter cell, the two active samples correspond to pixelCoord.x parity
-    int msaaSampleIndex = int(uint(pixelCoord.x) & 1u);
+    // In a 2x2 quarter cell, Sample 0 is top row (y even) and Sample 1 is bottom row (y odd)
+    int msaaSampleIndex = int(uint(pixelCoord.y) & 1u);
 
     // Fetch current frame sample
     vec4 currentSample = texelFetch(u_QuarterColorMSAA, quarterCoord, msaaSampleIndex);
@@ -2183,17 +2268,19 @@ void main() {
     // 2. Fetch Motion Vectors & Calculate Previous UV Coordinates
     // -------------------------------------------------------------------------
     // 3x3 closest depth search for dilated motion vector (eliminates edge silhouette smearing)
-    // NOTE: assumes conventional depth (smaller = nearer); invert the comparison for reversed-Z.
+    // RDR2 uses reversed-Z depth (near=1.0, far=0.0): greater depth value means closer to camera.
     // Skipped entirely when disabled (saves 9 MSAA depth fetches per pixel).
     float closestDepth = currentDepth;
     ivec2 closestCoord = pixelCoord;
-    for (int dy = -1; dy <= 1 && pc.u_EnableMotionDilation != 0u; ++dy) {
-        for (int dx = -1; dx <= 1; ++dx) {
-            ivec2 nCoord = clamp(pixelCoord + ivec2(dx, dy), ivec2(0), targetSize - ivec2(1));
-            float d = texelFetch(u_QuarterDepthMSAA, nCoord / 2, int(uint(nCoord.x) & 1u)).r;
-            if (d < closestDepth) {
-                closestDepth = d;
-                closestCoord = nCoord;
+    if (pc.u_EnableMotionDilation != 0u) {
+        for (int dy = -1; dy <= 1; ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                ivec2 nCoord = clamp(pixelCoord + ivec2(dx, dy), ivec2(0), targetSize - ivec2(1));
+                float d = texelFetch(u_QuarterDepthMSAA, nCoord / 2, int(uint(nCoord.y) & 1u)).r;
+                if (d > closestDepth) { // Reversed-Z: greater = nearer to camera
+                    closestDepth = d;
+                    closestCoord = nCoord;
+                }
             }
         }
     }
@@ -2215,7 +2302,7 @@ void main() {
         // Exact texel fetch: independent of the bound sampler, so depth is never blended across edges
         ivec2 historyCoord = clamp(ivec2(historyUV * pc.u_TargetResolution), ivec2(0), targetSize - ivec2(1));
         previousDepth = texelFetch(u_HistoryDepth, historyCoord, 0).r;
-        float depthDelta = abs(currentDepth - previousDepth) / max(currentDepth, 1e-5);
+        float depthDelta = abs(currentDepth - previousDepth);
 
         if (depthDelta > pc.u_DepthTolerance) {
             isDisoccluded = true;
@@ -2243,7 +2330,7 @@ void main() {
             for (int dx = -1; dx <= 1; ++dx) {
                 ivec2 neighborCoord = clamp(pixelCoord + ivec2(dx, dy), ivec2(0), targetSize - ivec2(1));
                 ivec2 neighborQuarter = neighborCoord / 2;
-                int neighborSample = int(uint(neighborCoord.x) & 1u);
+                int neighborSample = int(uint(neighborCoord.y) & 1u);
                 vec3 neighborColor = texelFetch(u_QuarterColorMSAA, neighborQuarter, neighborSample).rgb;
 
                 vec3 neighborClampSpace = ToClampSpace(neighborColor);
@@ -2295,13 +2382,13 @@ void main() {
             for (int i = 0; i < 4 && pc.u_EnableSpatialFallback != 0u; ++i) {
                 ivec2 sampleCoord = clamp(pixelCoord + offsets[i], ivec2(0), targetSize - ivec2(1));
                 ivec2 sQuarter = sampleCoord / 2;
-                int sIndex = int(uint(sampleCoord.x) & 1u);
+                int sIndex = int(uint(sampleCoord.y) & 1u);
 
                 vec3 sCol = texelFetch(u_QuarterColorMSAA, sQuarter, sIndex).rgb;
                 float sDep = texelFetch(u_QuarterDepthMSAA, sQuarter, sIndex).r;
 
                 // Relative depth weighting: robust across depth ranges and reversed-Z
-                float depthWeight = exp(-abs(currentDepth - sDep) / (max(currentDepth, 1e-5) * pc.u_DepthTolerance));
+                float depthWeight = exp(-abs(currentDepth - sDep) / max(pc.u_DepthTolerance, 1e-4));
                 accumColor += sCol * depthWeight;
                 accumDepth += sDep * depthWeight;
                 accumWeight += depthWeight;
@@ -2456,8 +2543,8 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     uint frameParity = g_FrameIndex & 1u;
     bool isCurrentSampleActive = (pixelParity == frameParity);
 
-    // In a 2x2 quarter cell, the two active samples correspond to pixelCoord.x parity
-    int msaaSampleIndex = int(uint(pixelCoord.x) & 1u);
+    // In a 2x2 quarter cell, Sample 0 is top row (y even) and Sample 1 is bottom row (y odd)
+    int msaaSampleIndex = int(uint(pixelCoord.y) & 1u);
 
     // In HLSL, Texture2DMS.Load takes (int2 Location, int SampleIndex)
     float4 currentSample = g_QuarterColorMSAA.Load(quarterCoord, msaaSampleIndex);
@@ -2467,20 +2554,23 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     // 2. Motion Vector Fetch & History Coordinate Calculation
     // -------------------------------------------------------------------------
     // 3x3 closest depth search for dilated motion vector (eliminates edge silhouette smearing)
-    // NOTE: assumes conventional depth (smaller = nearer); invert the comparison for reversed-Z.
+    // RDR2 uses reversed-Z depth (near=1.0, far=0.0): greater depth value means closer to camera.
     // Skipped entirely when disabled (saves 9 MSAA depth fetches per pixel).
     float closestDepth = currentDepth;
     int2 closestCoord = pixelCoord;
-    for (int dy = -1; dy <= 1 && g_EnableMotionDilation != 0u; ++dy)
+    if (g_EnableMotionDilation != 0u)
     {
-        for (int dx = -1; dx <= 1; ++dx)
+        for (int dy = -1; dy <= 1; ++dy)
         {
-            int2 nCoord = clamp(pixelCoord + int2(dx, dy), int2(0, 0), targetSize - int2(1, 1));
-            float d = g_QuarterDepthMSAA.Load(nCoord / 2, int(uint(nCoord.x) & 1u)).r;
-            if (d < closestDepth)
+            for (int dx = -1; dx <= 1; ++dx)
             {
-                closestDepth = d;
-                closestCoord = nCoord;
+                int2 nCoord = clamp(pixelCoord + int2(dx, dy), int2(0, 0), targetSize - int2(1, 1));
+                float d = g_QuarterDepthMSAA.Load(nCoord / 2, int(uint(nCoord.y) & 1u)).r;
+                if (d > closestDepth) // Reversed-Z: greater = nearer to camera
+                {
+                    closestDepth = d;
+                    closestCoord = nCoord;
+                }
             }
         }
     }
@@ -2503,7 +2593,7 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     {
         // Point sampling for depth history avoids edge bleeding across discontinuities
         previousDepth = g_HistoryDepth.SampleLevel(g_PointClampSampler, historyUV, 0.0f).r;
-        float depthDelta = abs(currentDepth - previousDepth) / max(currentDepth, 1e-5f);
+        float depthDelta = abs(currentDepth - previousDepth);
 
         if (depthDelta > g_DepthTolerance)
         {
@@ -2536,7 +2626,7 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
             {
                 int2 neighborCoord = clamp(pixelCoord + int2(dx, dy), int2(0, 0), targetSize - int2(1, 1));
                 int2 neighborQuarter = neighborCoord / 2;
-                int neighborSample = int(uint(neighborCoord.x) & 1u);
+                int neighborSample = int(uint(neighborCoord.y) & 1u);
                 float3 neighborColor = g_QuarterColorMSAA.Load(neighborQuarter, neighborSample).rgb;
 
                 float3 neighborClampSpace = ToClampSpace(neighborColor);
@@ -2595,13 +2685,13 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
             {
                 int2 sampleCoord = clamp(pixelCoord + offsets[i], int2(0, 0), targetSize - int2(1, 1));
                 int2 sQuarter = sampleCoord / 2;
-                int sIndex = int(uint(sampleCoord.x) & 1u);
+                int sIndex = int(uint(sampleCoord.y) & 1u);
 
                 float3 sCol = g_QuarterColorMSAA.Load(sQuarter, sIndex).rgb;
                 float  sDep = g_QuarterDepthMSAA.Load(sQuarter, sIndex).r;
 
                 // Relative depth weighting: robust across depth ranges and reversed-Z
-                float depthWeight = exp(-abs(currentDepth - sDep) / (max(currentDepth, 1e-5f) * g_DepthTolerance));
+                float depthWeight = exp(-abs(currentDepth - sDep) / max(g_DepthTolerance, 1e-4f));
                 accumColor += sCol * depthWeight;
                 accumDepth += sDep * depthWeight;
                 accumWeight += depthWeight;
@@ -2689,16 +2779,16 @@ void main() {
     uint pixelParity = (uint(pixelCoord.x) + uint(pixelCoord.y)) & 1u;
     uint frameParity = pc.u_FrameIndex & 1u;
 
-    int sampleIndex = int(uint(pixelCoord.x) & 1u);
-    vec4 sample0 = texelFetch(u_QuarterColorMSAA, quarterCoord, 0);
-    vec4 sample1 = texelFetch(u_QuarterColorMSAA, quarterCoord, 1);
+    int sampleIndex = int(uint(pixelCoord.y) & 1u);
+    vec4 activeSample = texelFetch(u_QuarterColorMSAA, quarterCoord, sampleIndex);
 
     vec3 finalColor;
     if (pixelParity == frameParity) {
-        finalColor = (sampleIndex == 0) ? sample0.rgb : sample1.rgb;
+        finalColor = activeSample.rgb;
     } else {
         // Average the 2 subpixel samples for missing positions
-        finalColor = 0.5 * (sample0.rgb + sample1.rgb);
+        vec4 otherSample = texelFetch(u_QuarterColorMSAA, quarterCoord, 1 - sampleIndex);
+        finalColor = 0.5 * (activeSample.rgb + otherSample.rgb);
     }
 
     imageStore(u_OutputImage, pixelCoord, vec4(finalColor, 1.0));
@@ -2829,7 +2919,8 @@ static void TestJitter() {
 
     CHECK(std::fabs(even.x + odd.x) < 1e-9f);                // alternating +/- phases
     CHECK(std::fabs(odd.x - 0.5f / 3840.0f) < 1e-9f);
-    CHECK(std::fabs(odd.y - 0.5f / 2160.0f) < 1e-9f);
+    CHECK(std::fabs(odd.y) < 1e-9f);                         // 1D horizontal jitter (delta y = 0) per Intel CBR spec
+    CHECK(std::fabs(even.y) < 1e-9f);
     CHECK(std::fabs(j.GetJitterDelta().x - (odd.x - even.x)) < 1e-9f);
 
     cfg.jitterScale = 2.0f;                                   // JitterScale must take effect

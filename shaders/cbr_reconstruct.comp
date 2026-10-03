@@ -99,8 +99,8 @@ void main() {
     uint frameParity = pc.u_FrameIndex & 1u;
     bool isCurrentSampleActive = (pixelParity == frameParity);
 
-    // In a 2x2 quarter cell, the two active samples correspond to pixelCoord.x parity
-    int msaaSampleIndex = int(uint(pixelCoord.x) & 1u);
+    // In a 2x2 quarter cell, Sample 0 is top row (y even) and Sample 1 is bottom row (y odd)
+    int msaaSampleIndex = int(uint(pixelCoord.y) & 1u);
 
     // Fetch current frame sample
     vec4 currentSample = texelFetch(u_QuarterColorMSAA, quarterCoord, msaaSampleIndex);
@@ -110,17 +110,19 @@ void main() {
     // 2. Fetch Motion Vectors & Calculate Previous UV Coordinates
     // -------------------------------------------------------------------------
     // 3x3 closest depth search for dilated motion vector (eliminates edge silhouette smearing)
-    // NOTE: assumes conventional depth (smaller = nearer); invert the comparison for reversed-Z.
+    // RDR2 uses reversed-Z depth (near=1.0, far=0.0): greater depth value means closer to camera.
     // Skipped entirely when disabled (saves 9 MSAA depth fetches per pixel).
     float closestDepth = currentDepth;
     ivec2 closestCoord = pixelCoord;
-    for (int dy = -1; dy <= 1 && pc.u_EnableMotionDilation != 0u; ++dy) {
-        for (int dx = -1; dx <= 1; ++dx) {
-            ivec2 nCoord = clamp(pixelCoord + ivec2(dx, dy), ivec2(0), targetSize - ivec2(1));
-            float d = texelFetch(u_QuarterDepthMSAA, nCoord / 2, int(uint(nCoord.x) & 1u)).r;
-            if (d < closestDepth) {
-                closestDepth = d;
-                closestCoord = nCoord;
+    if (pc.u_EnableMotionDilation != 0u) {
+        for (int dy = -1; dy <= 1; ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                ivec2 nCoord = clamp(pixelCoord + ivec2(dx, dy), ivec2(0), targetSize - ivec2(1));
+                float d = texelFetch(u_QuarterDepthMSAA, nCoord / 2, int(uint(nCoord.y) & 1u)).r;
+                if (d > closestDepth) { // Reversed-Z: greater = nearer to camera
+                    closestDepth = d;
+                    closestCoord = nCoord;
+                }
             }
         }
     }
@@ -142,7 +144,7 @@ void main() {
         // Exact texel fetch: independent of the bound sampler, so depth is never blended across edges
         ivec2 historyCoord = clamp(ivec2(historyUV * pc.u_TargetResolution), ivec2(0), targetSize - ivec2(1));
         previousDepth = texelFetch(u_HistoryDepth, historyCoord, 0).r;
-        float depthDelta = abs(currentDepth - previousDepth) / max(currentDepth, 1e-5);
+        float depthDelta = abs(currentDepth - previousDepth);
 
         if (depthDelta > pc.u_DepthTolerance) {
             isDisoccluded = true;
@@ -170,7 +172,7 @@ void main() {
             for (int dx = -1; dx <= 1; ++dx) {
                 ivec2 neighborCoord = clamp(pixelCoord + ivec2(dx, dy), ivec2(0), targetSize - ivec2(1));
                 ivec2 neighborQuarter = neighborCoord / 2;
-                int neighborSample = int(uint(neighborCoord.x) & 1u);
+                int neighborSample = int(uint(neighborCoord.y) & 1u);
                 vec3 neighborColor = texelFetch(u_QuarterColorMSAA, neighborQuarter, neighborSample).rgb;
 
                 vec3 neighborClampSpace = ToClampSpace(neighborColor);
@@ -222,13 +224,13 @@ void main() {
             for (int i = 0; i < 4 && pc.u_EnableSpatialFallback != 0u; ++i) {
                 ivec2 sampleCoord = clamp(pixelCoord + offsets[i], ivec2(0), targetSize - ivec2(1));
                 ivec2 sQuarter = sampleCoord / 2;
-                int sIndex = int(uint(sampleCoord.x) & 1u);
+                int sIndex = int(uint(sampleCoord.y) & 1u);
 
                 vec3 sCol = texelFetch(u_QuarterColorMSAA, sQuarter, sIndex).rgb;
                 float sDep = texelFetch(u_QuarterDepthMSAA, sQuarter, sIndex).r;
 
                 // Relative depth weighting: robust across depth ranges and reversed-Z
-                float depthWeight = exp(-abs(currentDepth - sDep) / (max(currentDepth, 1e-5) * pc.u_DepthTolerance));
+                float depthWeight = exp(-abs(currentDepth - sDep) / max(pc.u_DepthTolerance, 1e-4));
                 accumColor += sCol * depthWeight;
                 accumDepth += sDep * depthWeight;
                 accumWeight += depthWeight;

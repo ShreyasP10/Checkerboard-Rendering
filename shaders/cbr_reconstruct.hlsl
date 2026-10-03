@@ -100,8 +100,8 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     uint frameParity = g_FrameIndex & 1u;
     bool isCurrentSampleActive = (pixelParity == frameParity);
 
-    // In a 2x2 quarter cell, the two active samples correspond to pixelCoord.x parity
-    int msaaSampleIndex = int(uint(pixelCoord.x) & 1u);
+    // In a 2x2 quarter cell, Sample 0 is top row (y even) and Sample 1 is bottom row (y odd)
+    int msaaSampleIndex = int(uint(pixelCoord.y) & 1u);
 
     // In HLSL, Texture2DMS.Load takes (int2 Location, int SampleIndex)
     float4 currentSample = g_QuarterColorMSAA.Load(quarterCoord, msaaSampleIndex);
@@ -111,20 +111,23 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     // 2. Motion Vector Fetch & History Coordinate Calculation
     // -------------------------------------------------------------------------
     // 3x3 closest depth search for dilated motion vector (eliminates edge silhouette smearing)
-    // NOTE: assumes conventional depth (smaller = nearer); invert the comparison for reversed-Z.
+    // RDR2 uses reversed-Z depth (near=1.0, far=0.0): greater depth value means closer to camera.
     // Skipped entirely when disabled (saves 9 MSAA depth fetches per pixel).
     float closestDepth = currentDepth;
     int2 closestCoord = pixelCoord;
-    for (int dy = -1; dy <= 1 && g_EnableMotionDilation != 0u; ++dy)
+    if (g_EnableMotionDilation != 0u)
     {
-        for (int dx = -1; dx <= 1; ++dx)
+        for (int dy = -1; dy <= 1; ++dy)
         {
-            int2 nCoord = clamp(pixelCoord + int2(dx, dy), int2(0, 0), targetSize - int2(1, 1));
-            float d = g_QuarterDepthMSAA.Load(nCoord / 2, int(uint(nCoord.x) & 1u)).r;
-            if (d < closestDepth)
+            for (int dx = -1; dx <= 1; ++dx)
             {
-                closestDepth = d;
-                closestCoord = nCoord;
+                int2 nCoord = clamp(pixelCoord + int2(dx, dy), int2(0, 0), targetSize - int2(1, 1));
+                float d = g_QuarterDepthMSAA.Load(nCoord / 2, int(uint(nCoord.y) & 1u)).r;
+                if (d > closestDepth) // Reversed-Z: greater = nearer to camera
+                {
+                    closestDepth = d;
+                    closestCoord = nCoord;
+                }
             }
         }
     }
@@ -147,7 +150,7 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     {
         // Point sampling for depth history avoids edge bleeding across discontinuities
         previousDepth = g_HistoryDepth.SampleLevel(g_PointClampSampler, historyUV, 0.0f).r;
-        float depthDelta = abs(currentDepth - previousDepth) / max(currentDepth, 1e-5f);
+        float depthDelta = abs(currentDepth - previousDepth);
 
         if (depthDelta > g_DepthTolerance)
         {
@@ -180,7 +183,7 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
             {
                 int2 neighborCoord = clamp(pixelCoord + int2(dx, dy), int2(0, 0), targetSize - int2(1, 1));
                 int2 neighborQuarter = neighborCoord / 2;
-                int neighborSample = int(uint(neighborCoord.x) & 1u);
+                int neighborSample = int(uint(neighborCoord.y) & 1u);
                 float3 neighborColor = g_QuarterColorMSAA.Load(neighborQuarter, neighborSample).rgb;
 
                 float3 neighborClampSpace = ToClampSpace(neighborColor);
@@ -239,13 +242,13 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
             {
                 int2 sampleCoord = clamp(pixelCoord + offsets[i], int2(0, 0), targetSize - int2(1, 1));
                 int2 sQuarter = sampleCoord / 2;
-                int sIndex = int(uint(sampleCoord.x) & 1u);
+                int sIndex = int(uint(sampleCoord.y) & 1u);
 
                 float3 sCol = g_QuarterColorMSAA.Load(sQuarter, sIndex).rgb;
                 float  sDep = g_QuarterDepthMSAA.Load(sQuarter, sIndex).r;
 
                 // Relative depth weighting: robust across depth ranges and reversed-Z
-                float depthWeight = exp(-abs(currentDepth - sDep) / (max(currentDepth, 1e-5f) * g_DepthTolerance));
+                float depthWeight = exp(-abs(currentDepth - sDep) / max(g_DepthTolerance, 1e-4f));
                 accumColor += sCol * depthWeight;
                 accumDepth += sDep * depthWeight;
                 accumWeight += depthWeight;

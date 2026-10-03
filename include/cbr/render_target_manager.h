@@ -24,6 +24,7 @@ public:
     const TargetDimensions& GetDimensions() const { return m_dims; }
 
     bool IsTargetInterceptCandidate(uint32_t width, uint32_t height, uint32_t format) const;
+    bool IsQuarterPassCandidate(uint32_t width, uint32_t height) const;
 
     // Ping-pong history buffer index management
     uint32_t GetCurrentHistoryIndex() const { return m_historyPingPong.load(); }

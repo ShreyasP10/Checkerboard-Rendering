@@ -4,6 +4,8 @@
 #include <filesystem>
 #include <string>
 
+#include <mutex>
+
 namespace cbr {
 
 enum class GraphicsApi {
@@ -62,13 +64,24 @@ public:
     bool Load(const std::filesystem::path& configPath);
     bool Save(const std::filesystem::path& configPath);
 
-    const CBRConfig& GetConfig() const { return m_config; }
-    CBRConfig& GetMutableConfig() { return m_config; }
+    CBRConfig GetConfig() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_config;
+    }
+    CBRConfig& GetMutableConfig() {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_config;
+    }
+    void UpdateConfig(const CBRConfig& config) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_config = config;
+    }
 
 private:
     ConfigManager() = default;
     ~ConfigManager() = default;
 
+    mutable std::mutex m_mutex;
     CBRConfig m_config;
 };
 
