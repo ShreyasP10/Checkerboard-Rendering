@@ -9,6 +9,7 @@
 #include "cbr/config.h"
 #include "cbr/hooks.h"
 #include "cbr/render_target_manager.h"
+#include "cbr/ui_overlay.h"
 
 #include <atomic>
 #include <cstring>
@@ -127,6 +128,23 @@ static void RunVulkanTests() {
 
     e.OnSwapchainRecreated(3840, 2160);
     CHECK(rt.GetDimensions().fullWidth == 3840 && rt.GetDimensions().fullHeight == 2160);
+
+    // UIOverlay state and telemetry verification
+    auto& ui = UIOverlay::Get();
+    CHECK(ui.IsInitialized());
+    const bool initialVis = ui.IsVisible();
+    ui.ToggleVisibility();
+    CHECK(ui.IsVisible() == !initialVis);
+    ui.SetVisible(true);
+    CHECK(ui.IsVisible());
+    ui.SetVisible(false);
+    CHECK(!ui.IsVisible());
+
+    const OverlayMetrics metrics = ui.GetCurrentMetrics();
+    CHECK(metrics.targetWidth == 3840 && metrics.targetHeight == 2160);
+    CHECK(metrics.cbrEnabled == true);
+    CHECK(metrics.vramFootprintMiB > 300.0);
+    CHECK(metrics.vramFootprintMB > 310.0);
 }
 
 static void RunAutoTests() {
