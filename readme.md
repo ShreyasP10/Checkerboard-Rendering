@@ -189,16 +189,24 @@ $$C_{\text{spatial}} = \frac{\sum_{k=1}^4 w_k C_k}{\sum_{k=1}^4 w_k}, \quad w_k 
 ---
 
 <a id="building"></a>
-## 🚀 How to Build, Install & Run
+## 🚀 How to Install & Run
 
-### Step 1: Software Prerequisites
-To compile the mod from source, ensure you have:
+### Option A: Download Pre-built Binaries (Recommended)
+1. Go to the [Releases](../../releases) page of this repository.
+2. Download the latest `rdr2-cbr-release.zip` or download `rdr2-cbr.asi` and `cbr.ini` directly from the release assets.
+3. Skip to **Step 3: Install into RDR2 from Scratch**.
+
+### Option B: Build from Source
+If you prefer to compile the mod yourself, follow these steps:
+
+#### B.1 Software Prerequisites
+Ensure you have:
 1. **Visual Studio 2022** (Community or higher) with the **"Desktop development with C++"** workload (C++20).
 2. **CMake** (v3.20 or newer).
 3. **Vulkan SDK** (1.3.x from [LunarG](https://vulkan.lunarg.com/)).
 4. An **ASI Loader** for RDR2 (`dinput8.dll`). Download it only from the loader project's official release page and verify its checksum before installing.
 
-### Step 2: Build the ASI Plugin
+#### B.2 Build the ASI Plugin
 Run the following commands in PowerShell or Command Prompt:
 
 ```powershell
@@ -216,8 +224,8 @@ cmake --build . --config Release
 ```
 
 The build process outputs:
-- `build/bin/rdr2-cbr.asi` — The compiled ASI mod binary.
-- `build/bin/cbr.ini` — The default configuration file.
+- `build/bin/Release/rdr2-cbr.asi` — The compiled ASI mod binary.
+- `build/bin/Release/cbr.ini` — The default configuration file.
 
 ### Step 3: Install into RDR2 from Scratch
 
