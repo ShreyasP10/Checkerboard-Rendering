@@ -281,7 +281,7 @@ JitterCompensation = 0.0     ; History reprojection jitter sign (default 0.0: wh
 
 [Debug]
 ShowOverlay = false          ; Toggle in-game overlay
-DebugView = 0                ; 0=Reconstructed 4K, 1=CBR Mask, 2=Disocclusion Heatmap, 3=Motion Vectors, 4=Raw
+DebugView = 0                ; 0=Reconstructed 4K, 1=CBR Mask, 2=Disocclusion Heatmap, 3=Motion Vectors, 4=Raw, 5=Spatial Baseline
 LogToFile = true             ; Writes cbr.log for installation diagnostic
 LogLevel = Info              ; Debug, Info, Warning, Error
 ```
@@ -357,6 +357,7 @@ You can toggle diagnostic visualization modes in `cbr.ini` by modifying `DebugVi
 - `DebugView = 2`: **Disocclusion Heatmap** — **Green** indicates valid temporal reprojection; **Red** highlights disoccluded geometry using spatial cross-bilateral fallback.
 - `DebugView = 3`: **Motion Vector Field** — visualizes screen-space velocity vectors (R=horizontal motion, G=vertical motion).
 - `DebugView = 4`: **Raw Buffer** — displays the unresolved quarter-resolution native render.
+- `DebugView = 5`: **Spatial Baseline Resolve** — displays naive spatial reconstruction for A/B quality comparison against temporal CBR.
 
 ---
 

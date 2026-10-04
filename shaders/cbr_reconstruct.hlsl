@@ -236,8 +236,8 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     float4 historyColor = float4(0.0f, 0.0f, 0.0f, 0.0f);
     float previousDepth = currentDepth;
 
-    if (historyUV.x < 0.0f || historyUV.x > 1.0f || historyUV.y < 0.0f || historyUV.y > 1.0f) {
-        isDisoccluded = true; // Sample moved outside screen space
+    if (g_FrameIndex == 0u || historyUV.x < 0.0f || historyUV.x > 1.0f || historyUV.y < 0.0f || historyUV.y > 1.0f) {
+        isDisoccluded = true; // First frame or sample moved outside screen space
     } else {
         previousDepth = g_HistoryDepth.SampleLevel(g_PointClampSampler, historyUV, 0.0f).r;
         float depthDelta = abs(currentLinear - LinearizeDepth(previousDepth)) / max(currentLinear, 1e-5f);
@@ -246,7 +246,7 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
         } else {
             historyColor = g_HistoryColor.SampleLevel(g_LinearClampSampler, historyUV, 0.0f);
             if (historyColor.a <= 0.0f) {
-                isDisoccluded = true; // First frame or cleared history buffer
+                isDisoccluded = true; // Cleared history buffer
             }
         }
     }
@@ -285,6 +285,7 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
             float gamma = 1.25f;
             float3 varianceMin = max(colorMin, mean - gamma * stdDev);
             float3 varianceMax = min(colorMax, mean + gamma * stdDev);
+            varianceMax = max(varianceMin, varianceMax); // Ensure varianceMin <= varianceMax to prevent clamp inversion
 
             float3 historyClampSpace = ToClampSpace(historyColor.rgb);
             historyClampSpace = clamp(historyClampSpace, varianceMin, varianceMax);
@@ -357,6 +358,15 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     } else if (g_DebugView == 4u) {
         // Quarter-resolution raw colour (nearest native sample for reconstructed pixels)
         finalColor = isCurrentSampleActive ? currentColor : FetchColor(MapPixelToSample(cardinalCoord[0], frameParity));
+    } else if (g_DebugView == 5u) {
+        // Spatial baseline resolve: average of 4 cardinal samples for reconstructed pixels
+        // (direct visual A/B baseline comparison against temporal CBR, matching reference Space toggle)
+        finalColor = isCurrentSampleActive ? currentColor : (
+            FetchColor(MapPixelToSample(cardinalCoord[0], frameParity)) +
+            FetchColor(MapPixelToSample(cardinalCoord[1], frameParity)) +
+            FetchColor(MapPixelToSample(cardinalCoord[2], frameParity)) +
+            FetchColor(MapPixelToSample(cardinalCoord[3], frameParity))
+        ) * 0.25f;
     }
 
     // Write final reconstructed pixel to output storage image (alpha = 1.0 for valid history)

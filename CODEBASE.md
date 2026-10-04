@@ -362,6 +362,7 @@ ShowOverlay = false
 ; 2 = Disocclusion Heatmap (Green = Temporal History, Red = Spatial Fallback)
 ; 3 = Motion Vector Field
 ; 4 = Quarter-Resolution Raw Unresolved Buffer
+; 5 = Naive Spatial Baseline Resolve (A/B comparison against temporal CBR)
 DebugView = 0
 
 ; Log diagnostic messages to cbr.log
@@ -714,7 +715,7 @@ struct CBRConfig {
 
     // Debug
     bool        showOverlay{ false };
-    uint32_t    debugView{ 0 }; // 0=Normal, 1=Mask, 2=Disocclusion, 3=Motion, 4=Raw
+    uint32_t    debugView{ 0 }; // 0=Normal, 1=Mask, 2=Disocclusion, 3=Motion, 4=Raw, 5=SpatialUpscaleBaseline
     bool        logToFile{ true };
     std::string logLevel{ "Info" };
 };
@@ -1631,7 +1632,7 @@ bool ConfigManager::Load(const std::filesystem::path& configPath) {
             } else if (key == "JitterCompensation") {
                 m_config.jitterCompensation = ParseFloat(val, m_config.jitterCompensation, -1.0f, 1.0f);
             } else if (key == "DebugView") {
-                m_config.debugView = ParseUInt(val, m_config.debugView, 0, 4);
+                m_config.debugView = ParseUInt(val, m_config.debugView, 0, 5);
             } else if (key == "ShowOverlay") {
                 m_config.showOverlay = ParseBool(val, m_config.showOverlay);
             } else if (key == "LogToFile") {
@@ -2624,8 +2625,8 @@ void main() {
     vec4 historyColor = vec4(0.0);
     float previousDepth = currentDepth;
 
-    if (historyUV.x < 0.0 || historyUV.x > 1.0 || historyUV.y < 0.0 || historyUV.y > 1.0) {
-        isDisoccluded = true; // Sample moved outside screen space
+    if (pc.u_FrameIndex == 0u || historyUV.x < 0.0 || historyUV.x > 1.0 || historyUV.y < 0.0 || historyUV.y > 1.0) {
+        isDisoccluded = true; // First frame or sample moved outside screen space
     } else {
         // Exact texel fetch: independent of the bound sampler, so depth is never blended across edges
         ivec2 historyCoord = clamp(ivec2(historyUV * pc.u_TargetResolution), ivec2(0), targetSize - ivec2(1));
@@ -2636,7 +2637,7 @@ void main() {
         } else {
             historyColor = textureLod(u_HistoryColor, historyUV, 0.0);
             if (historyColor.a <= 0.0) {
-                isDisoccluded = true; // First frame or cleared history buffer
+                isDisoccluded = true; // Cleared history buffer
             }
         }
     }
@@ -2675,6 +2676,7 @@ void main() {
             float gamma = 1.25;
             vec3 varianceMin = max(colorMin, mean - gamma * stdDev);
             vec3 varianceMax = min(colorMax, mean + gamma * stdDev);
+            varianceMax = max(varianceMin, varianceMax); // Ensure varianceMin <= varianceMax to prevent clamp inversion
 
             vec3 historyClampSpace = ToClampSpace(historyColor.rgb);
             historyClampSpace = clamp(historyClampSpace, varianceMin, varianceMax);
@@ -2749,6 +2751,15 @@ void main() {
     } else if (pc.u_DebugView == 4u) {
         // Quarter-resolution raw colour (nearest native sample for reconstructed pixels)
         finalColor = isCurrentSampleActive ? currentColor : FetchColor(MapPixelToSample(cardinalCoord[0], frameParity));
+    } else if (pc.u_DebugView == 5u) {
+        // Spatial baseline resolve: average of 4 cardinal samples for reconstructed pixels
+        // (direct visual A/B baseline comparison against temporal CBR, matching reference Space toggle)
+        finalColor = isCurrentSampleActive ? currentColor : (
+            FetchColor(MapPixelToSample(cardinalCoord[0], frameParity)) +
+            FetchColor(MapPixelToSample(cardinalCoord[1], frameParity)) +
+            FetchColor(MapPixelToSample(cardinalCoord[2], frameParity)) +
+            FetchColor(MapPixelToSample(cardinalCoord[3], frameParity))
+        ) * 0.25;
     }
 
     // Write final reconstructed pixel to output storage image (alpha = 1.0 for valid history)
@@ -3005,8 +3016,8 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     float4 historyColor = float4(0.0f, 0.0f, 0.0f, 0.0f);
     float previousDepth = currentDepth;
 
-    if (historyUV.x < 0.0f || historyUV.x > 1.0f || historyUV.y < 0.0f || historyUV.y > 1.0f) {
-        isDisoccluded = true; // Sample moved outside screen space
+    if (g_FrameIndex == 0u || historyUV.x < 0.0f || historyUV.x > 1.0f || historyUV.y < 0.0f || historyUV.y > 1.0f) {
+        isDisoccluded = true; // First frame or sample moved outside screen space
     } else {
         previousDepth = g_HistoryDepth.SampleLevel(g_PointClampSampler, historyUV, 0.0f).r;
         float depthDelta = abs(currentLinear - LinearizeDepth(previousDepth)) / max(currentLinear, 1e-5f);
@@ -3015,7 +3026,7 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
         } else {
             historyColor = g_HistoryColor.SampleLevel(g_LinearClampSampler, historyUV, 0.0f);
             if (historyColor.a <= 0.0f) {
-                isDisoccluded = true; // First frame or cleared history buffer
+                isDisoccluded = true; // Cleared history buffer
             }
         }
     }
@@ -3054,6 +3065,7 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
             float gamma = 1.25f;
             float3 varianceMin = max(colorMin, mean - gamma * stdDev);
             float3 varianceMax = min(colorMax, mean + gamma * stdDev);
+            varianceMax = max(varianceMin, varianceMax); // Ensure varianceMin <= varianceMax to prevent clamp inversion
 
             float3 historyClampSpace = ToClampSpace(historyColor.rgb);
             historyClampSpace = clamp(historyClampSpace, varianceMin, varianceMax);
@@ -3126,6 +3138,15 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     } else if (g_DebugView == 4u) {
         // Quarter-resolution raw colour (nearest native sample for reconstructed pixels)
         finalColor = isCurrentSampleActive ? currentColor : FetchColor(MapPixelToSample(cardinalCoord[0], frameParity));
+    } else if (g_DebugView == 5u) {
+        // Spatial baseline resolve: average of 4 cardinal samples for reconstructed pixels
+        // (direct visual A/B baseline comparison against temporal CBR, matching reference Space toggle)
+        finalColor = isCurrentSampleActive ? currentColor : (
+            FetchColor(MapPixelToSample(cardinalCoord[0], frameParity)) +
+            FetchColor(MapPixelToSample(cardinalCoord[1], frameParity)) +
+            FetchColor(MapPixelToSample(cardinalCoord[2], frameParity)) +
+            FetchColor(MapPixelToSample(cardinalCoord[3], frameParity))
+        ) * 0.25f;
     }
 
     // Write final reconstructed pixel to output storage image (alpha = 1.0 for valid history)
@@ -3292,7 +3313,7 @@ static void TestConfigHardening(const fs::path& dir) {
     CHECK(c.depthTolerance == 1.0f);
     CHECK(c.mipLodBias == -0.5f);
     CHECK(c.jitterPattern == JitterPattern::Checkerboard);
-    CHECK(c.debugView == 4);
+    CHECK(c.debugView == 5);
     CHECK(!c.enableMotionDilation);
     CHECK(c.jitterCompensation == -1.0f);
     CHECK(c.jitterDirection == -1);

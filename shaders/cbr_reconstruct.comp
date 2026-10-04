@@ -237,8 +237,8 @@ void main() {
     vec4 historyColor = vec4(0.0);
     float previousDepth = currentDepth;
 
-    if (historyUV.x < 0.0 || historyUV.x > 1.0 || historyUV.y < 0.0 || historyUV.y > 1.0) {
-        isDisoccluded = true; // Sample moved outside screen space
+    if (pc.u_FrameIndex == 0u || historyUV.x < 0.0 || historyUV.x > 1.0 || historyUV.y < 0.0 || historyUV.y > 1.0) {
+        isDisoccluded = true; // First frame or sample moved outside screen space
     } else {
         // Exact texel fetch: independent of the bound sampler, so depth is never blended across edges
         ivec2 historyCoord = clamp(ivec2(historyUV * pc.u_TargetResolution), ivec2(0), targetSize - ivec2(1));
@@ -249,7 +249,7 @@ void main() {
         } else {
             historyColor = textureLod(u_HistoryColor, historyUV, 0.0);
             if (historyColor.a <= 0.0) {
-                isDisoccluded = true; // First frame or cleared history buffer
+                isDisoccluded = true; // Cleared history buffer
             }
         }
     }
@@ -288,6 +288,7 @@ void main() {
             float gamma = 1.25;
             vec3 varianceMin = max(colorMin, mean - gamma * stdDev);
             vec3 varianceMax = min(colorMax, mean + gamma * stdDev);
+            varianceMax = max(varianceMin, varianceMax); // Ensure varianceMin <= varianceMax to prevent clamp inversion
 
             vec3 historyClampSpace = ToClampSpace(historyColor.rgb);
             historyClampSpace = clamp(historyClampSpace, varianceMin, varianceMax);
@@ -362,6 +363,15 @@ void main() {
     } else if (pc.u_DebugView == 4u) {
         // Quarter-resolution raw colour (nearest native sample for reconstructed pixels)
         finalColor = isCurrentSampleActive ? currentColor : FetchColor(MapPixelToSample(cardinalCoord[0], frameParity));
+    } else if (pc.u_DebugView == 5u) {
+        // Spatial baseline resolve: average of 4 cardinal samples for reconstructed pixels
+        // (direct visual A/B baseline comparison against temporal CBR, matching reference Space toggle)
+        finalColor = isCurrentSampleActive ? currentColor : (
+            FetchColor(MapPixelToSample(cardinalCoord[0], frameParity)) +
+            FetchColor(MapPixelToSample(cardinalCoord[1], frameParity)) +
+            FetchColor(MapPixelToSample(cardinalCoord[2], frameParity)) +
+            FetchColor(MapPixelToSample(cardinalCoord[3], frameParity))
+        ) * 0.25;
     }
 
     // Write final reconstructed pixel to output storage image (alpha = 1.0 for valid history)

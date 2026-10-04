@@ -174,7 +174,7 @@ bool ConfigManager::Load(const std::filesystem::path& configPath) {
             } else if (key == "JitterCompensation") {
                 m_config.jitterCompensation = ParseFloat(val, m_config.jitterCompensation, -1.0f, 1.0f);
             } else if (key == "DebugView") {
-                m_config.debugView = ParseUInt(val, m_config.debugView, 0, 4);
+                m_config.debugView = ParseUInt(val, m_config.debugView, 0, 5);
             } else if (key == "ShowOverlay") {
                 m_config.showOverlay = ParseBool(val, m_config.showOverlay);
             } else if (key == "LogToFile") {

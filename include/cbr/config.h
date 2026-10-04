@@ -63,7 +63,7 @@ struct CBRConfig {
 
     // Debug
     bool        showOverlay{ false };
-    uint32_t    debugView{ 0 }; // 0=Normal, 1=Mask, 2=Disocclusion, 3=Motion, 4=Raw
+    uint32_t    debugView{ 0 }; // 0=Normal, 1=Mask, 2=Disocclusion, 3=Motion, 4=Raw, 5=SpatialUpscaleBaseline
     bool        logToFile{ true };
     std::string logLevel{ "Info" };
 };

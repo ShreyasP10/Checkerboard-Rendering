@@ -73,7 +73,7 @@ static void TestConfigHardening(const fs::path& dir) {
     CHECK(c.depthTolerance == 1.0f);
     CHECK(c.mipLodBias == -0.5f);
     CHECK(c.jitterPattern == JitterPattern::Checkerboard);
-    CHECK(c.debugView == 4);
+    CHECK(c.debugView == 5);
     CHECK(!c.enableMotionDilation);
     CHECK(c.jitterCompensation == -1.0f);
     CHECK(c.jitterDirection == -1);
