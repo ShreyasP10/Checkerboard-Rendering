@@ -9,6 +9,7 @@
 #include "cbr/config.h"
 #include "cbr/hooks.h"
 #include "cbr/render_target_manager.h"
+#include "cbr/ui_overlay.h"
 
 #include <atomic>
 #include <cstring>
@@ -110,6 +111,40 @@ static void RunVulkanTests() {
     CHECK(e.GetCurrentFrameIndex() == 1);
     e.OnPostPresent(&g_a);
     CHECK(e.GetCurrentFrameIndex() == 1);
+
+    // Swapchain extents are untrusted: odd sizes round up to even, implausible ones are ignored
+    e.OnSwapchainRecreated(1921, 1081);
+    CHECK(rt.GetDimensions().fullWidth == 1922 && rt.GetDimensions().fullHeight == 1082);
+    CHECK(rt.GetDimensions().quarterWidth == 961 && rt.GetDimensions().quarterHeight == 541);
+
+    e.OnSwapchainRecreated(0, 0); // minimised window
+    CHECK(rt.GetDimensions().fullWidth == 1922);
+
+    e.OnSwapchainRecreated(5, 5); // too small
+    CHECK(rt.GetDimensions().fullWidth == 1922);
+
+    e.OnSwapchainRecreated(100000, 100000); // absurd
+    CHECK(rt.GetDimensions().fullWidth == 1922 && rt.GetDimensions().fullHeight == 1082);
+
+    e.OnSwapchainRecreated(3840, 2160);
+    CHECK(rt.GetDimensions().fullWidth == 3840 && rt.GetDimensions().fullHeight == 2160);
+
+    // UIOverlay state and telemetry verification
+    auto& ui = UIOverlay::Get();
+    CHECK(ui.IsInitialized());
+    const bool initialVis = ui.IsVisible();
+    ui.ToggleVisibility();
+    CHECK(ui.IsVisible() == !initialVis);
+    ui.SetVisible(true);
+    CHECK(ui.IsVisible());
+    ui.SetVisible(false);
+    CHECK(!ui.IsVisible());
+
+    const OverlayMetrics metrics = ui.GetCurrentMetrics();
+    CHECK(metrics.targetWidth == 3840 && metrics.targetHeight == 2160);
+    CHECK(metrics.cbrEnabled == true);
+    CHECK(metrics.vramFootprintMiB > 300.0);
+    CHECK(metrics.vramFootprintMB > 310.0);
 }
 
 static void RunAutoTests() {

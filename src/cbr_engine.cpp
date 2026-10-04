@@ -187,7 +187,13 @@ void CBREngine::OnSwapchainRecreated(uint32_t width, uint32_t height) {
     m_mainPresentTarget.store(nullptr);
     m_frameIndex.store(0);
     m_lastDispatchedFrame.store(kNoFrame);
-    if (width > 0 && height > 0) {
+
+    // Swapchain extents are untrusted: odd sizes round up to even, implausible ones (< 320 or > 16384) are ignored
+    constexpr uint32_t kMinExtent = 320;
+    constexpr uint32_t kMaxExtent = 16384;
+    if (width >= kMinExtent && width <= kMaxExtent && height >= 240 && height <= kMaxExtent) {
+        if (width & 1u) ++width;
+        if (height & 1u) ++height;
         RenderTargetManager::Get().Initialize(width, height);
         JitterManager::Get().Initialize(width, height);
         CBR_LOG_INFO("Swapchain recreated with new resolution %ux%u: frame parity and history reset.", width, height);

@@ -1,5 +1,6 @@
 #include "cbr/reconstruction_pass.h"
 #include "cbr/config.h"
+#include "cbr/depth_convention.h"
 #include "cbr/jitter_manager.h"
 #include "cbr/render_target_manager.h"
 #include "cbr/logger.h"
@@ -53,6 +54,11 @@ ReconstructionPushConstants BuildReconstructionPushConstants(uint32_t frameIndex
     pc.jitterDelta[1] = jitterDelta.y;
     pc.enableMotionDilation = config.enableMotionDilation ? 1u : 0u;
     pc.jitterCompensation = config.jitterCompensation;
+    pc.shiftDirection = (config.jitterDirection < 0) ? -1 : 1;
+    const DepthRange range = SanitizeDepthRange(config.depthConvention, config.depthNear, config.depthFar);
+    pc.depthMode = (config.depthConvention == DepthConvention::Reversed) ? 1u : 0u;
+    pc.depthNear = range.zNear;
+    pc.depthFar = range.zFar;
     return pc;
 }
 

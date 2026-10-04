@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <array>
+#include <utility>
 
 namespace cbr {
 
@@ -22,6 +23,10 @@ public:
     JitterOffset GetJitterDelta() const {
         return { m_currentJitter.x - m_previousJitter.x, m_currentJitter.y - m_previousJitter.y };
     }
+
+    // Computes the NDC projection offset (delta_x, delta_y) applied to proj[8] and proj[9].
+    // Incorporates ConfigManager::Get().GetConfig().projectionJitterSign and Vulkan Y-flip.
+    std::pair<float, float> ComputeProjectionOffset(const JitterOffset& jitter, bool isVulkan) const;
 
     // Computes subpixel jitter offset for a 4x4 projection matrix
     void ApplyJitterToProjection(float* projMatrix4x4, bool isVulkan) const;

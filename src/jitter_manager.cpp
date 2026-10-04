@@ -21,32 +21,42 @@ void JitterManager::Initialize(uint32_t targetWidth, uint32_t targetHeight) {
 void JitterManager::Update(uint32_t frameIndex) {
     m_previousJitter = m_currentJitter;
 
-    // 2-phase subpixel checkerboard jitter sequence:
-    // Shifts alternating frames horizontally by +0.5px and -0.5px (presentation pixels).
-    // Standard 2x MSAA diagonal sample geometry requires 1D horizontal shift only (delta Y = 0)
-    // to achieve 100% 4-quadrant geometric coverage across 2 frames (Intel 2018 White Paper).
-    float pixelWidth = 1.0f / static_cast<float>(m_targetWidth);
-    const float amplitude = 0.5f * ConfigManager::Get().GetConfig().jitterScale;
+    // 2-phase checkerboard jitter sequence:
+    // Even frames are unjittered (samples land on pixel centres).
+    // Odd frames are shifted horizontally by exactly one full-resolution pixel (shiftDirection * pixelWidth),
+    // giving 100% 4-quadrant geometric coverage across two frames with standard 2x MSAA sample locations.
+    const auto& config = ConfigManager::Get().GetConfig();
+    const float pixelWidth = 1.0f / static_cast<float>(m_targetWidth);
+    const float dir = (config.jitterDirection < 0) ? -1.0f : 1.0f;
 
     if (frameIndex & 1u) {
-        m_currentJitter.x = amplitude * pixelWidth;
+        m_currentJitter.x = dir * pixelWidth;
         m_currentJitter.y = 0.0f;
     } else {
-        m_currentJitter.x = -amplitude * pixelWidth;
+        m_currentJitter.x = 0.0f;
         m_currentJitter.y = 0.0f;
     }
+}
+
+std::pair<float, float> JitterManager::ComputeProjectionOffset(const JitterOffset& jitter, bool isVulkan) const {
+    const auto& config = ConfigManager::Get().GetConfig();
+    const float sign = (config.projectionJitterSign < 0) ? -1.0f : 1.0f;
+
+    // Projection matrix offset in NDC space
+    float jitterNdcX = sign * (2.0f * jitter.x);
+    float jitterNdcY = sign * (2.0f * jitter.y);
+
+    if (isVulkan) {
+        jitterNdcY = -jitterNdcY;
+    }
+
+    return { jitterNdcX, jitterNdcY };
 }
 
 void JitterManager::ApplyJitterToProjection(float* projMatrix4x4, bool isVulkan) const {
     if (!projMatrix4x4) return;
 
-    // Projection matrix offset in NDC space
-    float jitterNdcX = 2.0f * m_currentJitter.x;
-    float jitterNdcY = 2.0f * m_currentJitter.y;
-
-    if (isVulkan) {
-        jitterNdcY = -jitterNdcY;
-    }
+    auto [jitterNdcX, jitterNdcY] = ComputeProjectionOffset(m_currentJitter, isVulkan);
 
     projMatrix4x4[8] += jitterNdcX;
     projMatrix4x4[9] += jitterNdcY;
@@ -55,12 +65,7 @@ void JitterManager::ApplyJitterToProjection(float* projMatrix4x4, bool isVulkan)
 void JitterManager::RemoveJitterFromProjection(float* projMatrix4x4, bool isVulkan) const {
     if (!projMatrix4x4) return;
 
-    float jitterNdcX = 2.0f * m_currentJitter.x;
-    float jitterNdcY = 2.0f * m_currentJitter.y;
-
-    if (isVulkan) {
-        jitterNdcY = -jitterNdcY;
-    }
+    auto [jitterNdcX, jitterNdcY] = ComputeProjectionOffset(m_currentJitter, isVulkan);
 
     projMatrix4x4[8] -= jitterNdcX;
     projMatrix4x4[9] -= jitterNdcY;
@@ -75,12 +80,7 @@ void JitterManager::SetProjectionJitter(float* outMatrix4x4, const float* inUnji
         }
     }
 
-    float jitterNdcX = 2.0f * m_currentJitter.x;
-    float jitterNdcY = 2.0f * m_currentJitter.y;
-
-    if (isVulkan) {
-        jitterNdcY = -jitterNdcY;
-    }
+    auto [jitterNdcX, jitterNdcY] = ComputeProjectionOffset(m_currentJitter, isVulkan);
 
     outMatrix4x4[8] = inUnjitteredMatrix4x4[8] + jitterNdcX;
     outMatrix4x4[9] = inUnjitteredMatrix4x4[9] + jitterNdcY;
