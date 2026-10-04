@@ -4118,6 +4118,9 @@ name: build
 
 on:
   push:
+    branches: [ main, master ]
+    tags:
+      - 'v*'
   pull_request:
 
 jobs:
@@ -4173,4 +4176,15 @@ jobs:
             build/bin/Release/rdr2-cbr.asi
             build/bin/Release/cbr.ini
             build/bin/Release/SHA256SUMS.txt
+      
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            build/bin/Release/rdr2-cbr.asi
+            build/bin/Release/cbr.ini
+            build/bin/Release/SHA256SUMS.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 ```
