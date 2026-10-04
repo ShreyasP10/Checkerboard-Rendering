@@ -22,6 +22,21 @@ jobs:
           glslangValidator -V shaders/cbr_reconstruct.comp -o /tmp/r.spv
           glslangValidator -V shaders/cbr_resolve_simple.comp -o /tmp/s.spv
           glslangValidator -D -e CSMain -S comp -V shaders/cbr_reconstruct.hlsl -o /tmp/h.spv
+      - name: Verify shader mapping equivalence
+        run: python3 tests/check_shader_mapping.py
+
+  windows-syntax-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install MinGW cross-compiler
+        run: sudo apt-get update && sudo apt-get install -y g++-mingw-w64-x86-64
+      - name: Syntax check Windows sources
+        run: |
+          for f in logger config jitter_manager render_target_manager reconstruction_pass ui_overlay cbr_engine hooks main hooks_vulkan hooks_dx12; do
+            echo "Checking src/$f.cpp..."
+            x86_64-w64-mingw32-g++ -std=c++20 -fsyntax-only -Wall -Wextra -Wpedantic -Wshadow -Iinclude src/$f.cpp
+          done
 
   windows-release:
     runs-on: windows-latest

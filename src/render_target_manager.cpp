@@ -33,7 +33,9 @@ void RenderTargetManager::Initialize(uint32_t width, uint32_t height) {
 
     CBR_LOG_INFO("RenderTargetManager initialized for target: %ux%u", width, height);
     CBR_LOG_INFO("Quarter-Resolution 2x MSAA Buffer size: %ux%u", m_dims.quarterWidth, m_dims.quarterHeight);
-    CBR_LOG_INFO("Total CBR VRAM Footprint: %.2f MB", static_cast<double>(m_totalAllocatedVramBytes) / (1024.0 * 1024.0));
+    CBR_LOG_INFO("Total CBR VRAM Footprint: %.2f MiB (%.2f MB)",
+        static_cast<double>(m_totalAllocatedVramBytes) / (1024.0 * 1024.0),
+        static_cast<double>(m_totalAllocatedVramBytes) / 1000000.0);
 }
 
 void RenderTargetManager::Shutdown() {

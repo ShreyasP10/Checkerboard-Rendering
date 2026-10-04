@@ -58,6 +58,7 @@ static void TestConfigHardening(const fs::path& dir) {
         "JitterPattern = Halton\n"    // unimplemented     -> Checkerboard
         "JitterCompensation = -5\n"   // out of range      -> clamped to -1
         "JitterDirection = -1\n"
+        "ProjectionJitterSign = -1\n"
         "JitterScale = 3\n"              // accepted but ignored (warned)
         "[Debug]\n"
         "DebugView = 77\n");          // out of range      -> clamped
@@ -76,6 +77,7 @@ static void TestConfigHardening(const fs::path& dir) {
     CHECK(!c.enableMotionDilation);
     CHECK(c.jitterCompensation == -1.0f);
     CHECK(c.jitterDirection == -1);
+    CHECK(c.projectionJitterSign == -1);
     CHECK(c.depthConvention == DepthConvention::Standard);
     CHECK(c.depthNear == 0.5f && c.depthFar == 5000.0f);
 
@@ -83,12 +85,14 @@ static void TestConfigHardening(const fs::path& dir) {
     const CBRConfig fresh{};
     CHECK(fresh.jitterCompensation == 0.0f); // whole-pixel jitter needs NO history compensation
     CHECK(fresh.jitterDirection == 1);
+    CHECK(fresh.projectionJitterSign == 1);
     CHECK(fresh.depthConvention == DepthConvention::Reversed);
 
     // Invalid enum-like values keep the previous setting
-    WriteFile(dir / "bad2.ini", "[Jitter]\nJitterDirection = 2\n[Reconstruction]\nDepthConvention = sideways\n");
+    WriteFile(dir / "bad2.ini", "[Jitter]\nJitterDirection = 2\nProjectionJitterSign = 42\n[Reconstruction]\nDepthConvention = sideways\n");
     CHECK(ConfigManager::Get().Load(dir / "bad2.ini"));
     CHECK(ConfigManager::Get().GetConfig().jitterDirection == -1);
+    CHECK(ConfigManager::Get().GetConfig().projectionJitterSign == -1);
     CHECK(ConfigManager::Get().GetConfig().depthConvention == DepthConvention::Standard);
 }
 
@@ -106,6 +110,7 @@ static void TestConfigMissingFileAndRoundTrip(const fs::path& dir) {
     CHECK(after.enableMotionDilation == before.enableMotionDilation);
     CHECK(after.jitterCompensation == before.jitterCompensation);
     CHECK(after.jitterDirection == before.jitterDirection);
+    CHECK(after.projectionJitterSign == before.projectionJitterSign);
     CHECK(after.depthConvention == before.depthConvention);
     CHECK(after.depthNear == before.depthNear && after.depthFar == before.depthFar);
 }
@@ -380,6 +385,39 @@ static void TestPushConstantLayout() {
     CHECK(sizeof(ReconstructionPushConstants) == 80);
 }
 
+static void TestProjectionJitterSign() {
+    auto& j = JitterManager::Get();
+    j.Initialize(3840, 2160);
+    j.Update(1); // odd frame has non-zero jitter in X
+
+    const JitterOffset jitter = j.GetCurrentJitter();
+    CHECK(jitter.x > 0.0f);
+
+    // Default: projectionJitterSign = +1
+    ConfigManager::Get().Modify([](CBRConfig& c) { c.projectionJitterSign = 1; });
+    auto [ndcDx1, ndcDy1] = j.ComputeProjectionOffset(jitter, false);
+    CHECK(ndcDx1 > 0.0f);
+    CHECK(std::fabs(ndcDx1 - 2.0f * jitter.x) < 1e-7f);
+
+    // Negated: projectionJitterSign = -1
+    ConfigManager::Get().Modify([](CBRConfig& c) { c.projectionJitterSign = -1; });
+    auto [ndcDx2, ndcDy2] = j.ComputeProjectionOffset(jitter, false);
+    CHECK(ndcDx2 < 0.0f);
+    CHECK(std::fabs(ndcDx2 + 2.0f * jitter.x) < 1e-7f);
+    CHECK(std::fabs(ndcDx1 + ndcDx2) < 1e-7f);
+
+    // Vulkan Y-flip behavior
+    JitterOffset arbitraryJitter{ 0.001f, 0.002f };
+    ConfigManager::Get().Modify([](CBRConfig& c) { c.projectionJitterSign = 1; });
+    auto [vkX, vkY] = j.ComputeProjectionOffset(arbitraryJitter, true);
+    auto [dxX, dxY] = j.ComputeProjectionOffset(arbitraryJitter, false);
+    CHECK(vkX == dxX);
+    CHECK(vkY == -dxY);
+
+    // Reset default
+    ConfigManager::Get().Modify([](CBRConfig& c) { c.projectionJitterSign = 1; });
+}
+
 int main() {
     const fs::path dir = fs::temp_directory_path() / "cbr_tests";
     fs::create_directories(dir);
@@ -393,6 +431,7 @@ int main() {
     TestPushConstantBuilder();
     TestRenderTargets();
     TestPushConstantLayout();
+    TestProjectionJitterSign();
 
     fs::remove_all(dir);
     if (g_failures == 0) {

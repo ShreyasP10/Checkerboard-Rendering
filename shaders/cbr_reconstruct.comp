@@ -195,17 +195,28 @@ void main() {
     // -------------------------------------------------------------------------
     // Only natively shaded neighbours carry depth, so the dilation scans just those (5 of the 3x3 around an
     // active pixel, 4 around a reconstructed one). Skipped entirely when disabled.
+    // For inactive pixels, the 4 cardinal neighbours are already fetched in step 1, avoiding redundant texture fetches.
     ivec2 motionCoord = pixelCoord;
     if (pc.u_EnableMotionDilation != 0u) {
-        bool found = false;
-        float best = 0.0;
-        for (int dy = -1; dy <= 1; ++dy) {
-            for (int dx = -1; dx <= 1; ++dx) {
-                ivec2 n = pixelCoord + ivec2(dx, dy);
+        if (isCurrentSampleActive) {
+            float best = currentDepth;
+            const ivec2 kDiagonal[4] = ivec2[](ivec2(-1, -1), ivec2(1, -1), ivec2(-1, 1), ivec2(1, 1));
+            for (int i = 0; i < 4; ++i) {
+                ivec2 n = pixelCoord + kDiagonal[i];
                 if (!InBounds(n, targetSize)) continue;
-                CbrSample ns = MapPixelToSample(n, frameParity);
-                if (!ns.isActive) continue;
-                float d = FetchDepth(ns);
+                float d = FetchDepth(MapPixelToSample(n, frameParity));
+                if (IsNearer(d, best)) {
+                    best = d;
+                    motionCoord = n;
+                }
+            }
+        } else {
+            bool found = false;
+            float best = 0.0;
+            for (int i = 0; i < 4; ++i) {
+                ivec2 n = pixelCoord + kCardinal[i];
+                if (!InBounds(n, targetSize)) continue;
+                float d = cardinalDepth[i];
                 if (!found || IsNearer(d, best)) {
                     found = true;
                     best = d;

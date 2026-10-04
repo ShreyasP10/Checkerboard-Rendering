@@ -160,6 +160,17 @@ bool ConfigManager::Load(const std::filesystem::path& configPath) {
                 } catch (...) {
                     CBR_LOG_WARN("Invalid JitterDirection '%s'; keeping previous.", val.c_str());
                 }
+            } else if (key == "ProjectionJitterSign") {
+                try {
+                    int s = std::stoi(val);
+                    if (s == 1 || s == -1) {
+                        m_config.projectionJitterSign = s;
+                    } else {
+                        CBR_LOG_WARN("Invalid ProjectionJitterSign '%s' (expected +1 or -1); keeping previous.", val.c_str());
+                    }
+                } catch (...) {
+                    CBR_LOG_WARN("Invalid ProjectionJitterSign '%s'; keeping previous.", val.c_str());
+                }
             } else if (key == "JitterCompensation") {
                 m_config.jitterCompensation = ParseFloat(val, m_config.jitterCompensation, -1.0f, 1.0f);
             } else if (key == "DebugView") {
@@ -218,6 +229,7 @@ bool ConfigManager::Save(const std::filesystem::path& configPath) {
     file << "JitterPattern = " << (m_config.jitterPattern == JitterPattern::Halton ? "Halton" : "Checkerboard") << "\n";
     file << "JitterScale = " << m_config.jitterScale << "\n";
     file << "JitterDirection = " << m_config.jitterDirection << "\n";
+    file << "ProjectionJitterSign = " << m_config.projectionJitterSign << "\n";
     file << "JitterCompensation = " << m_config.jitterCompensation << "\n\n";
 
     file << "[Debug]\n";

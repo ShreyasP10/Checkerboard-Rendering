@@ -53,6 +53,10 @@ struct CBRConfig {
     JitterPattern jitterPattern{ JitterPattern::Checkerboard };
     float         jitterScale{ 1.0f };
     int32_t       jitterDirection{ 1 }; // +1 or -1
+    // Independent sign applied when writing jitter offsets into the projection matrix
+    // (proj[8] / proj[9]). Accounts for engine projection-matrix handedness / column-major vs
+    // row-major conventions independently of reconstruction sample parity (+1 or -1).
+    int32_t       projectionJitterSign{ 1 };
     // Multiplier applied to the jitter delta when reprojecting history: default 0.0
     // (whole-pixel coverage jitter is absorbed by the sample mapping, so history needs no compensation).
     float         jitterCompensation{ 0.0f };

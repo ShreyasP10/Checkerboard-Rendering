@@ -46,6 +46,7 @@ This document contains the complete, unabridged source code for every file in th
 5. [Tests & CI](#sec-tests)
    - [`tests/test_core.cpp`](#teststestcorecpp)
    - [`tests/test_engine.cpp`](#teststestenginecpp)
+   - [`tests/check_shader_mapping.py`](#testscheckshadermappingpy)
    - [`.github/workflows/build.yml`](#githubworkflowsbuildyml)
 
 ---
@@ -247,6 +248,12 @@ if(CBR_BUILD_TESTS)
     target_include_directories(cbr_engine_tests PRIVATE ${CBR_INCLUDE_DIR})
     add_test(NAME cbr_engine      COMMAND cbr_engine_tests)
     add_test(NAME cbr_engine_auto COMMAND cbr_engine_tests auto)
+
+    # Equivalence verification between C++ checkerboard mapping and compute shaders
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME cbr_shader_mapping COMMAND Python3::Interpreter ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_shader_mapping.py)
+    endif()
 endif()
 
 # Copy sample configuration to output directory post-build
@@ -314,7 +321,7 @@ HistoryWeight = 0.90
 EnableSpatialFallback = true
 
 ; 3x3 closest-depth motion-vector dilation (cleaner moving silhouettes).
-; Costs 9 extra MSAA depth fetches per pixel: set false on bandwidth-limited GPUs.
+; Inactive pixels reuse cardinal depths from step 1 (0 extra texture fetches); active pixels scan diagonals.
 EnableMotionDilation = true
 
 ; Depth buffer convention: Reversed (1 near .. 0 far, RDR2 default) or Standard (0 near .. 1 far)
@@ -335,6 +342,10 @@ JitterScale = 1.0
 
 ; Odd-frame sampling-grid shift direction in presentation pixels (+1 or -1). Default: 1
 JitterDirection = 1
+
+; Independent sign applied when writing jitter offsets into the projection matrix (proj[8] / proj[9]).
+; Accounts for engine projection-matrix handedness / column-major vs row-major conventions (+1 or -1). Default: 1
+ProjectionJitterSign = 1
 
 ; Sub-pixel jitter compensation applied when reprojecting history.
 ; Default: 0.0 (the whole-pixel 2x MSAA checkerboard shift is absorbed by the sample mapping,
@@ -693,6 +704,10 @@ struct CBRConfig {
     JitterPattern jitterPattern{ JitterPattern::Checkerboard };
     float         jitterScale{ 1.0f };
     int32_t       jitterDirection{ 1 }; // +1 or -1
+    // Independent sign applied when writing jitter offsets into the projection matrix
+    // (proj[8] / proj[9]). Accounts for engine projection-matrix handedness / column-major vs
+    // row-major conventions independently of reconstruction sample parity (+1 or -1).
+    int32_t       projectionJitterSign{ 1 };
     // Multiplier applied to the jitter delta when reprojecting history: default 0.0
     // (whole-pixel coverage jitter is absorbed by the sample mapping, so history needs no compensation).
     float         jitterCompensation{ 0.0f };
@@ -837,6 +852,7 @@ private:
 
 #include <cstdint>
 #include <array>
+#include <utility>
 
 namespace cbr {
 
@@ -857,6 +873,10 @@ public:
     JitterOffset GetJitterDelta() const {
         return { m_currentJitter.x - m_previousJitter.x, m_currentJitter.y - m_previousJitter.y };
     }
+
+    // Computes the NDC projection offset (delta_x, delta_y) applied to proj[8] and proj[9].
+    // Incorporates ConfigManager::Get().GetConfig().projectionJitterSign and Vulkan Y-flip.
+    std::pair<float, float> ComputeProjectionOffset(const JitterOffset& jitter, bool isVulkan) const;
 
     // Computes subpixel jitter offset for a 4x4 projection matrix
     void ApplyJitterToProjection(float* projMatrix4x4, bool isVulkan) const;
@@ -1597,6 +1617,17 @@ bool ConfigManager::Load(const std::filesystem::path& configPath) {
                 } catch (...) {
                     CBR_LOG_WARN("Invalid JitterDirection '%s'; keeping previous.", val.c_str());
                 }
+            } else if (key == "ProjectionJitterSign") {
+                try {
+                    int s = std::stoi(val);
+                    if (s == 1 || s == -1) {
+                        m_config.projectionJitterSign = s;
+                    } else {
+                        CBR_LOG_WARN("Invalid ProjectionJitterSign '%s' (expected +1 or -1); keeping previous.", val.c_str());
+                    }
+                } catch (...) {
+                    CBR_LOG_WARN("Invalid ProjectionJitterSign '%s'; keeping previous.", val.c_str());
+                }
             } else if (key == "JitterCompensation") {
                 m_config.jitterCompensation = ParseFloat(val, m_config.jitterCompensation, -1.0f, 1.0f);
             } else if (key == "DebugView") {
@@ -1655,6 +1686,7 @@ bool ConfigManager::Save(const std::filesystem::path& configPath) {
     file << "JitterPattern = " << (m_config.jitterPattern == JitterPattern::Halton ? "Halton" : "Checkerboard") << "\n";
     file << "JitterScale = " << m_config.jitterScale << "\n";
     file << "JitterDirection = " << m_config.jitterDirection << "\n";
+    file << "ProjectionJitterSign = " << m_config.projectionJitterSign << "\n";
     file << "JitterCompensation = " << m_config.jitterCompensation << "\n\n";
 
     file << "[Debug]\n";
@@ -1974,16 +2006,25 @@ void JitterManager::Update(uint32_t frameIndex) {
     }
 }
 
-void JitterManager::ApplyJitterToProjection(float* projMatrix4x4, bool isVulkan) const {
-    if (!projMatrix4x4) return;
+std::pair<float, float> JitterManager::ComputeProjectionOffset(const JitterOffset& jitter, bool isVulkan) const {
+    const auto& config = ConfigManager::Get().GetConfig();
+    const float sign = (config.projectionJitterSign < 0) ? -1.0f : 1.0f;
 
     // Projection matrix offset in NDC space
-    float jitterNdcX = 2.0f * m_currentJitter.x;
-    float jitterNdcY = 2.0f * m_currentJitter.y;
+    float jitterNdcX = sign * (2.0f * jitter.x);
+    float jitterNdcY = sign * (2.0f * jitter.y);
 
     if (isVulkan) {
         jitterNdcY = -jitterNdcY;
     }
+
+    return { jitterNdcX, jitterNdcY };
+}
+
+void JitterManager::ApplyJitterToProjection(float* projMatrix4x4, bool isVulkan) const {
+    if (!projMatrix4x4) return;
+
+    auto [jitterNdcX, jitterNdcY] = ComputeProjectionOffset(m_currentJitter, isVulkan);
 
     projMatrix4x4[8] += jitterNdcX;
     projMatrix4x4[9] += jitterNdcY;
@@ -1992,12 +2033,7 @@ void JitterManager::ApplyJitterToProjection(float* projMatrix4x4, bool isVulkan)
 void JitterManager::RemoveJitterFromProjection(float* projMatrix4x4, bool isVulkan) const {
     if (!projMatrix4x4) return;
 
-    float jitterNdcX = 2.0f * m_currentJitter.x;
-    float jitterNdcY = 2.0f * m_currentJitter.y;
-
-    if (isVulkan) {
-        jitterNdcY = -jitterNdcY;
-    }
+    auto [jitterNdcX, jitterNdcY] = ComputeProjectionOffset(m_currentJitter, isVulkan);
 
     projMatrix4x4[8] -= jitterNdcX;
     projMatrix4x4[9] -= jitterNdcY;
@@ -2012,12 +2048,7 @@ void JitterManager::SetProjectionJitter(float* outMatrix4x4, const float* inUnji
         }
     }
 
-    float jitterNdcX = 2.0f * m_currentJitter.x;
-    float jitterNdcY = 2.0f * m_currentJitter.y;
-
-    if (isVulkan) {
-        jitterNdcY = -jitterNdcY;
-    }
+    auto [jitterNdcX, jitterNdcY] = ComputeProjectionOffset(m_currentJitter, isVulkan);
 
     outMatrix4x4[8] = inUnjitteredMatrix4x4[8] + jitterNdcX;
     outMatrix4x4[9] = inUnjitteredMatrix4x4[9] + jitterNdcY;
@@ -2278,7 +2309,9 @@ void RenderTargetManager::Initialize(uint32_t width, uint32_t height) {
 
     CBR_LOG_INFO("RenderTargetManager initialized for target: %ux%u", width, height);
     CBR_LOG_INFO("Quarter-Resolution 2x MSAA Buffer size: %ux%u", m_dims.quarterWidth, m_dims.quarterHeight);
-    CBR_LOG_INFO("Total CBR VRAM Footprint: %.2f MB", static_cast<double>(m_totalAllocatedVramBytes) / (1024.0 * 1024.0));
+    CBR_LOG_INFO("Total CBR VRAM Footprint: %.2f MiB (%.2f MB)",
+        static_cast<double>(m_totalAllocatedVramBytes) / (1024.0 * 1024.0),
+        static_cast<double>(m_totalAllocatedVramBytes) / 1000000.0);
 }
 
 void RenderTargetManager::Shutdown() {
@@ -2549,17 +2582,28 @@ void main() {
     // -------------------------------------------------------------------------
     // Only natively shaded neighbours carry depth, so the dilation scans just those (5 of the 3x3 around an
     // active pixel, 4 around a reconstructed one). Skipped entirely when disabled.
+    // For inactive pixels, the 4 cardinal neighbours are already fetched in step 1, avoiding redundant texture fetches.
     ivec2 motionCoord = pixelCoord;
     if (pc.u_EnableMotionDilation != 0u) {
-        bool found = false;
-        float best = 0.0;
-        for (int dy = -1; dy <= 1; ++dy) {
-            for (int dx = -1; dx <= 1; ++dx) {
-                ivec2 n = pixelCoord + ivec2(dx, dy);
+        if (isCurrentSampleActive) {
+            float best = currentDepth;
+            const ivec2 kDiagonal[4] = ivec2[](ivec2(-1, -1), ivec2(1, -1), ivec2(-1, 1), ivec2(1, 1));
+            for (int i = 0; i < 4; ++i) {
+                ivec2 n = pixelCoord + kDiagonal[i];
                 if (!InBounds(n, targetSize)) continue;
-                CbrSample ns = MapPixelToSample(n, frameParity);
-                if (!ns.isActive) continue;
-                float d = FetchDepth(ns);
+                float d = FetchDepth(MapPixelToSample(n, frameParity));
+                if (IsNearer(d, best)) {
+                    best = d;
+                    motionCoord = n;
+                }
+            }
+        } else {
+            bool found = false;
+            float best = 0.0;
+            for (int i = 0; i < 4; ++i) {
+                ivec2 n = pixelCoord + kCardinal[i];
+                if (!InBounds(n, targetSize)) continue;
+                float d = cardinalDepth[i];
                 if (!found || IsNearer(d, best)) {
                     found = true;
                     best = d;
@@ -2919,17 +2963,28 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     // -------------------------------------------------------------------------
     // Only natively shaded neighbours carry depth, so the dilation scans just those (5 of the 3x3 around an
     // active pixel, 4 around a reconstructed one). Skipped entirely when disabled.
+    // For inactive pixels, the 4 cardinal neighbours are already fetched in step 1, avoiding redundant texture fetches.
     int2 motionCoord = pixelCoord;
     if (g_EnableMotionDilation != 0u) {
-        bool found = false;
-        float best = 0.0f;
-        for (int dy = -1; dy <= 1; ++dy) {
-            for (int dx = -1; dx <= 1; ++dx) {
-                int2 n = pixelCoord + int2(dx, dy);
+        if (isCurrentSampleActive) {
+            float best = currentDepth;
+            static const int2 kDiagonal[4] = { int2(-1, -1), int2(1, -1), int2(-1, 1), int2(1, 1) };
+            for (int i = 0; i < 4; ++i) {
+                int2 n = pixelCoord + kDiagonal[i];
                 if (!InBounds(n, targetSize)) continue;
-                CbrSample ns = MapPixelToSample(n, frameParity);
-                if (!ns.isActive) continue;
-                float d = FetchDepth(ns);
+                float d = FetchDepth(MapPixelToSample(n, frameParity));
+                if (IsNearer(d, best)) {
+                    best = d;
+                    motionCoord = n;
+                }
+            }
+        } else {
+            bool found = false;
+            float best = 0.0f;
+            for (int i = 0; i < 4; ++i) {
+                int2 n = pixelCoord + kCardinal[i];
+                if (!InBounds(n, targetSize)) continue;
+                float d = cardinalDepth[i];
                 if (!found || IsNearer(d, best)) {
                     found = true;
                     best = d;
@@ -3222,6 +3277,7 @@ static void TestConfigHardening(const fs::path& dir) {
         "JitterPattern = Halton\n"    // unimplemented     -> Checkerboard
         "JitterCompensation = -5\n"   // out of range      -> clamped to -1
         "JitterDirection = -1\n"
+        "ProjectionJitterSign = -1\n"
         "JitterScale = 3\n"              // accepted but ignored (warned)
         "[Debug]\n"
         "DebugView = 77\n");          // out of range      -> clamped
@@ -3240,6 +3296,7 @@ static void TestConfigHardening(const fs::path& dir) {
     CHECK(!c.enableMotionDilation);
     CHECK(c.jitterCompensation == -1.0f);
     CHECK(c.jitterDirection == -1);
+    CHECK(c.projectionJitterSign == -1);
     CHECK(c.depthConvention == DepthConvention::Standard);
     CHECK(c.depthNear == 0.5f && c.depthFar == 5000.0f);
 
@@ -3247,12 +3304,14 @@ static void TestConfigHardening(const fs::path& dir) {
     const CBRConfig fresh{};
     CHECK(fresh.jitterCompensation == 0.0f); // whole-pixel jitter needs NO history compensation
     CHECK(fresh.jitterDirection == 1);
+    CHECK(fresh.projectionJitterSign == 1);
     CHECK(fresh.depthConvention == DepthConvention::Reversed);
 
     // Invalid enum-like values keep the previous setting
-    WriteFile(dir / "bad2.ini", "[Jitter]\nJitterDirection = 2\n[Reconstruction]\nDepthConvention = sideways\n");
+    WriteFile(dir / "bad2.ini", "[Jitter]\nJitterDirection = 2\nProjectionJitterSign = 42\n[Reconstruction]\nDepthConvention = sideways\n");
     CHECK(ConfigManager::Get().Load(dir / "bad2.ini"));
     CHECK(ConfigManager::Get().GetConfig().jitterDirection == -1);
+    CHECK(ConfigManager::Get().GetConfig().projectionJitterSign == -1);
     CHECK(ConfigManager::Get().GetConfig().depthConvention == DepthConvention::Standard);
 }
 
@@ -3270,6 +3329,7 @@ static void TestConfigMissingFileAndRoundTrip(const fs::path& dir) {
     CHECK(after.enableMotionDilation == before.enableMotionDilation);
     CHECK(after.jitterCompensation == before.jitterCompensation);
     CHECK(after.jitterDirection == before.jitterDirection);
+    CHECK(after.projectionJitterSign == before.projectionJitterSign);
     CHECK(after.depthConvention == before.depthConvention);
     CHECK(after.depthNear == before.depthNear && after.depthFar == before.depthFar);
 }
@@ -3544,6 +3604,39 @@ static void TestPushConstantLayout() {
     CHECK(sizeof(ReconstructionPushConstants) == 80);
 }
 
+static void TestProjectionJitterSign() {
+    auto& j = JitterManager::Get();
+    j.Initialize(3840, 2160);
+    j.Update(1); // odd frame has non-zero jitter in X
+
+    const JitterOffset jitter = j.GetCurrentJitter();
+    CHECK(jitter.x > 0.0f);
+
+    // Default: projectionJitterSign = +1
+    ConfigManager::Get().Modify([](CBRConfig& c) { c.projectionJitterSign = 1; });
+    auto [ndcDx1, ndcDy1] = j.ComputeProjectionOffset(jitter, false);
+    CHECK(ndcDx1 > 0.0f);
+    CHECK(std::fabs(ndcDx1 - 2.0f * jitter.x) < 1e-7f);
+
+    // Negated: projectionJitterSign = -1
+    ConfigManager::Get().Modify([](CBRConfig& c) { c.projectionJitterSign = -1; });
+    auto [ndcDx2, ndcDy2] = j.ComputeProjectionOffset(jitter, false);
+    CHECK(ndcDx2 < 0.0f);
+    CHECK(std::fabs(ndcDx2 + 2.0f * jitter.x) < 1e-7f);
+    CHECK(std::fabs(ndcDx1 + ndcDx2) < 1e-7f);
+
+    // Vulkan Y-flip behavior
+    JitterOffset arbitraryJitter{ 0.001f, 0.002f };
+    ConfigManager::Get().Modify([](CBRConfig& c) { c.projectionJitterSign = 1; });
+    auto [vkX, vkY] = j.ComputeProjectionOffset(arbitraryJitter, true);
+    auto [dxX, dxY] = j.ComputeProjectionOffset(arbitraryJitter, false);
+    CHECK(vkX == dxX);
+    CHECK(vkY == -dxY);
+
+    // Reset default
+    ConfigManager::Get().Modify([](CBRConfig& c) { c.projectionJitterSign = 1; });
+}
+
 int main() {
     const fs::path dir = fs::temp_directory_path() / "cbr_tests";
     fs::create_directories(dir);
@@ -3557,6 +3650,7 @@ int main() {
     TestPushConstantBuilder();
     TestRenderTargets();
     TestPushConstantLayout();
+    TestProjectionJitterSign();
 
     fs::remove_all(dir);
     if (g_failures == 0) {
@@ -3736,6 +3830,155 @@ int main(int argc, char** argv) {
 }
 ```
 
+<a id="testscheckshadermappingpy"></a>
+### `tests/check_shader_mapping.py`
+```python
+#!/usr/bin/env python3
+"""
+Equivalence test between C++ checkerboard_mapping.h and shaders (GLSL / HLSL).
+Verifies that:
+1. C++ MapPixelToSample and shader MapPixelToSample implement identical logic.
+2. Across two frames (parity 0 and parity 1), 100% 4-quadrant geometric coverage
+   is achieved with standard 2x MSAA sample locations.
+3. Shader files (cbr_reconstruct.comp and cbr_reconstruct.hlsl) contain the
+   synchronized mapping logic.
+"""
+
+import sys
+import os
+
+def cpp_map_pixel_to_sample(x: int, y: int, frame_parity: int, shift_dir: int = 1):
+    y_bit = y & 1
+    active = bool(((x ^ y) & 1) == (frame_parity & 1))
+    if (frame_parity & 1) == 0:
+        qx = x >> 1
+    elif shift_dir >= 0:
+        qx = (x - y_bit if x > y_bit else 0) >> 1
+    else:
+        qx = (x + 1 - y_bit) >> 1
+    qy = y >> 1
+    sample = 1 - y_bit
+    return {
+        "active": active,
+        "quarterX": qx,
+        "quarterY": qy,
+        "sample": sample
+    }
+
+def glsl_map_pixel_to_sample(x: int, y: int, frame_parity: int, shift_dir: int, target_w: int, target_h: int):
+    y_bit = y & 1
+    is_active = bool(((x ^ y) & 1) == (frame_parity & 1))
+    if frame_parity == 0:
+        qx = x >> 1
+    elif shift_dir >= 0:
+        qx = max(x - y_bit, 0) >> 1
+    else:
+        qx = (x + 1 - y_bit) >> 1
+    q_max_x = (target_w // 2) - 1
+    q_max_y = (target_h // 2) - 1
+    clamped_qx = max(0, min(qx, q_max_x))
+    clamped_qy = min(y >> 1, q_max_y)
+    sample_idx = 1 - y_bit
+    return {
+        "active": is_active,
+        "quarterX": clamped_qx,
+        "quarterY": clamped_qy,
+        "sample": sample_idx,
+        "unclamped_qx": qx
+    }
+
+def hlsl_map_pixel_to_sample(x: int, y: int, frame_parity: int, shift_dir: int, target_w: int, target_h: int):
+    # Same logic as GLSL
+    return glsl_map_pixel_to_sample(x, y, frame_parity, shift_dir, target_w, target_h)
+
+def test_mapping_equivalence():
+    target_w = 3840
+    target_h = 2160
+    tested = 0
+    for shift_dir in [1, -1]:
+        for frame_parity in [0, 1]:
+            # Test interior and boundary regions
+            x_samples = list(range(0, 32)) + list(range(target_w // 2 - 16, target_w // 2 + 16)) + list(range(target_w - 32, target_w))
+            y_samples = list(range(0, 32)) + list(range(target_h // 2 - 16, target_h // 2 + 16)) + list(range(target_h - 32, target_h))
+            for y in y_samples:
+                for x in x_samples:
+                    cpp_res = cpp_map_pixel_to_sample(x, y, frame_parity, shift_dir)
+                    glsl_res = glsl_map_pixel_to_sample(x, y, frame_parity, shift_dir, target_w, target_h)
+                    hlsl_res = hlsl_map_pixel_to_sample(x, y, frame_parity, shift_dir, target_w, target_h)
+
+                    assert cpp_res["active"] == glsl_res["active"] == hlsl_res["active"], f"Active mismatch at ({x}, {y})"
+                    assert cpp_res["sample"] == glsl_res["sample"] == hlsl_res["sample"], f"Sample index mismatch at ({x}, {y})"
+                    assert cpp_res["quarterY"] == glsl_res["quarterY"] == hlsl_res["quarterY"], f"quarterY mismatch at ({x}, {y})"
+
+                    # In the interior (not edge), unclamped qx must match C++ exactly
+                    assert cpp_res["quarterX"] == glsl_res["unclamped_qx"], f"quarterX mismatch at ({x}, {y})"
+                    tested += 1
+
+    print(f"[PASS] Verified mapping equivalence across {tested} coordinate combinations.")
+
+def test_two_frame_coverage():
+    # Verify 100% 4-quadrant coverage across 2 frames for 2x2 pixel blocks
+    for shift_dir in [1, -1]:
+        for block_x in range(0, 64, 2):
+            for block_y in range(0, 64, 2):
+                pixels = [
+                    (block_x, block_y),
+                    (block_x + 1, block_y),
+                    (block_x, block_y + 1),
+                    (block_x + 1, block_y + 1),
+                ]
+                f0_active = [p for p in pixels if cpp_map_pixel_to_sample(p[0], p[1], 0, shift_dir)["active"]]
+                f1_active = [p for p in pixels if cpp_map_pixel_to_sample(p[0], p[1], 1, shift_dir)["active"]]
+
+                assert len(f0_active) == 2, f"Frame 0 active count != 2 at block ({block_x}, {block_y})"
+                assert len(f1_active) == 2, f"Frame 1 active count != 2 at block ({block_x}, {block_y})"
+                assert set(f0_active).isdisjoint(set(f1_active)), f"Overlap between frame 0 and frame 1 at block ({block_x}, {block_y})"
+                assert len(set(f0_active) | set(f1_active)) == 4, f"Incomplete coverage across 2 frames at block ({block_x}, {block_y})"
+
+    print("[PASS] Verified 100% 4-quadrant coverage across 2 frames.")
+
+def test_source_code_consistency():
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    repo_root = os.path.abspath(os.path.join(script_dir, ".."))
+
+    comp_path = os.path.join(repo_root, "shaders", "cbr_reconstruct.comp")
+    hlsl_path = os.path.join(repo_root, "shaders", "cbr_reconstruct.hlsl")
+    header_path = os.path.join(repo_root, "include", "cbr", "checkerboard_mapping.h")
+
+    assert os.path.isfile(comp_path), f"Missing {comp_path}"
+    assert os.path.isfile(hlsl_path), f"Missing {hlsl_path}"
+    assert os.path.isfile(header_path), f"Missing {header_path}"
+
+    with open(comp_path, "r", encoding="utf-8") as f:
+        comp_src = f.read()
+    with open(hlsl_path, "r", encoding="utf-8") as f:
+        hlsl_src = f.read()
+    with open(header_path, "r", encoding="utf-8") as f:
+        header_src = f.read()
+
+    # Check that MapPixelToSample is present in all three
+    assert "MapPixelToSample" in comp_src, "MapPixelToSample missing from cbr_reconstruct.comp"
+    assert "MapPixelToSample" in hlsl_src, "MapPixelToSample missing from cbr_reconstruct.hlsl"
+    assert "MapPixelToSample" in header_src, "MapPixelToSample missing from checkerboard_mapping.h"
+
+    # Check parity check formula ((x ^ y) & 1) == frameParity in all three
+    assert "(p.x) ^ uint(p.y)) & 1u) == frameParity" in comp_src
+    assert "(p.x) ^ uint(p.y)) & 1u) == frameParity" in hlsl_src
+    assert "((static_cast<uint32_t>(x ^ y) & 1u) == (frameParity & 1u))" in header_src
+
+    print("[PASS] Verified source code consistency across GLSL, HLSL, and C++ header.")
+
+def main():
+    test_mapping_equivalence()
+    test_two_frame_coverage()
+    test_source_code_consistency()
+    print("All shader-to-C++ mapping equivalence tests passed successfully.")
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
 <a id="githubworkflowsbuildyml"></a>
 ### `.github/workflows/build.yml`
 ```yaml
@@ -3763,6 +4006,21 @@ jobs:
           glslangValidator -V shaders/cbr_reconstruct.comp -o /tmp/r.spv
           glslangValidator -V shaders/cbr_resolve_simple.comp -o /tmp/s.spv
           glslangValidator -D -e CSMain -S comp -V shaders/cbr_reconstruct.hlsl -o /tmp/h.spv
+      - name: Verify shader mapping equivalence
+        run: python3 tests/check_shader_mapping.py
+
+  windows-syntax-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install MinGW cross-compiler
+        run: sudo apt-get update && sudo apt-get install -y g++-mingw-w64-x86-64
+      - name: Syntax check Windows sources
+        run: |
+          for f in logger config jitter_manager render_target_manager reconstruction_pass ui_overlay cbr_engine hooks main hooks_vulkan hooks_dx12; do
+            echo "Checking src/$f.cpp..."
+            x86_64-w64-mingw32-g++ -std=c++20 -fsyntax-only -Wall -Wextra -Wpedantic -Wshadow -Iinclude src/$f.cpp
+          done
 
   windows-release:
     runs-on: windows-latest

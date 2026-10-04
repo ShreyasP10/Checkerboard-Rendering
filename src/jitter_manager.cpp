@@ -38,16 +38,25 @@ void JitterManager::Update(uint32_t frameIndex) {
     }
 }
 
-void JitterManager::ApplyJitterToProjection(float* projMatrix4x4, bool isVulkan) const {
-    if (!projMatrix4x4) return;
+std::pair<float, float> JitterManager::ComputeProjectionOffset(const JitterOffset& jitter, bool isVulkan) const {
+    const auto& config = ConfigManager::Get().GetConfig();
+    const float sign = (config.projectionJitterSign < 0) ? -1.0f : 1.0f;
 
     // Projection matrix offset in NDC space
-    float jitterNdcX = 2.0f * m_currentJitter.x;
-    float jitterNdcY = 2.0f * m_currentJitter.y;
+    float jitterNdcX = sign * (2.0f * jitter.x);
+    float jitterNdcY = sign * (2.0f * jitter.y);
 
     if (isVulkan) {
         jitterNdcY = -jitterNdcY;
     }
+
+    return { jitterNdcX, jitterNdcY };
+}
+
+void JitterManager::ApplyJitterToProjection(float* projMatrix4x4, bool isVulkan) const {
+    if (!projMatrix4x4) return;
+
+    auto [jitterNdcX, jitterNdcY] = ComputeProjectionOffset(m_currentJitter, isVulkan);
 
     projMatrix4x4[8] += jitterNdcX;
     projMatrix4x4[9] += jitterNdcY;
@@ -56,12 +65,7 @@ void JitterManager::ApplyJitterToProjection(float* projMatrix4x4, bool isVulkan)
 void JitterManager::RemoveJitterFromProjection(float* projMatrix4x4, bool isVulkan) const {
     if (!projMatrix4x4) return;
 
-    float jitterNdcX = 2.0f * m_currentJitter.x;
-    float jitterNdcY = 2.0f * m_currentJitter.y;
-
-    if (isVulkan) {
-        jitterNdcY = -jitterNdcY;
-    }
+    auto [jitterNdcX, jitterNdcY] = ComputeProjectionOffset(m_currentJitter, isVulkan);
 
     projMatrix4x4[8] -= jitterNdcX;
     projMatrix4x4[9] -= jitterNdcY;
@@ -76,12 +80,7 @@ void JitterManager::SetProjectionJitter(float* outMatrix4x4, const float* inUnji
         }
     }
 
-    float jitterNdcX = 2.0f * m_currentJitter.x;
-    float jitterNdcY = 2.0f * m_currentJitter.y;
-
-    if (isVulkan) {
-        jitterNdcY = -jitterNdcY;
-    }
+    auto [jitterNdcX, jitterNdcY] = ComputeProjectionOffset(m_currentJitter, isVulkan);
 
     outMatrix4x4[8] = inUnjitteredMatrix4x4[8] + jitterNdcX;
     outMatrix4x4[9] = inUnjitteredMatrix4x4[9] + jitterNdcY;

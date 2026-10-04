@@ -276,6 +276,7 @@ DepthFar = 0.0               ; Far plane in metres (0.0 = infinite far plane for
 JitterPattern = Checkerboard ; 2-phase complementary grid jitter (whole-pixel horizontal shift)
 JitterScale = 1.0            ; Jitter scale (1.0 = exact whole-pixel coverage shift)
 JitterDirection = 1          ; Odd-frame horizontal shift direction: +1 or -1
+ProjectionJitterSign = 1     ; Independent sign for projection matrix jitter offsets (proj[8]/proj[9])
 JitterCompensation = 0.0     ; History reprojection jitter sign (default 0.0: whole-pixel shift is absorbed by sample mapping)
 
 [Debug]
@@ -313,7 +314,7 @@ Launch *Red Dead Redemption 2*, open **Settings > Graphics**, and configure the 
 * **MSAA:** **Off** (leave in-game MSAA disabled; the planned design has CBR allocate its own dedicated 2× MSAA intermediate buffer, which is not implemented yet).
 
 #### 4. Geometry & Texture Settings (Optimized for GTX 1070 Ti / Pascal 8 GB)
-* **Texture Quality:** **Ultra** (the CBR buffers themselves need ~315.19 MB; whether Ultra textures plus those fit in 8 GB at 4K is unverified, so lower this first if you run out of VRAM).
+* **Texture Quality:** **Ultra** (the CBR buffers themselves need ~300.58 MiB (315.19 MB); whether Ultra textures plus those fit in 8 GB at 4K is unverified, so lower this first if you run out of VRAM).
 * **Anisotropic Filtering:** **16×** (negligible performance cost on Pascal GPUs; keeps road and terrain textures sharp at oblique viewing angles).
 * **Lighting Quality:** **Medium** or **High**.
 * **Global Illumination Quality:** **High**.
@@ -344,7 +345,7 @@ Exit or Alt-Tab from the game and open `cbr.log` in the RDR2 root folder to veri
 [INFO] Configuration successfully loaded from cbr.ini (Target: 3840x2160, API: Vulkan, CBR Enabled: true)
 [INFO] RenderTargetManager initialized for target: 3840x2160
 [INFO] Quarter-Resolution 2x MSAA Buffer size: 1920x1080
-[INFO] Total CBR VRAM Footprint: 315.19 MB
+[INFO] Total CBR VRAM Footprint: 300.58 MiB (315.19 MB)
 [WARN] Vulkan hook installation is not implemented yet; no hooks are active.
 [INFO] CBREngine initialized successfully. Ready for frame interception.
 ```
@@ -393,8 +394,11 @@ EnableSpatialFallback = true
 EnableMotionDilation = true
 
 [Jitter]
+JitterPattern = Checkerboard
 JitterScale = 1.0
-JitterCompensation = 1.0
+JitterDirection = 1
+ProjectionJitterSign = 1
+JitterCompensation = 0.0
 ```
 
 ---
@@ -405,6 +409,7 @@ JitterCompensation = 1.0
 cmake -S . -B build-tests -DCBR_BUILD_TESTS=ON
 cmake --build build-tests --target cbr_tests cbr_engine_tests
 ctest --test-dir build-tests --output-on-failure
+python tests/check_shader_mapping.py
 ```
 
 The tests cover the portable code only (no Windows APIs or GPU): config, logger, jitter, push-constant layout, and the engine's hook-retry, once-per-frame dispatch and frame-parity logic (using fake hook installers). Validate shaders with:

@@ -189,6 +189,12 @@ if(CBR_BUILD_TESTS)
     target_include_directories(cbr_engine_tests PRIVATE ${CBR_INCLUDE_DIR})
     add_test(NAME cbr_engine      COMMAND cbr_engine_tests)
     add_test(NAME cbr_engine_auto COMMAND cbr_engine_tests auto)
+
+    # Equivalence verification between C++ checkerboard mapping and compute shaders
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME cbr_shader_mapping COMMAND Python3::Interpreter ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_shader_mapping.py)
+    endif()
 endif()
 
 # Copy sample configuration to output directory post-build
