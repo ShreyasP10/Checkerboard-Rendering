@@ -15,6 +15,7 @@ A community-driven graphics modification implementing **Checkerboard Rendering (
 
 ## 📖 Table of Contents
 - [About](#about)
+- [Why Checkerboard Rendering? (CBR vs. DLSS / FSR)](#why-checkerboard-rendering-cbr-vs-dlss--fsr)
 - [How It Works](#how-it-works)
 - [Key Features](#key-features)
 - [Architecture & Repository Structure](#architecture--repository-structure)
@@ -22,7 +23,7 @@ A community-driven graphics modification implementing **Checkerboard Rendering (
 - [Engineering Documentation](#engineering-documentation)
 - [Reconstruction Shader Math](#reconstruction-shader-math)
 - [Hardware & Development Requirements](#hardware--development-requirements)
-- [How to Build, Install & Run](#-how-to-build-install--run)
+- [How to Install & Run](#-how-to-install--run)
 - [Configuration](#configuration-cbrini)
 - [Testing](#testing)
 - [Contributing](#contributing)
@@ -42,6 +43,23 @@ On PC, players on mid-range GPUs such as the **NVIDIA GeForce GTX 1070 Ti** face
 - **FSR** provides spatial/temporal upscaling but has a distinct aesthetic and does not replicate the console presentation.
 
 This project delivers a **native ASI plugin** that intercepts RDR2's rendering passes, renders the primary geometry at half shading cost, and reconstructs a full 4K frame using an optimized compute shader with temporal reprojection, depth disocclusion detection, and YCoCg neighborhood color clamping.
+
+---
+
+## Why Checkerboard Rendering? (CBR vs. DLSS / FSR)
+
+**Inspiration: The PlayStation 4 Pro**  
+When *Red Dead Redemption 2* launched on the PS4 Pro, it achieved a gorgeous 4K presentation despite the console's mid-range GPU architecture. It accomplished this using **Checkerboard Rendering (CBR)**: shading only half the pixels of a 4K frame (using a 2× MSAA alternating grid pattern) and mathematically reconstructing the missing pixels using historical frame data. This mod brings that exact algorithmic elegance and console presentation to the PC version of RDR2.
+
+**How is CBR different from DLSS or FSR?**  
+Modern upscaling solutions (like DLSS, FSR, and XeSS) operate on lower-resolution flat 2D buffers (e.g., rendering natively at 1080p and scaling up to 4K). 
+* **DLSS / XeSS:** Rely on AI machine learning and specialized hardware (Tensor cores) to hallucinate missing details. They are extremely effective, but **DLSS cannot run on older hardware like the GTX 10-series (Pascal)**.
+* **FSR 2.0+:** A spatial-temporal algorithmic upscaler that runs on any GPU. However, because it reconstructs a full 4K image from a standard, lower-resolution flat grid, it introduces a distinctly different aesthetic, often resulting in over-sharpening, shimmering, or loss of high-frequency geometry details.
+
+**What extra benefits does CBR provide?**  
+1. **Geometric Fidelity (2× MSAA):** Unlike FSR which renders a standard flat 1080p image, CBR renders using 2× MSAA arranged in a subpixel checkerboard pattern. This means that across two frames, CBR physically samples **100% of the 4K geometry**, providing native-like edge clarity without the temporal smearing of standard upscalers.
+2. **Universal Compatibility & Hardware Efficiency:** CBR is a pure algorithmic math shader (utilizing YCoCg neighborhood color clamping and temporal motion vector reprojection). It requires **no AI Tensor cores** and **no proprietary hardware**, making it the ultimate solution for aging but powerful architectures like the GTX 1070 Ti, GTX 1080, and AMD Vega APUs.
+3. **The Authentic "Console" Look:** It exactly replicates the specific temporal aesthetic of the PS4 Pro, giving players the intended cinematic console experience with PC framerates.
 
 ---
 
