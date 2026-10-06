@@ -262,20 +262,32 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
         float3 m2 = float3(0.0f, 0.0f, 0.0f);
         float n = 0.0f;
 
-        for (int dy = -1; dy <= 1; ++dy) {
-            for (int dx = -1; dx <= 1; ++dx) {
-                int2 nc = pixelCoord + int2(dx, dy);
-                if (!InBounds(nc, targetSize)) continue;
-                CbrSample ns = MapPixelToSample(nc, frameParity);
-                if (!ns.isActive) continue;
-
-                float3 c = ToClampSpace(FetchColor(ns));
-                colorMin = min(colorMin, c);
-                colorMax = max(colorMax, c);
-                m1 += c;
-                m2 += c * c;
-                n += 1.0f;
+        int numNeighbors = isCurrentSampleActive ? 5 : 4;
+        const int2 kDiagonal[4] = { int2(-1, -1), int2(1, -1), int2(-1, 1), int2(1, 1) };
+        
+        for (int i = 0; i < numNeighbors; ++i) {
+            int2 offset;
+            if (isCurrentSampleActive) {
+                offset = (i == 0) ? int2(0, 0) : kDiagonal[i - 1];
+            } else {
+                offset = kCardinal[i];
             }
+            
+            int2 nc = pixelCoord + offset;
+            if (!InBounds(nc, targetSize)) continue;
+            
+            float3 c;
+            if (isCurrentSampleActive && i == 0) {
+                c = ToClampSpace(currentColor);
+            } else {
+                c = ToClampSpace(FetchColor(MapPixelToSample(nc, frameParity)));
+            }
+            
+            colorMin = min(colorMin, c);
+            colorMax = max(colorMax, c);
+            m1 += c;
+            m2 += c * c;
+            n += 1.0f;
         }
 
         if (n >= 2.0f) {
