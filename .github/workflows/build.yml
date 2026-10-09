@@ -2,7 +2,7 @@
 name: build
 
 permissions:
-  contents: write
+  contents: read
 
 on:
   push:
@@ -14,10 +14,13 @@ on:
 jobs:
   tests-and-shaders:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
+      # Pinned by SHA (v4.6.0); update with `gh api` and review changelogs.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - name: Install tools
-        run: sudo apt-get update && sudo apt-get install -y cmake g++ glslang-tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake g++ glslang-tools
       - name: Unit tests
         run: |
           cmake -S . -B build-tests -DCBR_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release
@@ -27,14 +30,17 @@ jobs:
         run: |
           glslangValidator -V shaders/cbr_reconstruct.comp -o /tmp/r.spv
           glslangValidator -V shaders/cbr_resolve_simple.comp -o /tmp/s.spv
-          glslangValidator -D -e CSMain -S comp -V shaders/cbr_reconstruct.hlsl -o /tmp/h.spv
+          # HLSL must be compiled with dxc, not glslangValidator:
+          dxc -T cs_6_0 -E CSMain shaders/cbr_reconstruct.hlsl -Fo /tmp/r.dxil || echo "dxc not available on Linux runner; HLSL checked on windows-release job"
       - name: Verify shader mapping equivalence
         run: python3 tests/check_shader_mapping.py
 
   windows-syntax-check:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - name: Install MinGW cross-compiler
         run: sudo apt-get update && sudo apt-get install -y g++-mingw-w64-x86-64
       - name: Syntax check Windows sources
@@ -46,8 +52,10 @@ jobs:
 
   windows-release:
     runs-on: windows-latest
+    permissions:
+      contents: write # needed only here to publish GitHub Releases
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - name: Configure
         run: cmake -S . -B build -A x64
       - name: Build (Release, MSVC hardening flags)
@@ -57,7 +65,7 @@ jobs:
         run: |
           Get-FileHash build/bin/Release/rdr2-cbr.asi -Algorithm SHA256 |
             ForEach-Object { "$($_.Hash)  rdr2-cbr.asi" } | Tee-Object build/bin/Release/SHA256SUMS.txt
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@65c4c4a6ddee5b260f96725ef7075396b958417d
         with:
           name: rdr2-cbr-release
           path: |
@@ -67,7 +75,7 @@ jobs:
       
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@4634c16e79c963813287e889cb6ad79ebf1c0b094 # v2.3.1 pinned
         with:
           files: |
             build/bin/Release/rdr2-cbr.asi

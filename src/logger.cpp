@@ -30,15 +30,21 @@ void Logger::Initialize(const std::filesystem::path& logFilePath) {
         for (const auto& line : m_pending) {
             m_logFile << line;
         }
+        if (m_droppedPending > 0) {
+            m_logFile << "[WARN] " << m_droppedPending << " early log message(s) dropped (buffer cap "
+                      << kMaxPendingMessages << ").\n";
+        }
         m_logFile.flush();
     }
     m_pending.clear();
+    m_droppedPending = 0;
 }
 
 void Logger::Disable() {
     std::lock_guard<std::mutex> lock(m_mutex);
     m_disabled = true;
     m_pending.clear();
+    m_droppedPending = 0;
 }
 
 void Logger::Shutdown() {
@@ -51,6 +57,7 @@ void Logger::Shutdown() {
     m_initialized = false;
     m_disabled = true;
     m_pending.clear();
+    m_droppedPending = 0;
 }
 
 void Logger::SetMinLevel(LogLevel level) {
@@ -94,8 +101,12 @@ void Logger::Log(LogLevel level, const std::string& message) {
     if (m_initialized && m_logFile.is_open()) {
         m_logFile << formatted;
         m_logFile.flush();
-    } else if (!m_initialized && !m_disabled && m_pending.size() < kMaxPendingMessages) {
-        m_pending.push_back(formatted);
+    } else if (!m_initialized && !m_disabled) {
+        if (m_pending.size() < kMaxPendingMessages) {
+            m_pending.push_back(formatted);
+        } else {
+            ++m_droppedPending;
+        }
     }
 
 #if defined(_DEBUG)

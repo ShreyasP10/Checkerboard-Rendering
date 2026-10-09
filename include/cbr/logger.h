@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -45,7 +46,13 @@ public:
         static_assert((!std::is_same_v<std::decay_t<Args>, std::wstring> && ...),
                       "Wide strings are not supported by CBR_LOG_* macros");
         char buffer[1024];
-        std::snprintf(buffer, sizeof(buffer), format, args...);
+        const int n = std::snprintf(buffer, sizeof(buffer), format, args...);
+        if (n < 0) return; // encoding error: drop rather than log garbage
+        if (static_cast<size_t>(n) >= sizeof(buffer)) {
+            // Truncation would mislead diagnostics; mark it explicitly.
+            constexpr char kTrunc[] = "...<truncated>";
+            std::memcpy(buffer + sizeof(buffer) - sizeof(kTrunc), kTrunc, sizeof(kTrunc));
+        }
         Log(level, std::string(buffer));
     }
 
@@ -63,6 +70,7 @@ private:
     bool                     m_disabled{ false };
     LogLevel                 m_minLevel{ LogLevel::Info };
     std::vector<std::string> m_pending; // messages logged before Initialize()/Disable()
+    size_t                   m_droppedPending{ 0 }; // buffered messages dropped beyond cap
 };
 
 } // namespace cbr

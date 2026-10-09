@@ -53,7 +53,7 @@ private:
     ~ReconstructionPass() = default;
 
     std::atomic<bool> m_initialized{ false };
-    bool m_isVulkan{ true };
+    std::atomic<bool> m_isVulkan{ true };
 };
 
 } // namespace cbr

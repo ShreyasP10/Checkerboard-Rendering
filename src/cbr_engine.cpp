@@ -1,5 +1,6 @@
 #include "cbr/cbr_engine.h"
 #include "cbr/config.h"
+#include "cbr/limits.h"
 #include "cbr/logger.h"
 #include "cbr/jitter_manager.h"
 #include "cbr/render_target_manager.h"
@@ -174,6 +175,9 @@ void CBREngine::OnPrePresent(void* queueOrSwapchain, const void* /*presentInfo*/
 }
 
 void CBREngine::OnPostPresent(void* presentTarget) {
+    // Intentional: frame parity advances even while disabled so that re-enabling
+    // resumes on a fresh frame (OnScenePassEnd is gated on m_enabled and will
+    // dispatch exactly once for the new frame). Do not gate this on m_enabled.
     // The first present seen after start-up / swapchain recreation defines the main target.
     void* expected = nullptr;
     m_mainPresentTarget.compare_exchange_strong(expected, presentTarget);
@@ -188,12 +192,11 @@ void CBREngine::OnSwapchainRecreated(uint32_t width, uint32_t height) {
     m_frameIndex.store(0);
     m_lastDispatchedFrame.store(kNoFrame);
 
-    // Swapchain extents are untrusted: odd sizes round up to even, implausible ones (< 320 or > 16384) are ignored
-    constexpr uint32_t kMinExtent = 320;
-    constexpr uint32_t kMaxExtent = 16384;
-    if (width >= kMinExtent && width <= kMaxExtent && height >= 240 && height <= kMaxExtent) {
-        if (width & 1u) ++width;
-        if (height & 1u) ++height;
+    // Swapchain extents are untrusted: odd sizes round up to even, implausible ones are ignored.
+    if (width >= kMinSwapchainExtent && width <= kMaxSwapchainExtent &&
+        height >= kMinSwapchainHeight && height <= kMaxSwapchainExtent) {
+        width = MakeEvenUp(width);
+        height = MakeEvenUp(height);
         RenderTargetManager::Get().Initialize(width, height);
         JitterManager::Get().Initialize(width, height);
         CBR_LOG_INFO("Swapchain recreated with new resolution %ux%u: frame parity and history reset.", width, height);

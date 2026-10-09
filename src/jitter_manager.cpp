@@ -10,15 +10,22 @@ JitterManager& JitterManager::Get() {
 }
 
 void JitterManager::Initialize(uint32_t targetWidth, uint32_t targetHeight) {
-    m_targetWidth = (targetWidth > 0) ? targetWidth : 3840;
-    m_targetHeight = (targetHeight > 0) ? targetHeight : 2160;
-    m_currentJitter = { 0.0f, 0.0f };
-    m_previousJitter = { 0.0f, 0.0f };
-
-    CBR_LOG_INFO("JitterManager initialized with target resolution: %ux%u", m_targetWidth, m_targetHeight);
+    uint32_t w, h;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_targetWidth = (targetWidth > 0) ? targetWidth : 3840;
+        m_targetHeight = (targetHeight > 0) ? targetHeight : 2160;
+        m_currentJitter = { 0.0f, 0.0f };
+        m_previousJitter = { 0.0f, 0.0f };
+        w = m_targetWidth; h = m_targetHeight;
+    }
+    CBR_LOG_INFO("JitterManager initialized with target resolution: %ux%u", w, h);
 }
 
 void JitterManager::Update(uint32_t frameIndex) {
+    // JitterScale is intentionally ignored: 2x MSAA checkerboard coverage
+    // requires exactly one full-resolution pixel shift. See config warning.
+    std::lock_guard<std::mutex> lock(m_mutex);
     m_previousJitter = m_currentJitter;
 
     // 2-phase checkerboard jitter sequence:
@@ -56,7 +63,9 @@ std::pair<float, float> JitterManager::ComputeProjectionOffset(const JitterOffse
 void JitterManager::ApplyJitterToProjection(float* projMatrix4x4, bool isVulkan) const {
     if (!projMatrix4x4) return;
 
-    auto [jitterNdcX, jitterNdcY] = ComputeProjectionOffset(m_currentJitter, isVulkan);
+    JitterOffset cur;
+    { std::lock_guard<std::mutex> lock(m_mutex); cur = m_currentJitter; }
+    auto [jitterNdcX, jitterNdcY] = ComputeProjectionOffset(cur, isVulkan);
 
     projMatrix4x4[8] += jitterNdcX;
     projMatrix4x4[9] += jitterNdcY;
@@ -65,7 +74,9 @@ void JitterManager::ApplyJitterToProjection(float* projMatrix4x4, bool isVulkan)
 void JitterManager::RemoveJitterFromProjection(float* projMatrix4x4, bool isVulkan) const {
     if (!projMatrix4x4) return;
 
-    auto [jitterNdcX, jitterNdcY] = ComputeProjectionOffset(m_currentJitter, isVulkan);
+    JitterOffset cur;
+    { std::lock_guard<std::mutex> lock(m_mutex); cur = m_currentJitter; }
+    auto [jitterNdcX, jitterNdcY] = ComputeProjectionOffset(cur, isVulkan);
 
     projMatrix4x4[8] -= jitterNdcX;
     projMatrix4x4[9] -= jitterNdcY;
@@ -80,7 +91,9 @@ void JitterManager::SetProjectionJitter(float* outMatrix4x4, const float* inUnji
         }
     }
 
-    auto [jitterNdcX, jitterNdcY] = ComputeProjectionOffset(m_currentJitter, isVulkan);
+    JitterOffset cur;
+    { std::lock_guard<std::mutex> lock(m_mutex); cur = m_currentJitter; }
+    auto [jitterNdcX, jitterNdcY] = ComputeProjectionOffset(cur, isVulkan);
 
     outMatrix4x4[8] = inUnjitteredMatrix4x4[8] + jitterNdcX;
     outMatrix4x4[9] = inUnjitteredMatrix4x4[9] + jitterNdcY;

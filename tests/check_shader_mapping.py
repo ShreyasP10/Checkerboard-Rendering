@@ -11,8 +11,20 @@ Verifies that:
 
 import sys
 import os
+from typing import Dict
 
-def cpp_map_pixel_to_sample(x: int, y: int, frame_parity: int, shift_dir: int = 1):
+def _check_coords(x: int, y: int, target_w: int, target_h: int) -> None:
+    for name, v in (("x", x), ("y", y)):
+        if not isinstance(v, int) or v < 0:
+            raise ValueError(f"{name} must be a non-negative int, got {v!r}")
+    if target_w <= 0 or target_h <= 0:
+        raise ValueError("target dimensions must be positive")
+
+def cpp_map_pixel_to_sample(x: int, y: int, frame_parity: int, shift_dir: int = 1) -> Dict[str, int]:
+    if x < 0 or y < 0:
+        raise ValueError(f"pixel coords must be >= 0, got ({x}, {y})")
+    if frame_parity not in (0, 1):
+        raise ValueError(f"frame_parity must be 0/1, got {frame_parity}")
     y_bit = y & 1
     active = bool(((x ^ y) & 1) == (frame_parity & 1))
     if (frame_parity & 1) == 0:
@@ -31,6 +43,7 @@ def cpp_map_pixel_to_sample(x: int, y: int, frame_parity: int, shift_dir: int = 
     }
 
 def glsl_map_pixel_to_sample(x: int, y: int, frame_parity: int, shift_dir: int, target_w: int, target_h: int):
+    _check_coords(x, y, target_w, target_h)
     y_bit = y & 1
     is_active = bool(((x ^ y) & 1) == (frame_parity & 1))
     if frame_parity == 0:

@@ -255,8 +255,9 @@ Find the folder containing `RDR2.exe`:
 
 #### 3.2 Install the ASI Loader
 An ASI loader is required to load custom `.asi` game modifications:
-1. Download `dinput8.dll` from the official [Script Hook RDR2](https://www.dev-c.com/rdr2/scripthookrdr2/) release by Alexander Blade (confirm the page loads over a valid HTTPS connection), or from an ASI loader project's official release page. Verify any published checksum before use.
-2. Place `dinput8.dll` directly into the RDR2 root folder (where `RDR2.exe` is located).
+1. Download `dinput8.dll` only from the loader project's official release page over HTTPS (e.g. the official [Script Hook RDR2](https://www.dev-c.com/rdr2/scripthookrdr2/) release by Alexander Blade). Do not use re-uploads, Discord attachments, or video-description links.
+2. Verify integrity before installing: compare `Get-FileHash dinput8.dll -Algorithm SHA256` against the hash published on that release page (do not install if the page lists no hash or the hash mismatches). Scan with Windows Defender/SmartScreen.
+3. Place the verified `dinput8.dll` directly into the RDR2 root folder (where `RDR2.exe` is located). Use strictly offline / story mode only; remove ASI loaders before joining Red Dead Online.
 
 #### 3.3 Deploy CBR Plugin & Configuration
 Copy the built mod files into your RDR2 root directory:

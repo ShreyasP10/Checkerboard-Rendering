@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <shared_mutex>
 #include <vector>
 
 namespace cbr {
@@ -21,7 +22,10 @@ public:
     void Initialize(uint32_t width, uint32_t height);
     void Shutdown();
 
-    const TargetDimensions& GetDimensions() const { return m_dims; }
+    TargetDimensions GetDimensions() const {
+        std::shared_lock<std::shared_mutex> lock(m_mutex);
+        return m_dims;
+    }
 
     bool IsTargetInterceptCandidate(uint32_t width, uint32_t height, uint32_t format) const;
     bool IsQuarterPassCandidate(uint32_t width, uint32_t height) const;
@@ -33,15 +37,16 @@ public:
     void     ResetHistory() { m_historyPingPong.store(0u); }
 
     // Memory footprint tracking
-    size_t GetTotalAllocatedVramBytes() const { return m_totalAllocatedVramBytes; }
+    size_t GetTotalAllocatedVramBytes() const { return m_totalAllocatedVramBytes.load(); }
 
 private:
     RenderTargetManager() = default;
     ~RenderTargetManager() = default;
 
+    mutable std::shared_mutex m_mutex;
     TargetDimensions m_dims;
     std::atomic<uint32_t> m_historyPingPong{ 0 };
-    size_t           m_totalAllocatedVramBytes{ 0 };
+    std::atomic<size_t> m_totalAllocatedVramBytes{ 0 };
     std::atomic<bool> m_initialized{ false };
 };
 

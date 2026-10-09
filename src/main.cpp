@@ -76,16 +76,23 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID /*lpRese
             // installed hook is still executing code inside it. ASI plugins are not meant
             // to be unloaded, and this removes the need to wait on a thread from DllMain.
             HMODULE pinned = nullptr;
-            GetModuleHandleExW(
+            if (!GetModuleHandleExW(
                 GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
                 reinterpret_cast<LPCWSTR>(&CBR_PluginInit),
-                &pinned);
+                &pinned)) {
+                // Pin failed: do not spawn a thread that would execute unmapped code.
+                // Record directory anyway so a later CBR_PluginInit can still initialize.
+                cbr::CBREngine::Get().SetModuleDirectory(GetModuleDirectoryPath(hModule));
+                break;
+            }
 
             // Record module directory for resolving cbr.ini and cbr.log relative to the DLL
             cbr::CBREngine::Get().SetModuleDirectory(GetModuleDirectoryPath(hModule));
 
-            // Launch initialization in a background thread to avoid blocking process startup.
-            // The handle is not needed afterwards, and the module is pinned, so close it now.
+            // NOTE: CreateThread under the loader lock can deadlock. This is tolerated
+            // only because the module is pinned and the thread touches just CBR singletons.
+            // Preferred path is the loader calling CBR_PluginInit (no thread); this thread
+            // is a fallback for loaders that only map the DLL.
             HANDLE hThread = CreateThread(nullptr, 0, CBRInitThread, nullptr, 0, nullptr);
             if (hThread) {
                 CloseHandle(hThread);

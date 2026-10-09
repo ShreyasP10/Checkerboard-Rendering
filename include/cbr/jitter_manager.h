@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <array>
+#include <mutex>
 #include <utility>
 
 namespace cbr {
@@ -18,9 +19,16 @@ public:
     void Initialize(uint32_t targetWidth, uint32_t targetHeight);
     void Update(uint32_t frameIndex);
 
-    JitterOffset GetCurrentJitter() const { return m_currentJitter; }
-    JitterOffset GetPreviousJitter() const { return m_previousJitter; }
+    JitterOffset GetCurrentJitter() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_currentJitter;
+    }
+    JitterOffset GetPreviousJitter() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_previousJitter;
+    }
     JitterOffset GetJitterDelta() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
         return { m_currentJitter.x - m_previousJitter.x, m_currentJitter.y - m_previousJitter.y };
     }
 
@@ -41,6 +49,7 @@ private:
     JitterManager() = default;
     ~JitterManager() = default;
 
+    mutable std::mutex m_mutex;
     uint32_t     m_targetWidth{ 3840 };
     uint32_t     m_targetHeight{ 2160 };
     JitterOffset m_currentJitter;

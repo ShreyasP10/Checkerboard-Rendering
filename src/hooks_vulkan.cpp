@@ -1,5 +1,7 @@
 #include "cbr/hooks.h"
 #include <atomic>
+#include <cstddef>
+#include <cstring>
 #include "cbr/cbr_engine.h"
 #include "cbr/logger.h"
 
@@ -25,7 +27,10 @@ PFN_vkCreateSwapchainKHR g_Original_vkCreateSwapchainKHR = nullptr;
 // so the failure is visible to the caller instead of silently dropping frames / swapchains.
 constexpr int kVkErrorInitializationFailed = -3;
 
-// Minimal Vulkan struct layouts for headerless extraction of swapchain and extent
+// Minimal Vulkan struct layouts for headerless extraction of swapchain and extent.
+// WARNING: headerless ABI hack. Offsets must match VkSwapchainCreateInfoKHR /
+// VkPresentInfoKHR from the Vulkan headers. Prefer including <vulkan/vulkan.h>
+// when the SDK is available. Static asserts below pin the assumed layout.
 struct MinimalVkExtent2D {
     uint32_t width;
     uint32_t height;
@@ -41,6 +46,8 @@ struct MinimalVkSwapchainCreateInfoKHR {
     int32_t           imageColorSpace;
     MinimalVkExtent2D imageExtent;
 };
+static_assert(offsetof(MinimalVkSwapchainCreateInfoKHR, sType) == 0, "ABI drift");
+static_assert(sizeof(MinimalVkSwapchainCreateInfoKHR) >= sizeof(uint32_t) + sizeof(void*) + sizeof(uint32_t) + sizeof(uint64_t), "ABI drift");
 
 struct MinimalVkPresentInfoKHR {
     uint32_t     sType;
@@ -60,9 +67,14 @@ int Hooked_vkQueuePresentKHR(void* queue, const void* pPresentInfo) {
 
     void* presentTarget = queue;
     if (pPresentInfo) {
-        const auto* info = reinterpret_cast<const MinimalVkPresentInfoKHR*>(pPresentInfo);
-        if (info->swapchainCount > 0 && info->pSwapchains) {
-            presentTarget = const_cast<void*>(info->pSwapchains[0]);
+        // Safe copy-out: avoid strict-aliasing violation from reinterpret_cast
+        // of the game's struct; copy only the fields we need.
+        MinimalVkPresentInfoKHR info{};
+        std::memcpy(&info, pPresentInfo, sizeof(info));
+        if (info.swapchainCount > 0 && info.swapchainCount < 16 && info.pSwapchains) {
+            void* first = nullptr;
+            std::memcpy(&first, info.pSwapchains, sizeof(first));
+            if (first) presentTarget = first;
         }
     }
 
@@ -90,9 +102,11 @@ int Hooked_vkCreateSwapchainKHR(void* device, const void* pCreateInfo, const voi
     if (result == 0) { // VK_SUCCESS
         uint32_t w = 0, h = 0;
         if (pCreateInfo) {
-            const auto* info = reinterpret_cast<const MinimalVkSwapchainCreateInfoKHR*>(pCreateInfo);
-            w = info->imageExtent.width;
-            h = info->imageExtent.height;
+            MinimalVkSwapchainCreateInfoKHR info{};
+            std::memcpy(&info, pCreateInfo, sizeof(info));
+            w = info.imageExtent.width;
+            h = info.imageExtent.height;
+            if (w > 16384 || h > 16384) { w = 0; h = 0; } // untrusted: let engine ignore
         }
         try { CBREngine::Get().OnSwapchainRecreated(w, h); } catch (...) {}
     }

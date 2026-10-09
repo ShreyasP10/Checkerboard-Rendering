@@ -37,10 +37,13 @@ static std::atomic<int> g_vulkanFailuresRemaining{ 0 };
 namespace cbr {
 bool HookManager::InstallVulkanHooks() {
     ++g_vulkanAttempts;
-    if (g_vulkanFailuresRemaining.load() > 0) {
-        --g_vulkanFailuresRemaining;
+    // Atomic consume-one-failure: fetch_sub returns the previous value.
+    int prev = g_vulkanFailuresRemaining.fetch_sub(1);
+    if (prev > 0) {
         return false;
     }
+    // No failures left: restore the counter (fetch_sub went to -1) and succeed.
+    g_vulkanFailuresRemaining.fetch_add(1);
     m_vulkanHooked.store(true);
     return true;
 }

@@ -50,6 +50,15 @@ void UIOverlay::ToggleVisibility() {
 
 void UIOverlay::CheckHotkeys() {
 #if defined(_WIN32)
+    // Only poll when the game process owns the foreground window, to avoid
+    // toggling while the user types in another app and to reduce AV/anti-cheat
+    // heuristics around global GetAsyncKeyState polling.
+    HWND fg = GetForegroundWindow();
+    if (fg) {
+        DWORD fgPid = 0;
+        GetWindowThreadProcessId(fg, &fgPid);
+        if (fgPid != GetCurrentProcessId()) return;
+    }
     // Non-intrusive async key state polling for F11 and Insert
     const bool f11Down = (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
     const bool insertDown = (GetAsyncKeyState(VK_INSERT) & 0x8000) != 0;

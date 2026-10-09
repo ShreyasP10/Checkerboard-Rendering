@@ -79,10 +79,9 @@ public:
         std::lock_guard<std::mutex> lock(m_mutex);
         return m_config;
     }
-    CBRConfig& GetMutableConfig() {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        return m_config;
-    }
+    // NOTE: GetMutableConfig() was removed: it returned CBRConfig& after the
+    // lock_guard was destroyed, exposing an unprotected reference (data race).
+    // Mutate via Modify() or UpdateConfig() which hold the lock for the write.
     void UpdateConfig(const CBRConfig& config) {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_config = config;

@@ -1,10 +1,14 @@
 #include "cbr/config.h"
+#include "cbr/limits.h"
 #include "cbr/logger.h"
 #include <fstream>
 #include <sstream>
 #include <algorithm>
 #include <cmath>
 #include <charconv>
+#include <cctype>
+#include <system_error>
+#include <vector>
 
 namespace cbr {
 
@@ -70,6 +74,32 @@ std::string ToUpper(std::string s) {
     return s;
 }
 
+uint32_t MakeEvenClamped(uint32_t v) { return MakeEvenUp(v); }
+
+bool TryParseIntStrict(const std::string& val, int& out) {
+    if (val.empty()) return false;
+    try {
+        size_t pos = 0;
+        int v = std::stoi(val, &pos);
+        if (pos != val.size()) return false; // reject trailing garbage ("1xyz")
+        out = v;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+std::string SanitizeLogLevel(const std::string& val, const std::string& fallback) {
+    std::string v = Trim(val);
+    if (v.size() > 16) v.resize(16);
+    // Strip CR/LF to prevent log injection via Save().
+    v.erase(std::remove(v.begin(), v.end(), '\n'), v.end());
+    v.erase(std::remove(v.begin(), v.end(), '\r'), v.end());
+    std::string u = ToUpper(v);
+    if (u == "DEBUG" || u == "INFO" || u == "WARN" || u == "WARNING" || u == "ERROR") return v;
+    return fallback;
+}
+
 } // namespace
 
 ConfigManager& ConfigManager::Get() {
@@ -78,24 +108,48 @@ ConfigManager& ConfigManager::Get() {
 }
 
 bool ConfigManager::Load(const std::filesystem::path& configPath) {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    // Stat first: reject absurd files before reading (DoS guard). Do not hold
+    // m_mutex during I/O or logging (lock-order: config -> logger would deadlock
+    // if a log callback ever touched config; Modify() callbacks have same rule).
+    {
+        std::error_code ec;
+        const auto sz = std::filesystem::file_size(configPath, ec);
+        if (!ec && sz > kMaxConfigFileBytes) {
+            CBR_LOG_ERROR("Config file %s too large (%llu bytes, cap %zu); using defaults.",
+                configPath.filename().string().c_str(),
+                static_cast<unsigned long long>(sz), kMaxConfigFileBytes);
+            return false;
+        }
+    }
     std::ifstream file(configPath);
     if (!file.is_open()) {
-        CBR_LOG_WARN("Configuration file not found at %s. Using default settings.", configPath.string().c_str());
+        CBR_LOG_WARN("Configuration file %s not found. Using default settings.",
+            configPath.filename().string().c_str());
         return false;
     }
 
+    CBRConfig parsed = GetConfig(); // start from current settings
+    std::vector<std::string> warnings;
     std::string line;
     std::string currentSection;
+    size_t lineCount = 0;
 
     while (std::getline(file, line)) {
+        if (++lineCount > kMaxConfigLines) {
+            warnings.emplace_back("cbr.ini truncated: too many lines");
+            break;
+        }
+        if (line.size() > kMaxConfigLineChars) {
+            warnings.emplace_back("oversized line ignored");
+            continue;
+        }
         std::string trimmed = Trim(line);
         if (trimmed.empty() || trimmed[0] == ';' || trimmed[0] == '#') {
             continue;
         }
 
         if (trimmed.front() == '[' && trimmed.back() == ']') {
-            currentSection = trimmed.substr(1, trimmed.size() - 2);
+            currentSection = ToUpper(Trim(trimmed.substr(1, trimmed.size() - 2)));
             continue;
         }
 
@@ -105,139 +159,147 @@ bool ConfigManager::Load(const std::filesystem::path& configPath) {
             std::string val = Trim(StripComment(trimmed.substr(eqPos + 1)));
 
             if (key == "Enabled") {
-                m_config.enabled = ParseBool(val, m_config.enabled);
+                parsed.enabled = ParseBool(val, parsed.enabled);
             } else if (key == "TargetWidth") {
-                m_config.targetWidth = ParseUInt(val, m_config.targetWidth, 720, 7680) & ~1u; // Ensure even width
+                parsed.targetWidth = MakeEvenUp(ParseUInt(val, parsed.targetWidth, kMinTargetWidth, kMaxTargetWidth));
             } else if (key == "TargetHeight") {
-                m_config.targetHeight = ParseUInt(val, m_config.targetHeight, 480, 4320) & ~1u; // Ensure even height
+                parsed.targetHeight = MakeEvenUp(ParseUInt(val, parsed.targetHeight, kMinTargetHeight, kMaxTargetHeight));
             } else if (key == "PreferredApi") {
                 std::string apiUpper = ToUpper(val);
-                if (apiUpper == "VULKAN") m_config.preferredApi = GraphicsApi::Vulkan;
-                else if (apiUpper == "D3D12") m_config.preferredApi = GraphicsApi::D3D12;
-                else if (apiUpper == "AUTO")  m_config.preferredApi = GraphicsApi::Auto;
-                else CBR_LOG_WARN("Unknown PreferredApi '%s' (expected Vulkan, D3D12 or Auto); keeping default.", val.c_str());
+                if (apiUpper == "VULKAN") parsed.preferredApi = GraphicsApi::Vulkan;
+                else if (apiUpper == "D3D12") parsed.preferredApi = GraphicsApi::D3D12;
+                else if (apiUpper == "AUTO")  parsed.preferredApi = GraphicsApi::Auto;
+                else warnings.emplace_back("Unknown PreferredApi '" + val + "'; keeping previous.");
             } else if (key == "MipLodBias") {
-                m_config.mipLodBias = ParseFloat(val, m_config.mipLodBias, -4.0f, 4.0f);
+                parsed.mipLodBias = ParseFloat(val, parsed.mipLodBias, -4.0f, 4.0f);
             } else if (key == "DepthTolerance") {
-                m_config.depthTolerance = ParseFloat(val, m_config.depthTolerance, 0.0001f, 1.0f);
+                parsed.depthTolerance = ParseFloat(val, parsed.depthTolerance, 0.0001f, 1.0f);
             } else if (key == "EnableColorClamping") {
-                m_config.enableColorClamping = ParseBool(val, m_config.enableColorClamping);
+                parsed.enableColorClamping = ParseBool(val, parsed.enableColorClamping);
             } else if (key == "ColorSpace") {
-                m_config.colorSpace = (ToUpper(val) == "RGB") ? ColorSpace::RGB : ColorSpace::YCoCg;
+                parsed.colorSpace = (ToUpper(val) == "RGB") ? ColorSpace::RGB : ColorSpace::YCoCg;
             } else if (key == "HistoryWeight") {
-                m_config.historyWeight = ParseFloat(val, m_config.historyWeight, 0.0f, 1.0f);
+                parsed.historyWeight = ParseFloat(val, parsed.historyWeight, 0.0f, 1.0f);
             } else if (key == "EnableSpatialFallback") {
-                m_config.enableSpatialFallback = ParseBool(val, m_config.enableSpatialFallback);
+                parsed.enableSpatialFallback = ParseBool(val, parsed.enableSpatialFallback);
             } else if (key == "EnableMotionDilation") {
-                m_config.enableMotionDilation = ParseBool(val, m_config.enableMotionDilation);
+                parsed.enableMotionDilation = ParseBool(val, parsed.enableMotionDilation);
             } else if (key == "DepthConvention") {
                 std::string dc = ToUpper(val);
-                if (dc == "STANDARD") m_config.depthConvention = DepthConvention::Standard;
-                else if (dc == "REVERSED") m_config.depthConvention = DepthConvention::Reversed;
-                else CBR_LOG_WARN("Unknown DepthConvention '%s' (expected Standard or Reversed); keeping previous.", val.c_str());
+                if (dc == "STANDARD") parsed.depthConvention = DepthConvention::Standard;
+                else if (dc == "REVERSED") parsed.depthConvention = DepthConvention::Reversed;
+                else warnings.emplace_back("Unknown DepthConvention '" + val + "'; keeping previous.");
             } else if (key == "DepthNear") {
-                m_config.depthNear = ParseFloat(val, m_config.depthNear, 0.001f, 100.0f);
+                parsed.depthNear = ParseFloat(val, parsed.depthNear, 0.001f, 100.0f);
             } else if (key == "DepthFar") {
-                m_config.depthFar = ParseFloat(val, m_config.depthFar, 0.0f, 1000000.0f);
+                parsed.depthFar = ParseFloat(val, parsed.depthFar, 0.0f, 1000000.0f);
             } else if (key == "JitterPattern") {
                 if (ToUpper(val) == "HALTON") {
-                    CBR_LOG_WARN("JitterPattern=Halton is not implemented yet; using Checkerboard.");
+                    warnings.emplace_back("JitterPattern=Halton is not implemented yet; using Checkerboard.");
                 }
-                m_config.jitterPattern = JitterPattern::Checkerboard;
+                parsed.jitterPattern = JitterPattern::Checkerboard;
             } else if (key == "JitterScale") {
-                m_config.jitterScale = ParseFloat(val, m_config.jitterScale, 0.1f, 4.0f);
-                if (m_config.jitterScale != 1.0f) {
-                    CBR_LOG_WARN("JitterScale != 1.0 is ignored for 2x MSAA checkerboard geometry; coverage requires exactly one pixel.");
+                parsed.jitterScale = ParseFloat(val, parsed.jitterScale, 0.1f, 4.0f);
+                if (parsed.jitterScale != 1.0f) {
+                    warnings.emplace_back("JitterScale != 1.0 is ignored for 2x MSAA checkerboard geometry.");
                 }
             } else if (key == "JitterDirection") {
-                try {
-                    int d = std::stoi(val);
-                    if (d == 1 || d == -1) {
-                        m_config.jitterDirection = d;
-                    } else {
-                        CBR_LOG_WARN("Invalid JitterDirection '%s' (expected +1 or -1); keeping previous.", val.c_str());
-                    }
-                } catch (...) {
-                    CBR_LOG_WARN("Invalid JitterDirection '%s'; keeping previous.", val.c_str());
+                int d = 0;
+                if (TryParseIntStrict(val, d) && (d == 1 || d == -1)) {
+                    parsed.jitterDirection = d;
+                } else {
+                    warnings.emplace_back("Invalid JitterDirection '" + val + "'; keeping previous.");
                 }
             } else if (key == "ProjectionJitterSign") {
-                try {
-                    int s = std::stoi(val);
-                    if (s == 1 || s == -1) {
-                        m_config.projectionJitterSign = s;
-                    } else {
-                        CBR_LOG_WARN("Invalid ProjectionJitterSign '%s' (expected +1 or -1); keeping previous.", val.c_str());
-                    }
-                } catch (...) {
-                    CBR_LOG_WARN("Invalid ProjectionJitterSign '%s'; keeping previous.", val.c_str());
+                int s = 0;
+                if (TryParseIntStrict(val, s) && (s == 1 || s == -1)) {
+                    parsed.projectionJitterSign = s;
+                } else {
+                    warnings.emplace_back("Invalid ProjectionJitterSign '" + val + "'; keeping previous.");
                 }
             } else if (key == "JitterCompensation") {
-                m_config.jitterCompensation = ParseFloat(val, m_config.jitterCompensation, -1.0f, 1.0f);
+                parsed.jitterCompensation = ParseFloat(val, parsed.jitterCompensation, -1.0f, 1.0f);
             } else if (key == "DebugView") {
-                m_config.debugView = ParseUInt(val, m_config.debugView, 0, 5);
+                parsed.debugView = ParseUInt(val, parsed.debugView, 0, 5);
             } else if (key == "ShowOverlay") {
-                m_config.showOverlay = ParseBool(val, m_config.showOverlay);
+                parsed.showOverlay = ParseBool(val, parsed.showOverlay);
             } else if (key == "LogToFile") {
-                m_config.logToFile = ParseBool(val, m_config.logToFile);
+                parsed.logToFile = ParseBool(val, parsed.logToFile);
             } else if (key == "LogLevel") {
-                m_config.logLevel = val;
+                const std::string clean = SanitizeLogLevel(val, parsed.logLevel);
+                if (clean != Trim(val)) warnings.emplace_back("Invalid LogLevel sanitized.");
+                parsed.logLevel = clean;
+            } else {
+                warnings.emplace_back("Unknown key '" + key + "' in [" + currentSection + "]; ignored.");
             }
         }
     }
 
-    CBR_LOG_INFO("Configuration successfully loaded from %s (Target: %ux%u, API: %s, CBR Enabled: %s)",
-        configPath.string().c_str(),
-        m_config.targetWidth,
-        m_config.targetHeight,
-        m_config.preferredApi == GraphicsApi::Vulkan ? "Vulkan"
-            : m_config.preferredApi == GraphicsApi::D3D12 ? "D3D12" : "Auto",
-        m_config.enabled ? "true" : "false");
+    UpdateConfig(parsed);
+    for (const auto& w : warnings) CBR_LOG_WARN("%s", w.c_str());
+
+    const CBRConfig applied = GetConfig();
+    CBR_LOG_INFO("Configuration loaded from %s (Target: %ux%u, API: %s, CBR Enabled: %s)",
+        configPath.filename().string().c_str(),
+        applied.targetWidth,
+        applied.targetHeight,
+        applied.preferredApi == GraphicsApi::Vulkan ? "Vulkan"
+            : applied.preferredApi == GraphicsApi::D3D12 ? "D3D12" : "Auto",
+        applied.enabled ? "true" : "false");
 
     return true;
 }
 
 bool ConfigManager::Save(const std::filesystem::path& configPath) {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    const CBRConfig snapshot = GetConfig(); // copy under lock; do I/O outside
     std::ofstream file(configPath);
     if (!file.is_open()) {
-        CBR_LOG_ERROR("Failed to open %s for saving configuration.", configPath.string().c_str());
+        CBR_LOG_ERROR("Failed to open %s for saving configuration.", configPath.filename().string().c_str());
         return false;
     }
 
     file << "; RDR2 Checkerboard Rendering Mod Configuration\n";
     file << "[General]\n";
-    file << "Enabled = " << (m_config.enabled ? "true" : "false") << "\n";
-    file << "TargetWidth = " << m_config.targetWidth << "\n";
-    file << "TargetHeight = " << m_config.targetHeight << "\n";
+    file << "Enabled = " << (snapshot.enabled ? "true" : "false") << "\n";
+    file << "TargetWidth = " << snapshot.targetWidth << "\n";
+    file << "TargetHeight = " << snapshot.targetHeight << "\n";
     file << "PreferredApi = "
-         << (m_config.preferredApi == GraphicsApi::Vulkan ? "Vulkan"
-           : m_config.preferredApi == GraphicsApi::D3D12 ? "D3D12" : "Auto") << "\n";
-    file << "MipLodBias = " << m_config.mipLodBias << "\n\n";
+         << (snapshot.preferredApi == GraphicsApi::Vulkan ? "Vulkan"
+           : snapshot.preferredApi == GraphicsApi::D3D12 ? "D3D12" : "Auto") << "\n";
+    file << "MipLodBias = " << snapshot.mipLodBias << "\n\n";
 
     file << "[Reconstruction]\n";
-    file << "DepthTolerance = " << m_config.depthTolerance << "\n";
-    file << "EnableColorClamping = " << (m_config.enableColorClamping ? "true" : "false") << "\n";
-    file << "ColorSpace = " << (m_config.colorSpace == ColorSpace::RGB ? "RGB" : "YCoCg") << "\n";
-    file << "HistoryWeight = " << m_config.historyWeight << "\n";
-    file << "EnableSpatialFallback = " << (m_config.enableSpatialFallback ? "true" : "false") << "\n";
-    file << "EnableMotionDilation = " << (m_config.enableMotionDilation ? "true" : "false") << "\n";
-    file << "DepthConvention = " << (m_config.depthConvention == DepthConvention::Standard ? "Standard" : "Reversed") << "\n";
-    file << "DepthNear = " << m_config.depthNear << "\n";
-    file << "DepthFar = " << m_config.depthFar << "\n\n";
+    file << "DepthTolerance = " << snapshot.depthTolerance << "\n";
+    file << "EnableColorClamping = " << (snapshot.enableColorClamping ? "true" : "false") << "\n";
+    file << "ColorSpace = " << (snapshot.colorSpace == ColorSpace::RGB ? "RGB" : "YCoCg") << "\n";
+    file << "HistoryWeight = " << snapshot.historyWeight << "\n";
+    file << "EnableSpatialFallback = " << (snapshot.enableSpatialFallback ? "true" : "false") << "\n";
+    file << "EnableMotionDilation = " << (snapshot.enableMotionDilation ? "true" : "false") << "\n";
+    file << "DepthConvention = " << (snapshot.depthConvention == DepthConvention::Standard ? "Standard" : "Reversed") << "\n";
+    file << "DepthNear = " << snapshot.depthNear << "\n";
+    file << "DepthFar = " << snapshot.depthFar << "\n\n";
 
     file << "[Jitter]\n";
-    file << "JitterPattern = " << (m_config.jitterPattern == JitterPattern::Halton ? "Halton" : "Checkerboard") << "\n";
-    file << "JitterScale = " << m_config.jitterScale << "\n";
-    file << "JitterDirection = " << m_config.jitterDirection << "\n";
-    file << "ProjectionJitterSign = " << m_config.projectionJitterSign << "\n";
-    file << "JitterCompensation = " << m_config.jitterCompensation << "\n\n";
+    // Halton is reserved/not implemented: always persist Checkerboard so a
+    // round-trip never claims Halton support.
+    file << "JitterPattern = Checkerboard ; Halton reserved, not implemented\n";
+    file << "JitterScale = " << snapshot.jitterScale << "\n";
+    file << "JitterDirection = " << snapshot.jitterDirection << "\n";
+    file << "ProjectionJitterSign = " << snapshot.projectionJitterSign << "\n";
+    file << "JitterCompensation = " << snapshot.jitterCompensation << "\n\n";
 
     file << "[Debug]\n";
-    file << "ShowOverlay = " << (m_config.showOverlay ? "true" : "false") << "\n";
-    file << "DebugView = " << m_config.debugView << "\n";
-    file << "LogToFile = " << (m_config.logToFile ? "true" : "false") << "\n";
-    file << "LogLevel = " << m_config.logLevel << "\n";
+    file << "ShowOverlay = " << (snapshot.showOverlay ? "true" : "false") << "\n";
+    file << "DebugView = " << snapshot.debugView << "\n";
+    file << "LogToFile = " << (snapshot.logToFile ? "true" : "false") << "\n";
+    file << "LogLevel = " << SanitizeLogLevel(snapshot.logLevel, "Info") << "\n";
 
+    file.flush();
+    if (!file.good()) {
+        CBR_LOG_ERROR("Failed to write %s (disk full or I/O error); config may be truncated.",
+            configPath.filename().string().c_str());
+        return false;
+    }
     return true;
 }
 

@@ -14,34 +14,36 @@ ReconstructionPass& ReconstructionPass::Get() {
 }
 
 bool ReconstructionPass::InitializeVulkan(void* /*vkDevice*/, void* /*vkPhysicalDevice*/) {
-    m_isVulkan = true;
-    m_initialized = true;
+    m_isVulkan.store(true);
+    m_initialized.store(true);
     CBR_LOG_INFO("ReconstructionPass initialized for Vulkan API pipeline.");
     return true;
 }
 
 bool ReconstructionPass::InitializeDX12(void* /*d3d12Device*/) {
-    m_isVulkan = false;
-    m_initialized = true;
+    m_isVulkan.store(false);
+    m_initialized.store(true);
     CBR_LOG_INFO("ReconstructionPass initialized for DirectX 12 API pipeline.");
     return true;
 }
 
 void ReconstructionPass::Shutdown() {
-    m_initialized = false;
+    m_initialized.store(false);
     CBR_LOG_INFO("ReconstructionPass shut down.");
 }
 
 ReconstructionPushConstants BuildReconstructionPushConstants(uint32_t frameIndex) {
-    const auto& config = ConfigManager::Get().GetConfig();
-    const auto& dims = RenderTargetManager::Get().GetDimensions();
+    const auto config = ConfigManager::Get().GetConfig();
+    const auto dims = RenderTargetManager::Get().GetDimensions();
     const auto jitterDelta = JitterManager::Get().GetJitterDelta();
 
     ReconstructionPushConstants pc{};
-    pc.targetResolution[0] = static_cast<float>(dims.fullWidth);
-    pc.targetResolution[1] = static_cast<float>(dims.fullHeight);
-    pc.invTargetResolution[0] = 1.0f / pc.targetResolution[0];
-    pc.invTargetResolution[1] = 1.0f / pc.targetResolution[1];
+    const float fw = dims.fullWidth > 0 ? static_cast<float>(dims.fullWidth) : 3840.0f;
+    const float fh = dims.fullHeight > 0 ? static_cast<float>(dims.fullHeight) : 2160.0f;
+    pc.targetResolution[0] = fw;
+    pc.targetResolution[1] = fh;
+    pc.invTargetResolution[0] = 1.0f / fw;
+    pc.invTargetResolution[1] = 1.0f / fh;
     pc.frameIndex = frameIndex;
     pc.depthTolerance = config.depthTolerance;
     pc.historyWeight = config.historyWeight;
@@ -63,10 +65,13 @@ ReconstructionPushConstants BuildReconstructionPushConstants(uint32_t frameIndex
 }
 
 void ReconstructionPass::DispatchVulkan(void* /*vkCommandBuffer*/, uint32_t frameIndex) {
-    if (!m_initialized) return;
+    if (!m_initialized.load()) {
+        CBR_LOG_WARN("DispatchVulkan dropped: ReconstructionPass not initialized.");
+        return;
+    }
 
     const ReconstructionPushConstants pushConstants = BuildReconstructionPushConstants(frameIndex);
-    const auto& dims = RenderTargetManager::Get().GetDimensions();
+    const auto dims = RenderTargetManager::Get().GetDimensions();
 
     const uint32_t groupCountX = (dims.fullWidth + 15u) / 16u;
     const uint32_t groupCountY = (dims.fullHeight + 15u) / 16u;
@@ -80,10 +85,13 @@ void ReconstructionPass::DispatchVulkan(void* /*vkCommandBuffer*/, uint32_t fram
 }
 
 void ReconstructionPass::DispatchDX12(void* /*d3d12GraphicsCommandList*/, uint32_t frameIndex) {
-    if (!m_initialized) return;
+    if (!m_initialized.load()) {
+        CBR_LOG_WARN("DispatchDX12 dropped: ReconstructionPass not initialized.");
+        return;
+    }
 
     const ReconstructionPushConstants pushConstants = BuildReconstructionPushConstants(frameIndex);
-    const auto& dims = RenderTargetManager::Get().GetDimensions();
+    const auto dims = RenderTargetManager::Get().GetDimensions();
 
     const uint32_t groupCountX = (dims.fullWidth + 15u) / 16u;
     const uint32_t groupCountY = (dims.fullHeight + 15u) / 16u;

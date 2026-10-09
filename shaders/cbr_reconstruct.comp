@@ -22,6 +22,9 @@ layout(set = 0, binding = 0) uniform sampler2DMS u_QuarterColorMSAA;
 layout(set = 0, binding = 1) uniform sampler2DMS u_QuarterDepthMSAA;
 
 // History frame: full-resolution reconstructed color & depth buffers
+// SAMPLER REQUIREMENT (must match HLSL LinearClamp/PointClamp):
+//   u_HistoryColor -> LINEAR + CLAMP_TO_EDGE, u_HistoryDepth -> NEAREST + CLAMP_TO_EDGE,
+//   u_Velocity -> LINEAR + CLAMP_TO_EDGE. Depth history uses texelFetch (sampler-independent).
 layout(set = 0, binding = 2) uniform sampler2D   u_HistoryColor;
 layout(set = 0, binding = 3) uniform sampler2D   u_HistoryDepth;
 
@@ -122,13 +125,17 @@ float FetchDepth(CbrSample s) {
 }
 
 // MIRRORS include/cbr/depth_convention.h
+// NaN/Inf device depth yields NaN so the disocclusion test must reject it.
 float LinearizeDepth(float d) {
+    if (isnan(d) || isinf(d)) return uintBitsToFloat(0x7fc00000u); // quiet NaN
     float n = pc.u_DepthNear;
     float f = pc.u_DepthFar;
     if (pc.u_DepthMode == 1u) {
         return (f > 0.0) ? (n * f) / (n + d * (f - n)) : n / max(d, 1e-7);
     }
-    return (n * f) / (f - d * (f - n));
+    float denom = (f - d * (f - n));
+    if (denom == 0.0 || isinf(denom) || isnan(denom)) return uintBitsToFloat(0x7fc00000u);
+    return (n * f) / denom;
 }
 
 bool IsNearer(float a, float b) {
@@ -228,7 +235,12 @@ void main() {
 
     vec2 dilatedUV = (vec2(motionCoord) + 0.5) * pc.u_InvTargetResolution;
     vec2 velocity = textureLod(u_Velocity, dilatedUV, 0.0).xy;
+    // NaN/Inf velocity or UV must disocclude: ivec2(NaN) is UB and NaN comparisons are false.
+    bool velocityBad = isinf(velocity.x) || isnan(velocity.x) || isinf(velocity.y) || isnan(velocity.y)
+        || isinf(uv.x) || isnan(uv.x) || isinf(uv.y) || isnan(uv.y);
     vec2 historyUV = uv - velocity - pc.u_JitterDelta * pc.u_JitterCompensation;
+    bool historyUVBad = velocityBad || isinf(historyUV.x) || isnan(historyUV.x)
+        || isinf(historyUV.y) || isnan(historyUV.y);
 
     // -------------------------------------------------------------------------
     // 3. Disocclusion & depth delta testing (scale-invariant: relative difference of LINEAR depth)
@@ -237,13 +249,15 @@ void main() {
     vec4 historyColor = vec4(0.0);
     float previousDepth = currentDepth;
 
-    if (pc.u_FrameIndex == 0u || historyUV.x < 0.0 || historyUV.x > 1.0 || historyUV.y < 0.0 || historyUV.y > 1.0) {
-        isDisoccluded = true; // First frame or sample moved outside screen space
+    if (historyUVBad || pc.u_FrameIndex == 0u || historyUV.x < 0.0 || historyUV.x > 1.0 || historyUV.y < 0.0 || historyUV.y > 1.0) {
+        isDisoccluded = true; // First frame, bad velocity/UV, or sample moved outside screen space
     } else {
         // Exact texel fetch: independent of the bound sampler, so depth is never blended across edges
         ivec2 historyCoord = clamp(ivec2(historyUV * pc.u_TargetResolution), ivec2(0), targetSize - ivec2(1));
         previousDepth = texelFetch(u_HistoryDepth, historyCoord, 0).r;
-        float depthDelta = abs(currentLinear - LinearizeDepth(previousDepth)) / max(currentLinear, 1e-5);
+        float prevLin = LinearizeDepth(previousDepth);
+        bool depthBad = isinf(currentLinear) || isnan(currentLinear) || isinf(prevLin) || isnan(prevLin);
+        float depthDelta = depthBad ? 10.0 : abs(currentLinear - prevLin) / max(currentLinear, 1e-5);
         if (depthDelta > pc.u_DepthTolerance) {
             isDisoccluded = true;
         } else {
@@ -297,7 +311,7 @@ void main() {
             // Variance clipping: clamp history inside [mean - gamma * stdDev, mean + gamma * stdDev]
             vec3 mean = m1 / n;
             vec3 stdDev = sqrt(max(vec3(0.0), (m2 / n) - (mean * mean)));
-            float gamma = 1.25;
+            const float gamma = 1.25; // kVarianceClipGamma (include/cbr/limits.h)
             vec3 varianceMin = max(colorMin, mean - gamma * stdDev);
             vec3 varianceMax = min(colorMax, mean + gamma * stdDev);
             varianceMax = max(varianceMin, varianceMax); // Ensure varianceMin <= varianceMax to prevent clamp inversion

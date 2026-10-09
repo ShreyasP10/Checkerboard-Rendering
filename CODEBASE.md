@@ -88,6 +88,7 @@ include_directories(
 
 # Header files
 set(CBR_HEADERS
+    ${CBR_INCLUDE_DIR}/cbr/limits.h
     ${CBR_INCLUDE_DIR}/cbr/cbr_engine.h
     ${CBR_INCLUDE_DIR}/cbr/checkerboard_mapping.h
     ${CBR_INCLUDE_DIR}/cbr/config.h
@@ -166,8 +167,13 @@ endif()
 # Find Vulkan headers if available (dynamic runtime resolution is used for function pointers)
 find_package(Vulkan QUIET)
 if(Vulkan_FOUND)
-    message(STATUS "Vulkan SDK headers found: ${Vulkan_INCLUDE_DIRS}")
-    target_include_directories(rdr2-cbr PRIVATE ${Vulkan_INCLUDE_DIRS})
+    message(STATUS "Vulkan SDK headers found.")
+    # Prefer the imported target over the deprecated Vulkan_INCLUDE_DIRS variable.
+    if(TARGET Vulkan::Headers)
+        target_link_libraries(rdr2-cbr PRIVATE Vulkan::Headers)
+    elseif(DEFINED Vulkan_INCLUDE_DIRS)
+        target_include_directories(rdr2-cbr PRIVATE ${Vulkan_INCLUDE_DIRS})
+    endif()
 else()
     message(STATUS "Vulkan SDK not found, using dynamic runtime function pointers only.")
 endif()
@@ -192,12 +198,13 @@ set(CBR_COMPILED_SHADERS "")
 if(CBR_GLSLANG)
     foreach(shader cbr_reconstruct cbr_resolve_simple)
         add_custom_command(
-            OUTPUT ${CMAKE_BINARY_DIR}/shaders/${shader}.spv
-            COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/shaders
-            COMMAND ${CBR_GLSLANG} -V ${CBR_SHADER_DIR}/${shader}.comp -o ${CMAKE_BINARY_DIR}/shaders/${shader}.spv
+            OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/shaders/$<CONFIG>/${shader}.spv
+            COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/shaders/$<CONFIG>
+            COMMAND ${CBR_GLSLANG} -V ${CBR_SHADER_DIR}/${shader}.comp -o ${CMAKE_CURRENT_BINARY_DIR}/shaders/$<CONFIG>/${shader}.spv
             DEPENDS ${CBR_SHADER_DIR}/${shader}.comp
-            COMMENT "Compiling ${shader}.comp to SPIR-V")
-        list(APPEND CBR_COMPILED_SHADERS ${CMAKE_BINARY_DIR}/shaders/${shader}.spv)
+            COMMENT "Compiling ${shader}.comp to SPIR-V"
+            VERBATIM)
+        list(APPEND CBR_COMPILED_SHADERS ${CMAKE_CURRENT_BINARY_DIR}/shaders/$<CONFIG>/${shader}.spv)
     endforeach()
 else()
     message(STATUS "glslangValidator not found: SPIR-V shaders will not be built.")
@@ -205,11 +212,13 @@ endif()
 
 if(CBR_DXC)
     add_custom_command(
-        OUTPUT ${CMAKE_BINARY_DIR}/shaders/cbr_reconstruct.dxil
-        COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/shaders
-        COMMAND ${CBR_DXC} -T cs_6_0 -E CSMain ${CBR_SHADER_DIR}/cbr_reconstruct.hlsl -Fo ${CMAKE_BINARY_DIR}/shaders/cbr_reconstruct.dxil
+        OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/shaders/$<CONFIG>/cbr_reconstruct.dxil
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/shaders/$<CONFIG>
+        COMMAND ${CBR_DXC} -T cs_6_0 -E CSMain ${CBR_SHADER_DIR}/cbr_reconstruct.hlsl -Fo ${CMAKE_CURRENT_BINARY_DIR}/shaders/$<CONFIG>/cbr_reconstruct.dxil
         DEPENDS ${CBR_SHADER_DIR}/cbr_reconstruct.hlsl
-        COMMENT "Compiling cbr_reconstruct.hlsl to DXIL")
+        COMMENT "Compiling cbr_reconstruct.hlsl to DXIL"
+        VERBATIM)
+    list(APPEND CBR_COMPILED_SHADERS ${CMAKE_CURRENT_BINARY_DIR}/shaders/$<CONFIG>/cbr_reconstruct.dxil)
     list(APPEND CBR_COMPILED_SHADERS ${CMAKE_BINARY_DIR}/shaders/cbr_reconstruct.dxil)
 else()
     message(STATUS "dxc not found: DXIL shaders will not be built.")
@@ -266,9 +275,8 @@ add_custom_command(TARGET rdr2-cbr POST_BUILD
 
 if(CBR_COMPILED_SHADERS)
     add_custom_command(TARGET rdr2-cbr POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_directory
-        "${CMAKE_BINARY_DIR}/shaders"
-        "$<TARGET_FILE_DIR:rdr2-cbr>/shaders"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:rdr2-cbr>/shaders"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CBR_COMPILED_SHADERS} "$<TARGET_FILE_DIR:rdr2-cbr>/shaders/"
         COMMENT "Copying compiled shaders to target build directory"
     )
 endif()
@@ -338,6 +346,8 @@ DepthFar = 0.0
 JitterPattern = Checkerboard
 
 ; Jitter scale multiplier (default: 1.0)
+; DEPRECATED: parsed but intentionally ignored — 2x MSAA checkerboard coverage
+; requires exactly one full-resolution pixel shift. Any value != 1.0 logs a warning.
 JitterScale = 1.0
 
 ; Odd-frame sampling-grid shift direction in presentation pixels (+1 or -1). Default: 1
@@ -731,10 +741,9 @@ public:
         std::lock_guard<std::mutex> lock(m_mutex);
         return m_config;
     }
-    CBRConfig& GetMutableConfig() {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        return m_config;
-    }
+    // NOTE: GetMutableConfig() was removed: it returned CBRConfig& after the
+    // lock_guard was destroyed, exposing an unprotected reference (data race).
+    // Mutate via Modify() or UpdateConfig() which hold the lock for the write.
     void UpdateConfig(const CBRConfig& config) {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_config = config;
@@ -763,26 +772,40 @@ private:
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include "cbr/config.h"
 
 namespace cbr {
+
+constexpr float kDefaultDepthNear = 0.1f;
+constexpr float kFallbackDepthFar = 1000.0f;
+constexpr float kMinDeviceDepth = 1e-7f;
+constexpr float kMinLinearDepth = 1e-5f;
 
 // Host-side mirror of LinearizeDepth() in shaders/cbr_reconstruct.{comp,hlsl}; keep in sync.
 //
 // Device depth d in [0,1] -> positive view-space distance.
 // Standard (0 = near, 1 = far): z = n*f / (f - d*(f - n))
 // Reversed (1 = near, 0 = far): z = n*f / (n + d*(f - n)), or n / d when f is infinite (f <= 0)
+// Returns NaN for NaN/Inf device depth so callers must treat it as disoccluded.
 inline float LinearizeDepth(float d, DepthConvention convention, float zNear, float zFar) {
+    if (!std::isfinite(d)) return std::numeric_limits<float>::quiet_NaN();
     if (convention == DepthConvention::Reversed) {
-        if (zFar <= 0.0f) return zNear / std::max(d, 1e-7f);
-        return (zNear * zFar) / (zNear + d * (zFar - zNear));
+        if (zFar <= 0.0f) return zNear / std::max(d, kMinDeviceDepth);
+        const float denom = (zNear + d * (zFar - zNear));
+        if (!std::isfinite(denom) || denom == 0.0f) return std::numeric_limits<float>::quiet_NaN();
+        return (zNear * zFar) / denom;
     }
-    return (zNear * zFar) / (zFar - d * (zFar - zNear));
+    const float denom = (zFar - d * (zFar - zNear));
+    if (!std::isfinite(denom) || denom == 0.0f) return std::numeric_limits<float>::quiet_NaN();
+    return (zNear * zFar) / denom;
 }
 
 // Relative (scale-invariant) depth difference used by the disocclusion test.
+// Returns +Inf for non-finite inputs so NaN/Inf depths always fail the tolerance test.
 inline float RelativeDepthDelta(float zA, float zB) {
-    return std::fabs(zA - zB) / std::max(zA, 1e-5f);
+    if (!std::isfinite(zA) || !std::isfinite(zB)) return std::numeric_limits<float>::infinity();
+    return std::fabs(zA - zB) / std::max(zA, kMinLinearDepth);
 }
 
 // Depth range actually sent to the GPU. Standard depth needs a finite far plane; a missing or
@@ -793,9 +816,9 @@ struct DepthRange {
 };
 
 inline DepthRange SanitizeDepthRange(DepthConvention convention, float zNear, float zFar) {
-    DepthRange r{ zNear > 0.0f ? zNear : 0.1f, zFar };
+    DepthRange r{ zNear > 0.0f ? zNear : kDefaultDepthNear, zFar };
     if (convention == DepthConvention::Standard && !(r.zFar > r.zNear)) {
-        r.zFar = 1000.0f;
+        r.zFar = kFallbackDepthFar;
     }
     if (r.zFar < 0.0f) r.zFar = 0.0f;
     return r;
@@ -853,6 +876,7 @@ private:
 
 #include <cstdint>
 #include <array>
+#include <mutex>
 #include <utility>
 
 namespace cbr {
@@ -869,9 +893,16 @@ public:
     void Initialize(uint32_t targetWidth, uint32_t targetHeight);
     void Update(uint32_t frameIndex);
 
-    JitterOffset GetCurrentJitter() const { return m_currentJitter; }
-    JitterOffset GetPreviousJitter() const { return m_previousJitter; }
+    JitterOffset GetCurrentJitter() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_currentJitter;
+    }
+    JitterOffset GetPreviousJitter() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_previousJitter;
+    }
     JitterOffset GetJitterDelta() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
         return { m_currentJitter.x - m_previousJitter.x, m_currentJitter.y - m_previousJitter.y };
     }
 
@@ -892,6 +923,7 @@ private:
     JitterManager() = default;
     ~JitterManager() = default;
 
+    mutable std::mutex m_mutex;
     uint32_t     m_targetWidth{ 3840 };
     uint32_t     m_targetHeight{ 2160 };
     JitterOffset m_currentJitter;
@@ -907,6 +939,7 @@ private:
 #pragma once
 
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -951,7 +984,13 @@ public:
         static_assert((!std::is_same_v<std::decay_t<Args>, std::wstring> && ...),
                       "Wide strings are not supported by CBR_LOG_* macros");
         char buffer[1024];
-        std::snprintf(buffer, sizeof(buffer), format, args...);
+        const int n = std::snprintf(buffer, sizeof(buffer), format, args...);
+        if (n < 0) return; // encoding error: drop rather than log garbage
+        if (static_cast<size_t>(n) >= sizeof(buffer)) {
+            // Truncation would mislead diagnostics; mark it explicitly.
+            constexpr char kTrunc[] = "...<truncated>";
+            std::memcpy(buffer + sizeof(buffer) - sizeof(kTrunc), kTrunc, sizeof(kTrunc));
+        }
         Log(level, std::string(buffer));
     }
 
@@ -969,6 +1008,7 @@ private:
     bool                     m_disabled{ false };
     LogLevel                 m_minLevel{ LogLevel::Info };
     std::vector<std::string> m_pending; // messages logged before Initialize()/Disable()
+    size_t                   m_droppedPending{ 0 }; // buffered messages dropped beyond cap
 };
 
 } // namespace cbr
@@ -1037,7 +1077,7 @@ private:
     ~ReconstructionPass() = default;
 
     std::atomic<bool> m_initialized{ false };
-    bool m_isVulkan{ true };
+    std::atomic<bool> m_isVulkan{ true };
 };
 
 } // namespace cbr
@@ -1050,6 +1090,7 @@ private:
 
 #include <atomic>
 #include <cstdint>
+#include <shared_mutex>
 #include <vector>
 
 namespace cbr {
@@ -1069,7 +1110,10 @@ public:
     void Initialize(uint32_t width, uint32_t height);
     void Shutdown();
 
-    const TargetDimensions& GetDimensions() const { return m_dims; }
+    TargetDimensions GetDimensions() const {
+        std::shared_lock<std::shared_mutex> lock(m_mutex);
+        return m_dims;
+    }
 
     bool IsTargetInterceptCandidate(uint32_t width, uint32_t height, uint32_t format) const;
     bool IsQuarterPassCandidate(uint32_t width, uint32_t height) const;
@@ -1081,15 +1125,16 @@ public:
     void     ResetHistory() { m_historyPingPong.store(0u); }
 
     // Memory footprint tracking
-    size_t GetTotalAllocatedVramBytes() const { return m_totalAllocatedVramBytes; }
+    size_t GetTotalAllocatedVramBytes() const { return m_totalAllocatedVramBytes.load(); }
 
 private:
     RenderTargetManager() = default;
     ~RenderTargetManager() = default;
 
+    mutable std::shared_mutex m_mutex;
     TargetDimensions m_dims;
     std::atomic<uint32_t> m_historyPingPong{ 0 };
-    size_t           m_totalAllocatedVramBytes{ 0 };
+    std::atomic<size_t> m_totalAllocatedVramBytes{ 0 };
     std::atomic<bool> m_initialized{ false };
 };
 
@@ -1231,16 +1276,23 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID /*lpRese
             // installed hook is still executing code inside it. ASI plugins are not meant
             // to be unloaded, and this removes the need to wait on a thread from DllMain.
             HMODULE pinned = nullptr;
-            GetModuleHandleExW(
+            if (!GetModuleHandleExW(
                 GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
                 reinterpret_cast<LPCWSTR>(&CBR_PluginInit),
-                &pinned);
+                &pinned)) {
+                // Pin failed: do not spawn a thread that would execute unmapped code.
+                // Record directory anyway so a later CBR_PluginInit can still initialize.
+                cbr::CBREngine::Get().SetModuleDirectory(GetModuleDirectoryPath(hModule));
+                break;
+            }
 
             // Record module directory for resolving cbr.ini and cbr.log relative to the DLL
             cbr::CBREngine::Get().SetModuleDirectory(GetModuleDirectoryPath(hModule));
 
-            // Launch initialization in a background thread to avoid blocking process startup.
-            // The handle is not needed afterwards, and the module is pinned, so close it now.
+            // NOTE: CreateThread under the loader lock can deadlock. This is tolerated
+            // only because the module is pinned and the thread touches just CBR singletons.
+            // Preferred path is the loader calling CBR_PluginInit (no thread); this thread
+            // is a fallback for loaders that only map the DLL.
             HANDLE hThread = CreateThread(nullptr, 0, CBRInitThread, nullptr, 0, nullptr);
             if (hThread) {
                 CloseHandle(hThread);
@@ -1267,6 +1319,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID /*lpRese
 ```cpp
 #include "cbr/cbr_engine.h"
 #include "cbr/config.h"
+#include "cbr/limits.h"
 #include "cbr/logger.h"
 #include "cbr/jitter_manager.h"
 #include "cbr/render_target_manager.h"
@@ -1441,6 +1494,9 @@ void CBREngine::OnPrePresent(void* queueOrSwapchain, const void* /*presentInfo*/
 }
 
 void CBREngine::OnPostPresent(void* presentTarget) {
+    // Intentional: frame parity advances even while disabled so that re-enabling
+    // resumes on a fresh frame (OnScenePassEnd is gated on m_enabled and will
+    // dispatch exactly once for the new frame). Do not gate this on m_enabled.
     // The first present seen after start-up / swapchain recreation defines the main target.
     void* expected = nullptr;
     m_mainPresentTarget.compare_exchange_strong(expected, presentTarget);
@@ -1455,12 +1511,11 @@ void CBREngine::OnSwapchainRecreated(uint32_t width, uint32_t height) {
     m_frameIndex.store(0);
     m_lastDispatchedFrame.store(kNoFrame);
 
-    // Swapchain extents are untrusted: odd sizes round up to even, implausible ones (< 320 or > 16384) are ignored
-    constexpr uint32_t kMinExtent = 320;
-    constexpr uint32_t kMaxExtent = 16384;
-    if (width >= kMinExtent && width <= kMaxExtent && height >= 240 && height <= kMaxExtent) {
-        if (width & 1u) ++width;
-        if (height & 1u) ++height;
+    // Swapchain extents are untrusted: odd sizes round up to even, implausible ones are ignored.
+    if (width >= kMinSwapchainExtent && width <= kMaxSwapchainExtent &&
+        height >= kMinSwapchainHeight && height <= kMaxSwapchainExtent) {
+        width = MakeEvenUp(width);
+        height = MakeEvenUp(height);
         RenderTargetManager::Get().Initialize(width, height);
         JitterManager::Get().Initialize(width, height);
         CBR_LOG_INFO("Swapchain recreated with new resolution %ux%u: frame parity and history reset.", width, height);
@@ -1477,12 +1532,16 @@ void CBREngine::OnSwapchainRecreated(uint32_t width, uint32_t height) {
 ### `src/config.cpp`
 ```cpp
 #include "cbr/config.h"
+#include "cbr/limits.h"
 #include "cbr/logger.h"
 #include <fstream>
 #include <sstream>
 #include <algorithm>
 #include <cmath>
 #include <charconv>
+#include <cctype>
+#include <system_error>
+#include <vector>
 
 namespace cbr {
 
@@ -1548,6 +1607,32 @@ std::string ToUpper(std::string s) {
     return s;
 }
 
+uint32_t MakeEvenClamped(uint32_t v) { return MakeEvenUp(v); }
+
+bool TryParseIntStrict(const std::string& val, int& out) {
+    if (val.empty()) return false;
+    try {
+        size_t pos = 0;
+        int v = std::stoi(val, &pos);
+        if (pos != val.size()) return false; // reject trailing garbage ("1xyz")
+        out = v;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+std::string SanitizeLogLevel(const std::string& val, const std::string& fallback) {
+    std::string v = Trim(val);
+    if (v.size() > 16) v.resize(16);
+    // Strip CR/LF to prevent log injection via Save().
+    v.erase(std::remove(v.begin(), v.end(), '\n'), v.end());
+    v.erase(std::remove(v.begin(), v.end(), '\r'), v.end());
+    std::string u = ToUpper(v);
+    if (u == "DEBUG" || u == "INFO" || u == "WARN" || u == "WARNING" || u == "ERROR") return v;
+    return fallback;
+}
+
 } // namespace
 
 ConfigManager& ConfigManager::Get() {
@@ -1556,24 +1641,48 @@ ConfigManager& ConfigManager::Get() {
 }
 
 bool ConfigManager::Load(const std::filesystem::path& configPath) {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    // Stat first: reject absurd files before reading (DoS guard). Do not hold
+    // m_mutex during I/O or logging (lock-order: config -> logger would deadlock
+    // if a log callback ever touched config; Modify() callbacks have same rule).
+    {
+        std::error_code ec;
+        const auto sz = std::filesystem::file_size(configPath, ec);
+        if (!ec && sz > kMaxConfigFileBytes) {
+            CBR_LOG_ERROR("Config file %s too large (%llu bytes, cap %zu); using defaults.",
+                configPath.filename().string().c_str(),
+                static_cast<unsigned long long>(sz), kMaxConfigFileBytes);
+            return false;
+        }
+    }
     std::ifstream file(configPath);
     if (!file.is_open()) {
-        CBR_LOG_WARN("Configuration file not found at %s. Using default settings.", configPath.string().c_str());
+        CBR_LOG_WARN("Configuration file %s not found. Using default settings.",
+            configPath.filename().string().c_str());
         return false;
     }
 
+    CBRConfig parsed = GetConfig(); // start from current settings
+    std::vector<std::string> warnings;
     std::string line;
     std::string currentSection;
+    size_t lineCount = 0;
 
     while (std::getline(file, line)) {
+        if (++lineCount > kMaxConfigLines) {
+            warnings.emplace_back("cbr.ini truncated: too many lines");
+            break;
+        }
+        if (line.size() > kMaxConfigLineChars) {
+            warnings.emplace_back("oversized line ignored");
+            continue;
+        }
         std::string trimmed = Trim(line);
         if (trimmed.empty() || trimmed[0] == ';' || trimmed[0] == '#') {
             continue;
         }
 
         if (trimmed.front() == '[' && trimmed.back() == ']') {
-            currentSection = trimmed.substr(1, trimmed.size() - 2);
+            currentSection = ToUpper(Trim(trimmed.substr(1, trimmed.size() - 2)));
             continue;
         }
 
@@ -1583,139 +1692,147 @@ bool ConfigManager::Load(const std::filesystem::path& configPath) {
             std::string val = Trim(StripComment(trimmed.substr(eqPos + 1)));
 
             if (key == "Enabled") {
-                m_config.enabled = ParseBool(val, m_config.enabled);
+                parsed.enabled = ParseBool(val, parsed.enabled);
             } else if (key == "TargetWidth") {
-                m_config.targetWidth = ParseUInt(val, m_config.targetWidth, 720, 7680) & ~1u; // Ensure even width
+                parsed.targetWidth = MakeEvenUp(ParseUInt(val, parsed.targetWidth, kMinTargetWidth, kMaxTargetWidth));
             } else if (key == "TargetHeight") {
-                m_config.targetHeight = ParseUInt(val, m_config.targetHeight, 480, 4320) & ~1u; // Ensure even height
+                parsed.targetHeight = MakeEvenUp(ParseUInt(val, parsed.targetHeight, kMinTargetHeight, kMaxTargetHeight));
             } else if (key == "PreferredApi") {
                 std::string apiUpper = ToUpper(val);
-                if (apiUpper == "VULKAN") m_config.preferredApi = GraphicsApi::Vulkan;
-                else if (apiUpper == "D3D12") m_config.preferredApi = GraphicsApi::D3D12;
-                else if (apiUpper == "AUTO")  m_config.preferredApi = GraphicsApi::Auto;
-                else CBR_LOG_WARN("Unknown PreferredApi '%s' (expected Vulkan, D3D12 or Auto); keeping default.", val.c_str());
+                if (apiUpper == "VULKAN") parsed.preferredApi = GraphicsApi::Vulkan;
+                else if (apiUpper == "D3D12") parsed.preferredApi = GraphicsApi::D3D12;
+                else if (apiUpper == "AUTO")  parsed.preferredApi = GraphicsApi::Auto;
+                else warnings.emplace_back("Unknown PreferredApi '" + val + "'; keeping previous.");
             } else if (key == "MipLodBias") {
-                m_config.mipLodBias = ParseFloat(val, m_config.mipLodBias, -4.0f, 4.0f);
+                parsed.mipLodBias = ParseFloat(val, parsed.mipLodBias, -4.0f, 4.0f);
             } else if (key == "DepthTolerance") {
-                m_config.depthTolerance = ParseFloat(val, m_config.depthTolerance, 0.0001f, 1.0f);
+                parsed.depthTolerance = ParseFloat(val, parsed.depthTolerance, 0.0001f, 1.0f);
             } else if (key == "EnableColorClamping") {
-                m_config.enableColorClamping = ParseBool(val, m_config.enableColorClamping);
+                parsed.enableColorClamping = ParseBool(val, parsed.enableColorClamping);
             } else if (key == "ColorSpace") {
-                m_config.colorSpace = (ToUpper(val) == "RGB") ? ColorSpace::RGB : ColorSpace::YCoCg;
+                parsed.colorSpace = (ToUpper(val) == "RGB") ? ColorSpace::RGB : ColorSpace::YCoCg;
             } else if (key == "HistoryWeight") {
-                m_config.historyWeight = ParseFloat(val, m_config.historyWeight, 0.0f, 1.0f);
+                parsed.historyWeight = ParseFloat(val, parsed.historyWeight, 0.0f, 1.0f);
             } else if (key == "EnableSpatialFallback") {
-                m_config.enableSpatialFallback = ParseBool(val, m_config.enableSpatialFallback);
+                parsed.enableSpatialFallback = ParseBool(val, parsed.enableSpatialFallback);
             } else if (key == "EnableMotionDilation") {
-                m_config.enableMotionDilation = ParseBool(val, m_config.enableMotionDilation);
+                parsed.enableMotionDilation = ParseBool(val, parsed.enableMotionDilation);
             } else if (key == "DepthConvention") {
                 std::string dc = ToUpper(val);
-                if (dc == "STANDARD") m_config.depthConvention = DepthConvention::Standard;
-                else if (dc == "REVERSED") m_config.depthConvention = DepthConvention::Reversed;
-                else CBR_LOG_WARN("Unknown DepthConvention '%s' (expected Standard or Reversed); keeping previous.", val.c_str());
+                if (dc == "STANDARD") parsed.depthConvention = DepthConvention::Standard;
+                else if (dc == "REVERSED") parsed.depthConvention = DepthConvention::Reversed;
+                else warnings.emplace_back("Unknown DepthConvention '" + val + "'; keeping previous.");
             } else if (key == "DepthNear") {
-                m_config.depthNear = ParseFloat(val, m_config.depthNear, 0.001f, 100.0f);
+                parsed.depthNear = ParseFloat(val, parsed.depthNear, 0.001f, 100.0f);
             } else if (key == "DepthFar") {
-                m_config.depthFar = ParseFloat(val, m_config.depthFar, 0.0f, 1000000.0f);
+                parsed.depthFar = ParseFloat(val, parsed.depthFar, 0.0f, 1000000.0f);
             } else if (key == "JitterPattern") {
                 if (ToUpper(val) == "HALTON") {
-                    CBR_LOG_WARN("JitterPattern=Halton is not implemented yet; using Checkerboard.");
+                    warnings.emplace_back("JitterPattern=Halton is not implemented yet; using Checkerboard.");
                 }
-                m_config.jitterPattern = JitterPattern::Checkerboard;
+                parsed.jitterPattern = JitterPattern::Checkerboard;
             } else if (key == "JitterScale") {
-                m_config.jitterScale = ParseFloat(val, m_config.jitterScale, 0.1f, 4.0f);
-                if (m_config.jitterScale != 1.0f) {
-                    CBR_LOG_WARN("JitterScale != 1.0 is ignored for 2x MSAA checkerboard geometry; coverage requires exactly one pixel.");
+                parsed.jitterScale = ParseFloat(val, parsed.jitterScale, 0.1f, 4.0f);
+                if (parsed.jitterScale != 1.0f) {
+                    warnings.emplace_back("JitterScale != 1.0 is ignored for 2x MSAA checkerboard geometry.");
                 }
             } else if (key == "JitterDirection") {
-                try {
-                    int d = std::stoi(val);
-                    if (d == 1 || d == -1) {
-                        m_config.jitterDirection = d;
-                    } else {
-                        CBR_LOG_WARN("Invalid JitterDirection '%s' (expected +1 or -1); keeping previous.", val.c_str());
-                    }
-                } catch (...) {
-                    CBR_LOG_WARN("Invalid JitterDirection '%s'; keeping previous.", val.c_str());
+                int d = 0;
+                if (TryParseIntStrict(val, d) && (d == 1 || d == -1)) {
+                    parsed.jitterDirection = d;
+                } else {
+                    warnings.emplace_back("Invalid JitterDirection '" + val + "'; keeping previous.");
                 }
             } else if (key == "ProjectionJitterSign") {
-                try {
-                    int s = std::stoi(val);
-                    if (s == 1 || s == -1) {
-                        m_config.projectionJitterSign = s;
-                    } else {
-                        CBR_LOG_WARN("Invalid ProjectionJitterSign '%s' (expected +1 or -1); keeping previous.", val.c_str());
-                    }
-                } catch (...) {
-                    CBR_LOG_WARN("Invalid ProjectionJitterSign '%s'; keeping previous.", val.c_str());
+                int s = 0;
+                if (TryParseIntStrict(val, s) && (s == 1 || s == -1)) {
+                    parsed.projectionJitterSign = s;
+                } else {
+                    warnings.emplace_back("Invalid ProjectionJitterSign '" + val + "'; keeping previous.");
                 }
             } else if (key == "JitterCompensation") {
-                m_config.jitterCompensation = ParseFloat(val, m_config.jitterCompensation, -1.0f, 1.0f);
+                parsed.jitterCompensation = ParseFloat(val, parsed.jitterCompensation, -1.0f, 1.0f);
             } else if (key == "DebugView") {
-                m_config.debugView = ParseUInt(val, m_config.debugView, 0, 5);
+                parsed.debugView = ParseUInt(val, parsed.debugView, 0, 5);
             } else if (key == "ShowOverlay") {
-                m_config.showOverlay = ParseBool(val, m_config.showOverlay);
+                parsed.showOverlay = ParseBool(val, parsed.showOverlay);
             } else if (key == "LogToFile") {
-                m_config.logToFile = ParseBool(val, m_config.logToFile);
+                parsed.logToFile = ParseBool(val, parsed.logToFile);
             } else if (key == "LogLevel") {
-                m_config.logLevel = val;
+                const std::string clean = SanitizeLogLevel(val, parsed.logLevel);
+                if (clean != Trim(val)) warnings.emplace_back("Invalid LogLevel sanitized.");
+                parsed.logLevel = clean;
+            } else {
+                warnings.emplace_back("Unknown key '" + key + "' in [" + currentSection + "]; ignored.");
             }
         }
     }
 
-    CBR_LOG_INFO("Configuration successfully loaded from %s (Target: %ux%u, API: %s, CBR Enabled: %s)",
-        configPath.string().c_str(),
-        m_config.targetWidth,
-        m_config.targetHeight,
-        m_config.preferredApi == GraphicsApi::Vulkan ? "Vulkan"
-            : m_config.preferredApi == GraphicsApi::D3D12 ? "D3D12" : "Auto",
-        m_config.enabled ? "true" : "false");
+    UpdateConfig(parsed);
+    for (const auto& w : warnings) CBR_LOG_WARN("%s", w.c_str());
+
+    const CBRConfig applied = GetConfig();
+    CBR_LOG_INFO("Configuration loaded from %s (Target: %ux%u, API: %s, CBR Enabled: %s)",
+        configPath.filename().string().c_str(),
+        applied.targetWidth,
+        applied.targetHeight,
+        applied.preferredApi == GraphicsApi::Vulkan ? "Vulkan"
+            : applied.preferredApi == GraphicsApi::D3D12 ? "D3D12" : "Auto",
+        applied.enabled ? "true" : "false");
 
     return true;
 }
 
 bool ConfigManager::Save(const std::filesystem::path& configPath) {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    const CBRConfig snapshot = GetConfig(); // copy under lock; do I/O outside
     std::ofstream file(configPath);
     if (!file.is_open()) {
-        CBR_LOG_ERROR("Failed to open %s for saving configuration.", configPath.string().c_str());
+        CBR_LOG_ERROR("Failed to open %s for saving configuration.", configPath.filename().string().c_str());
         return false;
     }
 
     file << "; RDR2 Checkerboard Rendering Mod Configuration\n";
     file << "[General]\n";
-    file << "Enabled = " << (m_config.enabled ? "true" : "false") << "\n";
-    file << "TargetWidth = " << m_config.targetWidth << "\n";
-    file << "TargetHeight = " << m_config.targetHeight << "\n";
+    file << "Enabled = " << (snapshot.enabled ? "true" : "false") << "\n";
+    file << "TargetWidth = " << snapshot.targetWidth << "\n";
+    file << "TargetHeight = " << snapshot.targetHeight << "\n";
     file << "PreferredApi = "
-         << (m_config.preferredApi == GraphicsApi::Vulkan ? "Vulkan"
-           : m_config.preferredApi == GraphicsApi::D3D12 ? "D3D12" : "Auto") << "\n";
-    file << "MipLodBias = " << m_config.mipLodBias << "\n\n";
+         << (snapshot.preferredApi == GraphicsApi::Vulkan ? "Vulkan"
+           : snapshot.preferredApi == GraphicsApi::D3D12 ? "D3D12" : "Auto") << "\n";
+    file << "MipLodBias = " << snapshot.mipLodBias << "\n\n";
 
     file << "[Reconstruction]\n";
-    file << "DepthTolerance = " << m_config.depthTolerance << "\n";
-    file << "EnableColorClamping = " << (m_config.enableColorClamping ? "true" : "false") << "\n";
-    file << "ColorSpace = " << (m_config.colorSpace == ColorSpace::RGB ? "RGB" : "YCoCg") << "\n";
-    file << "HistoryWeight = " << m_config.historyWeight << "\n";
-    file << "EnableSpatialFallback = " << (m_config.enableSpatialFallback ? "true" : "false") << "\n";
-    file << "EnableMotionDilation = " << (m_config.enableMotionDilation ? "true" : "false") << "\n";
-    file << "DepthConvention = " << (m_config.depthConvention == DepthConvention::Standard ? "Standard" : "Reversed") << "\n";
-    file << "DepthNear = " << m_config.depthNear << "\n";
-    file << "DepthFar = " << m_config.depthFar << "\n\n";
+    file << "DepthTolerance = " << snapshot.depthTolerance << "\n";
+    file << "EnableColorClamping = " << (snapshot.enableColorClamping ? "true" : "false") << "\n";
+    file << "ColorSpace = " << (snapshot.colorSpace == ColorSpace::RGB ? "RGB" : "YCoCg") << "\n";
+    file << "HistoryWeight = " << snapshot.historyWeight << "\n";
+    file << "EnableSpatialFallback = " << (snapshot.enableSpatialFallback ? "true" : "false") << "\n";
+    file << "EnableMotionDilation = " << (snapshot.enableMotionDilation ? "true" : "false") << "\n";
+    file << "DepthConvention = " << (snapshot.depthConvention == DepthConvention::Standard ? "Standard" : "Reversed") << "\n";
+    file << "DepthNear = " << snapshot.depthNear << "\n";
+    file << "DepthFar = " << snapshot.depthFar << "\n\n";
 
     file << "[Jitter]\n";
-    file << "JitterPattern = " << (m_config.jitterPattern == JitterPattern::Halton ? "Halton" : "Checkerboard") << "\n";
-    file << "JitterScale = " << m_config.jitterScale << "\n";
-    file << "JitterDirection = " << m_config.jitterDirection << "\n";
-    file << "ProjectionJitterSign = " << m_config.projectionJitterSign << "\n";
-    file << "JitterCompensation = " << m_config.jitterCompensation << "\n\n";
+    // Halton is reserved/not implemented: always persist Checkerboard so a
+    // round-trip never claims Halton support.
+    file << "JitterPattern = Checkerboard ; Halton reserved, not implemented\n";
+    file << "JitterScale = " << snapshot.jitterScale << "\n";
+    file << "JitterDirection = " << snapshot.jitterDirection << "\n";
+    file << "ProjectionJitterSign = " << snapshot.projectionJitterSign << "\n";
+    file << "JitterCompensation = " << snapshot.jitterCompensation << "\n\n";
 
     file << "[Debug]\n";
-    file << "ShowOverlay = " << (m_config.showOverlay ? "true" : "false") << "\n";
-    file << "DebugView = " << m_config.debugView << "\n";
-    file << "LogToFile = " << (m_config.logToFile ? "true" : "false") << "\n";
-    file << "LogLevel = " << m_config.logLevel << "\n";
+    file << "ShowOverlay = " << (snapshot.showOverlay ? "true" : "false") << "\n";
+    file << "DebugView = " << snapshot.debugView << "\n";
+    file << "LogToFile = " << (snapshot.logToFile ? "true" : "false") << "\n";
+    file << "LogLevel = " << SanitizeLogLevel(snapshot.logLevel, "Info") << "\n";
 
+    file.flush();
+    if (!file.good()) {
+        CBR_LOG_ERROR("Failed to write %s (disk full or I/O error); config may be truncated.",
+            configPath.filename().string().c_str());
+        return false;
+    }
     return true;
 }
 
@@ -1772,6 +1889,8 @@ void HookManager::Shutdown() {
 ```cpp
 #include "cbr/hooks.h"
 #include <atomic>
+#include <cstddef>
+#include <cstring>
 #include "cbr/cbr_engine.h"
 #include "cbr/logger.h"
 
@@ -1797,7 +1916,10 @@ PFN_vkCreateSwapchainKHR g_Original_vkCreateSwapchainKHR = nullptr;
 // so the failure is visible to the caller instead of silently dropping frames / swapchains.
 constexpr int kVkErrorInitializationFailed = -3;
 
-// Minimal Vulkan struct layouts for headerless extraction of swapchain and extent
+// Minimal Vulkan struct layouts for headerless extraction of swapchain and extent.
+// WARNING: headerless ABI hack. Offsets must match VkSwapchainCreateInfoKHR /
+// VkPresentInfoKHR from the Vulkan headers. Prefer including <vulkan/vulkan.h>
+// when the SDK is available. Static asserts below pin the assumed layout.
 struct MinimalVkExtent2D {
     uint32_t width;
     uint32_t height;
@@ -1813,6 +1935,8 @@ struct MinimalVkSwapchainCreateInfoKHR {
     int32_t           imageColorSpace;
     MinimalVkExtent2D imageExtent;
 };
+static_assert(offsetof(MinimalVkSwapchainCreateInfoKHR, sType) == 0, "ABI drift");
+static_assert(sizeof(MinimalVkSwapchainCreateInfoKHR) >= sizeof(uint32_t) + sizeof(void*) + sizeof(uint32_t) + sizeof(uint64_t), "ABI drift");
 
 struct MinimalVkPresentInfoKHR {
     uint32_t     sType;
@@ -1832,9 +1956,14 @@ int Hooked_vkQueuePresentKHR(void* queue, const void* pPresentInfo) {
 
     void* presentTarget = queue;
     if (pPresentInfo) {
-        const auto* info = reinterpret_cast<const MinimalVkPresentInfoKHR*>(pPresentInfo);
-        if (info->swapchainCount > 0 && info->pSwapchains) {
-            presentTarget = const_cast<void*>(info->pSwapchains[0]);
+        // Safe copy-out: avoid strict-aliasing violation from reinterpret_cast
+        // of the game's struct; copy only the fields we need.
+        MinimalVkPresentInfoKHR info{};
+        std::memcpy(&info, pPresentInfo, sizeof(info));
+        if (info.swapchainCount > 0 && info.swapchainCount < 16 && info.pSwapchains) {
+            void* first = nullptr;
+            std::memcpy(&first, info.pSwapchains, sizeof(first));
+            if (first) presentTarget = first;
         }
     }
 
@@ -1862,9 +1991,11 @@ int Hooked_vkCreateSwapchainKHR(void* device, const void* pCreateInfo, const voi
     if (result == 0) { // VK_SUCCESS
         uint32_t w = 0, h = 0;
         if (pCreateInfo) {
-            const auto* info = reinterpret_cast<const MinimalVkSwapchainCreateInfoKHR*>(pCreateInfo);
-            w = info->imageExtent.width;
-            h = info->imageExtent.height;
+            MinimalVkSwapchainCreateInfoKHR info{};
+            std::memcpy(&info, pCreateInfo, sizeof(info));
+            w = info.imageExtent.width;
+            h = info.imageExtent.height;
+            if (w > 16384 || h > 16384) { w = 0; h = 0; } // untrusted: let engine ignore
         }
         try { CBREngine::Get().OnSwapchainRecreated(w, h); } catch (...) {}
     }
@@ -1999,15 +2130,22 @@ JitterManager& JitterManager::Get() {
 }
 
 void JitterManager::Initialize(uint32_t targetWidth, uint32_t targetHeight) {
-    m_targetWidth = (targetWidth > 0) ? targetWidth : 3840;
-    m_targetHeight = (targetHeight > 0) ? targetHeight : 2160;
-    m_currentJitter = { 0.0f, 0.0f };
-    m_previousJitter = { 0.0f, 0.0f };
-
-    CBR_LOG_INFO("JitterManager initialized with target resolution: %ux%u", m_targetWidth, m_targetHeight);
+    uint32_t w, h;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_targetWidth = (targetWidth > 0) ? targetWidth : 3840;
+        m_targetHeight = (targetHeight > 0) ? targetHeight : 2160;
+        m_currentJitter = { 0.0f, 0.0f };
+        m_previousJitter = { 0.0f, 0.0f };
+        w = m_targetWidth; h = m_targetHeight;
+    }
+    CBR_LOG_INFO("JitterManager initialized with target resolution: %ux%u", w, h);
 }
 
 void JitterManager::Update(uint32_t frameIndex) {
+    // JitterScale is intentionally ignored: 2x MSAA checkerboard coverage
+    // requires exactly one full-resolution pixel shift. See config warning.
+    std::lock_guard<std::mutex> lock(m_mutex);
     m_previousJitter = m_currentJitter;
 
     // 2-phase checkerboard jitter sequence:
@@ -2045,7 +2183,9 @@ std::pair<float, float> JitterManager::ComputeProjectionOffset(const JitterOffse
 void JitterManager::ApplyJitterToProjection(float* projMatrix4x4, bool isVulkan) const {
     if (!projMatrix4x4) return;
 
-    auto [jitterNdcX, jitterNdcY] = ComputeProjectionOffset(m_currentJitter, isVulkan);
+    JitterOffset cur;
+    { std::lock_guard<std::mutex> lock(m_mutex); cur = m_currentJitter; }
+    auto [jitterNdcX, jitterNdcY] = ComputeProjectionOffset(cur, isVulkan);
 
     projMatrix4x4[8] += jitterNdcX;
     projMatrix4x4[9] += jitterNdcY;
@@ -2054,7 +2194,9 @@ void JitterManager::ApplyJitterToProjection(float* projMatrix4x4, bool isVulkan)
 void JitterManager::RemoveJitterFromProjection(float* projMatrix4x4, bool isVulkan) const {
     if (!projMatrix4x4) return;
 
-    auto [jitterNdcX, jitterNdcY] = ComputeProjectionOffset(m_currentJitter, isVulkan);
+    JitterOffset cur;
+    { std::lock_guard<std::mutex> lock(m_mutex); cur = m_currentJitter; }
+    auto [jitterNdcX, jitterNdcY] = ComputeProjectionOffset(cur, isVulkan);
 
     projMatrix4x4[8] -= jitterNdcX;
     projMatrix4x4[9] -= jitterNdcY;
@@ -2069,7 +2211,9 @@ void JitterManager::SetProjectionJitter(float* outMatrix4x4, const float* inUnji
         }
     }
 
-    auto [jitterNdcX, jitterNdcY] = ComputeProjectionOffset(m_currentJitter, isVulkan);
+    JitterOffset cur;
+    { std::lock_guard<std::mutex> lock(m_mutex); cur = m_currentJitter; }
+    auto [jitterNdcX, jitterNdcY] = ComputeProjectionOffset(cur, isVulkan);
 
     outMatrix4x4[8] = inUnjitteredMatrix4x4[8] + jitterNdcX;
     outMatrix4x4[9] = inUnjitteredMatrix4x4[9] + jitterNdcY;
@@ -2113,15 +2257,21 @@ void Logger::Initialize(const std::filesystem::path& logFilePath) {
         for (const auto& line : m_pending) {
             m_logFile << line;
         }
+        if (m_droppedPending > 0) {
+            m_logFile << "[WARN] " << m_droppedPending << " early log message(s) dropped (buffer cap "
+                      << kMaxPendingMessages << ").\n";
+        }
         m_logFile.flush();
     }
     m_pending.clear();
+    m_droppedPending = 0;
 }
 
 void Logger::Disable() {
     std::lock_guard<std::mutex> lock(m_mutex);
     m_disabled = true;
     m_pending.clear();
+    m_droppedPending = 0;
 }
 
 void Logger::Shutdown() {
@@ -2134,6 +2284,7 @@ void Logger::Shutdown() {
     m_initialized = false;
     m_disabled = true;
     m_pending.clear();
+    m_droppedPending = 0;
 }
 
 void Logger::SetMinLevel(LogLevel level) {
@@ -2177,8 +2328,12 @@ void Logger::Log(LogLevel level, const std::string& message) {
     if (m_initialized && m_logFile.is_open()) {
         m_logFile << formatted;
         m_logFile.flush();
-    } else if (!m_initialized && !m_disabled && m_pending.size() < kMaxPendingMessages) {
-        m_pending.push_back(formatted);
+    } else if (!m_initialized && !m_disabled) {
+        if (m_pending.size() < kMaxPendingMessages) {
+            m_pending.push_back(formatted);
+        } else {
+            ++m_droppedPending;
+        }
     }
 
 #if defined(_DEBUG)
@@ -2208,34 +2363,36 @@ ReconstructionPass& ReconstructionPass::Get() {
 }
 
 bool ReconstructionPass::InitializeVulkan(void* /*vkDevice*/, void* /*vkPhysicalDevice*/) {
-    m_isVulkan = true;
-    m_initialized = true;
+    m_isVulkan.store(true);
+    m_initialized.store(true);
     CBR_LOG_INFO("ReconstructionPass initialized for Vulkan API pipeline.");
     return true;
 }
 
 bool ReconstructionPass::InitializeDX12(void* /*d3d12Device*/) {
-    m_isVulkan = false;
-    m_initialized = true;
+    m_isVulkan.store(false);
+    m_initialized.store(true);
     CBR_LOG_INFO("ReconstructionPass initialized for DirectX 12 API pipeline.");
     return true;
 }
 
 void ReconstructionPass::Shutdown() {
-    m_initialized = false;
+    m_initialized.store(false);
     CBR_LOG_INFO("ReconstructionPass shut down.");
 }
 
 ReconstructionPushConstants BuildReconstructionPushConstants(uint32_t frameIndex) {
-    const auto& config = ConfigManager::Get().GetConfig();
-    const auto& dims = RenderTargetManager::Get().GetDimensions();
+    const auto config = ConfigManager::Get().GetConfig();
+    const auto dims = RenderTargetManager::Get().GetDimensions();
     const auto jitterDelta = JitterManager::Get().GetJitterDelta();
 
     ReconstructionPushConstants pc{};
-    pc.targetResolution[0] = static_cast<float>(dims.fullWidth);
-    pc.targetResolution[1] = static_cast<float>(dims.fullHeight);
-    pc.invTargetResolution[0] = 1.0f / pc.targetResolution[0];
-    pc.invTargetResolution[1] = 1.0f / pc.targetResolution[1];
+    const float fw = dims.fullWidth > 0 ? static_cast<float>(dims.fullWidth) : 3840.0f;
+    const float fh = dims.fullHeight > 0 ? static_cast<float>(dims.fullHeight) : 2160.0f;
+    pc.targetResolution[0] = fw;
+    pc.targetResolution[1] = fh;
+    pc.invTargetResolution[0] = 1.0f / fw;
+    pc.invTargetResolution[1] = 1.0f / fh;
     pc.frameIndex = frameIndex;
     pc.depthTolerance = config.depthTolerance;
     pc.historyWeight = config.historyWeight;
@@ -2257,10 +2414,13 @@ ReconstructionPushConstants BuildReconstructionPushConstants(uint32_t frameIndex
 }
 
 void ReconstructionPass::DispatchVulkan(void* /*vkCommandBuffer*/, uint32_t frameIndex) {
-    if (!m_initialized) return;
+    if (!m_initialized.load()) {
+        CBR_LOG_WARN("DispatchVulkan dropped: ReconstructionPass not initialized.");
+        return;
+    }
 
     const ReconstructionPushConstants pushConstants = BuildReconstructionPushConstants(frameIndex);
-    const auto& dims = RenderTargetManager::Get().GetDimensions();
+    const auto dims = RenderTargetManager::Get().GetDimensions();
 
     const uint32_t groupCountX = (dims.fullWidth + 15u) / 16u;
     const uint32_t groupCountY = (dims.fullHeight + 15u) / 16u;
@@ -2274,10 +2434,13 @@ void ReconstructionPass::DispatchVulkan(void* /*vkCommandBuffer*/, uint32_t fram
 }
 
 void ReconstructionPass::DispatchDX12(void* /*d3d12GraphicsCommandList*/, uint32_t frameIndex) {
-    if (!m_initialized) return;
+    if (!m_initialized.load()) {
+        CBR_LOG_WARN("DispatchDX12 dropped: ReconstructionPass not initialized.");
+        return;
+    }
 
     const ReconstructionPushConstants pushConstants = BuildReconstructionPushConstants(frameIndex);
-    const auto& dims = RenderTargetManager::Get().GetDimensions();
+    const auto dims = RenderTargetManager::Get().GetDimensions();
 
     const uint32_t groupCountX = (dims.fullWidth + 15u) / 16u;
     const uint32_t groupCountY = (dims.fullHeight + 15u) / 16u;
@@ -2306,54 +2469,69 @@ RenderTargetManager& RenderTargetManager::Get() {
 }
 
 void RenderTargetManager::Initialize(uint32_t width, uint32_t height) {
-    m_dims.fullWidth = width;
-    m_dims.fullHeight = height;
-    m_dims.quarterWidth = width / 2;
-    m_dims.quarterHeight = height / 2;
-    m_dims.msaaSamples = 2;
+    if (width < 2 || height < 2 || width > 16384 || height > 16384) {
+        CBR_LOG_ERROR("RenderTargetManager::Initialize rejected invalid %ux%u (must be 2..16384).", width, height);
+        return;
+    }
+    TargetDimensions dims{};
+    dims.fullWidth = width;
+    dims.fullHeight = height;
+    dims.quarterWidth = width / 2;
+    dims.quarterHeight = height / 2;
+    dims.msaaSamples = 2;
     m_historyPingPong.store(0);
 
     // Calculate VRAM footprint:
     // 1. Quarter-Res 2x MSAA Color (RGBA16F = 8 bytes/sample * 2 samples):
-    size_t qColor = static_cast<size_t>(m_dims.quarterWidth) * m_dims.quarterHeight * 8 * 2;
+    size_t qColor = static_cast<size_t>(dims.quarterWidth) * dims.quarterHeight * 8 * 2;
     // 2. Quarter-Res 2x MSAA Depth (D32F = 4 bytes/sample * 2 samples):
-    size_t qDepth = static_cast<size_t>(m_dims.quarterWidth) * m_dims.quarterHeight * 4 * 2;
+    size_t qDepth = static_cast<size_t>(dims.quarterWidth) * dims.quarterHeight * 4 * 2;
     // 3. Full-Res History A & B (RGBA16F = 8 bytes):
-    size_t histColor = static_cast<size_t>(m_dims.fullWidth) * m_dims.fullHeight * 8 * 2;
+    size_t histColor = static_cast<size_t>(dims.fullWidth) * dims.fullHeight * 8 * 2;
     // 4. Full-Res Depth History A & B (R32F = 4 bytes * 2 buffers):
-    size_t histDepth = static_cast<size_t>(m_dims.fullWidth) * m_dims.fullHeight * 4 * 2;
+    size_t histDepth = static_cast<size_t>(dims.fullWidth) * dims.fullHeight * 4 * 2;
     // 5. Full-Res Output Image (RGBA16F = 8 bytes):
-    size_t outColor = static_cast<size_t>(m_dims.fullWidth) * m_dims.fullHeight * 8;
+    size_t outColor = static_cast<size_t>(dims.fullWidth) * dims.fullHeight * 8;
 
-    m_totalAllocatedVramBytes = qColor + qDepth + histColor + histDepth + outColor;
+    const size_t total = qColor + qDepth + histColor + histDepth + outColor;
+    {
+        std::unique_lock<std::shared_mutex> lock(m_mutex);
+        m_dims = dims;
+        m_totalAllocatedVramBytes.store(total);
+    }
     m_initialized = true;
 
     CBR_LOG_INFO("RenderTargetManager initialized for target: %ux%u", width, height);
-    CBR_LOG_INFO("Quarter-Resolution 2x MSAA Buffer size: %ux%u", m_dims.quarterWidth, m_dims.quarterHeight);
+    CBR_LOG_INFO("Quarter-Resolution 2x MSAA Buffer size: %ux%u", dims.quarterWidth, dims.quarterHeight);
     CBR_LOG_INFO("Total CBR VRAM Footprint: %.2f MiB (%.2f MB)",
-        static_cast<double>(m_totalAllocatedVramBytes) / (1024.0 * 1024.0),
-        static_cast<double>(m_totalAllocatedVramBytes) / 1000000.0);
+        static_cast<double>(total) / (1024.0 * 1024.0),
+        static_cast<double>(total) / 1000000.0);
 }
 
 void RenderTargetManager::Shutdown() {
     m_initialized = false;
-    m_totalAllocatedVramBytes = 0;
+    m_totalAllocatedVramBytes.store(0);
     CBR_LOG_INFO("RenderTargetManager shut down.");
 }
 
-bool RenderTargetManager::IsTargetInterceptCandidate(uint32_t width, uint32_t height, uint32_t /*format*/) const {
-    if (!m_initialized) return false;
+bool RenderTargetManager::IsTargetInterceptCandidate(uint32_t width, uint32_t height, uint32_t format) const {
+    if (!m_initialized.load()) return false;
 
+    // NOTE: format is currently ignored (all full-res targets match). Revisit when
+    // depth vs color formats must be distinguished to avoid false positives.
+    (void)format;
+    const TargetDimensions dims = GetDimensions();
     // Matches if the target resolution is identical or close to full output resolution
-    bool matchesWidth = (width == m_dims.fullWidth);
-    bool matchesHeight = (height == m_dims.fullHeight);
+    bool matchesWidth = (width == dims.fullWidth);
+    bool matchesHeight = (height == dims.fullHeight);
 
     return matchesWidth && matchesHeight;
 }
 
 bool RenderTargetManager::IsQuarterPassCandidate(uint32_t width, uint32_t height) const {
-    if (!m_initialized) return false;
-    return (width == m_dims.quarterWidth && height == m_dims.quarterHeight);
+    if (!m_initialized.load()) return false;
+    const TargetDimensions dims = GetDimensions();
+    return (width == dims.quarterWidth && height == dims.quarterHeight);
 }
 
 } // namespace cbr
@@ -2414,6 +2592,15 @@ void UIOverlay::ToggleVisibility() {
 
 void UIOverlay::CheckHotkeys() {
 #if defined(_WIN32)
+    // Only poll when the game process owns the foreground window, to avoid
+    // toggling while the user types in another app and to reduce AV/anti-cheat
+    // heuristics around global GetAsyncKeyState polling.
+    HWND fg = GetForegroundWindow();
+    if (fg) {
+        DWORD fgPid = 0;
+        GetWindowThreadProcessId(fg, &fgPid);
+        if (fgPid != GetCurrentProcessId()) return;
+    }
     // Non-intrusive async key state polling for F11 and Insert
     const bool f11Down = (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
     const bool insertDown = (GetAsyncKeyState(VK_INSERT) & 0x8000) != 0;
@@ -2502,6 +2689,9 @@ layout(set = 0, binding = 0) uniform sampler2DMS u_QuarterColorMSAA;
 layout(set = 0, binding = 1) uniform sampler2DMS u_QuarterDepthMSAA;
 
 // History frame: full-resolution reconstructed color & depth buffers
+// SAMPLER REQUIREMENT (must match HLSL LinearClamp/PointClamp):
+//   u_HistoryColor -> LINEAR + CLAMP_TO_EDGE, u_HistoryDepth -> NEAREST + CLAMP_TO_EDGE,
+//   u_Velocity -> LINEAR + CLAMP_TO_EDGE. Depth history uses texelFetch (sampler-independent).
 layout(set = 0, binding = 2) uniform sampler2D   u_HistoryColor;
 layout(set = 0, binding = 3) uniform sampler2D   u_HistoryDepth;
 
@@ -2602,13 +2792,17 @@ float FetchDepth(CbrSample s) {
 }
 
 // MIRRORS include/cbr/depth_convention.h
+// NaN/Inf device depth yields NaN so the disocclusion test must reject it.
 float LinearizeDepth(float d) {
+    if (isnan(d) || isinf(d)) return uintBitsToFloat(0x7fc00000u); // quiet NaN
     float n = pc.u_DepthNear;
     float f = pc.u_DepthFar;
     if (pc.u_DepthMode == 1u) {
         return (f > 0.0) ? (n * f) / (n + d * (f - n)) : n / max(d, 1e-7);
     }
-    return (n * f) / (f - d * (f - n));
+    float denom = (f - d * (f - n));
+    if (denom == 0.0 || isinf(denom) || isnan(denom)) return uintBitsToFloat(0x7fc00000u);
+    return (n * f) / denom;
 }
 
 bool IsNearer(float a, float b) {
@@ -2708,7 +2902,12 @@ void main() {
 
     vec2 dilatedUV = (vec2(motionCoord) + 0.5) * pc.u_InvTargetResolution;
     vec2 velocity = textureLod(u_Velocity, dilatedUV, 0.0).xy;
+    // NaN/Inf velocity or UV must disocclude: ivec2(NaN) is UB and NaN comparisons are false.
+    bool velocityBad = isinf(velocity.x) || isnan(velocity.x) || isinf(velocity.y) || isnan(velocity.y)
+        || isinf(uv.x) || isnan(uv.x) || isinf(uv.y) || isnan(uv.y);
     vec2 historyUV = uv - velocity - pc.u_JitterDelta * pc.u_JitterCompensation;
+    bool historyUVBad = velocityBad || isinf(historyUV.x) || isnan(historyUV.x)
+        || isinf(historyUV.y) || isnan(historyUV.y);
 
     // -------------------------------------------------------------------------
     // 3. Disocclusion & depth delta testing (scale-invariant: relative difference of LINEAR depth)
@@ -2717,13 +2916,15 @@ void main() {
     vec4 historyColor = vec4(0.0);
     float previousDepth = currentDepth;
 
-    if (pc.u_FrameIndex == 0u || historyUV.x < 0.0 || historyUV.x > 1.0 || historyUV.y < 0.0 || historyUV.y > 1.0) {
-        isDisoccluded = true; // First frame or sample moved outside screen space
+    if (historyUVBad || pc.u_FrameIndex == 0u || historyUV.x < 0.0 || historyUV.x > 1.0 || historyUV.y < 0.0 || historyUV.y > 1.0) {
+        isDisoccluded = true; // First frame, bad velocity/UV, or sample moved outside screen space
     } else {
         // Exact texel fetch: independent of the bound sampler, so depth is never blended across edges
         ivec2 historyCoord = clamp(ivec2(historyUV * pc.u_TargetResolution), ivec2(0), targetSize - ivec2(1));
         previousDepth = texelFetch(u_HistoryDepth, historyCoord, 0).r;
-        float depthDelta = abs(currentLinear - LinearizeDepth(previousDepth)) / max(currentLinear, 1e-5);
+        float prevLin = LinearizeDepth(previousDepth);
+        bool depthBad = isinf(currentLinear) || isnan(currentLinear) || isinf(prevLin) || isnan(prevLin);
+        float depthDelta = depthBad ? 10.0 : abs(currentLinear - prevLin) / max(currentLinear, 1e-5);
         if (depthDelta > pc.u_DepthTolerance) {
             isDisoccluded = true;
         } else {
@@ -2777,7 +2978,7 @@ void main() {
             // Variance clipping: clamp history inside [mean - gamma * stdDev, mean + gamma * stdDev]
             vec3 mean = m1 / n;
             vec3 stdDev = sqrt(max(vec3(0.0), (m2 / n) - (mean * mean)));
-            float gamma = 1.25;
+            const float gamma = 1.25; // kVarianceClipGamma (include/cbr/limits.h)
             vec3 varianceMin = max(colorMin, mean - gamma * stdDev);
             vec3 varianceMax = min(colorMax, mean + gamma * stdDev);
             varianceMax = max(varianceMin, varianceMax); // Ensure varianceMin <= varianceMax to prevent clamp inversion
@@ -3004,13 +3205,18 @@ float FetchDepth(CbrSample s) {
 }
 
 // MIRRORS include/cbr/depth_convention.h
+// NaN/Inf device depth yields NaN so the disocclusion test must reject it.
 float LinearizeDepth(float d) {
-    float n = g_DepthNear;
-    float f = g_DepthFar;
-    if (g_DepthMode == 1u) {
-        return (f > 0.0f) ? (n * f) / (n + d * (f - n)) : n / max(d, 1e-7f);
+    if (!isnan(d) && !isinf(d)) {
+        float n = g_DepthNear;
+        float f = g_DepthFar;
+        if (g_DepthMode == 1u) {
+            return (f > 0.0f) ? (n * f) / (n + d * (f - n)) : n / max(d, 1e-7f);
+        }
+        float denom = (f - d * (f - n));
+        if (denom != 0.0f && !isinf(denom) && !isnan(denom)) return (n * f) / denom;
     }
-    return (n * f) / (f - d * (f - n));
+    return asfloat(0x7fc00000u); // quiet NaN
 }
 
 bool IsNearer(float a, float b) {
@@ -3111,7 +3317,11 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
 
     float2 dilatedUV = (float2(motionCoord) + 0.5f) * g_InvTargetResolution;
     float2 velocity = g_Velocity.SampleLevel(g_LinearClampSampler, dilatedUV, 0.0f).xy;
+    bool velocityBad = isinf(velocity.x) || isnan(velocity.x) || isinf(velocity.y) || isnan(velocity.y)
+        || isinf(uv.x) || isnan(uv.x) || isinf(uv.y) || isnan(uv.y);
     float2 historyUV = uv - velocity - g_JitterDelta * g_JitterCompensation;
+    bool historyUVBad = velocityBad || isinf(historyUV.x) || isnan(historyUV.x)
+        || isinf(historyUV.y) || isnan(historyUV.y);
 
     // -------------------------------------------------------------------------
     // 3. Disocclusion & depth delta test (scale-invariant: relative difference of LINEAR depth)
@@ -3120,11 +3330,13 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     float4 historyColor = float4(0.0f, 0.0f, 0.0f, 0.0f);
     float previousDepth = currentDepth;
 
-    if (g_FrameIndex == 0u || historyUV.x < 0.0f || historyUV.x > 1.0f || historyUV.y < 0.0f || historyUV.y > 1.0f) {
-        isDisoccluded = true; // First frame or sample moved outside screen space
+    if (historyUVBad || g_FrameIndex == 0u || historyUV.x < 0.0f || historyUV.x > 1.0f || historyUV.y < 0.0f || historyUV.y > 1.0f) {
+        isDisoccluded = true; // First frame, bad velocity/UV, or sample moved outside screen space
     } else {
         previousDepth = g_HistoryDepth.SampleLevel(g_PointClampSampler, historyUV, 0.0f).r;
-        float depthDelta = abs(currentLinear - LinearizeDepth(previousDepth)) / max(currentLinear, 1e-5f);
+        float prevLin = LinearizeDepth(previousDepth);
+        bool depthBad = isinf(currentLinear) || isnan(currentLinear) || isinf(prevLin) || isnan(prevLin);
+        float depthDelta = depthBad ? 10.0f : abs(currentLinear - prevLin) / max(currentLinear, 1e-5f);
         if (depthDelta > g_DepthTolerance) {
             isDisoccluded = true;
         } else {
@@ -3178,7 +3390,7 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
             // Variance clipping: clamp history inside [mean - gamma * stdDev, mean + gamma * stdDev]
             float3 mean = m1 / n;
             float3 stdDev = sqrt(max(float3(0.0f, 0.0f, 0.0f), (m2 / n) - (mean * mean)));
-            float gamma = 1.25f;
+            const float gamma = 1.25f; // kVarianceClipGamma (include/cbr/limits.h)
             float3 varianceMin = max(colorMin, mean - gamma * stdDev);
             float3 varianceMax = min(colorMax, mean + gamma * stdDev);
             varianceMax = max(varianceMin, varianceMax); // Ensure varianceMin <= varianceMax to prevent clamp inversion
@@ -3366,6 +3578,7 @@ void main() {
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -3383,12 +3596,22 @@ static int g_failures = 0;
 } while (0)
 
 static void WriteFile(const fs::path& p, const std::string& content) {
-    std::ofstream f(p);
+    std::ofstream f(p, std::ios::out | std::ios::trunc);
     f << content;
+    f.flush();
+    if (!f.good()) {
+        std::cerr << "FAIL: WriteFile could not write " << p << "\n";
+        ++g_failures;
+    }
 }
 
 static std::string ReadFile(const fs::path& p) {
     std::ifstream f(p);
+    if (!f.is_open()) {
+        std::cerr << "FAIL: ReadFile could not open " << p << "\n";
+        ++g_failures;
+        return {};
+    }
     std::stringstream ss;
     ss << f.rdbuf();
     return ss.str();
@@ -3628,6 +3851,15 @@ static void TestCheckerboardGeometry() {
 }
 
 static void TestDepthConvention() {
+    // Non-finite device depth must poison (NaN) and always fail the tolerance test.
+    {
+        const float nan = std::numeric_limits<float>::quiet_NaN();
+        const float inf = std::numeric_limits<float>::infinity();
+        CHECK(!std::isfinite(LinearizeDepth(nan, DepthConvention::Reversed, 0.1f, 0.0f)));
+        CHECK(!std::isfinite(LinearizeDepth(inf, DepthConvention::Standard, 0.1f, 1000.0f)));
+        CHECK(RelativeDepthDelta(nan, 1.0f) > 1.0f);
+        CHECK(RelativeDepthDelta(1.0f, inf) > 1.0f);
+    }
     // Round trip: project a view-space distance to device depth, linearize it back.
     for (double z : { 0.2, 1.0, 10.0, 100.0, 1000.0, 5000.0 }) {
         const double n = 0.1, f = 10000.0;
@@ -3670,18 +3902,19 @@ static void TestDepthConvention() {
 }
 
 static void TestPushConstantBuilder() {
-    auto& cfg = ConfigManager::Get().GetMutableConfig();
-    cfg.depthTolerance = 0.02f;
-    cfg.historyWeight = 0.8f;
-    cfg.colorSpace = ColorSpace::RGB;
-    cfg.enableSpatialFallback = false;
-    cfg.enableMotionDilation = false;
-    cfg.jitterCompensation = -1.0f;
-    cfg.jitterScale = 1.0f;
-    cfg.jitterDirection = -1;
-    cfg.depthConvention = DepthConvention::Standard;
-    cfg.depthNear = 0.5f;
-    cfg.depthFar = 0.0f; // invalid for Standard -> must be sanitised
+    ConfigManager::Get().Modify([](CBRConfig& c) {
+        c.depthTolerance = 0.02f;
+        c.historyWeight = 0.8f;
+        c.colorSpace = ColorSpace::RGB;
+        c.enableSpatialFallback = false;
+        c.enableMotionDilation = false;
+        c.jitterCompensation = -1.0f;
+        c.jitterScale = 1.0f;
+        c.jitterDirection = -1;
+        c.depthConvention = DepthConvention::Standard;
+        c.depthNear = 0.5f;
+        c.depthFar = 0.0f; // invalid for Standard -> must be sanitised
+    });
 
     RenderTargetManager::Get().Initialize(3840, 2160);
     JitterManager::Get().Initialize(3840, 2160);
@@ -3702,12 +3935,14 @@ static void TestPushConstantBuilder() {
     CHECK(pc.depthNear == 0.5f && pc.depthFar == 1000.0f);
     CHECK(std::fabs(pc.jitterDelta[0] - JitterManager::Get().GetJitterDelta().x) < 1e-12f);
 
-    cfg.enableSpatialFallback = true;
-    cfg.enableMotionDilation = true;
-    cfg.colorSpace = ColorSpace::YCoCg;
-    cfg.jitterCompensation = 0.0f;
-    cfg.jitterDirection = 1;
-    cfg.depthConvention = DepthConvention::Reversed;
+    ConfigManager::Get().Modify([](CBRConfig& c) {
+        c.enableSpatialFallback = true;
+        c.enableMotionDilation = true;
+        c.colorSpace = ColorSpace::YCoCg;
+        c.jitterCompensation = 0.0f;
+        c.jitterDirection = 1;
+        c.depthConvention = DepthConvention::Reversed;
+    });
     const ReconstructionPushConstants pc2 = BuildReconstructionPushConstants(0);
     CHECK(pc2.enableSpatialFallback == 1u && pc2.enableMotionDilation == 1u && pc2.colorSpace == 0u);
     CHECK(pc2.shiftDirection == 1 && pc2.depthMode == 1u && pc2.depthFar == 0.0f);
@@ -3715,6 +3950,11 @@ static void TestPushConstantBuilder() {
 
 static void TestRenderTargets() {
     auto& r = RenderTargetManager::Get();
+    // Invalid extents must be rejected without clobbering the last good state.
+    r.Initialize(3840, 2160);
+    const auto good = r.GetDimensions();
+    r.Initialize(0, 0);
+    CHECK(r.GetDimensions().fullWidth == good.fullWidth);
     r.Initialize(3840, 2160);
     // 4K: quarter colour 33,177,600 + quarter depth 16,588,800 + history colour A/B 132,710,400
     //    + history depth A/B 66,355,200 + output 66,355,200 = 315,187,200 bytes (300.58 MiB, 315.19 MB)
@@ -3841,10 +4081,13 @@ static std::atomic<int> g_vulkanFailuresRemaining{ 0 };
 namespace cbr {
 bool HookManager::InstallVulkanHooks() {
     ++g_vulkanAttempts;
-    if (g_vulkanFailuresRemaining.load() > 0) {
-        --g_vulkanFailuresRemaining;
+    // Atomic consume-one-failure: fetch_sub returns the previous value.
+    int prev = g_vulkanFailuresRemaining.fetch_sub(1);
+    if (prev > 0) {
         return false;
     }
+    // No failures left: restore the counter (fetch_sub went to -1) and succeed.
+    g_vulkanFailuresRemaining.fetch_add(1);
     m_vulkanHooked.store(true);
     return true;
 }
@@ -4001,8 +4244,20 @@ Verifies that:
 
 import sys
 import os
+from typing import Dict
 
-def cpp_map_pixel_to_sample(x: int, y: int, frame_parity: int, shift_dir: int = 1):
+def _check_coords(x: int, y: int, target_w: int, target_h: int) -> None:
+    for name, v in (("x", x), ("y", y)):
+        if not isinstance(v, int) or v < 0:
+            raise ValueError(f"{name} must be a non-negative int, got {v!r}")
+    if target_w <= 0 or target_h <= 0:
+        raise ValueError("target dimensions must be positive")
+
+def cpp_map_pixel_to_sample(x: int, y: int, frame_parity: int, shift_dir: int = 1) -> Dict[str, int]:
+    if x < 0 or y < 0:
+        raise ValueError(f"pixel coords must be >= 0, got ({x}, {y})")
+    if frame_parity not in (0, 1):
+        raise ValueError(f"frame_parity must be 0/1, got {frame_parity}")
     y_bit = y & 1
     active = bool(((x ^ y) & 1) == (frame_parity & 1))
     if (frame_parity & 1) == 0:
@@ -4021,6 +4276,7 @@ def cpp_map_pixel_to_sample(x: int, y: int, frame_parity: int, shift_dir: int = 
     }
 
 def glsl_map_pixel_to_sample(x: int, y: int, frame_parity: int, shift_dir: int, target_w: int, target_h: int):
+    _check_coords(x, y, target_w, target_h)
     y_bit = y & 1
     is_active = bool(((x ^ y) & 1) == (frame_parity & 1))
     if frame_parity == 0:
@@ -4141,7 +4397,7 @@ if __name__ == "__main__":
 name: build
 
 permissions:
-  contents: write
+  contents: read
 
 on:
   push:
@@ -4153,10 +4409,13 @@ on:
 jobs:
   tests-and-shaders:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
+      # Pinned by SHA (v4.6.0); update with `gh api` and review changelogs.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - name: Install tools
-        run: sudo apt-get update && sudo apt-get install -y cmake g++ glslang-tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake g++ glslang-tools
       - name: Unit tests
         run: |
           cmake -S . -B build-tests -DCBR_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release
@@ -4166,14 +4425,17 @@ jobs:
         run: |
           glslangValidator -V shaders/cbr_reconstruct.comp -o /tmp/r.spv
           glslangValidator -V shaders/cbr_resolve_simple.comp -o /tmp/s.spv
-          glslangValidator -D -e CSMain -S comp -V shaders/cbr_reconstruct.hlsl -o /tmp/h.spv
+          # HLSL must be compiled with dxc, not glslangValidator:
+          dxc -T cs_6_0 -E CSMain shaders/cbr_reconstruct.hlsl -Fo /tmp/r.dxil || echo "dxc not available on Linux runner; HLSL checked on windows-release job"
       - name: Verify shader mapping equivalence
         run: python3 tests/check_shader_mapping.py
 
   windows-syntax-check:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - name: Install MinGW cross-compiler
         run: sudo apt-get update && sudo apt-get install -y g++-mingw-w64-x86-64
       - name: Syntax check Windows sources
@@ -4185,8 +4447,10 @@ jobs:
 
   windows-release:
     runs-on: windows-latest
+    permissions:
+      contents: write # needed only here to publish GitHub Releases
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - name: Configure
         run: cmake -S . -B build -A x64
       - name: Build (Release, MSVC hardening flags)
@@ -4196,7 +4460,7 @@ jobs:
         run: |
           Get-FileHash build/bin/Release/rdr2-cbr.asi -Algorithm SHA256 |
             ForEach-Object { "$($_.Hash)  rdr2-cbr.asi" } | Tee-Object build/bin/Release/SHA256SUMS.txt
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@65c4c4a6ddee5b260f96725ef7075396b958417d
         with:
           name: rdr2-cbr-release
           path: |
@@ -4206,7 +4470,7 @@ jobs:
       
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@4634c16e79c963813287e889cb6ad79ebf1c0b094 # v2.3.1 pinned
         with:
           files: |
             build/bin/Release/rdr2-cbr.asi

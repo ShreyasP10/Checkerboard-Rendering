@@ -29,6 +29,7 @@ include_directories(
 
 # Header files
 set(CBR_HEADERS
+    ${CBR_INCLUDE_DIR}/cbr/limits.h
     ${CBR_INCLUDE_DIR}/cbr/cbr_engine.h
     ${CBR_INCLUDE_DIR}/cbr/checkerboard_mapping.h
     ${CBR_INCLUDE_DIR}/cbr/config.h
@@ -107,8 +108,13 @@ endif()
 # Find Vulkan headers if available (dynamic runtime resolution is used for function pointers)
 find_package(Vulkan QUIET)
 if(Vulkan_FOUND)
-    message(STATUS "Vulkan SDK headers found: ${Vulkan_INCLUDE_DIRS}")
-    target_include_directories(rdr2-cbr PRIVATE ${Vulkan_INCLUDE_DIRS})
+    message(STATUS "Vulkan SDK headers found.")
+    # Prefer the imported target over the deprecated Vulkan_INCLUDE_DIRS variable.
+    if(TARGET Vulkan::Headers)
+        target_link_libraries(rdr2-cbr PRIVATE Vulkan::Headers)
+    elseif(DEFINED Vulkan_INCLUDE_DIRS)
+        target_include_directories(rdr2-cbr PRIVATE ${Vulkan_INCLUDE_DIRS})
+    endif()
 else()
     message(STATUS "Vulkan SDK not found, using dynamic runtime function pointers only.")
 endif()
@@ -133,12 +139,13 @@ set(CBR_COMPILED_SHADERS "")
 if(CBR_GLSLANG)
     foreach(shader cbr_reconstruct cbr_resolve_simple)
         add_custom_command(
-            OUTPUT ${CMAKE_BINARY_DIR}/shaders/${shader}.spv
-            COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/shaders
-            COMMAND ${CBR_GLSLANG} -V ${CBR_SHADER_DIR}/${shader}.comp -o ${CMAKE_BINARY_DIR}/shaders/${shader}.spv
+            OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/shaders/$<CONFIG>/${shader}.spv
+            COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/shaders/$<CONFIG>
+            COMMAND ${CBR_GLSLANG} -V ${CBR_SHADER_DIR}/${shader}.comp -o ${CMAKE_CURRENT_BINARY_DIR}/shaders/$<CONFIG>/${shader}.spv
             DEPENDS ${CBR_SHADER_DIR}/${shader}.comp
-            COMMENT "Compiling ${shader}.comp to SPIR-V")
-        list(APPEND CBR_COMPILED_SHADERS ${CMAKE_BINARY_DIR}/shaders/${shader}.spv)
+            COMMENT "Compiling ${shader}.comp to SPIR-V"
+            VERBATIM)
+        list(APPEND CBR_COMPILED_SHADERS ${CMAKE_CURRENT_BINARY_DIR}/shaders/$<CONFIG>/${shader}.spv)
     endforeach()
 else()
     message(STATUS "glslangValidator not found: SPIR-V shaders will not be built.")
@@ -146,11 +153,13 @@ endif()
 
 if(CBR_DXC)
     add_custom_command(
-        OUTPUT ${CMAKE_BINARY_DIR}/shaders/cbr_reconstruct.dxil
-        COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/shaders
-        COMMAND ${CBR_DXC} -T cs_6_0 -E CSMain ${CBR_SHADER_DIR}/cbr_reconstruct.hlsl -Fo ${CMAKE_BINARY_DIR}/shaders/cbr_reconstruct.dxil
+        OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/shaders/$<CONFIG>/cbr_reconstruct.dxil
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/shaders/$<CONFIG>
+        COMMAND ${CBR_DXC} -T cs_6_0 -E CSMain ${CBR_SHADER_DIR}/cbr_reconstruct.hlsl -Fo ${CMAKE_CURRENT_BINARY_DIR}/shaders/$<CONFIG>/cbr_reconstruct.dxil
         DEPENDS ${CBR_SHADER_DIR}/cbr_reconstruct.hlsl
-        COMMENT "Compiling cbr_reconstruct.hlsl to DXIL")
+        COMMENT "Compiling cbr_reconstruct.hlsl to DXIL"
+        VERBATIM)
+    list(APPEND CBR_COMPILED_SHADERS ${CMAKE_CURRENT_BINARY_DIR}/shaders/$<CONFIG>/cbr_reconstruct.dxil)
     list(APPEND CBR_COMPILED_SHADERS ${CMAKE_BINARY_DIR}/shaders/cbr_reconstruct.dxil)
 else()
     message(STATUS "dxc not found: DXIL shaders will not be built.")
@@ -207,9 +216,8 @@ add_custom_command(TARGET rdr2-cbr POST_BUILD
 
 if(CBR_COMPILED_SHADERS)
     add_custom_command(TARGET rdr2-cbr POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_directory
-        "${CMAKE_BINARY_DIR}/shaders"
-        "$<TARGET_FILE_DIR:rdr2-cbr>/shaders"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:rdr2-cbr>/shaders"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CBR_COMPILED_SHADERS} "$<TARGET_FILE_DIR:rdr2-cbr>/shaders/"
         COMMENT "Copying compiled shaders to target build directory"
     )
 endif()

@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -27,12 +28,22 @@ static int g_failures = 0;
 } while (0)
 
 static void WriteFile(const fs::path& p, const std::string& content) {
-    std::ofstream f(p);
+    std::ofstream f(p, std::ios::out | std::ios::trunc);
     f << content;
+    f.flush();
+    if (!f.good()) {
+        std::cerr << "FAIL: WriteFile could not write " << p << "\n";
+        ++g_failures;
+    }
 }
 
 static std::string ReadFile(const fs::path& p) {
     std::ifstream f(p);
+    if (!f.is_open()) {
+        std::cerr << "FAIL: ReadFile could not open " << p << "\n";
+        ++g_failures;
+        return {};
+    }
     std::stringstream ss;
     ss << f.rdbuf();
     return ss.str();
@@ -272,6 +283,15 @@ static void TestCheckerboardGeometry() {
 }
 
 static void TestDepthConvention() {
+    // Non-finite device depth must poison (NaN) and always fail the tolerance test.
+    {
+        const float nan = std::numeric_limits<float>::quiet_NaN();
+        const float inf = std::numeric_limits<float>::infinity();
+        CHECK(!std::isfinite(LinearizeDepth(nan, DepthConvention::Reversed, 0.1f, 0.0f)));
+        CHECK(!std::isfinite(LinearizeDepth(inf, DepthConvention::Standard, 0.1f, 1000.0f)));
+        CHECK(RelativeDepthDelta(nan, 1.0f) > 1.0f);
+        CHECK(RelativeDepthDelta(1.0f, inf) > 1.0f);
+    }
     // Round trip: project a view-space distance to device depth, linearize it back.
     for (double z : { 0.2, 1.0, 10.0, 100.0, 1000.0, 5000.0 }) {
         const double n = 0.1, f = 10000.0;
@@ -314,18 +334,19 @@ static void TestDepthConvention() {
 }
 
 static void TestPushConstantBuilder() {
-    auto& cfg = ConfigManager::Get().GetMutableConfig();
-    cfg.depthTolerance = 0.02f;
-    cfg.historyWeight = 0.8f;
-    cfg.colorSpace = ColorSpace::RGB;
-    cfg.enableSpatialFallback = false;
-    cfg.enableMotionDilation = false;
-    cfg.jitterCompensation = -1.0f;
-    cfg.jitterScale = 1.0f;
-    cfg.jitterDirection = -1;
-    cfg.depthConvention = DepthConvention::Standard;
-    cfg.depthNear = 0.5f;
-    cfg.depthFar = 0.0f; // invalid for Standard -> must be sanitised
+    ConfigManager::Get().Modify([](CBRConfig& c) {
+        c.depthTolerance = 0.02f;
+        c.historyWeight = 0.8f;
+        c.colorSpace = ColorSpace::RGB;
+        c.enableSpatialFallback = false;
+        c.enableMotionDilation = false;
+        c.jitterCompensation = -1.0f;
+        c.jitterScale = 1.0f;
+        c.jitterDirection = -1;
+        c.depthConvention = DepthConvention::Standard;
+        c.depthNear = 0.5f;
+        c.depthFar = 0.0f; // invalid for Standard -> must be sanitised
+    });
 
     RenderTargetManager::Get().Initialize(3840, 2160);
     JitterManager::Get().Initialize(3840, 2160);
@@ -346,12 +367,14 @@ static void TestPushConstantBuilder() {
     CHECK(pc.depthNear == 0.5f && pc.depthFar == 1000.0f);
     CHECK(std::fabs(pc.jitterDelta[0] - JitterManager::Get().GetJitterDelta().x) < 1e-12f);
 
-    cfg.enableSpatialFallback = true;
-    cfg.enableMotionDilation = true;
-    cfg.colorSpace = ColorSpace::YCoCg;
-    cfg.jitterCompensation = 0.0f;
-    cfg.jitterDirection = 1;
-    cfg.depthConvention = DepthConvention::Reversed;
+    ConfigManager::Get().Modify([](CBRConfig& c) {
+        c.enableSpatialFallback = true;
+        c.enableMotionDilation = true;
+        c.colorSpace = ColorSpace::YCoCg;
+        c.jitterCompensation = 0.0f;
+        c.jitterDirection = 1;
+        c.depthConvention = DepthConvention::Reversed;
+    });
     const ReconstructionPushConstants pc2 = BuildReconstructionPushConstants(0);
     CHECK(pc2.enableSpatialFallback == 1u && pc2.enableMotionDilation == 1u && pc2.colorSpace == 0u);
     CHECK(pc2.shiftDirection == 1 && pc2.depthMode == 1u && pc2.depthFar == 0.0f);
@@ -359,6 +382,11 @@ static void TestPushConstantBuilder() {
 
 static void TestRenderTargets() {
     auto& r = RenderTargetManager::Get();
+    // Invalid extents must be rejected without clobbering the last good state.
+    r.Initialize(3840, 2160);
+    const auto good = r.GetDimensions();
+    r.Initialize(0, 0);
+    CHECK(r.GetDimensions().fullWidth == good.fullWidth);
     r.Initialize(3840, 2160);
     // 4K: quarter colour 33,177,600 + quarter depth 16,588,800 + history colour A/B 132,710,400
     //    + history depth A/B 66,355,200 + output 66,355,200 = 315,187,200 bytes (300.58 MiB, 315.19 MB)

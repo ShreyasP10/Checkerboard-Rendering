@@ -120,13 +120,18 @@ float FetchDepth(CbrSample s) {
 }
 
 // MIRRORS include/cbr/depth_convention.h
+// NaN/Inf device depth yields NaN so the disocclusion test must reject it.
 float LinearizeDepth(float d) {
-    float n = g_DepthNear;
-    float f = g_DepthFar;
-    if (g_DepthMode == 1u) {
-        return (f > 0.0f) ? (n * f) / (n + d * (f - n)) : n / max(d, 1e-7f);
+    if (!isnan(d) && !isinf(d)) {
+        float n = g_DepthNear;
+        float f = g_DepthFar;
+        if (g_DepthMode == 1u) {
+            return (f > 0.0f) ? (n * f) / (n + d * (f - n)) : n / max(d, 1e-7f);
+        }
+        float denom = (f - d * (f - n));
+        if (denom != 0.0f && !isinf(denom) && !isnan(denom)) return (n * f) / denom;
     }
-    return (n * f) / (f - d * (f - n));
+    return asfloat(0x7fc00000u); // quiet NaN
 }
 
 bool IsNearer(float a, float b) {
@@ -227,7 +232,11 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
 
     float2 dilatedUV = (float2(motionCoord) + 0.5f) * g_InvTargetResolution;
     float2 velocity = g_Velocity.SampleLevel(g_LinearClampSampler, dilatedUV, 0.0f).xy;
+    bool velocityBad = isinf(velocity.x) || isnan(velocity.x) || isinf(velocity.y) || isnan(velocity.y)
+        || isinf(uv.x) || isnan(uv.x) || isinf(uv.y) || isnan(uv.y);
     float2 historyUV = uv - velocity - g_JitterDelta * g_JitterCompensation;
+    bool historyUVBad = velocityBad || isinf(historyUV.x) || isnan(historyUV.x)
+        || isinf(historyUV.y) || isnan(historyUV.y);
 
     // -------------------------------------------------------------------------
     // 3. Disocclusion & depth delta test (scale-invariant: relative difference of LINEAR depth)
@@ -236,11 +245,13 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     float4 historyColor = float4(0.0f, 0.0f, 0.0f, 0.0f);
     float previousDepth = currentDepth;
 
-    if (g_FrameIndex == 0u || historyUV.x < 0.0f || historyUV.x > 1.0f || historyUV.y < 0.0f || historyUV.y > 1.0f) {
-        isDisoccluded = true; // First frame or sample moved outside screen space
+    if (historyUVBad || g_FrameIndex == 0u || historyUV.x < 0.0f || historyUV.x > 1.0f || historyUV.y < 0.0f || historyUV.y > 1.0f) {
+        isDisoccluded = true; // First frame, bad velocity/UV, or sample moved outside screen space
     } else {
         previousDepth = g_HistoryDepth.SampleLevel(g_PointClampSampler, historyUV, 0.0f).r;
-        float depthDelta = abs(currentLinear - LinearizeDepth(previousDepth)) / max(currentLinear, 1e-5f);
+        float prevLin = LinearizeDepth(previousDepth);
+        bool depthBad = isinf(currentLinear) || isnan(currentLinear) || isinf(prevLin) || isnan(prevLin);
+        float depthDelta = depthBad ? 10.0f : abs(currentLinear - prevLin) / max(currentLinear, 1e-5f);
         if (depthDelta > g_DepthTolerance) {
             isDisoccluded = true;
         } else {
@@ -294,7 +305,7 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
             // Variance clipping: clamp history inside [mean - gamma * stdDev, mean + gamma * stdDev]
             float3 mean = m1 / n;
             float3 stdDev = sqrt(max(float3(0.0f, 0.0f, 0.0f), (m2 / n) - (mean * mean)));
-            float gamma = 1.25f;
+            const float gamma = 1.25f; // kVarianceClipGamma (include/cbr/limits.h)
             float3 varianceMin = max(colorMin, mean - gamma * stdDev);
             float3 varianceMax = min(colorMax, mean + gamma * stdDev);
             varianceMax = max(varianceMin, varianceMax); // Ensure varianceMin <= varianceMax to prevent clamp inversion
