@@ -448,6 +448,15 @@ glslangValidator -V shaders/cbr_resolve_simple.comp -o /tmp/s.spv
 glslangValidator -D -e CSMain -S comp -V shaders/cbr_reconstruct.hlsl -o /tmp/h.spv
 ```
 
+## Changelog / Recent Updates (v0.1.0-alpha)
+
+* **Architecture & Documentation:** Fully synchronized `CODEBASE.md` and compiled the final `REPORT.md` (PRD, SRS, Risk Register).
+* **Robust Thread-Safety:** Completely refactored `ConfigManager`, `RenderTargetManager`, and `JitterManager` to use lock-free read access (`std::shared_mutex` and `std::atomic`), preventing data races and frame tearing across game threads.
+* **Shader Mathematical Hardening (NaN-Guards):** Added strict bounds for `NaN`/`Inf` detection in `cbr_reconstruct.comp` and `.hlsl`. This prevents single-pixel `NaN` errors from permanently poisoning the ping-pong history buffers.
+* **Configuration (cbr.ini) Security:** Hardened the config parser against maliciously sized files (OOM protection) and strict input validation for safe round-tripping.
+* **Loader-Lock Safety:** Deferred all thread creation out of `DllMain` to prevent ASI loader deadlocks upon game startup.
+* **Optimized Variance Clipping:** Unrolled the 3x3 YCoCg neighborhood gather loop to skip inactive pixels, vastly improving ALU occupancy.
+
 ---
 
 ## Contributing
