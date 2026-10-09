@@ -4140,6 +4140,9 @@ if __name__ == "__main__":
 # NOTE: written but not executed by the author's tooling; verify on first push.
 name: build
 
+permissions:
+  contents: write
+
 on:
   push:
     branches: [ main, master ]
