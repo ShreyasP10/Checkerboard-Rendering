@@ -26,6 +26,7 @@ A community-driven graphics modification implementing **Checkerboard Rendering (
 - [How to Install & Run](#-how-to-install--run)
 - [Configuration](#configuration-cbrini)
 - [Testing](#testing)
+- [Changelog](#changelog--recent-updates-v010-alpha)
 - [Contributing](#contributing)
 - [Collaborators & Maintainers](#collaborators--maintainers)
 - [License](#license)
@@ -95,7 +96,7 @@ Output:      Full 3840×2160 4K Image
 - [x] 3×3 neighborhood color bounding box clamping (YCoCg or RGB, selectable via `ColorSpace`) to suppress ghosting.
 - [x] Reconstruction pass writes a full-resolution history-depth target for the next frame's disocclusion test.
 - [x] Closest-depth motion-vector dilation, variance clipping and jitter-compensated history reprojection in the shaders (validated by compilation and unit-tested plumbing only; the jitter sign convention is configurable via `JitterCompensation` and must be confirmed in-game).
-- [x] Host-side unit tests (config, logger, jitter, VRAM accounting) and a CI workflow; shaders are validated with glslang.
+- [x] Host-side unit tests (config, logger, jitter, VRAM accounting) and a CI workflow; GLSL validated with glslang, HLSL gated by the glslang front-end plus `dxc` when installed.
 - [x] Pascal-oriented design (16×16 thread groups, guarded neighborhood fetches to cut bandwidth).
 - [ ] Shared-memory tiling (not implemented; neighborhood data is fetched directly from the MSAA targets).
 - [x] Runtime configuration via `cbr.ini`.
@@ -132,7 +133,8 @@ Checkerboard-Rendering/
 │   ├── render_target_manager.h # Intermediate MSAA & history buffer manager
 │   ├── jitter_manager.h        # Projection matrix jitter calculator
 │   ├── reconstruction_pass.h   # Compute shader dispatch & pipeline manager
-│   ├── config.h                # cbr.ini configuration reader & settings
+│   ├── config.h                # cbr.ini configuration reader & settings (canonical limits live here)
+│   ├── limits.h                # Optional backwards-compat shim (forwards to config.h; not required to build)
 │   ├── logger.h                # Thread-safe cbr.log file logger
 │   └── ui_overlay.h            # ImGui in-game debug overlay
 │
@@ -301,7 +303,7 @@ DepthFar = 0.0               ; Far plane in metres (0.0 = infinite far plane for
 
 [Jitter]
 JitterPattern = Checkerboard ; 2-phase complementary grid jitter (whole-pixel horizontal shift)
-JitterScale = 1.0            ; Jitter scale (1.0 = exact whole-pixel coverage shift)
+JitterScale = 1.0            ; DEPRECATED: parsed but intentionally ignored (coverage requires exactly 1 px)
 JitterDirection = 1          ; Odd-frame horizontal shift direction: +1 or -1
 ProjectionJitterSign = 1     ; Independent sign for projection matrix jitter offsets (proj[8]/proj[9])
 JitterCompensation = 0.0     ; History reprojection jitter sign (default 0.0: whole-pixel shift is absorbed by sample mapping)
@@ -369,7 +371,7 @@ Exit or Alt-Tab from the game and open `cbr.log` in the RDR2 root folder to veri
  Target: NVIDIA GeForce GTX 1070 Ti & Vulkan / DX12              
 =================================================================
 [INFO] Initializing CBREngine for Red Dead Redemption 2...
-[INFO] Configuration successfully loaded from cbr.ini (Target: 3840x2160, API: Vulkan, CBR Enabled: true)
+[INFO] Configuration loaded from cbr.ini (Target: 3840x2160, API: Vulkan, CBR Enabled: true)
 [INFO] RenderTargetManager initialized for target: 3840x2160
 [INFO] Quarter-Resolution 2x MSAA Buffer size: 1920x1080
 [INFO] Total CBR VRAM Footprint: 300.58 MiB (315.19 MB)
@@ -423,7 +425,7 @@ EnableMotionDilation = true
 
 [Jitter]
 JitterPattern = Checkerboard
-JitterScale = 1.0
+JitterScale = 1.0            ; DEPRECATED: parsed but intentionally ignored
 JitterDirection = 1
 ProjectionJitterSign = 1
 JitterCompensation = 0.0
@@ -440,22 +442,24 @@ ctest --test-dir build-tests --output-on-failure
 python tests/check_shader_mapping.py
 ```
 
-The tests cover the portable code only (no Windows APIs or GPU): config, logger, jitter, push-constant layout, and the engine's hook-retry, once-per-frame dispatch and frame-parity logic (using fake hook installers). Validate shaders with:
+The tests cover the portable code only (no Windows APIs or GPU): config, logger, jitter, push-constant layout, and the engine's hook-retry, once-per-frame dispatch and frame-parity logic (using fake hook installers). Validate shaders with (mirrors CI):
 
 ```bash
 glslangValidator -V shaders/cbr_reconstruct.comp -o /tmp/r.spv
 glslangValidator -V shaders/cbr_resolve_simple.comp -o /tmp/s.spv
 glslangValidator -D -e CSMain -S comp -V shaders/cbr_reconstruct.hlsl -o /tmp/h.spv
+# plus, when installed: dxc -T cs_6_0 -E CSMain shaders/cbr_reconstruct.hlsl -Fo /tmp/r.dxil
 ```
 
 ## Changelog / Recent Updates (v0.1.0-alpha)
 
-* **Architecture & Documentation:** Fully synchronized `CODEBASE.md` and compiled the final `REPORT.md` (PRD, SRS, Risk Register).
-* **Robust Thread-Safety:** Completely refactored `ConfigManager`, `RenderTargetManager`, and `JitterManager` to use lock-free read access (`std::shared_mutex` and `std::atomic`), preventing data races and frame tearing across game threads.
-* **Shader Mathematical Hardening (NaN-Guards):** Added strict bounds for `NaN`/`Inf` detection in `cbr_reconstruct.comp` and `.hlsl`. This prevents single-pixel `NaN` errors from permanently poisoning the ping-pong history buffers.
-* **Configuration (cbr.ini) Security:** Hardened the config parser against maliciously sized files (OOM protection) and strict input validation for safe round-tripping.
-* **Loader-Lock Safety:** Deferred all thread creation out of `DllMain` to prevent ASI loader deadlocks upon game startup.
-* **Optimized Variance Clipping:** Unrolled the 3x3 YCoCg neighborhood gather loop to skip inactive pixels, vastly improving ALU occupancy.
+* **Thread-safety:** `ConfigManager` no longer exposes an unprotected reference (`GetMutableConfig` removed; mutate via `Modify`/`UpdateConfig`). `RenderTargetManager` guards dimensions behind `shared_mutex` (atomic VRAM counter); `JitterManager` guards jitter state behind `mutex`; `ReconstructionPass::m_isVulkan` is atomic. `ConfigManager::Load/Save` do file I/O outside the lock and batch warnings.
+* **Shader hardening (NaN/Inf guards):** `cbr_reconstruct.comp`/`.hlsl` reject non-finite device depth, velocity, UVs, and linear depths as disoccluded (previously a `NaN` compared `false` and poisoned ping-pong history). Documented sampler requirements (history color/velocity `LINEAR_CLAMP`, history depth point fetch).
+* **Configuration (`cbr.ini`) hardening:** 64 KiB / 500-line / 1024-char caps, strict integer parsing (rejects trailing garbage), `LogLevel` sanitized (length cap, CR/LF stripped), unknown-key warnings, even-dimension handling unified via `MakeEvenUp`, `Save` verifies `flush/good`, logs use the filename only (no absolute-path PII). `JitterScale` is parsed but intentionally ignored (coverage requires exactly 1 px); `JitterPattern = Halton` always round-trips to `Checkerboard`.
+* **Loader safety:** `DllMain` now checks the module-pin result and documents that `CreateThread` under the loader lock is a fallback only (preferred path is the loader calling `CBR_PluginInit`).
+* **Reliability:** `DispatchVulkan/DX12` warn once (not every frame) when uninitialized; `RenderTargetManager::Initialize` rejects `< 2` / `> 16384`; `BuildPushConstants` guards zero extents; Vulkan mini-structs use `memcpy` copy-out with bounds checks.
+* **CI:** least-privilege permissions (read-only except release job), SHA-pinned actions (`checkout` v4.2.2, `upload-artifact` v4.6.2, `gh-release` v2.6.2), HLSL gated by the glslang front-end plus `dxc` when installed (failures no longer swallowed).
+* **Source of truth:** the standalone tree is canonical. Canonical limits live in `include/cbr/config.h`; `include/cbr/limits.h` is an optional backwards-compat shim (not referenced by `CMakeLists.txt`). `CODEBASE.md` is a point-in-time snapshot and may lag the tree.
 
 ---
 
