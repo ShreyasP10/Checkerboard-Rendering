@@ -1,6 +1,5 @@
 #include "cbr/cbr_engine.h"
 #include "cbr/config.h"
-#include "cbr/limits.h"
 #include "cbr/logger.h"
 #include "cbr/jitter_manager.h"
 #include "cbr/render_target_manager.h"

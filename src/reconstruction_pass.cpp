@@ -1,4 +1,5 @@
 #include "cbr/reconstruction_pass.h"
+#include <atomic>
 #include "cbr/config.h"
 #include "cbr/depth_convention.h"
 #include "cbr/jitter_manager.h"
@@ -66,7 +67,8 @@ ReconstructionPushConstants BuildReconstructionPushConstants(uint32_t frameIndex
 
 void ReconstructionPass::DispatchVulkan(void* /*vkCommandBuffer*/, uint32_t frameIndex) {
     if (!m_initialized.load()) {
-        CBR_LOG_WARN("DispatchVulkan dropped: ReconstructionPass not initialized.");
+        static std::atomic<bool> s_warned{ false };   // once only: this runs every frame
+        if (!s_warned.exchange(true)) CBR_LOG_WARN("DispatchVulkan dropped: ReconstructionPass not initialized.");
         return;
     }
 
@@ -86,7 +88,8 @@ void ReconstructionPass::DispatchVulkan(void* /*vkCommandBuffer*/, uint32_t fram
 
 void ReconstructionPass::DispatchDX12(void* /*d3d12GraphicsCommandList*/, uint32_t frameIndex) {
     if (!m_initialized.load()) {
-        CBR_LOG_WARN("DispatchDX12 dropped: ReconstructionPass not initialized.");
+        static std::atomic<bool> s_warned{ false };   // once only: this runs every frame
+        if (!s_warned.exchange(true)) CBR_LOG_WARN("DispatchDX12 dropped: ReconstructionPass not initialized.");
         return;
     }
 

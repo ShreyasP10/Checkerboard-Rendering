@@ -17,7 +17,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      # Pinned by SHA (v4.6.0); update with `gh api` and review changelogs.
+      # Pinned by SHA = v4.2.2 (verified against the repository tags); review changelogs when updating.
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - name: Install tools
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake g++ glslang-tools
@@ -30,8 +30,14 @@ jobs:
         run: |
           glslangValidator -V shaders/cbr_reconstruct.comp -o /tmp/r.spv
           glslangValidator -V shaders/cbr_resolve_simple.comp -o /tmp/s.spv
-          # HLSL must be compiled with dxc, not glslangValidator:
-          dxc -T cs_6_0 -E CSMain shaders/cbr_reconstruct.hlsl -Fo /tmp/r.dxil || echo "dxc not available on Linux runner; HLSL checked on windows-release job"
+          # glslang's HLSL front-end is a syntax/semantics gate that runs everywhere.
+          glslangValidator -D -e CSMain -S comp -V shaders/cbr_reconstruct.hlsl -o /tmp/h.spv
+          # The production HLSL compiler (dxc) is used when installed. Never swallow its failures.
+          if command -v dxc >/dev/null 2>&1; then
+            dxc -T cs_6_0 -E CSMain shaders/cbr_reconstruct.hlsl -Fo /tmp/r.dxil
+          else
+            echo "::warning::dxc not installed on this runner; HLSL verified with the glslang front-end only"
+          fi
       - name: Verify shader mapping equivalence
         run: python3 tests/check_shader_mapping.py
 
@@ -65,7 +71,7 @@ jobs:
         run: |
           Get-FileHash build/bin/Release/rdr2-cbr.asi -Algorithm SHA256 |
             ForEach-Object { "$($_.Hash)  rdr2-cbr.asi" } | Tee-Object build/bin/Release/SHA256SUMS.txt
-      - uses: actions/upload-artifact@65c4c4a6ddee5b260f96725ef7075396b958417d
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: rdr2-cbr-release
           path: |
@@ -75,7 +81,7 @@ jobs:
       
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@4634c16e79c963813287e889cb6ad79ebf1c0b094 # v2.3.1 pinned
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: |
             build/bin/Release/rdr2-cbr.asi

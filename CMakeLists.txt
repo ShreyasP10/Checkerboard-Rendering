@@ -28,8 +28,10 @@ include_directories(
 )
 
 # Header files
+# NOTE: include/cbr/limits.h intentionally NOT listed here: it is an optional
+# compatibility shim (see below). config.h is the single source of truth for
+# limits so a clean checkout builds even if limits.h is absent.
 set(CBR_HEADERS
-    ${CBR_INCLUDE_DIR}/cbr/limits.h
     ${CBR_INCLUDE_DIR}/cbr/cbr_engine.h
     ${CBR_INCLUDE_DIR}/cbr/checkerboard_mapping.h
     ${CBR_INCLUDE_DIR}/cbr/config.h
