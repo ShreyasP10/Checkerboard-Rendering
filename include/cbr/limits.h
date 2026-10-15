@@ -1,8 +1,31 @@
 #pragma once
 
-// Compatibility shim: canonical limits now live in cbr/config.h so that a
-// clean checkout builds even if this file is absent (it is NOT referenced by
-// CMakeLists.txt or by any src/*.cpp). Kept only for backwards compatibility
-// with older branches / CODEBASE.md snapshots that still do
-// `#include "cbr/limits.h"`.
-#include "cbr/config.h"
+#include <cstddef>
+#include <cstdint>
+
+namespace cbr {
+
+// Central dimension, buffer, and configuration bounds
+constexpr uint32_t kMinTargetWidth = 720;
+constexpr uint32_t kMaxTargetWidth = 7680;
+constexpr uint32_t kMinTargetHeight = 480;
+constexpr uint32_t kMaxTargetHeight = 4320;
+
+constexpr uint32_t kMinSwapchainExtent = 320;
+constexpr uint32_t kMinSwapchainHeight = 320;
+constexpr uint32_t kMaxSwapchainExtent = 16384;
+
+constexpr uint32_t kWorkgroupSizeX = 16;
+constexpr uint32_t kWorkgroupSizeY = 16;
+
+constexpr size_t kMaxConfigFileBytes = 64 * 1024;
+constexpr size_t kMaxConfigLines = 500;
+constexpr size_t kMaxConfigLineChars = 1024;
+
+constexpr size_t kMaxLogLineChars = 1024;
+
+constexpr float kVarianceClipGamma = 1.25f;
+
+inline uint32_t MakeEvenUp(uint32_t v) { return (v & 1u) ? v + 1u : v; }
+
+} // namespace cbr

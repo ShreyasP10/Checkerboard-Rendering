@@ -23,6 +23,7 @@ This document contains the complete, unabridged source code for every file in th
    - [`include/cbr/depth_convention.h`](#includecbrdepthconventionh)
    - [`include/cbr/hooks.h`](#includecbrhooksh)
    - [`include/cbr/jitter_manager.h`](#includecbrjittermanagerh)
+   - [`include/cbr/limits.h`](#includecbrlimitsh)
    - [`include/cbr/logger.h`](#includecbrloggerh)
    - [`include/cbr/reconstruction_pass.h`](#includecbrreconstructionpassh)
    - [`include/cbr/render_target_manager.h`](#includecbrrendertargetmanagerh)
@@ -88,9 +89,6 @@ include_directories(
 )
 
 # Header files
-# NOTE: include/cbr/limits.h intentionally NOT listed here: it is an optional
-# compatibility shim (see below). config.h is the single source of truth for
-# limits so a clean checkout builds even if limits.h is absent.
 set(CBR_HEADERS
     ${CBR_INCLUDE_DIR}/cbr/cbr_engine.h
     ${CBR_INCLUDE_DIR}/cbr/checkerboard_mapping.h
@@ -98,6 +96,7 @@ set(CBR_HEADERS
     ${CBR_INCLUDE_DIR}/cbr/depth_convention.h
     ${CBR_INCLUDE_DIR}/cbr/hooks.h
     ${CBR_INCLUDE_DIR}/cbr/jitter_manager.h
+    ${CBR_INCLUDE_DIR}/cbr/limits.h
     ${CBR_INCLUDE_DIR}/cbr/logger.h
     ${CBR_INCLUDE_DIR}/cbr/reconstruction_pass.h
     ${CBR_INCLUDE_DIR}/cbr/render_target_manager.h
@@ -692,33 +691,9 @@ constexpr CheckerboardSample MapPixelToSample(int32_t x, int32_t y, uint32_t fra
 #include <string>
 
 #include <mutex>
+#include "cbr/limits.h"
 
 namespace cbr {
-
-// Central limits (folded here so no separate limits.h is required to build).
-// Previously in include/cbr/limits.h; kept here to avoid a missing-header
-// dependency when only tracked files are synced.
-constexpr uint32_t kMinTargetWidth = 720;
-constexpr uint32_t kMaxTargetWidth = 7680;
-constexpr uint32_t kMinTargetHeight = 480;
-constexpr uint32_t kMaxTargetHeight = 4320;
-
-constexpr uint32_t kMinSwapchainExtent = 320;
-constexpr uint32_t kMinSwapchainHeight = 320; // width and height share the same minimum
-constexpr uint32_t kMaxSwapchainExtent = 16384;
-
-constexpr uint32_t kWorkgroupSizeX = 16;
-constexpr uint32_t kWorkgroupSizeY = 16;
-
-constexpr size_t kMaxConfigFileBytes = 64 * 1024;
-constexpr size_t kMaxConfigLines = 500;
-constexpr size_t kMaxConfigLineChars = 1024;
-
-constexpr size_t kMaxLogLineChars = 1024;
-
-constexpr float kVarianceClipGamma = 1.25f;
-
-inline uint32_t MakeEvenUp(uint32_t v) { return (v & 1u) ? v + 1u : v; }
 
 enum class GraphicsApi {
     Vulkan,
@@ -986,6 +961,42 @@ private:
     JitterOffset m_currentJitter;
     JitterOffset m_previousJitter;
 };
+
+} // namespace cbr
+```
+
+<a id="includecbrlimitsh"></a>
+### `include/cbr/limits.h`
+```cpp
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+
+namespace cbr {
+
+// Central dimension, buffer, and configuration bounds
+constexpr uint32_t kMinTargetWidth = 720;
+constexpr uint32_t kMaxTargetWidth = 7680;
+constexpr uint32_t kMinTargetHeight = 480;
+constexpr uint32_t kMaxTargetHeight = 4320;
+
+constexpr uint32_t kMinSwapchainExtent = 320;
+constexpr uint32_t kMinSwapchainHeight = 320;
+constexpr uint32_t kMaxSwapchainExtent = 16384;
+
+constexpr uint32_t kWorkgroupSizeX = 16;
+constexpr uint32_t kWorkgroupSizeY = 16;
+
+constexpr size_t kMaxConfigFileBytes = 64 * 1024;
+constexpr size_t kMaxConfigLines = 500;
+constexpr size_t kMaxConfigLineChars = 1024;
+
+constexpr size_t kMaxLogLineChars = 1024;
+
+constexpr float kVarianceClipGamma = 1.25f;
+
+inline uint32_t MakeEvenUp(uint32_t v) { return (v & 1u) ? v + 1u : v; }
 
 } // namespace cbr
 ```
