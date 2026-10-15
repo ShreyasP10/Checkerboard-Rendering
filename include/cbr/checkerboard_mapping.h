@@ -33,10 +33,29 @@ struct SampleOffset {
     float y;
 };
 
+// Standard 2x MSAA sample locations in [0,1] pixel coordinates, y DOWN:
+//   sample 0 = (0.75, 0.75) bottom-right
+//   sample 1 = (0.25, 0.25) top-left
 inline constexpr SampleOffset kStandardSample2x[2] = {
     { 0.75f, 0.75f },
     { 0.25f, 0.25f }
 };
+
+// Alternating frame sample positions when using VK_EXT_sample_locations programmable
+// hardware sample locations (CHECKERBOARD.md: Sample Location Jittering):
+// Frame 0: sample 0 = (0.75, 0.75), sample 1 = (0.25, 0.25)
+// Frame 1: sample 0 = (0.25, 0.75), sample 1 = (0.75, 0.25)
+inline constexpr SampleOffset kCheckerboardSampleLocations[2][2] = {
+    { { 0.75f, 0.75f }, { 0.25f, 0.25f } }, // Frame 0 (even)
+    { { 0.25f, 0.75f }, { 0.75f, 0.25f } }  // Frame 1 (odd)
+};
+
+// In a quarter-resolution (half-width, half-height) 2x MSAA target, shifting the viewport
+// horizontally by half a pixel corresponds to exactly 1.0 target-resolution pixel shift across frames
+// (CHECKERBOARD.md: Viewport Half-Pixel Offset):
+constexpr float GetQuarterViewportShiftX(uint32_t frameIndex, int32_t shiftDir = 1) noexcept {
+    return (frameIndex & 1u) ? (0.5f * static_cast<float>(shiftDir >= 0 ? 1 : -1)) : 0.0f;
+}
 
 struct CheckerboardSample {
     bool     active;   // true if a native sample exists for this target pixel this frame

@@ -29,6 +29,7 @@ jobs:
       - name: Validate shaders
         run: |
           glslangValidator -V shaders/cbr_reconstruct.comp -o /tmp/r.spv
+          glslangValidator -V shaders/cbr_reconstruct_quad.comp -o /tmp/q.spv
           glslangValidator -V shaders/cbr_resolve_simple.comp -o /tmp/s.spv
           # glslang's HLSL front-end is a syntax/semantics gate that runs everywhere.
           glslangValidator -D -e CSMain -S comp -V shaders/cbr_reconstruct.hlsl -o /tmp/h.spv

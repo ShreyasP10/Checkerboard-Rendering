@@ -61,7 +61,10 @@ struct CBRConfig {
     uint32_t    targetWidth{ 3840 };
     uint32_t    targetHeight{ 2160 };
     GraphicsApi preferredApi{ GraphicsApi::Vulkan };
-    float       mipLodBias{ -0.5f };
+    // MIP LOD Bias: -1.0f mathematically compensates for the 2x larger texture coordinate
+    // derivatives in quarter-resolution (half-width, half-height) 2x MSAA rendering
+    // (CHECKERBOARD.md lines 365-425 / El Mansouri 2016: LOD' = -1 + LOD).
+    float       mipLodBias{ -1.0f };
 
     // Reconstruction
     float           depthTolerance{ 0.010f };

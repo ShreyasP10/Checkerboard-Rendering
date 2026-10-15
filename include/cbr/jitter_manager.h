@@ -32,6 +32,10 @@ public:
         return { m_currentJitter.x - m_previousJitter.x, m_currentJitter.y - m_previousJitter.y };
     }
 
+    // Returns viewport horizontal offset in quarter-resolution pixels (0.5 px shift on odd frames)
+    // per CHECKERBOARD.md (Viewport Half-Pixel Offset).
+    float GetQuarterViewportShiftX(uint32_t frameIndex) const;
+
     // Computes the NDC projection offset (delta_x, delta_y) applied to proj[8] and proj[9].
     // Incorporates ConfigManager::Get().GetConfig().projectionJitterSign and Vulkan Y-flip.
     std::pair<float, float> ComputeProjectionOffset(const JitterOffset& jitter, bool isVulkan) const;

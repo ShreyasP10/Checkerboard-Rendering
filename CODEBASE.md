@@ -41,6 +41,7 @@ This document contains the complete, unabridged source code for every file in th
    - [`src/ui_overlay.cpp`](#srcuioverlaycpp)
 4. [GPU Compute Shaders (`shaders/`)](#sec-shaders)
    - [`shaders/cbr_reconstruct.comp`](#shaderscbrreconstructcomp)
+   - [`shaders/cbr_reconstruct_quad.comp`](#shaderscbrreconstructquadcomp)
    - [`shaders/cbr_reconstruct.hlsl`](#shaderscbrreconstructhlsl)
    - [`shaders/cbr_resolve_simple.comp`](#shaderscbrresolvesimplecomp)
 5. [Tests & CI](#sec-tests)
@@ -87,8 +88,10 @@ include_directories(
 )
 
 # Header files
+# NOTE: include/cbr/limits.h intentionally NOT listed here: it is an optional
+# compatibility shim (see below). config.h is the single source of truth for
+# limits so a clean checkout builds even if limits.h is absent.
 set(CBR_HEADERS
-    ${CBR_INCLUDE_DIR}/cbr/limits.h
     ${CBR_INCLUDE_DIR}/cbr/cbr_engine.h
     ${CBR_INCLUDE_DIR}/cbr/checkerboard_mapping.h
     ${CBR_INCLUDE_DIR}/cbr/config.h
@@ -119,6 +122,7 @@ set(CBR_SOURCES
 # Shaders
 set(CBR_SHADERS
     ${CBR_SHADER_DIR}/cbr_reconstruct.comp
+    ${CBR_SHADER_DIR}/cbr_reconstruct_quad.comp
     ${CBR_SHADER_DIR}/cbr_reconstruct.hlsl
     ${CBR_SHADER_DIR}/cbr_resolve_simple.comp
 )
@@ -196,7 +200,7 @@ set(CBR_SHADER_OUT_DIR "$<TARGET_FILE_DIR:rdr2-cbr>/shaders")
 set(CBR_COMPILED_SHADERS "")
 
 if(CBR_GLSLANG)
-    foreach(shader cbr_reconstruct cbr_resolve_simple)
+    foreach(shader cbr_reconstruct cbr_reconstruct_quad cbr_resolve_simple)
         add_custom_command(
             OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/shaders/$<CONFIG>/${shader}.spv
             COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/shaders/$<CONFIG>
@@ -307,8 +311,9 @@ TargetHeight = 2160
 PreferredApi = Vulkan
 
 ; Texture Sampler MIP LOD Bias applied during quarter-resolution rendering
-; Default: -0.5 (preserves high-frequency texture details at reduced resolution)
-MipLodBias = -0.5
+; Default: -1.0 (mathematically compensates for 2x larger texture coordinate derivatives in
+; quarter-resolution 2x MSAA, restoring native target texture detail per CHECKERBOARD.md / El Mansouri 2016)
+MipLodBias = -1.0
 
 [Reconstruction]
 ; Depth difference threshold for detecting disoccluded geometry
@@ -622,10 +627,29 @@ struct SampleOffset {
     float y;
 };
 
+// Standard 2x MSAA sample locations in [0,1] pixel coordinates, y DOWN:
+//   sample 0 = (0.75, 0.75) bottom-right
+//   sample 1 = (0.25, 0.25) top-left
 inline constexpr SampleOffset kStandardSample2x[2] = {
     { 0.75f, 0.75f },
     { 0.25f, 0.25f }
 };
+
+// Alternating frame sample positions when using VK_EXT_sample_locations programmable
+// hardware sample locations (CHECKERBOARD.md: Sample Location Jittering):
+// Frame 0: sample 0 = (0.75, 0.75), sample 1 = (0.25, 0.25)
+// Frame 1: sample 0 = (0.25, 0.75), sample 1 = (0.75, 0.25)
+inline constexpr SampleOffset kCheckerboardSampleLocations[2][2] = {
+    { { 0.75f, 0.75f }, { 0.25f, 0.25f } }, // Frame 0 (even)
+    { { 0.25f, 0.75f }, { 0.75f, 0.25f } }  // Frame 1 (odd)
+};
+
+// In a quarter-resolution (half-width, half-height) 2x MSAA target, shifting the viewport
+// horizontally by half a pixel corresponds to exactly 1.0 target-resolution pixel shift across frames
+// (CHECKERBOARD.md: Viewport Half-Pixel Offset):
+constexpr float GetQuarterViewportShiftX(uint32_t frameIndex, int32_t shiftDir = 1) noexcept {
+    return (frameIndex & 1u) ? (0.5f * static_cast<float>(shiftDir >= 0 ? 1 : -1)) : 0.0f;
+}
 
 struct CheckerboardSample {
     bool     active;   // true if a native sample exists for this target pixel this frame
@@ -662,6 +686,7 @@ constexpr CheckerboardSample MapPixelToSample(int32_t x, int32_t y, uint32_t fra
 ```cpp
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <string>
@@ -669,6 +694,31 @@ constexpr CheckerboardSample MapPixelToSample(int32_t x, int32_t y, uint32_t fra
 #include <mutex>
 
 namespace cbr {
+
+// Central limits (folded here so no separate limits.h is required to build).
+// Previously in include/cbr/limits.h; kept here to avoid a missing-header
+// dependency when only tracked files are synced.
+constexpr uint32_t kMinTargetWidth = 720;
+constexpr uint32_t kMaxTargetWidth = 7680;
+constexpr uint32_t kMinTargetHeight = 480;
+constexpr uint32_t kMaxTargetHeight = 4320;
+
+constexpr uint32_t kMinSwapchainExtent = 320;
+constexpr uint32_t kMinSwapchainHeight = 320; // width and height share the same minimum
+constexpr uint32_t kMaxSwapchainExtent = 16384;
+
+constexpr uint32_t kWorkgroupSizeX = 16;
+constexpr uint32_t kWorkgroupSizeY = 16;
+
+constexpr size_t kMaxConfigFileBytes = 64 * 1024;
+constexpr size_t kMaxConfigLines = 500;
+constexpr size_t kMaxConfigLineChars = 1024;
+
+constexpr size_t kMaxLogLineChars = 1024;
+
+constexpr float kVarianceClipGamma = 1.25f;
+
+inline uint32_t MakeEvenUp(uint32_t v) { return (v & 1u) ? v + 1u : v; }
 
 enum class GraphicsApi {
     Vulkan,
@@ -697,7 +747,10 @@ struct CBRConfig {
     uint32_t    targetWidth{ 3840 };
     uint32_t    targetHeight{ 2160 };
     GraphicsApi preferredApi{ GraphicsApi::Vulkan };
-    float       mipLodBias{ -0.5f };
+    // MIP LOD Bias: -1.0f mathematically compensates for the 2x larger texture coordinate
+    // derivatives in quarter-resolution (half-width, half-height) 2x MSAA rendering
+    // (CHECKERBOARD.md lines 365-425 / El Mansouri 2016: LOD' = -1 + LOD).
+    float       mipLodBias{ -1.0f };
 
     // Reconstruction
     float           depthTolerance{ 0.010f };
@@ -905,6 +958,10 @@ public:
         std::lock_guard<std::mutex> lock(m_mutex);
         return { m_currentJitter.x - m_previousJitter.x, m_currentJitter.y - m_previousJitter.y };
     }
+
+    // Returns viewport horizontal offset in quarter-resolution pixels (0.5 px shift on odd frames)
+    // per CHECKERBOARD.md (Viewport Half-Pixel Offset).
+    float GetQuarterViewportShiftX(uint32_t frameIndex) const;
 
     // Computes the NDC projection offset (delta_x, delta_y) applied to proj[8] and proj[9].
     // Incorporates ConfigManager::Get().GetConfig().projectionJitterSign and Vulkan Y-flip.
@@ -1319,7 +1376,6 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID /*lpRese
 ```cpp
 #include "cbr/cbr_engine.h"
 #include "cbr/config.h"
-#include "cbr/limits.h"
 #include "cbr/logger.h"
 #include "cbr/jitter_manager.h"
 #include "cbr/render_target_manager.h"
@@ -1532,7 +1588,6 @@ void CBREngine::OnSwapchainRecreated(uint32_t width, uint32_t height) {
 ### `src/config.cpp`
 ```cpp
 #include "cbr/config.h"
-#include "cbr/limits.h"
 #include "cbr/logger.h"
 #include <fstream>
 #include <sstream>
@@ -1949,6 +2004,74 @@ struct MinimalVkPresentInfoKHR {
     int*         pResults;
 };
 
+// =============================================================================
+// Vulkan Checkerboard Structures & Enums (CHECKERBOARD.md: Vulkan Setup)
+// =============================================================================
+constexpr uint32_t kVkSampleCount2Bit = 0x00000002;
+constexpr uint32_t kVkStructureTypeSampleLocationsInfoEXT = 1000143000;
+constexpr uint32_t kVkStructureTypePipelineSampleLocationsStateCreateInfoEXT = 1000143002;
+constexpr uint32_t kVkStructureTypeRenderPassSampleLocationsBeginInfoEXT = 1000143003;
+constexpr uint32_t kVkDynamicStateViewport = 0;
+constexpr uint32_t kVkDynamicStateSampleLocationsEXT = 1000143000;
+constexpr uint32_t kVkImageCreateSampleLocationsCompatibleDepthBitEXT = 0x00001000;
+
+struct MinimalVkSampleLocationEXT {
+    float x;
+    float y;
+};
+
+struct MinimalVkSampleLocationsInfoEXT {
+    uint32_t                          sType;
+    const void*                       pNext;
+    uint32_t                          sampleLocationsPerPixel; // kVkSampleCount2Bit
+    MinimalVkExtent2D                 sampleLocationGridSize;  // {1, 1}
+    uint32_t                          sampleLocationsCount;    // 2
+    const MinimalVkSampleLocationEXT* pSampleLocations;
+};
+
+struct MinimalVkPipelineMultisampleStateCreateInfo {
+    uint32_t     sType;
+    const void*  pNext;
+    uint32_t     flags;
+    uint32_t     rasterizationSamples; // VK_SAMPLE_COUNT_2_BIT
+    uint32_t     sampleShadingEnable;  // VK_TRUE
+    float        minSampleShading;     // 1.0f (CHECKERBOARD.md line 199)
+    const uint32_t* pSampleMask;
+    uint32_t     alphaToCoverageEnable;
+    uint32_t     alphaToOneEnable;
+};
+
+struct MinimalVkViewport {
+    float x;
+    float y;
+    float width;
+    float height;
+    float minDepth;
+    float maxDepth;
+};
+
+// Configures alternating 2x MSAA sample locations per frame according to CHECKERBOARD.md
+inline void ConfigureCheckerboardSampleLocations(uint32_t frameIndex,
+                                                MinimalVkSampleLocationsInfoEXT& outInfo,
+                                                MinimalVkSampleLocationEXT outLocations[2]) {
+    outInfo.sType = kVkStructureTypeSampleLocationsInfoEXT;
+    outInfo.pNext = nullptr;
+    outInfo.sampleLocationsPerPixel = kVkSampleCount2Bit;
+    outInfo.sampleLocationGridSize = { 1, 1 };
+    outInfo.sampleLocationsCount = 2;
+
+    if ((frameIndex & 1u) == 0u) {
+        // Frame 0: Standard 2x MSAA (0.75, 0.75) and (0.25, 0.25)
+        outLocations[0] = { 0.75f, 0.75f };
+        outLocations[1] = { 0.25f, 0.25f };
+    } else {
+        // Frame 1: Alternating positions (0.25, 0.75) and (0.75, 0.25)
+        outLocations[0] = { 0.25f, 0.75f };
+        outLocations[1] = { 0.75f, 0.25f };
+    }
+    outInfo.pSampleLocations = outLocations;
+}
+
 int Hooked_vkQueuePresentKHR(void* queue, const void* pPresentInfo) {
     if (!g_Original_vkQueuePresentKHR) {
         return kVkErrorInitializationFailed;
@@ -2165,6 +2288,12 @@ void JitterManager::Update(uint32_t frameIndex) {
     }
 }
 
+float JitterManager::GetQuarterViewportShiftX(uint32_t frameIndex) const {
+    const auto& config = ConfigManager::Get().GetConfig();
+    const float dir = (config.jitterDirection < 0) ? -1.0f : 1.0f;
+    return (frameIndex & 1u) ? (0.5f * dir) : 0.0f;
+}
+
 std::pair<float, float> JitterManager::ComputeProjectionOffset(const JitterOffset& jitter, bool isVulkan) const {
     const auto& config = ConfigManager::Get().GetConfig();
     const float sign = (config.projectionJitterSign < 0) ? -1.0f : 1.0f;
@@ -2348,6 +2477,7 @@ void Logger::Log(LogLevel level, const std::string& message) {
 ### `src/reconstruction_pass.cpp`
 ```cpp
 #include "cbr/reconstruction_pass.h"
+#include <atomic>
 #include "cbr/config.h"
 #include "cbr/depth_convention.h"
 #include "cbr/jitter_manager.h"
@@ -2415,7 +2545,8 @@ ReconstructionPushConstants BuildReconstructionPushConstants(uint32_t frameIndex
 
 void ReconstructionPass::DispatchVulkan(void* /*vkCommandBuffer*/, uint32_t frameIndex) {
     if (!m_initialized.load()) {
-        CBR_LOG_WARN("DispatchVulkan dropped: ReconstructionPass not initialized.");
+        static std::atomic<bool> s_warned{ false };   // once only: this runs every frame
+        if (!s_warned.exchange(true)) CBR_LOG_WARN("DispatchVulkan dropped: ReconstructionPass not initialized.");
         return;
     }
 
@@ -2435,7 +2566,8 @@ void ReconstructionPass::DispatchVulkan(void* /*vkCommandBuffer*/, uint32_t fram
 
 void ReconstructionPass::DispatchDX12(void* /*d3d12GraphicsCommandList*/, uint32_t frameIndex) {
     if (!m_initialized.load()) {
-        CBR_LOG_WARN("DispatchDX12 dropped: ReconstructionPass not initialized.");
+        static std::atomic<bool> s_warned{ false };   // once only: this runs every frame
+        if (!s_warned.exchange(true)) CBR_LOG_WARN("DispatchDX12 dropped: ReconstructionPass not initialized.");
         return;
     }
 
@@ -2909,6 +3041,11 @@ void main() {
     bool historyUVBad = velocityBad || isinf(historyUV.x) || isnan(historyUV.x)
         || isinf(historyUV.y) || isnan(historyUV.y);
 
+    // Motion indicator (CHECKERBOARD.md: Utilizing Velocity).
+    // Stationary pixels (dot < 1e-8) pass through directly from current and previous checkerboard
+    // without variance clipping blur, preserving 100% native subpixel sharpness.
+    bool isMoving = dot(velocity, velocity) > 1e-8;
+
     // -------------------------------------------------------------------------
     // 3. Disocclusion & depth delta testing (scale-invariant: relative difference of LINEAR depth)
     // -------------------------------------------------------------------------
@@ -2938,8 +3075,10 @@ void main() {
     // -------------------------------------------------------------------------
     // 4. Neighbourhood statistics & variance clipping (anti-ghosting)
     // Uses ONLY natively shaded neighbours: samples that do not exist this frame must not enter the statistics.
+    // When stationary (isMoving == false), ghosting is physically impossible: variance clipping is bypassed
+    // to preserve pin-sharp subpixel details on static geometry and text (CHECKERBOARD.md).
     // -------------------------------------------------------------------------
-    if (!isDisoccluded && pc.u_EnableColorClamping != 0u) {
+    if (!isDisoccluded && pc.u_EnableColorClamping != 0u && isMoving) {
         vec3 colorMin = vec3(1e6);
         vec3 colorMax = vec3(-1e6);
         vec3 m1 = vec3(0.0);
@@ -2996,10 +3135,11 @@ void main() {
     float spatialDepth = currentDepth; // depth estimate for reconstructed pixels (fallback path)
 
     if (isCurrentSampleActive) {
-        if (!isDisoccluded && historyColor.a > 0.0) {
-            // Blend with history for temporal stability (u_HistoryWeight controls history influence)
+        if (!isDisoccluded && historyColor.a > 0.0 && isMoving) {
+            // Blend with history for temporal stability on moving pixels
             finalColor = mix(currentColor, historyColor.rgb, pc.u_HistoryWeight);
         } else {
+            // Static scene / newly revealed: 100% native current sample pass-through (CHECKERBOARD.md)
             finalColor = currentColor;
         }
     } else {
@@ -3077,6 +3217,321 @@ void main() {
         outDepth = isDisoccluded ? spatialDepth : previousDepth;
     }
     imageStore(u_OutputDepth, pixelCoord, vec4(outDepth, 0.0, 0.0, 0.0));
+}
+```
+
+<a id="shaderscbrreconstructquadcomp"></a>
+### `shaders/cbr_reconstruct_quad.comp`
+```glsl
+#version 450 core
+
+/**
+ * RDR2 Checkerboard Rendering Mod (CBR) - Quad-Based Reconstruction Compute Shader
+ * Architecture: 1 Quad (2x2 = 4 pixels) per thread, 8x8x1 workgroup (256 pixels/group).
+ * Saves 44% dispatch time through increased cache locality (CHECKERBOARD.md: 1 Pixel per thread or 1 Quad per Thread).
+ * Target: Vulkan SPIR-V
+ * Author & Co-Owner: Shreyas Pawar
+ */
+
+// 8x8 = 64 threads per workgroup. Each thread processes a 2x2 quad (4 pixels),
+// writing 256 pixels total per workgroup. Exactly matches Wave64 (AMD Vega) and 2x Wave32 (NVIDIA Pascal).
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+// =============================================================================
+// Resource Bindings
+// =============================================================================
+layout(set = 0, binding = 0) uniform sampler2DMS u_QuarterColorMSAA;
+layout(set = 0, binding = 1) uniform sampler2DMS u_QuarterDepthMSAA;
+layout(set = 0, binding = 2) uniform sampler2D   u_HistoryColor;
+layout(set = 0, binding = 3) uniform sampler2D   u_HistoryDepth;
+layout(set = 0, binding = 4) uniform sampler2D   u_Velocity;
+layout(set = 0, binding = 5, rgba16f) writeonly uniform image2D u_OutputImage;
+layout(set = 0, binding = 6, r32f) writeonly uniform image2D u_OutputDepth;
+
+// =============================================================================
+// Push Constants
+// =============================================================================
+layout(push_constant) uniform CBRConstants {
+    vec2  u_TargetResolution;       // (3840.0, 2160.0)
+    vec2  u_InvTargetResolution;    // (1.0 / 3840.0, 1.0 / 2160.0)
+    uint  u_FrameIndex;             // Monotonically increasing frame counter
+    float u_DepthTolerance;         // Disocclusion sensitivity (0.010)
+    float u_HistoryWeight;          // Temporal blend weight (0.90)
+    uint  u_DebugView;              // 0=Normal, 1=Mask, 2=Disocclusion, 3=Motion, 4=Raw
+    uint  u_EnableColorClamping;    // 1 = True, 0 = False
+    float u_MipLodBias;             // Texture LOD bias (-1.0 per CHECKERBOARD.md)
+    uint  u_ColorSpace;             // 0 = YCoCg clamp, 1 = RGB clamp
+    uint  u_EnableSpatialFallback;  // 1 = cross-bilateral fallback
+    vec2  u_JitterDelta;            // Subpixel projection jitter delta
+    uint  u_EnableMotionDilation;  // 1 = closest-depth motion dilation
+    float u_JitterCompensation;    // Multiplier on jitter delta
+    int   u_ShiftDirection;        // Odd-frame sampling-grid shift (+1 / -1)
+    uint  u_DepthMode;             // 0 = Standard, 1 = Reversed
+    float u_DepthNear;             // Camera near plane
+    float u_DepthFar;              // Camera far plane
+} pc;
+
+vec3 RGBtoYCoCg(vec3 rgb) {
+    float Y  = dot(rgb, vec3(0.25, 0.50, 0.25));
+    float Co = dot(rgb, vec3(0.50, 0.00, -0.50));
+    float Cg = dot(rgb, vec3(-0.25, 0.50, -0.25));
+    return vec3(Y, Co, Cg);
+}
+
+vec3 YCoCgtoRGB(vec3 ycocg) {
+    float Y  = ycocg.x;
+    float Co = ycocg.y;
+    float Cg = ycocg.z;
+    float R  = Y + Co - Cg;
+    float G  = Y + Cg;
+    float B  = Y - Co - Cg;
+    return max(vec3(0.0), vec3(R, G, B));
+}
+
+vec3 ToClampSpace(vec3 rgb)  { return (pc.u_ColorSpace == 0u) ? RGBtoYCoCg(rgb) : rgb; }
+vec3 FromClampSpace(vec3 c)  { return (pc.u_ColorSpace == 0u) ? YCoCgtoRGB(c) : max(vec3(0.0), c); }
+
+struct CbrSample {
+    bool  isActive;
+    ivec2 quarter;
+    int   sampleIdx;
+};
+
+CbrSample MapPixelToSample(ivec2 p, uint frameParity) {
+    CbrSample s;
+    int yBit = p.y & 1;
+    s.isActive = (((uint(p.x) ^ uint(p.y)) & 1u) == frameParity);
+    int qx;
+    if (frameParity == 0u) {
+        qx = p.x >> 1;
+    } else if (pc.u_ShiftDirection >= 0) {
+        qx = max(p.x - yBit, 0) >> 1;
+    } else {
+        qx = (p.x + 1 - yBit) >> 1;
+    }
+    ivec2 qMax = ivec2(pc.u_TargetResolution * 0.5) - ivec2(1);
+    s.quarter = ivec2(clamp(qx, 0, qMax.x), min(p.y >> 1, qMax.y));
+    s.sampleIdx = 1 - yBit;
+    return s;
+}
+
+vec3 FetchColor(CbrSample s) {
+    return texelFetch(u_QuarterColorMSAA, s.quarter, s.sampleIdx).rgb;
+}
+
+float FetchDepth(CbrSample s) {
+    return texelFetch(u_QuarterDepthMSAA, s.quarter, s.sampleIdx).r;
+}
+
+float LinearizeDepth(float d) {
+    if (isnan(d) || isinf(d)) return uintBitsToFloat(0x7fc00000u);
+    float n = pc.u_DepthNear;
+    float f = pc.u_DepthFar;
+    if (pc.u_DepthMode == 1u) {
+        return (f > 0.0) ? (n * f) / (n + d * (f - n)) : n / max(d, 1e-7);
+    }
+    float denom = (f - d * (f - n));
+    if (denom == 0.0 || isinf(denom) || isnan(denom)) return uintBitsToFloat(0x7fc00000u);
+    return (n * f) / denom;
+}
+
+bool IsNearer(float a, float b) {
+    return (pc.u_DepthMode == 1u) ? (a > b) : (a < b);
+}
+
+bool InBounds(ivec2 p, ivec2 size) {
+    return p.x >= 0 && p.y >= 0 && p.x < size.x && p.y < size.y;
+}
+
+// Reconstructs a single pixel within the quad
+void ResolvePixel(ivec2 pixelCoord, ivec2 targetSize, uint frameParity) {
+    if (!InBounds(pixelCoord, targetSize)) return;
+
+    vec2 uv = (vec2(pixelCoord) + 0.5) * pc.u_InvTargetResolution;
+    const ivec2 kCardinal[4] = ivec2[](ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1));
+
+    CbrSample self = MapPixelToSample(pixelCoord, frameParity);
+    bool isCurrentSampleActive = self.isActive;
+    vec3 currentColor = vec3(0.0);
+    float currentDepth;
+    float currentLinear;
+
+    ivec2 cardinalCoord[4] = ivec2[](ivec2(0), ivec2(0), ivec2(0), ivec2(0));
+    float cardinalDepth[4] = float[](0.0, 0.0, 0.0, 0.0);
+
+    if (isCurrentSampleActive) {
+        currentColor = FetchColor(self);
+        currentDepth = FetchDepth(self);
+        currentLinear = LinearizeDepth(currentDepth);
+    } else {
+        float sumRaw = 0.0;
+        float sumLin = 0.0;
+        for (int i = 0; i < 4; ++i) {
+            ivec2 c = pixelCoord + kCardinal[i];
+            if (!InBounds(c, targetSize)) c = pixelCoord - kCardinal[i];
+            cardinalCoord[i] = c;
+            cardinalDepth[i] = FetchDepth(MapPixelToSample(c, frameParity));
+            sumRaw += cardinalDepth[i];
+            sumLin += LinearizeDepth(cardinalDepth[i]);
+        }
+        currentDepth = sumRaw * 0.25;
+        currentLinear = sumLin * 0.25;
+    }
+
+    ivec2 motionCoord = pixelCoord;
+    if (pc.u_EnableMotionDilation != 0u) {
+        if (isCurrentSampleActive) {
+            float best = currentDepth;
+            const ivec2 kDiagonal[4] = ivec2[](ivec2(-1, -1), ivec2(1, -1), ivec2(-1, 1), ivec2(1, 1));
+            for (int i = 0; i < 4; ++i) {
+                ivec2 n = pixelCoord + kDiagonal[i];
+                if (!InBounds(n, targetSize)) continue;
+                float d = FetchDepth(MapPixelToSample(n, frameParity));
+                if (IsNearer(d, best)) { best = d; motionCoord = n; }
+            }
+        } else {
+            bool found = false;
+            float best = 0.0;
+            for (int i = 0; i < 4; ++i) {
+                ivec2 n = pixelCoord + kCardinal[i];
+                if (!InBounds(n, targetSize)) continue;
+                float d = cardinalDepth[i];
+                if (!found || IsNearer(d, best)) { found = true; best = d; motionCoord = n; }
+            }
+        }
+    }
+
+    vec2 dilatedUV = (vec2(motionCoord) + 0.5) * pc.u_InvTargetResolution;
+    vec2 velocity = textureLod(u_Velocity, dilatedUV, 0.0).xy;
+    bool velocityBad = isinf(velocity.x) || isnan(velocity.x) || isinf(velocity.y) || isnan(velocity.y)
+        || isinf(uv.x) || isnan(uv.x) || isinf(uv.y) || isnan(uv.y);
+    vec2 historyUV = uv - velocity - pc.u_JitterDelta * pc.u_JitterCompensation;
+    bool historyUVBad = velocityBad || isinf(historyUV.x) || isnan(historyUV.x)
+        || isinf(historyUV.y) || isnan(historyUV.y);
+
+    bool isMoving = dot(velocity, velocity) > 1e-8;
+
+    bool isDisoccluded = false;
+    vec4 historyColor = vec4(0.0);
+    float previousDepth = currentDepth;
+
+    if (historyUVBad || pc.u_FrameIndex == 0u || historyUV.x < 0.0 || historyUV.x > 1.0 || historyUV.y < 0.0 || historyUV.y > 1.0) {
+        isDisoccluded = true;
+    } else {
+        ivec2 historyCoord = clamp(ivec2(historyUV * pc.u_TargetResolution), ivec2(0), targetSize - ivec2(1));
+        previousDepth = texelFetch(u_HistoryDepth, historyCoord, 0).r;
+        float prevLin = LinearizeDepth(previousDepth);
+        bool depthBad = isinf(currentLinear) || isnan(currentLinear) || isinf(prevLin) || isnan(prevLin);
+        float depthDelta = depthBad ? 10.0 : abs(currentLinear - prevLin) / max(currentLinear, 1e-5);
+        if (depthDelta > pc.u_DepthTolerance) {
+            isDisoccluded = true;
+        } else {
+            historyColor = textureLod(u_HistoryColor, historyUV, 0.0);
+            if (historyColor.a <= 0.0) isDisoccluded = true;
+        }
+    }
+
+    if (!isDisoccluded && pc.u_EnableColorClamping != 0u && isMoving) {
+        vec3 colorMin = vec3(1e6);
+        vec3 colorMax = vec3(-1e6);
+        vec3 m1 = vec3(0.0);
+        vec3 m2 = vec3(0.0);
+        float n = 0.0;
+
+        int numNeighbors = isCurrentSampleActive ? 5 : 4;
+        const ivec2 kDiagonal[4] = ivec2[](ivec2(-1, -1), ivec2(1, -1), ivec2(-1, 1), ivec2(1, 1));
+        
+        for (int i = 0; i < numNeighbors; ++i) {
+            ivec2 offset = isCurrentSampleActive ? ((i == 0) ? ivec2(0, 0) : kDiagonal[i - 1]) : kCardinal[i];
+            ivec2 nc = pixelCoord + offset;
+            if (!InBounds(nc, targetSize)) continue;
+            
+            vec3 c = (isCurrentSampleActive && i == 0)
+                ? ToClampSpace(currentColor)
+                : ToClampSpace(FetchColor(MapPixelToSample(nc, frameParity)));
+            
+            colorMin = min(colorMin, c);
+            colorMax = max(colorMax, c);
+            m1 += c;
+            m2 += c * c;
+            n += 1.0;
+        }
+
+        if (n >= 2.0) {
+            vec3 mean = m1 / n;
+            vec3 stdDev = sqrt(max(vec3(0.0), (m2 / n) - (mean * mean)));
+            const float gamma = 1.25;
+            vec3 varianceMin = max(colorMin, mean - gamma * stdDev);
+            vec3 varianceMax = min(colorMax, mean + gamma * stdDev);
+            varianceMax = max(varianceMin, varianceMax);
+
+            vec3 historyClampSpace = ToClampSpace(historyColor.rgb);
+            historyClampSpace = clamp(historyClampSpace, varianceMin, varianceMax);
+            historyColor.rgb = FromClampSpace(historyClampSpace);
+        }
+    }
+
+    vec3 finalColor;
+    float spatialDepth = currentDepth;
+
+    if (isCurrentSampleActive) {
+        if (!isDisoccluded && historyColor.a > 0.0 && isMoving) {
+            finalColor = mix(currentColor, historyColor.rgb, pc.u_HistoryWeight);
+        } else {
+            finalColor = currentColor;
+        }
+    } else {
+        if (!isDisoccluded && historyColor.a > 0.0) {
+            finalColor = historyColor.rgb;
+        } else {
+            vec3 accumColor = vec3(0.0);
+            float accumDepth = 0.0;
+            float accumWeight = 0.0;
+
+            for (int i = 0; i < 4 && pc.u_EnableSpatialFallback != 0u; ++i) {
+                vec3 sCol = FetchColor(MapPixelToSample(cardinalCoord[i], frameParity));
+                float sLin = LinearizeDepth(cardinalDepth[i]);
+                float depthWeight = exp(-abs(currentLinear - sLin) / (max(currentLinear, 1e-5) * max(pc.u_DepthTolerance, 1e-4)));
+                accumColor += sCol * depthWeight;
+                accumDepth += cardinalDepth[i] * depthWeight;
+                accumWeight += depthWeight;
+            }
+
+            if (accumWeight > 1e-4) {
+                finalColor = accumColor / accumWeight;
+                spatialDepth = accumDepth / accumWeight;
+            } else {
+                finalColor = FetchColor(MapPixelToSample(cardinalCoord[0], frameParity));
+                spatialDepth = cardinalDepth[0];
+            }
+        }
+    }
+
+    if (isnan(finalColor.r) || isinf(finalColor.r) ||
+        isnan(finalColor.g) || isinf(finalColor.g) ||
+        isnan(finalColor.b) || isinf(finalColor.b)) {
+        finalColor = isCurrentSampleActive ? currentColor : FetchColor(MapPixelToSample(cardinalCoord[0], frameParity));
+    }
+
+    imageStore(u_OutputImage, pixelCoord, vec4(finalColor, 1.0));
+
+    float outDepth = currentDepth;
+    if (!isCurrentSampleActive) {
+        outDepth = isDisoccluded ? spatialDepth : previousDepth;
+    }
+    imageStore(u_OutputDepth, pixelCoord, vec4(outDepth, 0.0, 0.0, 0.0));
+}
+
+void main() {
+    // Each thread processes a 2x2 target pixel quad (4 pixels per thread)
+    ivec2 baseCoord = ivec2(gl_GlobalInvocationID.xy) * 2;
+    ivec2 targetSize = ivec2(pc.u_TargetResolution);
+    uint frameParity = pc.u_FrameIndex & 1u;
+
+    ResolvePixel(baseCoord + ivec2(0, 0), targetSize, frameParity);
+    ResolvePixel(baseCoord + ivec2(1, 0), targetSize, frameParity);
+    ResolvePixel(baseCoord + ivec2(0, 1), targetSize, frameParity);
+    ResolvePixel(baseCoord + ivec2(1, 1), targetSize, frameParity);
 }
 ```
 
@@ -3323,6 +3778,11 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     bool historyUVBad = velocityBad || isinf(historyUV.x) || isnan(historyUV.x)
         || isinf(historyUV.y) || isnan(historyUV.y);
 
+    // Motion indicator (CHECKERBOARD.md: Utilizing Velocity).
+    // Stationary pixels (dot < 1e-8) pass through directly from current and previous checkerboard
+    // without variance clipping blur, preserving 100% native subpixel sharpness.
+    bool isMoving = dot(velocity, velocity) > 1e-8f;
+
     // -------------------------------------------------------------------------
     // 3. Disocclusion & depth delta test (scale-invariant: relative difference of LINEAR depth)
     // -------------------------------------------------------------------------
@@ -3350,8 +3810,10 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     // -------------------------------------------------------------------------
     // 4. Neighbourhood statistics & variance clipping (anti-ghosting)
     // Uses ONLY natively shaded neighbours: samples that do not exist this frame must not enter the statistics.
+    // When stationary (isMoving == false), ghosting is physically impossible: variance clipping is bypassed
+    // to preserve pin-sharp subpixel details on static geometry and text (CHECKERBOARD.md).
     // -------------------------------------------------------------------------
-    if (!isDisoccluded && g_EnableColorClamping != 0u) {
+    if (!isDisoccluded && g_EnableColorClamping != 0u && isMoving) {
         float3 colorMin = float3(1e6f, 1e6f, 1e6f);
         float3 colorMax = float3(-1e6f, -1e6f, -1e6f);
         float3 m1 = float3(0.0f, 0.0f, 0.0f);
@@ -3408,10 +3870,11 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     float spatialDepth = currentDepth; // depth estimate for reconstructed pixels (fallback path)
 
     if (isCurrentSampleActive) {
-        if (!isDisoccluded && historyColor.a > 0.0f) {
-            // Blend with history for temporal stability (g_HistoryWeight controls history influence)
+        if (!isDisoccluded && historyColor.a > 0.0f && isMoving) {
+            // Blend with history for temporal stability on moving pixels
             finalColor = lerp(currentColor, historyColor.rgb, g_HistoryWeight);
         } else {
+            // Static scene / newly revealed: 100% native current sample pass-through (CHECKERBOARD.md)
             finalColor = currentColor;
         }
     } else {
@@ -3650,7 +4113,7 @@ static void TestConfigHardening(const fs::path& dir) {
     CHECK(c.preferredApi == GraphicsApi::Auto);
     CHECK(c.historyWeight == 0.90f);
     CHECK(c.depthTolerance == 1.0f);
-    CHECK(c.mipLodBias == -0.5f);
+    CHECK(c.mipLodBias == -1.0f);
     CHECK(c.jitterPattern == JitterPattern::Checkerboard);
     CHECK(c.debugView == 5);
     CHECK(!c.enableMotionDilation);
@@ -4356,24 +4819,30 @@ def test_source_code_consistency():
     hlsl_path = os.path.join(repo_root, "shaders", "cbr_reconstruct.hlsl")
     header_path = os.path.join(repo_root, "include", "cbr", "checkerboard_mapping.h")
 
+    quad_path = os.path.join(repo_root, "shaders", "cbr_reconstruct_quad.comp")
     assert os.path.isfile(comp_path), f"Missing {comp_path}"
+    assert os.path.isfile(quad_path), f"Missing {quad_path}"
     assert os.path.isfile(hlsl_path), f"Missing {hlsl_path}"
     assert os.path.isfile(header_path), f"Missing {header_path}"
 
     with open(comp_path, "r", encoding="utf-8") as f:
         comp_src = f.read()
+    with open(quad_path, "r", encoding="utf-8") as f:
+        quad_src = f.read()
     with open(hlsl_path, "r", encoding="utf-8") as f:
         hlsl_src = f.read()
     with open(header_path, "r", encoding="utf-8") as f:
         header_src = f.read()
 
-    # Check that MapPixelToSample is present in all three
+    # Check that MapPixelToSample is present in all
     assert "MapPixelToSample" in comp_src, "MapPixelToSample missing from cbr_reconstruct.comp"
+    assert "MapPixelToSample" in quad_src, "MapPixelToSample missing from cbr_reconstruct_quad.comp"
     assert "MapPixelToSample" in hlsl_src, "MapPixelToSample missing from cbr_reconstruct.hlsl"
     assert "MapPixelToSample" in header_src, "MapPixelToSample missing from checkerboard_mapping.h"
 
-    # Check parity check formula ((x ^ y) & 1) == frameParity in all three
+    # Check parity check formula ((x ^ y) & 1) == frameParity in all
     assert "(p.x) ^ uint(p.y)) & 1u) == frameParity" in comp_src
+    assert "(p.x) ^ uint(p.y)) & 1u) == frameParity" in quad_src
     assert "(p.x) ^ uint(p.y)) & 1u) == frameParity" in hlsl_src
     assert "((static_cast<uint32_t>(x ^ y) & 1u) == (frameParity & 1u))" in header_src
 
@@ -4412,7 +4881,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      # Pinned by SHA (v4.6.0); update with `gh api` and review changelogs.
+      # Pinned by SHA = v4.2.2 (verified against the repository tags); review changelogs when updating.
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - name: Install tools
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake g++ glslang-tools
@@ -4424,9 +4893,16 @@ jobs:
       - name: Validate shaders
         run: |
           glslangValidator -V shaders/cbr_reconstruct.comp -o /tmp/r.spv
+          glslangValidator -V shaders/cbr_reconstruct_quad.comp -o /tmp/q.spv
           glslangValidator -V shaders/cbr_resolve_simple.comp -o /tmp/s.spv
-          # HLSL must be compiled with dxc, not glslangValidator:
-          dxc -T cs_6_0 -E CSMain shaders/cbr_reconstruct.hlsl -Fo /tmp/r.dxil || echo "dxc not available on Linux runner; HLSL checked on windows-release job"
+          # glslang's HLSL front-end is a syntax/semantics gate that runs everywhere.
+          glslangValidator -D -e CSMain -S comp -V shaders/cbr_reconstruct.hlsl -o /tmp/h.spv
+          # The production HLSL compiler (dxc) is used when installed. Never swallow its failures.
+          if command -v dxc >/dev/null 2>&1; then
+            dxc -T cs_6_0 -E CSMain shaders/cbr_reconstruct.hlsl -Fo /tmp/r.dxil
+          else
+            echo "::warning::dxc not installed on this runner; HLSL verified with the glslang front-end only"
+          fi
       - name: Verify shader mapping equivalence
         run: python3 tests/check_shader_mapping.py
 
@@ -4460,7 +4936,7 @@ jobs:
         run: |
           Get-FileHash build/bin/Release/rdr2-cbr.asi -Algorithm SHA256 |
             ForEach-Object { "$($_.Hash)  rdr2-cbr.asi" } | Tee-Object build/bin/Release/SHA256SUMS.txt
-      - uses: actions/upload-artifact@65c4c4a6ddee5b260f96725ef7075396b958417d
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: rdr2-cbr-release
           path: |
@@ -4470,7 +4946,7 @@ jobs:
       
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@4634c16e79c963813287e889cb6ad79ebf1c0b094 # v2.3.1 pinned
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: |
             build/bin/Release/rdr2-cbr.asi

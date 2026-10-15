@@ -123,24 +123,30 @@ def test_source_code_consistency():
     hlsl_path = os.path.join(repo_root, "shaders", "cbr_reconstruct.hlsl")
     header_path = os.path.join(repo_root, "include", "cbr", "checkerboard_mapping.h")
 
+    quad_path = os.path.join(repo_root, "shaders", "cbr_reconstruct_quad.comp")
     assert os.path.isfile(comp_path), f"Missing {comp_path}"
+    assert os.path.isfile(quad_path), f"Missing {quad_path}"
     assert os.path.isfile(hlsl_path), f"Missing {hlsl_path}"
     assert os.path.isfile(header_path), f"Missing {header_path}"
 
     with open(comp_path, "r", encoding="utf-8") as f:
         comp_src = f.read()
+    with open(quad_path, "r", encoding="utf-8") as f:
+        quad_src = f.read()
     with open(hlsl_path, "r", encoding="utf-8") as f:
         hlsl_src = f.read()
     with open(header_path, "r", encoding="utf-8") as f:
         header_src = f.read()
 
-    # Check that MapPixelToSample is present in all three
+    # Check that MapPixelToSample is present in all
     assert "MapPixelToSample" in comp_src, "MapPixelToSample missing from cbr_reconstruct.comp"
+    assert "MapPixelToSample" in quad_src, "MapPixelToSample missing from cbr_reconstruct_quad.comp"
     assert "MapPixelToSample" in hlsl_src, "MapPixelToSample missing from cbr_reconstruct.hlsl"
     assert "MapPixelToSample" in header_src, "MapPixelToSample missing from checkerboard_mapping.h"
 
-    # Check parity check formula ((x ^ y) & 1) == frameParity in all three
+    # Check parity check formula ((x ^ y) & 1) == frameParity in all
     assert "(p.x) ^ uint(p.y)) & 1u) == frameParity" in comp_src
+    assert "(p.x) ^ uint(p.y)) & 1u) == frameParity" in quad_src
     assert "(p.x) ^ uint(p.y)) & 1u) == frameParity" in hlsl_src
     assert "((static_cast<uint32_t>(x ^ y) & 1u) == (frameParity & 1u))" in header_src
 

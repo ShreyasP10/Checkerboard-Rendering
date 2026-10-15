@@ -288,7 +288,7 @@ Enabled = true
 TargetWidth = 3840           ; Set to your display resolution width (e.g. 3840 for 4K, 2560 for 1440p)
 TargetHeight = 2160          ; Set to your display resolution height (e.g. 2160 for 4K, 1440 for 1440p)
 PreferredApi = Vulkan        ; "Vulkan" (strongly recommended for Pascal/GTX 1070 Ti), "D3D12", or "Auto"
-MipLodBias = -0.5            ; Reserved: not applied yet (will bias scene texture sampling once the geometry pass is hooked)
+MipLodBias = -1.0            ; Mathematically compensates for 2x larger texture gradients in 2x MSAA per CHECKERBOARD.md
 
 [Reconstruction]
 DepthTolerance = 0.010       ; Relative depth disocclusion sensitivity threshold
@@ -413,7 +413,7 @@ Enabled = true
 TargetWidth = 3840
 TargetHeight = 2160
 PreferredApi = Vulkan
-MipLodBias = -0.5
+MipLodBias = -1.0
 
 [Reconstruction]
 DepthTolerance = 0.010

@@ -62,6 +62,7 @@ set(CBR_SOURCES
 # Shaders
 set(CBR_SHADERS
     ${CBR_SHADER_DIR}/cbr_reconstruct.comp
+    ${CBR_SHADER_DIR}/cbr_reconstruct_quad.comp
     ${CBR_SHADER_DIR}/cbr_reconstruct.hlsl
     ${CBR_SHADER_DIR}/cbr_resolve_simple.comp
 )
@@ -139,7 +140,7 @@ set(CBR_SHADER_OUT_DIR "$<TARGET_FILE_DIR:rdr2-cbr>/shaders")
 set(CBR_COMPILED_SHADERS "")
 
 if(CBR_GLSLANG)
-    foreach(shader cbr_reconstruct cbr_resolve_simple)
+    foreach(shader cbr_reconstruct cbr_reconstruct_quad cbr_resolve_simple)
         add_custom_command(
             OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/shaders/$<CONFIG>/${shader}.spv
             COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/shaders/$<CONFIG>

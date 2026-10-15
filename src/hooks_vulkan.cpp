@@ -60,6 +60,74 @@ struct MinimalVkPresentInfoKHR {
     int*         pResults;
 };
 
+// =============================================================================
+// Vulkan Checkerboard Structures & Enums (CHECKERBOARD.md: Vulkan Setup)
+// =============================================================================
+constexpr uint32_t kVkSampleCount2Bit = 0x00000002;
+constexpr uint32_t kVkStructureTypeSampleLocationsInfoEXT = 1000143000;
+constexpr uint32_t kVkStructureTypePipelineSampleLocationsStateCreateInfoEXT = 1000143002;
+constexpr uint32_t kVkStructureTypeRenderPassSampleLocationsBeginInfoEXT = 1000143003;
+constexpr uint32_t kVkDynamicStateViewport = 0;
+constexpr uint32_t kVkDynamicStateSampleLocationsEXT = 1000143000;
+constexpr uint32_t kVkImageCreateSampleLocationsCompatibleDepthBitEXT = 0x00001000;
+
+struct MinimalVkSampleLocationEXT {
+    float x;
+    float y;
+};
+
+struct MinimalVkSampleLocationsInfoEXT {
+    uint32_t                          sType;
+    const void*                       pNext;
+    uint32_t                          sampleLocationsPerPixel; // kVkSampleCount2Bit
+    MinimalVkExtent2D                 sampleLocationGridSize;  // {1, 1}
+    uint32_t                          sampleLocationsCount;    // 2
+    const MinimalVkSampleLocationEXT* pSampleLocations;
+};
+
+struct MinimalVkPipelineMultisampleStateCreateInfo {
+    uint32_t     sType;
+    const void*  pNext;
+    uint32_t     flags;
+    uint32_t     rasterizationSamples; // VK_SAMPLE_COUNT_2_BIT
+    uint32_t     sampleShadingEnable;  // VK_TRUE
+    float        minSampleShading;     // 1.0f (CHECKERBOARD.md line 199)
+    const uint32_t* pSampleMask;
+    uint32_t     alphaToCoverageEnable;
+    uint32_t     alphaToOneEnable;
+};
+
+struct MinimalVkViewport {
+    float x;
+    float y;
+    float width;
+    float height;
+    float minDepth;
+    float maxDepth;
+};
+
+// Configures alternating 2x MSAA sample locations per frame according to CHECKERBOARD.md
+inline void ConfigureCheckerboardSampleLocations(uint32_t frameIndex,
+                                                MinimalVkSampleLocationsInfoEXT& outInfo,
+                                                MinimalVkSampleLocationEXT outLocations[2]) {
+    outInfo.sType = kVkStructureTypeSampleLocationsInfoEXT;
+    outInfo.pNext = nullptr;
+    outInfo.sampleLocationsPerPixel = kVkSampleCount2Bit;
+    outInfo.sampleLocationGridSize = { 1, 1 };
+    outInfo.sampleLocationsCount = 2;
+
+    if ((frameIndex & 1u) == 0u) {
+        // Frame 0: Standard 2x MSAA (0.75, 0.75) and (0.25, 0.25)
+        outLocations[0] = { 0.75f, 0.75f };
+        outLocations[1] = { 0.25f, 0.25f };
+    } else {
+        // Frame 1: Alternating positions (0.25, 0.75) and (0.75, 0.25)
+        outLocations[0] = { 0.25f, 0.75f };
+        outLocations[1] = { 0.75f, 0.25f };
+    }
+    outInfo.pSampleLocations = outLocations;
+}
+
 int Hooked_vkQueuePresentKHR(void* queue, const void* pPresentInfo) {
     if (!g_Original_vkQueuePresentKHR) {
         return kVkErrorInitializationFailed;

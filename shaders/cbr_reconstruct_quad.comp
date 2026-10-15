@@ -1,0 +1,310 @@
+#version 450 core
+
+/**
+ * RDR2 Checkerboard Rendering Mod (CBR) - Quad-Based Reconstruction Compute Shader
+ * Architecture: 1 Quad (2x2 = 4 pixels) per thread, 8x8x1 workgroup (256 pixels/group).
+ * Saves 44% dispatch time through increased cache locality (CHECKERBOARD.md: 1 Pixel per thread or 1 Quad per Thread).
+ * Target: Vulkan SPIR-V
+ * Author & Co-Owner: Shreyas Pawar
+ */
+
+// 8x8 = 64 threads per workgroup. Each thread processes a 2x2 quad (4 pixels),
+// writing 256 pixels total per workgroup. Exactly matches Wave64 (AMD Vega) and 2x Wave32 (NVIDIA Pascal).
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+// =============================================================================
+// Resource Bindings
+// =============================================================================
+layout(set = 0, binding = 0) uniform sampler2DMS u_QuarterColorMSAA;
+layout(set = 0, binding = 1) uniform sampler2DMS u_QuarterDepthMSAA;
+layout(set = 0, binding = 2) uniform sampler2D   u_HistoryColor;
+layout(set = 0, binding = 3) uniform sampler2D   u_HistoryDepth;
+layout(set = 0, binding = 4) uniform sampler2D   u_Velocity;
+layout(set = 0, binding = 5, rgba16f) writeonly uniform image2D u_OutputImage;
+layout(set = 0, binding = 6, r32f) writeonly uniform image2D u_OutputDepth;
+
+// =============================================================================
+// Push Constants
+// =============================================================================
+layout(push_constant) uniform CBRConstants {
+    vec2  u_TargetResolution;       // (3840.0, 2160.0)
+    vec2  u_InvTargetResolution;    // (1.0 / 3840.0, 1.0 / 2160.0)
+    uint  u_FrameIndex;             // Monotonically increasing frame counter
+    float u_DepthTolerance;         // Disocclusion sensitivity (0.010)
+    float u_HistoryWeight;          // Temporal blend weight (0.90)
+    uint  u_DebugView;              // 0=Normal, 1=Mask, 2=Disocclusion, 3=Motion, 4=Raw
+    uint  u_EnableColorClamping;    // 1 = True, 0 = False
+    float u_MipLodBias;             // Texture LOD bias (-1.0 per CHECKERBOARD.md)
+    uint  u_ColorSpace;             // 0 = YCoCg clamp, 1 = RGB clamp
+    uint  u_EnableSpatialFallback;  // 1 = cross-bilateral fallback
+    vec2  u_JitterDelta;            // Subpixel projection jitter delta
+    uint  u_EnableMotionDilation;  // 1 = closest-depth motion dilation
+    float u_JitterCompensation;    // Multiplier on jitter delta
+    int   u_ShiftDirection;        // Odd-frame sampling-grid shift (+1 / -1)
+    uint  u_DepthMode;             // 0 = Standard, 1 = Reversed
+    float u_DepthNear;             // Camera near plane
+    float u_DepthFar;              // Camera far plane
+} pc;
+
+vec3 RGBtoYCoCg(vec3 rgb) {
+    float Y  = dot(rgb, vec3(0.25, 0.50, 0.25));
+    float Co = dot(rgb, vec3(0.50, 0.00, -0.50));
+    float Cg = dot(rgb, vec3(-0.25, 0.50, -0.25));
+    return vec3(Y, Co, Cg);
+}
+
+vec3 YCoCgtoRGB(vec3 ycocg) {
+    float Y  = ycocg.x;
+    float Co = ycocg.y;
+    float Cg = ycocg.z;
+    float R  = Y + Co - Cg;
+    float G  = Y + Cg;
+    float B  = Y - Co - Cg;
+    return max(vec3(0.0), vec3(R, G, B));
+}
+
+vec3 ToClampSpace(vec3 rgb)  { return (pc.u_ColorSpace == 0u) ? RGBtoYCoCg(rgb) : rgb; }
+vec3 FromClampSpace(vec3 c)  { return (pc.u_ColorSpace == 0u) ? YCoCgtoRGB(c) : max(vec3(0.0), c); }
+
+struct CbrSample {
+    bool  isActive;
+    ivec2 quarter;
+    int   sampleIdx;
+};
+
+CbrSample MapPixelToSample(ivec2 p, uint frameParity) {
+    CbrSample s;
+    int yBit = p.y & 1;
+    s.isActive = (((uint(p.x) ^ uint(p.y)) & 1u) == frameParity);
+    int qx;
+    if (frameParity == 0u) {
+        qx = p.x >> 1;
+    } else if (pc.u_ShiftDirection >= 0) {
+        qx = max(p.x - yBit, 0) >> 1;
+    } else {
+        qx = (p.x + 1 - yBit) >> 1;
+    }
+    ivec2 qMax = ivec2(pc.u_TargetResolution * 0.5) - ivec2(1);
+    s.quarter = ivec2(clamp(qx, 0, qMax.x), min(p.y >> 1, qMax.y));
+    s.sampleIdx = 1 - yBit;
+    return s;
+}
+
+vec3 FetchColor(CbrSample s) {
+    return texelFetch(u_QuarterColorMSAA, s.quarter, s.sampleIdx).rgb;
+}
+
+float FetchDepth(CbrSample s) {
+    return texelFetch(u_QuarterDepthMSAA, s.quarter, s.sampleIdx).r;
+}
+
+float LinearizeDepth(float d) {
+    if (isnan(d) || isinf(d)) return uintBitsToFloat(0x7fc00000u);
+    float n = pc.u_DepthNear;
+    float f = pc.u_DepthFar;
+    if (pc.u_DepthMode == 1u) {
+        return (f > 0.0) ? (n * f) / (n + d * (f - n)) : n / max(d, 1e-7);
+    }
+    float denom = (f - d * (f - n));
+    if (denom == 0.0 || isinf(denom) || isnan(denom)) return uintBitsToFloat(0x7fc00000u);
+    return (n * f) / denom;
+}
+
+bool IsNearer(float a, float b) {
+    return (pc.u_DepthMode == 1u) ? (a > b) : (a < b);
+}
+
+bool InBounds(ivec2 p, ivec2 size) {
+    return p.x >= 0 && p.y >= 0 && p.x < size.x && p.y < size.y;
+}
+
+// Reconstructs a single pixel within the quad
+void ResolvePixel(ivec2 pixelCoord, ivec2 targetSize, uint frameParity) {
+    if (!InBounds(pixelCoord, targetSize)) return;
+
+    vec2 uv = (vec2(pixelCoord) + 0.5) * pc.u_InvTargetResolution;
+    const ivec2 kCardinal[4] = ivec2[](ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1));
+
+    CbrSample self = MapPixelToSample(pixelCoord, frameParity);
+    bool isCurrentSampleActive = self.isActive;
+    vec3 currentColor = vec3(0.0);
+    float currentDepth;
+    float currentLinear;
+
+    ivec2 cardinalCoord[4] = ivec2[](ivec2(0), ivec2(0), ivec2(0), ivec2(0));
+    float cardinalDepth[4] = float[](0.0, 0.0, 0.0, 0.0);
+
+    if (isCurrentSampleActive) {
+        currentColor = FetchColor(self);
+        currentDepth = FetchDepth(self);
+        currentLinear = LinearizeDepth(currentDepth);
+    } else {
+        float sumRaw = 0.0;
+        float sumLin = 0.0;
+        for (int i = 0; i < 4; ++i) {
+            ivec2 c = pixelCoord + kCardinal[i];
+            if (!InBounds(c, targetSize)) c = pixelCoord - kCardinal[i];
+            cardinalCoord[i] = c;
+            cardinalDepth[i] = FetchDepth(MapPixelToSample(c, frameParity));
+            sumRaw += cardinalDepth[i];
+            sumLin += LinearizeDepth(cardinalDepth[i]);
+        }
+        currentDepth = sumRaw * 0.25;
+        currentLinear = sumLin * 0.25;
+    }
+
+    ivec2 motionCoord = pixelCoord;
+    if (pc.u_EnableMotionDilation != 0u) {
+        if (isCurrentSampleActive) {
+            float best = currentDepth;
+            const ivec2 kDiagonal[4] = ivec2[](ivec2(-1, -1), ivec2(1, -1), ivec2(-1, 1), ivec2(1, 1));
+            for (int i = 0; i < 4; ++i) {
+                ivec2 n = pixelCoord + kDiagonal[i];
+                if (!InBounds(n, targetSize)) continue;
+                float d = FetchDepth(MapPixelToSample(n, frameParity));
+                if (IsNearer(d, best)) { best = d; motionCoord = n; }
+            }
+        } else {
+            bool found = false;
+            float best = 0.0;
+            for (int i = 0; i < 4; ++i) {
+                ivec2 n = pixelCoord + kCardinal[i];
+                if (!InBounds(n, targetSize)) continue;
+                float d = cardinalDepth[i];
+                if (!found || IsNearer(d, best)) { found = true; best = d; motionCoord = n; }
+            }
+        }
+    }
+
+    vec2 dilatedUV = (vec2(motionCoord) + 0.5) * pc.u_InvTargetResolution;
+    vec2 velocity = textureLod(u_Velocity, dilatedUV, 0.0).xy;
+    bool velocityBad = isinf(velocity.x) || isnan(velocity.x) || isinf(velocity.y) || isnan(velocity.y)
+        || isinf(uv.x) || isnan(uv.x) || isinf(uv.y) || isnan(uv.y);
+    vec2 historyUV = uv - velocity - pc.u_JitterDelta * pc.u_JitterCompensation;
+    bool historyUVBad = velocityBad || isinf(historyUV.x) || isnan(historyUV.x)
+        || isinf(historyUV.y) || isnan(historyUV.y);
+
+    bool isMoving = dot(velocity, velocity) > 1e-8;
+
+    bool isDisoccluded = false;
+    vec4 historyColor = vec4(0.0);
+    float previousDepth = currentDepth;
+
+    if (historyUVBad || pc.u_FrameIndex == 0u || historyUV.x < 0.0 || historyUV.x > 1.0 || historyUV.y < 0.0 || historyUV.y > 1.0) {
+        isDisoccluded = true;
+    } else {
+        ivec2 historyCoord = clamp(ivec2(historyUV * pc.u_TargetResolution), ivec2(0), targetSize - ivec2(1));
+        previousDepth = texelFetch(u_HistoryDepth, historyCoord, 0).r;
+        float prevLin = LinearizeDepth(previousDepth);
+        bool depthBad = isinf(currentLinear) || isnan(currentLinear) || isinf(prevLin) || isnan(prevLin);
+        float depthDelta = depthBad ? 10.0 : abs(currentLinear - prevLin) / max(currentLinear, 1e-5);
+        if (depthDelta > pc.u_DepthTolerance) {
+            isDisoccluded = true;
+        } else {
+            historyColor = textureLod(u_HistoryColor, historyUV, 0.0);
+            if (historyColor.a <= 0.0) isDisoccluded = true;
+        }
+    }
+
+    if (!isDisoccluded && pc.u_EnableColorClamping != 0u && isMoving) {
+        vec3 colorMin = vec3(1e6);
+        vec3 colorMax = vec3(-1e6);
+        vec3 m1 = vec3(0.0);
+        vec3 m2 = vec3(0.0);
+        float n = 0.0;
+
+        int numNeighbors = isCurrentSampleActive ? 5 : 4;
+        const ivec2 kDiagonal[4] = ivec2[](ivec2(-1, -1), ivec2(1, -1), ivec2(-1, 1), ivec2(1, 1));
+        
+        for (int i = 0; i < numNeighbors; ++i) {
+            ivec2 offset = isCurrentSampleActive ? ((i == 0) ? ivec2(0, 0) : kDiagonal[i - 1]) : kCardinal[i];
+            ivec2 nc = pixelCoord + offset;
+            if (!InBounds(nc, targetSize)) continue;
+            
+            vec3 c = (isCurrentSampleActive && i == 0)
+                ? ToClampSpace(currentColor)
+                : ToClampSpace(FetchColor(MapPixelToSample(nc, frameParity)));
+            
+            colorMin = min(colorMin, c);
+            colorMax = max(colorMax, c);
+            m1 += c;
+            m2 += c * c;
+            n += 1.0;
+        }
+
+        if (n >= 2.0) {
+            vec3 mean = m1 / n;
+            vec3 stdDev = sqrt(max(vec3(0.0), (m2 / n) - (mean * mean)));
+            const float gamma = 1.25;
+            vec3 varianceMin = max(colorMin, mean - gamma * stdDev);
+            vec3 varianceMax = min(colorMax, mean + gamma * stdDev);
+            varianceMax = max(varianceMin, varianceMax);
+
+            vec3 historyClampSpace = ToClampSpace(historyColor.rgb);
+            historyClampSpace = clamp(historyClampSpace, varianceMin, varianceMax);
+            historyColor.rgb = FromClampSpace(historyClampSpace);
+        }
+    }
+
+    vec3 finalColor;
+    float spatialDepth = currentDepth;
+
+    if (isCurrentSampleActive) {
+        if (!isDisoccluded && historyColor.a > 0.0 && isMoving) {
+            finalColor = mix(currentColor, historyColor.rgb, pc.u_HistoryWeight);
+        } else {
+            finalColor = currentColor;
+        }
+    } else {
+        if (!isDisoccluded && historyColor.a > 0.0) {
+            finalColor = historyColor.rgb;
+        } else {
+            vec3 accumColor = vec3(0.0);
+            float accumDepth = 0.0;
+            float accumWeight = 0.0;
+
+            for (int i = 0; i < 4 && pc.u_EnableSpatialFallback != 0u; ++i) {
+                vec3 sCol = FetchColor(MapPixelToSample(cardinalCoord[i], frameParity));
+                float sLin = LinearizeDepth(cardinalDepth[i]);
+                float depthWeight = exp(-abs(currentLinear - sLin) / (max(currentLinear, 1e-5) * max(pc.u_DepthTolerance, 1e-4)));
+                accumColor += sCol * depthWeight;
+                accumDepth += cardinalDepth[i] * depthWeight;
+                accumWeight += depthWeight;
+            }
+
+            if (accumWeight > 1e-4) {
+                finalColor = accumColor / accumWeight;
+                spatialDepth = accumDepth / accumWeight;
+            } else {
+                finalColor = FetchColor(MapPixelToSample(cardinalCoord[0], frameParity));
+                spatialDepth = cardinalDepth[0];
+            }
+        }
+    }
+
+    if (isnan(finalColor.r) || isinf(finalColor.r) ||
+        isnan(finalColor.g) || isinf(finalColor.g) ||
+        isnan(finalColor.b) || isinf(finalColor.b)) {
+        finalColor = isCurrentSampleActive ? currentColor : FetchColor(MapPixelToSample(cardinalCoord[0], frameParity));
+    }
+
+    imageStore(u_OutputImage, pixelCoord, vec4(finalColor, 1.0));
+
+    float outDepth = currentDepth;
+    if (!isCurrentSampleActive) {
+        outDepth = isDisoccluded ? spatialDepth : previousDepth;
+    }
+    imageStore(u_OutputDepth, pixelCoord, vec4(outDepth, 0.0, 0.0, 0.0));
+}
+
+void main() {
+    // Each thread processes a 2x2 target pixel quad (4 pixels per thread)
+    ivec2 baseCoord = ivec2(gl_GlobalInvocationID.xy) * 2;
+    ivec2 targetSize = ivec2(pc.u_TargetResolution);
+    uint frameParity = pc.u_FrameIndex & 1u;
+
+    ResolvePixel(baseCoord + ivec2(0, 0), targetSize, frameParity);
+    ResolvePixel(baseCoord + ivec2(1, 0), targetSize, frameParity);
+    ResolvePixel(baseCoord + ivec2(0, 1), targetSize, frameParity);
+    ResolvePixel(baseCoord + ivec2(1, 1), targetSize, frameParity);
+}

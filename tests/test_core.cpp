@@ -82,7 +82,7 @@ static void TestConfigHardening(const fs::path& dir) {
     CHECK(c.preferredApi == GraphicsApi::Auto);
     CHECK(c.historyWeight == 0.90f);
     CHECK(c.depthTolerance == 1.0f);
-    CHECK(c.mipLodBias == -0.5f);
+    CHECK(c.mipLodBias == -1.0f);
     CHECK(c.jitterPattern == JitterPattern::Checkerboard);
     CHECK(c.debugView == 5);
     CHECK(!c.enableMotionDilation);

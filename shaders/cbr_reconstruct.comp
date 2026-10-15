@@ -242,6 +242,11 @@ void main() {
     bool historyUVBad = velocityBad || isinf(historyUV.x) || isnan(historyUV.x)
         || isinf(historyUV.y) || isnan(historyUV.y);
 
+    // Motion indicator (CHECKERBOARD.md: Utilizing Velocity).
+    // Stationary pixels (dot < 1e-8) pass through directly from current and previous checkerboard
+    // without variance clipping blur, preserving 100% native subpixel sharpness.
+    bool isMoving = dot(velocity, velocity) > 1e-8;
+
     // -------------------------------------------------------------------------
     // 3. Disocclusion & depth delta testing (scale-invariant: relative difference of LINEAR depth)
     // -------------------------------------------------------------------------
@@ -271,8 +276,10 @@ void main() {
     // -------------------------------------------------------------------------
     // 4. Neighbourhood statistics & variance clipping (anti-ghosting)
     // Uses ONLY natively shaded neighbours: samples that do not exist this frame must not enter the statistics.
+    // When stationary (isMoving == false), ghosting is physically impossible: variance clipping is bypassed
+    // to preserve pin-sharp subpixel details on static geometry and text (CHECKERBOARD.md).
     // -------------------------------------------------------------------------
-    if (!isDisoccluded && pc.u_EnableColorClamping != 0u) {
+    if (!isDisoccluded && pc.u_EnableColorClamping != 0u && isMoving) {
         vec3 colorMin = vec3(1e6);
         vec3 colorMax = vec3(-1e6);
         vec3 m1 = vec3(0.0);
@@ -329,10 +336,11 @@ void main() {
     float spatialDepth = currentDepth; // depth estimate for reconstructed pixels (fallback path)
 
     if (isCurrentSampleActive) {
-        if (!isDisoccluded && historyColor.a > 0.0) {
-            // Blend with history for temporal stability (u_HistoryWeight controls history influence)
+        if (!isDisoccluded && historyColor.a > 0.0 && isMoving) {
+            // Blend with history for temporal stability on moving pixels
             finalColor = mix(currentColor, historyColor.rgb, pc.u_HistoryWeight);
         } else {
+            // Static scene / newly revealed: 100% native current sample pass-through (CHECKERBOARD.md)
             finalColor = currentColor;
         }
     } else {

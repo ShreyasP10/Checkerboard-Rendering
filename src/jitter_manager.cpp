@@ -45,6 +45,12 @@ void JitterManager::Update(uint32_t frameIndex) {
     }
 }
 
+float JitterManager::GetQuarterViewportShiftX(uint32_t frameIndex) const {
+    const auto& config = ConfigManager::Get().GetConfig();
+    const float dir = (config.jitterDirection < 0) ? -1.0f : 1.0f;
+    return (frameIndex & 1u) ? (0.5f * dir) : 0.0f;
+}
+
 std::pair<float, float> JitterManager::ComputeProjectionOffset(const JitterOffset& jitter, bool isVulkan) const {
     const auto& config = ConfigManager::Get().GetConfig();
     const float sign = (config.projectionJitterSign < 0) ? -1.0f : 1.0f;
