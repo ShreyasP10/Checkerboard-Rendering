@@ -12,7 +12,6 @@ constexpr uint32_t kMinTargetHeight = 480;
 constexpr uint32_t kMaxTargetHeight = 4320;
 
 constexpr uint32_t kMinSwapchainExtent = 320;
-constexpr uint32_t kMinSwapchainHeight = 320;
 constexpr uint32_t kMaxSwapchainExtent = 16384;
 
 constexpr uint32_t kWorkgroupSizeX = 16;

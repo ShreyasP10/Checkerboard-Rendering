@@ -48,12 +48,12 @@ layout(push_constant) uniform CBRConstants {
     float u_HistoryWeight;          // Temporal blend weight (default: 0.90)
     uint  u_DebugView;              // 0=Normal, 1=Mask, 2=Disocclusion, 3=Motion, 4=Raw
     uint  u_EnableColorClamping;    // 1 = True, 0 = False
-    float u_MipLodBias;             // Texture LOD bias (-0.5)
+    float u_MipLodBias;             // Texture LOD bias (-1.0f: compensates for quarter-res 2x MSAA, see CHECKERBOARD.md)
     uint  u_ColorSpace;             // 0 = YCoCg clamp, 1 = RGB clamp
     uint  u_EnableSpatialFallback;  // 1 = cross-bilateral fallback, 0 = use raw current sample
     vec2  u_JitterDelta;            // Subpixel projection jitter delta (jc - jp)
-        uint      u_EnableMotionDilation;  // 1 = closest-depth motion dilation over the active 3x3 neighbours
-    float     u_JitterCompensation;    // Multiplier on u_JitterDelta (default 0: whole-pixel jitter is absorbed by the mapping)
+    uint  u_EnableMotionDilation;   // 1 = closest-depth motion dilation over the active 3x3 neighbours
+    float u_JitterCompensation;    // Multiplier on u_JitterDelta (default 0: whole-pixel jitter is absorbed by the mapping)
     int       u_ShiftDirection;        // Odd-frame sampling-grid shift: +1 / -1 (include/cbr/checkerboard_mapping.h)
     uint      u_DepthMode;             // 0 = Standard (0 near .. 1 far), 1 = Reversed (1 near .. 0 far)
     float     u_DepthNear;             // Camera near plane
@@ -168,8 +168,8 @@ void main() {
     CbrSample self = MapPixelToSample(pixelCoord, frameParity);
     bool isCurrentSampleActive = self.isActive;
     vec3 currentColor = vec3(0.0); // valid only for active pixels
-    float currentDepth;            // raw device depth (what gets written to the history depth target)
-    float currentLinear;           // linear depth used by the occlusion test
+    float currentDepth = 0.0;            // raw device depth (what gets written to the history depth target)
+    float currentLinear = 0.0;           // linear depth used by the occlusion test
 
     // The 4 cardinal neighbours of a reconstructed pixel are always natively shaded (mirrored at borders).
     ivec2 cardinalCoord[4] = ivec2[](ivec2(0), ivec2(0), ivec2(0), ivec2(0));
@@ -183,18 +183,32 @@ void main() {
         // No native sample here: estimate depth from the cardinal neighbours (Intel "CSO": average LINEAR depth).
         float sumRaw = 0.0;
         float sumLin = 0.0;
+        float validCount = 0.0;
         for (int i = 0; i < 4; ++i) {
             ivec2 c = pixelCoord + kCardinal[i];
             if (!InBounds(c, targetSize)) {
                 c = pixelCoord - kCardinal[i]; // mirror at the screen border
             }
+            if (!InBounds(c, targetSize)) {
+                c = pixelCoord;
+            }
             cardinalCoord[i] = c;
             cardinalDepth[i] = FetchDepth(MapPixelToSample(c, frameParity));
-            sumRaw += cardinalDepth[i];
-            sumLin += LinearizeDepth(cardinalDepth[i]);
+            float raw = cardinalDepth[i];
+            float lin = LinearizeDepth(raw);
+            if (!isnan(raw) && !isinf(raw) && !isnan(lin) && !isinf(lin)) {
+                sumRaw += raw;
+                sumLin += lin;
+                validCount += 1.0;
+            }
         }
-        currentDepth = sumRaw * 0.25;
-        currentLinear = sumLin * 0.25;
+        if (validCount > 0.0) {
+            currentDepth = sumRaw / validCount;
+            currentLinear = sumLin / validCount;
+        } else {
+            currentDepth = (pc.u_DepthMode == 1u) ? 0.0 : 1.0;
+            currentLinear = 1000.0;
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -363,8 +377,8 @@ void main() {
                 finalColor = accumColor / accumWeight;
                 spatialDepth = accumDepth / accumWeight;
             } else {
-                finalColor = FetchColor(MapPixelToSample(cardinalCoord[0], frameParity));
-                spatialDepth = cardinalDepth[0];
+                finalColor = isCurrentSampleActive ? currentColor : FetchColor(MapPixelToSample(cardinalCoord[0], frameParity));
+                spatialDepth = isCurrentSampleActive ? currentDepth : cardinalDepth[0];
             }
         }
     }
@@ -410,6 +424,9 @@ void main() {
     float outDepth = currentDepth;
     if (!isCurrentSampleActive) {
         outDepth = isDisoccluded ? spatialDepth : previousDepth;
+    }
+    if (isnan(outDepth) || isinf(outDepth)) {
+        outDepth = (pc.u_DepthMode == 1u) ? 0.0 : 1.0;
     }
     imageStore(u_OutputDepth, pixelCoord, vec4(outDepth, 0.0, 0.0, 0.0));
 }

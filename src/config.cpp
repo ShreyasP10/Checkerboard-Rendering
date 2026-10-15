@@ -73,8 +73,6 @@ std::string ToUpper(std::string s) {
     return s;
 }
 
-uint32_t MakeEvenClamped(uint32_t v) { return MakeEvenUp(v); }
-
 bool TryParseIntStrict(const std::string& val, int& out) {
     if (val.empty()) return false;
     try {
@@ -225,8 +223,9 @@ bool ConfigManager::Load(const std::filesystem::path& configPath) {
             } else if (key == "LogToFile") {
                 parsed.logToFile = ParseBool(val, parsed.logToFile);
             } else if (key == "LogLevel") {
-                const std::string clean = SanitizeLogLevel(val, parsed.logLevel);
-                if (clean != Trim(val)) warnings.emplace_back("Invalid LogLevel sanitized.");
+                const std::string trimmedVal = Trim(val);
+                const std::string clean = SanitizeLogLevel(trimmedVal, parsed.logLevel);
+                if (clean != trimmedVal) warnings.emplace_back("Invalid LogLevel sanitized.");
                 parsed.logLevel = clean;
             } else {
                 warnings.emplace_back("Unknown key '" + key + "' in [" + currentSection + "]; ignored.");

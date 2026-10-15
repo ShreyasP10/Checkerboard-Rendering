@@ -52,6 +52,7 @@ public:
             // Truncation would mislead diagnostics; mark it explicitly.
             constexpr char kTrunc[] = "...<truncated>";
             std::memcpy(buffer + sizeof(buffer) - sizeof(kTrunc), kTrunc, sizeof(kTrunc));
+            buffer[sizeof(buffer) - 1] = '\0';
         }
         Log(level, std::string(buffer));
     }

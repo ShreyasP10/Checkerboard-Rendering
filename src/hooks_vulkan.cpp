@@ -47,6 +47,7 @@ struct MinimalVkSwapchainCreateInfoKHR {
     MinimalVkExtent2D imageExtent;
 };
 static_assert(offsetof(MinimalVkSwapchainCreateInfoKHR, sType) == 0, "ABI drift");
+static_assert(offsetof(MinimalVkSwapchainCreateInfoKHR, imageExtent) == (sizeof(void*) == 8 ? 44 : 28), "ABI drift: imageExtent offset");
 static_assert(sizeof(MinimalVkSwapchainCreateInfoKHR) >= sizeof(uint32_t) + sizeof(void*) + sizeof(uint32_t) + sizeof(uint64_t), "ABI drift");
 
 struct MinimalVkPresentInfoKHR {
@@ -173,11 +174,18 @@ int Hooked_vkCreateSwapchainKHR(void* device, const void* pCreateInfo, const voi
     if (result == 0) { // VK_SUCCESS
         uint32_t w = 0, h = 0;
         if (pCreateInfo) {
-            MinimalVkSwapchainCreateInfoKHR info{};
-            std::memcpy(&info, pCreateInfo, sizeof(info));
-            w = info.imageExtent.width;
-            h = info.imageExtent.height;
-            if (w > 16384 || h > 16384) { w = 0; h = 0; } // untrusted: let engine ignore
+            uint32_t sType = 0;
+            std::memcpy(&sType, pCreateInfo, sizeof(sType));
+            constexpr uint32_t kVkStructureTypeSwapchainCreateInfoKHR = 1000001000;
+            if (sType == kVkStructureTypeSwapchainCreateInfoKHR) {
+                MinimalVkSwapchainCreateInfoKHR info{};
+                std::memcpy(&info, pCreateInfo, sizeof(info));
+                w = info.imageExtent.width;
+                h = info.imageExtent.height;
+                if (w > 16384 || h > 16384) { w = 0; h = 0; } // untrusted: let engine ignore
+            } else {
+                CBR_LOG_WARN("vkCreateSwapchainKHR: unexpected sType (%u), skipping extent extraction.", sType);
+            }
         }
         try { CBREngine::Get().OnSwapchainRecreated(w, h); } catch (...) {}
     }

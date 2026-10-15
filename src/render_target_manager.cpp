@@ -38,8 +38,8 @@ void RenderTargetManager::Initialize(uint32_t width, uint32_t height) {
         std::unique_lock<std::shared_mutex> lock(m_mutex);
         m_dims = dims;
         m_totalAllocatedVramBytes.store(total);
+        m_initialized.store(true);
     }
-    m_initialized = true;
 
     CBR_LOG_INFO("RenderTargetManager initialized for target: %ux%u", width, height);
     CBR_LOG_INFO("Quarter-Resolution 2x MSAA Buffer size: %ux%u", dims.quarterWidth, dims.quarterHeight);
@@ -49,8 +49,11 @@ void RenderTargetManager::Initialize(uint32_t width, uint32_t height) {
 }
 
 void RenderTargetManager::Shutdown() {
-    m_initialized = false;
-    m_totalAllocatedVramBytes.store(0);
+    {
+        std::unique_lock<std::shared_mutex> lock(m_mutex);
+        m_initialized.store(false);
+        m_totalAllocatedVramBytes.store(0);
+    }
     CBR_LOG_INFO("RenderTargetManager shut down.");
 }
 

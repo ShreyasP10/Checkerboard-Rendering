@@ -100,7 +100,9 @@ void Logger::Log(LogLevel level, const std::string& message) {
 
     if (m_initialized && m_logFile.is_open()) {
         m_logFile << formatted;
-        m_logFile.flush();
+        if (level >= LogLevel::Warning) {
+            m_logFile.flush();
+        }
     } else if (!m_initialized && !m_disabled) {
         if (m_pending.size() < kMaxPendingMessages) {
             m_pending.push_back(formatted);

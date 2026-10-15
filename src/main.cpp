@@ -63,8 +63,9 @@ std::filesystem::path GetModuleDirectoryPath(HMODULE hModule) {
 
 // Exported symbol ensuring the ASI plugin has an export table entry in PE header
 extern "C" __declspec(dllexport) void CBR_PluginInit() {
-    cbr::CBREngine::Get().Initialize();
-    cbr::CBREngine::Get().TryInstallHooks();
+    if (cbr::CBREngine::Get().Initialize()) {
+        cbr::CBREngine::Get().TryInstallHooks();
+    }
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID /*lpReserved*/) {

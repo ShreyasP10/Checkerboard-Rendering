@@ -25,6 +25,9 @@ void JitterManager::Initialize(uint32_t targetWidth, uint32_t targetHeight) {
 void JitterManager::Update(uint32_t frameIndex) {
     // JitterScale is intentionally ignored: 2x MSAA checkerboard coverage
     // requires exactly one full-resolution pixel shift. See config warning.
+    const auto config = ConfigManager::Get().GetConfig();
+    const float dir = (config.jitterDirection < 0) ? -1.0f : 1.0f;
+
     std::lock_guard<std::mutex> lock(m_mutex);
     m_previousJitter = m_currentJitter;
 
@@ -32,9 +35,7 @@ void JitterManager::Update(uint32_t frameIndex) {
     // Even frames are unjittered (samples land on pixel centres).
     // Odd frames are shifted horizontally by exactly one full-resolution pixel (shiftDirection * pixelWidth),
     // giving 100% 4-quadrant geometric coverage across two frames with standard 2x MSAA sample locations.
-    const auto& config = ConfigManager::Get().GetConfig();
     const float pixelWidth = 1.0f / static_cast<float>(m_targetWidth);
-    const float dir = (config.jitterDirection < 0) ? -1.0f : 1.0f;
 
     if (frameIndex & 1u) {
         m_currentJitter.x = dir * pixelWidth;

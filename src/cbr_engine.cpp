@@ -36,7 +36,7 @@ bool CBREngine::Initialize() {
         //    Logger and flushed (or discarded) once the log destination is known.
         const std::filesystem::path baseDir = m_moduleDirectory; // empty => current directory
         ConfigManager::Get().Load(baseDir / "cbr.ini");
-        const auto& config = ConfigManager::Get().GetConfig();
+        const auto config = ConfigManager::Get().GetConfig();
 
         // 2. Configure logging from the loaded settings
         Logger::Get().SetMinLevel(ParseLogLevel(config.logLevel));
@@ -193,7 +193,7 @@ void CBREngine::OnSwapchainRecreated(uint32_t width, uint32_t height) {
 
     // Swapchain extents are untrusted: odd sizes round up to even, implausible ones are ignored.
     if (width >= kMinSwapchainExtent && width <= kMaxSwapchainExtent &&
-        height >= kMinSwapchainHeight && height <= kMaxSwapchainExtent) {
+        height >= kMinSwapchainExtent && height <= kMaxSwapchainExtent) {
         width = MakeEvenUp(width);
         height = MakeEvenUp(height);
         RenderTargetManager::Get().Initialize(width, height);

@@ -1003,7 +1003,6 @@ constexpr uint32_t kMinTargetHeight = 480;
 constexpr uint32_t kMaxTargetHeight = 4320;
 
 constexpr uint32_t kMinSwapchainExtent = 320;
-constexpr uint32_t kMinSwapchainHeight = 320;
 constexpr uint32_t kMaxSwapchainExtent = 16384;
 
 constexpr uint32_t kWorkgroupSizeX = 16;
@@ -1079,6 +1078,7 @@ public:
             // Truncation would mislead diagnostics; mark it explicitly.
             constexpr char kTrunc[] = "...<truncated>";
             std::memcpy(buffer + sizeof(buffer) - sizeof(kTrunc), kTrunc, sizeof(kTrunc));
+            buffer[sizeof(buffer) - 1] = '\0';
         }
         Log(level, std::string(buffer));
     }
@@ -1352,8 +1352,9 @@ std::filesystem::path GetModuleDirectoryPath(HMODULE hModule) {
 
 // Exported symbol ensuring the ASI plugin has an export table entry in PE header
 extern "C" __declspec(dllexport) void CBR_PluginInit() {
-    cbr::CBREngine::Get().Initialize();
-    cbr::CBREngine::Get().TryInstallHooks();
+    if (cbr::CBREngine::Get().Initialize()) {
+        cbr::CBREngine::Get().TryInstallHooks();
+    }
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID /*lpReserved*/) {
@@ -1444,7 +1445,7 @@ bool CBREngine::Initialize() {
         //    Logger and flushed (or discarded) once the log destination is known.
         const std::filesystem::path baseDir = m_moduleDirectory; // empty => current directory
         ConfigManager::Get().Load(baseDir / "cbr.ini");
-        const auto& config = ConfigManager::Get().GetConfig();
+        const auto config = ConfigManager::Get().GetConfig();
 
         // 2. Configure logging from the loaded settings
         Logger::Get().SetMinLevel(ParseLogLevel(config.logLevel));
@@ -1601,7 +1602,7 @@ void CBREngine::OnSwapchainRecreated(uint32_t width, uint32_t height) {
 
     // Swapchain extents are untrusted: odd sizes round up to even, implausible ones are ignored.
     if (width >= kMinSwapchainExtent && width <= kMaxSwapchainExtent &&
-        height >= kMinSwapchainHeight && height <= kMaxSwapchainExtent) {
+        height >= kMinSwapchainExtent && height <= kMaxSwapchainExtent) {
         width = MakeEvenUp(width);
         height = MakeEvenUp(height);
         RenderTargetManager::Get().Initialize(width, height);
@@ -1693,8 +1694,6 @@ std::string ToUpper(std::string s) {
     for (char& c : s) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
     return s;
 }
-
-uint32_t MakeEvenClamped(uint32_t v) { return MakeEvenUp(v); }
 
 bool TryParseIntStrict(const std::string& val, int& out) {
     if (val.empty()) return false;
@@ -1846,8 +1845,9 @@ bool ConfigManager::Load(const std::filesystem::path& configPath) {
             } else if (key == "LogToFile") {
                 parsed.logToFile = ParseBool(val, parsed.logToFile);
             } else if (key == "LogLevel") {
-                const std::string clean = SanitizeLogLevel(val, parsed.logLevel);
-                if (clean != Trim(val)) warnings.emplace_back("Invalid LogLevel sanitized.");
+                const std::string trimmedVal = Trim(val);
+                const std::string clean = SanitizeLogLevel(trimmedVal, parsed.logLevel);
+                if (clean != trimmedVal) warnings.emplace_back("Invalid LogLevel sanitized.");
                 parsed.logLevel = clean;
             } else {
                 warnings.emplace_back("Unknown key '" + key + "' in [" + currentSection + "]; ignored.");
@@ -2023,6 +2023,7 @@ struct MinimalVkSwapchainCreateInfoKHR {
     MinimalVkExtent2D imageExtent;
 };
 static_assert(offsetof(MinimalVkSwapchainCreateInfoKHR, sType) == 0, "ABI drift");
+static_assert(offsetof(MinimalVkSwapchainCreateInfoKHR, imageExtent) == (sizeof(void*) == 8 ? 44 : 28), "ABI drift: imageExtent offset");
 static_assert(sizeof(MinimalVkSwapchainCreateInfoKHR) >= sizeof(uint32_t) + sizeof(void*) + sizeof(uint32_t) + sizeof(uint64_t), "ABI drift");
 
 struct MinimalVkPresentInfoKHR {
@@ -2149,11 +2150,18 @@ int Hooked_vkCreateSwapchainKHR(void* device, const void* pCreateInfo, const voi
     if (result == 0) { // VK_SUCCESS
         uint32_t w = 0, h = 0;
         if (pCreateInfo) {
-            MinimalVkSwapchainCreateInfoKHR info{};
-            std::memcpy(&info, pCreateInfo, sizeof(info));
-            w = info.imageExtent.width;
-            h = info.imageExtent.height;
-            if (w > 16384 || h > 16384) { w = 0; h = 0; } // untrusted: let engine ignore
+            uint32_t sType = 0;
+            std::memcpy(&sType, pCreateInfo, sizeof(sType));
+            constexpr uint32_t kVkStructureTypeSwapchainCreateInfoKHR = 1000001000;
+            if (sType == kVkStructureTypeSwapchainCreateInfoKHR) {
+                MinimalVkSwapchainCreateInfoKHR info{};
+                std::memcpy(&info, pCreateInfo, sizeof(info));
+                w = info.imageExtent.width;
+                h = info.imageExtent.height;
+                if (w > 16384 || h > 16384) { w = 0; h = 0; } // untrusted: let engine ignore
+            } else {
+                CBR_LOG_WARN("vkCreateSwapchainKHR: unexpected sType (%u), skipping extent extraction.", sType);
+            }
         }
         try { CBREngine::Get().OnSwapchainRecreated(w, h); } catch (...) {}
     }
@@ -2303,6 +2311,9 @@ void JitterManager::Initialize(uint32_t targetWidth, uint32_t targetHeight) {
 void JitterManager::Update(uint32_t frameIndex) {
     // JitterScale is intentionally ignored: 2x MSAA checkerboard coverage
     // requires exactly one full-resolution pixel shift. See config warning.
+    const auto config = ConfigManager::Get().GetConfig();
+    const float dir = (config.jitterDirection < 0) ? -1.0f : 1.0f;
+
     std::lock_guard<std::mutex> lock(m_mutex);
     m_previousJitter = m_currentJitter;
 
@@ -2310,9 +2321,7 @@ void JitterManager::Update(uint32_t frameIndex) {
     // Even frames are unjittered (samples land on pixel centres).
     // Odd frames are shifted horizontally by exactly one full-resolution pixel (shiftDirection * pixelWidth),
     // giving 100% 4-quadrant geometric coverage across two frames with standard 2x MSAA sample locations.
-    const auto& config = ConfigManager::Get().GetConfig();
     const float pixelWidth = 1.0f / static_cast<float>(m_targetWidth);
-    const float dir = (config.jitterDirection < 0) ? -1.0f : 1.0f;
 
     if (frameIndex & 1u) {
         m_currentJitter.x = dir * pixelWidth;
@@ -2491,7 +2500,9 @@ void Logger::Log(LogLevel level, const std::string& message) {
 
     if (m_initialized && m_logFile.is_open()) {
         m_logFile << formatted;
-        m_logFile.flush();
+        if (level >= LogLevel::Warning) {
+            m_logFile.flush();
+        }
     } else if (!m_initialized && !m_disabled) {
         if (m_pending.size() < kMaxPendingMessages) {
             m_pending.push_back(formatted);
@@ -2665,8 +2676,8 @@ void RenderTargetManager::Initialize(uint32_t width, uint32_t height) {
         std::unique_lock<std::shared_mutex> lock(m_mutex);
         m_dims = dims;
         m_totalAllocatedVramBytes.store(total);
+        m_initialized.store(true);
     }
-    m_initialized = true;
 
     CBR_LOG_INFO("RenderTargetManager initialized for target: %ux%u", width, height);
     CBR_LOG_INFO("Quarter-Resolution 2x MSAA Buffer size: %ux%u", dims.quarterWidth, dims.quarterHeight);
@@ -2676,8 +2687,11 @@ void RenderTargetManager::Initialize(uint32_t width, uint32_t height) {
 }
 
 void RenderTargetManager::Shutdown() {
-    m_initialized = false;
-    m_totalAllocatedVramBytes.store(0);
+    {
+        std::unique_lock<std::shared_mutex> lock(m_mutex);
+        m_initialized.store(false);
+        m_totalAllocatedVramBytes.store(0);
+    }
     CBR_LOG_INFO("RenderTargetManager shut down.");
 }
 
@@ -2882,12 +2896,12 @@ layout(push_constant) uniform CBRConstants {
     float u_HistoryWeight;          // Temporal blend weight (default: 0.90)
     uint  u_DebugView;              // 0=Normal, 1=Mask, 2=Disocclusion, 3=Motion, 4=Raw
     uint  u_EnableColorClamping;    // 1 = True, 0 = False
-    float u_MipLodBias;             // Texture LOD bias (-0.5)
+    float u_MipLodBias;             // Texture LOD bias (-1.0f: compensates for quarter-res 2x MSAA, see CHECKERBOARD.md)
     uint  u_ColorSpace;             // 0 = YCoCg clamp, 1 = RGB clamp
     uint  u_EnableSpatialFallback;  // 1 = cross-bilateral fallback, 0 = use raw current sample
     vec2  u_JitterDelta;            // Subpixel projection jitter delta (jc - jp)
-        uint      u_EnableMotionDilation;  // 1 = closest-depth motion dilation over the active 3x3 neighbours
-    float     u_JitterCompensation;    // Multiplier on u_JitterDelta (default 0: whole-pixel jitter is absorbed by the mapping)
+    uint  u_EnableMotionDilation;   // 1 = closest-depth motion dilation over the active 3x3 neighbours
+    float u_JitterCompensation;    // Multiplier on u_JitterDelta (default 0: whole-pixel jitter is absorbed by the mapping)
     int       u_ShiftDirection;        // Odd-frame sampling-grid shift: +1 / -1 (include/cbr/checkerboard_mapping.h)
     uint      u_DepthMode;             // 0 = Standard (0 near .. 1 far), 1 = Reversed (1 near .. 0 far)
     float     u_DepthNear;             // Camera near plane
@@ -3002,8 +3016,8 @@ void main() {
     CbrSample self = MapPixelToSample(pixelCoord, frameParity);
     bool isCurrentSampleActive = self.isActive;
     vec3 currentColor = vec3(0.0); // valid only for active pixels
-    float currentDepth;            // raw device depth (what gets written to the history depth target)
-    float currentLinear;           // linear depth used by the occlusion test
+    float currentDepth = 0.0;            // raw device depth (what gets written to the history depth target)
+    float currentLinear = 0.0;           // linear depth used by the occlusion test
 
     // The 4 cardinal neighbours of a reconstructed pixel are always natively shaded (mirrored at borders).
     ivec2 cardinalCoord[4] = ivec2[](ivec2(0), ivec2(0), ivec2(0), ivec2(0));
@@ -3017,18 +3031,32 @@ void main() {
         // No native sample here: estimate depth from the cardinal neighbours (Intel "CSO": average LINEAR depth).
         float sumRaw = 0.0;
         float sumLin = 0.0;
+        float validCount = 0.0;
         for (int i = 0; i < 4; ++i) {
             ivec2 c = pixelCoord + kCardinal[i];
             if (!InBounds(c, targetSize)) {
                 c = pixelCoord - kCardinal[i]; // mirror at the screen border
             }
+            if (!InBounds(c, targetSize)) {
+                c = pixelCoord;
+            }
             cardinalCoord[i] = c;
             cardinalDepth[i] = FetchDepth(MapPixelToSample(c, frameParity));
-            sumRaw += cardinalDepth[i];
-            sumLin += LinearizeDepth(cardinalDepth[i]);
+            float raw = cardinalDepth[i];
+            float lin = LinearizeDepth(raw);
+            if (!isnan(raw) && !isinf(raw) && !isnan(lin) && !isinf(lin)) {
+                sumRaw += raw;
+                sumLin += lin;
+                validCount += 1.0;
+            }
         }
-        currentDepth = sumRaw * 0.25;
-        currentLinear = sumLin * 0.25;
+        if (validCount > 0.0) {
+            currentDepth = sumRaw / validCount;
+            currentLinear = sumLin / validCount;
+        } else {
+            currentDepth = (pc.u_DepthMode == 1u) ? 0.0 : 1.0;
+            currentLinear = 1000.0;
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -3197,8 +3225,8 @@ void main() {
                 finalColor = accumColor / accumWeight;
                 spatialDepth = accumDepth / accumWeight;
             } else {
-                finalColor = FetchColor(MapPixelToSample(cardinalCoord[0], frameParity));
-                spatialDepth = cardinalDepth[0];
+                finalColor = isCurrentSampleActive ? currentColor : FetchColor(MapPixelToSample(cardinalCoord[0], frameParity));
+                spatialDepth = isCurrentSampleActive ? currentDepth : cardinalDepth[0];
             }
         }
     }
@@ -3245,6 +3273,9 @@ void main() {
     if (!isCurrentSampleActive) {
         outDepth = isDisoccluded ? spatialDepth : previousDepth;
     }
+    if (isnan(outDepth) || isinf(outDepth)) {
+        outDepth = (pc.u_DepthMode == 1u) ? 0.0 : 1.0;
+    }
     imageStore(u_OutputDepth, pixelCoord, vec4(outDepth, 0.0, 0.0, 0.0));
 }
 ```
@@ -3257,7 +3288,7 @@ void main() {
 /**
  * RDR2 Checkerboard Rendering Mod (CBR) - Quad-Based Reconstruction Compute Shader
  * Architecture: 1 Quad (2x2 = 4 pixels) per thread, 8x8x1 workgroup (256 pixels/group).
- * Saves 44% dispatch time through increased cache locality (CHECKERBOARD.md: 1 Pixel per thread or 1 Quad per Thread).
+ * Improves texture cache hit rate through 2x2 quad spatial locality (CHECKERBOARD.md: 1 Quad per Thread).
  * Target: Vulkan SPIR-V
  * Author & Co-Owner: Shreyas Pawar
  */
@@ -3382,8 +3413,8 @@ void ResolvePixel(ivec2 pixelCoord, ivec2 targetSize, uint frameParity) {
     CbrSample self = MapPixelToSample(pixelCoord, frameParity);
     bool isCurrentSampleActive = self.isActive;
     vec3 currentColor = vec3(0.0);
-    float currentDepth;
-    float currentLinear;
+    float currentDepth = 0.0;
+    float currentLinear = 0.0;
 
     ivec2 cardinalCoord[4] = ivec2[](ivec2(0), ivec2(0), ivec2(0), ivec2(0));
     float cardinalDepth[4] = float[](0.0, 0.0, 0.0, 0.0);
@@ -3395,16 +3426,28 @@ void ResolvePixel(ivec2 pixelCoord, ivec2 targetSize, uint frameParity) {
     } else {
         float sumRaw = 0.0;
         float sumLin = 0.0;
+        float validCount = 0.0;
         for (int i = 0; i < 4; ++i) {
             ivec2 c = pixelCoord + kCardinal[i];
             if (!InBounds(c, targetSize)) c = pixelCoord - kCardinal[i];
+            if (!InBounds(c, targetSize)) c = pixelCoord;
             cardinalCoord[i] = c;
             cardinalDepth[i] = FetchDepth(MapPixelToSample(c, frameParity));
-            sumRaw += cardinalDepth[i];
-            sumLin += LinearizeDepth(cardinalDepth[i]);
+            float raw = cardinalDepth[i];
+            float lin = LinearizeDepth(raw);
+            if (!isnan(raw) && !isinf(raw) && !isnan(lin) && !isinf(lin)) {
+                sumRaw += raw;
+                sumLin += lin;
+                validCount += 1.0;
+            }
         }
-        currentDepth = sumRaw * 0.25;
-        currentLinear = sumLin * 0.25;
+        if (validCount > 0.0) {
+            currentDepth = sumRaw / validCount;
+            currentLinear = sumLin / validCount;
+        } else {
+            currentDepth = (pc.u_DepthMode == 1u) ? 0.0 : 1.0;
+            currentLinear = 1000.0;
+        }
     }
 
     ivec2 motionCoord = pixelCoord;
@@ -3528,8 +3571,8 @@ void ResolvePixel(ivec2 pixelCoord, ivec2 targetSize, uint frameParity) {
                 finalColor = accumColor / accumWeight;
                 spatialDepth = accumDepth / accumWeight;
             } else {
-                finalColor = FetchColor(MapPixelToSample(cardinalCoord[0], frameParity));
-                spatialDepth = cardinalDepth[0];
+                finalColor = isCurrentSampleActive ? currentColor : FetchColor(MapPixelToSample(cardinalCoord[0], frameParity));
+                spatialDepth = isCurrentSampleActive ? currentDepth : cardinalDepth[0];
             }
         }
     }
@@ -3540,11 +3583,32 @@ void ResolvePixel(ivec2 pixelCoord, ivec2 targetSize, uint frameParity) {
         finalColor = isCurrentSampleActive ? currentColor : FetchColor(MapPixelToSample(cardinalCoord[0], frameParity));
     }
 
+    // Debug visualization modes
+    if (pc.u_DebugView == 1u) {
+        finalColor = isCurrentSampleActive ? vec3(1.0, 1.0, 1.0) : vec3(0.05, 0.05, 0.05);
+    } else if (pc.u_DebugView == 2u) {
+        finalColor = isDisoccluded ? vec3(1.0, 0.1, 0.1) : vec3(0.1, 0.9, 0.1);
+    } else if (pc.u_DebugView == 3u) {
+        finalColor = vec3(abs(velocity) * 50.0, 0.0);
+    } else if (pc.u_DebugView == 4u) {
+        finalColor = isCurrentSampleActive ? currentColor : FetchColor(MapPixelToSample(cardinalCoord[0], frameParity));
+    } else if (pc.u_DebugView == 5u) {
+        finalColor = isCurrentSampleActive ? currentColor : (
+            FetchColor(MapPixelToSample(cardinalCoord[0], frameParity)) +
+            FetchColor(MapPixelToSample(cardinalCoord[1], frameParity)) +
+            FetchColor(MapPixelToSample(cardinalCoord[2], frameParity)) +
+            FetchColor(MapPixelToSample(cardinalCoord[3], frameParity))
+        ) * 0.25;
+    }
+
     imageStore(u_OutputImage, pixelCoord, vec4(finalColor, 1.0));
 
     float outDepth = currentDepth;
     if (!isCurrentSampleActive) {
         outDepth = isDisoccluded ? spatialDepth : previousDepth;
+    }
+    if (isnan(outDepth) || isinf(outDepth)) {
+        outDepth = (pc.u_DepthMode == 1u) ? 0.0 : 1.0;
     }
     imageStore(u_OutputDepth, pixelCoord, vec4(outDepth, 0.0, 0.0, 0.0));
 }
@@ -3732,8 +3796,8 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     CbrSample self = MapPixelToSample(pixelCoord, frameParity);
     bool isCurrentSampleActive = self.isActive;
     float3 currentColor = float3(0.0f, 0.0f, 0.0f); // valid only for active pixels
-    float currentDepth;                              // raw device depth (written to the history depth target)
-    float currentLinear;                             // linear depth used by the occlusion test
+    float currentDepth = 0.0f;                              // raw device depth (written to the history depth target)
+    float currentLinear = 0.0f;                             // linear depth used by the occlusion test
 
     // The 4 cardinal neighbours of a reconstructed pixel are always natively shaded (mirrored at borders).
     int2 cardinalCoord[4] = { int2(0, 0), int2(0, 0), int2(0, 0), int2(0, 0) };
@@ -3747,18 +3811,32 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
         // No native sample here: estimate depth from the cardinal neighbours (Intel "CSO": average LINEAR depth).
         float sumRaw = 0.0f;
         float sumLin = 0.0f;
+        float validCount = 0.0f;
         for (int i = 0; i < 4; ++i) {
             int2 c = pixelCoord + kCardinal[i];
             if (!InBounds(c, targetSize)) {
                 c = pixelCoord - kCardinal[i]; // mirror at the screen border
             }
+            if (!InBounds(c, targetSize)) {
+                c = pixelCoord;
+            }
             cardinalCoord[i] = c;
             cardinalDepth[i] = FetchDepth(MapPixelToSample(c, frameParity));
-            sumRaw += cardinalDepth[i];
-            sumLin += LinearizeDepth(cardinalDepth[i]);
+            float raw = cardinalDepth[i];
+            float lin = LinearizeDepth(raw);
+            if (!isnan(raw) && !isinf(raw) && !isnan(lin) && !isinf(lin)) {
+                sumRaw += raw;
+                sumLin += lin;
+                validCount += 1.0f;
+            }
         }
-        currentDepth = sumRaw * 0.25f;
-        currentLinear = sumLin * 0.25f;
+        if (validCount > 0.0f) {
+            currentDepth = sumRaw / validCount;
+            currentLinear = sumLin / validCount;
+        } else {
+            currentDepth = (g_DepthMode == 1u) ? 0.0f : 1.0f;
+            currentLinear = 1000.0f;
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -3924,8 +4002,8 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
                 finalColor = accumColor / accumWeight;
                 spatialDepth = accumDepth / accumWeight;
             } else {
-                finalColor = FetchColor(MapPixelToSample(cardinalCoord[0], frameParity));
-                spatialDepth = cardinalDepth[0];
+                finalColor = isCurrentSampleActive ? currentColor : FetchColor(MapPixelToSample(cardinalCoord[0], frameParity));
+                spatialDepth = isCurrentSampleActive ? currentDepth : cardinalDepth[0];
             }
         }
     }
@@ -3968,6 +4046,9 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     float outDepth = currentDepth;
     if (!isCurrentSampleActive) {
         outDepth = isDisoccluded ? spatialDepth : previousDepth;
+    }
+    if (isnan(outDepth) || isinf(outDepth)) {
+        outDepth = (g_DepthMode == 1u) ? 0.0f : 1.0f;
     }
     g_OutputDepth[pixelCoord] = outDepth;
 }
