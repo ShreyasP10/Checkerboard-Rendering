@@ -634,8 +634,29 @@ inline constexpr SampleOffset kStandardSample2x[2] = {
     { 0.25f, 0.25f }
 };
 
+// -----------------------------------------------------------------------------------------------
+// MUTUAL EXCLUSIVITY NOTICE (Sampling Strategies):
+// There are two valid, mutually exclusive strategies to alternate checkerboard coverage:
+//
+// Strategy A (Standard Jittering / Viewport Shift):
+//   Keep standard 2x MSAA sample locations (kStandardSample2x) in both frames and shift the
+//   viewport horizontally by 0.5 quarter-res pixel (1.0 target pixel) on odd frames via
+//   GetQuarterViewportShiftX() or JitterManager. MapPixelToSample() implements this mapping.
+//   Coverage: 0 uncovered, 0 doubly covered.
+//
+// Strategy B (Hardware Programmable Sample Locations - VK_EXT_sample_locations):
+//   Keep the viewport stationary (0 shift) and alternate the 2x MSAA sample locations dynamically
+//   per frame (kCheckerboardSampleLocations): frame 0 uses (0.75, 0.75)/(0.25, 0.25), frame 1
+//   uses (0.25, 0.75)/(0.75, 0.25).
+//   Coverage: 0 uncovered, 0 doubly covered.
+//
+// CRITICAL: Strategy A and Strategy B MUST NEVER be combined simultaneously!
+// Applying both simultaneously inverts the diagonal relationship and causes sample cancellation:
+// 50% of pixels become doubly covered and 50% remain unshaded. Choose EITHER Strategy A OR Strategy B.
+// -----------------------------------------------------------------------------------------------
+
 // Alternating frame sample positions when using VK_EXT_sample_locations programmable
-// hardware sample locations (CHECKERBOARD.md: Sample Location Jittering):
+// hardware sample locations (Strategy B: Sample Location Jittering):
 // Frame 0: sample 0 = (0.75, 0.75), sample 1 = (0.25, 0.25)
 // Frame 1: sample 0 = (0.25, 0.75), sample 1 = (0.75, 0.25)
 inline constexpr SampleOffset kCheckerboardSampleLocations[2][2] = {
@@ -645,7 +666,7 @@ inline constexpr SampleOffset kCheckerboardSampleLocations[2][2] = {
 
 // In a quarter-resolution (half-width, half-height) 2x MSAA target, shifting the viewport
 // horizontally by half a pixel corresponds to exactly 1.0 target-resolution pixel shift across frames
-// (CHECKERBOARD.md: Viewport Half-Pixel Offset):
+// (Strategy A: Viewport Half-Pixel Offset):
 constexpr float GetQuarterViewportShiftX(uint32_t frameIndex, int32_t shiftDir = 1) noexcept {
     return (frameIndex & 1u) ? (0.5f * static_cast<float>(shiftDir >= 0 ? 1 : -1)) : 0.0f;
 }
@@ -2061,7 +2082,10 @@ struct MinimalVkViewport {
     float maxDepth;
 };
 
-// Configures alternating 2x MSAA sample locations per frame according to CHECKERBOARD.md
+// Configures alternating 2x MSAA sample locations per frame according to CHECKERBOARD.md (Strategy B).
+// NOTE (MUTUAL EXCLUSIVITY): When using programmable sample locations (Strategy B),
+// viewport horizontal jittering (Strategy A via GetQuarterViewportShiftX) MUST be disabled (set to 0).
+// Combining sample location alternation with viewport shifting cancels out checkerboard coverage.
 inline void ConfigureCheckerboardSampleLocations(uint32_t frameIndex,
                                                 MinimalVkSampleLocationsInfoEXT& outInfo,
                                                 MinimalVkSampleLocationEXT outLocations[2]) {
@@ -3052,11 +3076,6 @@ void main() {
     bool historyUVBad = velocityBad || isinf(historyUV.x) || isnan(historyUV.x)
         || isinf(historyUV.y) || isnan(historyUV.y);
 
-    // Motion indicator (CHECKERBOARD.md: Utilizing Velocity).
-    // Stationary pixels (dot < 1e-8) pass through directly from current and previous checkerboard
-    // without variance clipping blur, preserving 100% native subpixel sharpness.
-    bool isMoving = dot(velocity, velocity) > 1e-8;
-
     // -------------------------------------------------------------------------
     // 3. Disocclusion & depth delta testing (scale-invariant: relative difference of LINEAR depth)
     // -------------------------------------------------------------------------
@@ -3086,10 +3105,10 @@ void main() {
     // -------------------------------------------------------------------------
     // 4. Neighbourhood statistics & variance clipping (anti-ghosting)
     // Uses ONLY natively shaded neighbours: samples that do not exist this frame must not enter the statistics.
-    // When stationary (isMoving == false), ghosting is physically impossible: variance clipping is bypassed
-    // to preserve pin-sharp subpixel details on static geometry and text (CHECKERBOARD.md).
+    // Clamping is active on both static and moving geometry: static geometry subject to dynamic lighting,
+    // shadows, or moving occluders still requires history bounding to prevent temporal ghosting.
     // -------------------------------------------------------------------------
-    if (!isDisoccluded && pc.u_EnableColorClamping != 0u && isMoving) {
+    if (!isDisoccluded && pc.u_EnableColorClamping != 0u) {
         vec3 colorMin = vec3(1e6);
         vec3 colorMax = vec3(-1e6);
         vec3 m1 = vec3(0.0);
@@ -3146,11 +3165,10 @@ void main() {
     float spatialDepth = currentDepth; // depth estimate for reconstructed pixels (fallback path)
 
     if (isCurrentSampleActive) {
-        if (!isDisoccluded && historyColor.a > 0.0 && isMoving) {
-            // Blend with history for temporal stability on moving pixels
+        if (!isDisoccluded && historyColor.a > 0.0) {
+            // Blend with history for temporal stability
             finalColor = mix(currentColor, historyColor.rgb, pc.u_HistoryWeight);
         } else {
-            // Static scene / newly revealed: 100% native current sample pass-through (CHECKERBOARD.md)
             finalColor = currentColor;
         }
     } else {
@@ -3420,8 +3438,6 @@ void ResolvePixel(ivec2 pixelCoord, ivec2 targetSize, uint frameParity) {
     bool historyUVBad = velocityBad || isinf(historyUV.x) || isnan(historyUV.x)
         || isinf(historyUV.y) || isnan(historyUV.y);
 
-    bool isMoving = dot(velocity, velocity) > 1e-8;
-
     bool isDisoccluded = false;
     vec4 historyColor = vec4(0.0);
     float previousDepth = currentDepth;
@@ -3442,7 +3458,7 @@ void ResolvePixel(ivec2 pixelCoord, ivec2 targetSize, uint frameParity) {
         }
     }
 
-    if (!isDisoccluded && pc.u_EnableColorClamping != 0u && isMoving) {
+    if (!isDisoccluded && pc.u_EnableColorClamping != 0u) {
         vec3 colorMin = vec3(1e6);
         vec3 colorMax = vec3(-1e6);
         vec3 m1 = vec3(0.0);
@@ -3486,7 +3502,7 @@ void ResolvePixel(ivec2 pixelCoord, ivec2 targetSize, uint frameParity) {
     float spatialDepth = currentDepth;
 
     if (isCurrentSampleActive) {
-        if (!isDisoccluded && historyColor.a > 0.0 && isMoving) {
+        if (!isDisoccluded && historyColor.a > 0.0) {
             finalColor = mix(currentColor, historyColor.rgb, pc.u_HistoryWeight);
         } else {
             finalColor = currentColor;
@@ -3789,11 +3805,6 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     bool historyUVBad = velocityBad || isinf(historyUV.x) || isnan(historyUV.x)
         || isinf(historyUV.y) || isnan(historyUV.y);
 
-    // Motion indicator (CHECKERBOARD.md: Utilizing Velocity).
-    // Stationary pixels (dot < 1e-8) pass through directly from current and previous checkerboard
-    // without variance clipping blur, preserving 100% native subpixel sharpness.
-    bool isMoving = dot(velocity, velocity) > 1e-8f;
-
     // -------------------------------------------------------------------------
     // 3. Disocclusion & depth delta test (scale-invariant: relative difference of LINEAR depth)
     // -------------------------------------------------------------------------
@@ -3821,10 +3832,10 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     // -------------------------------------------------------------------------
     // 4. Neighbourhood statistics & variance clipping (anti-ghosting)
     // Uses ONLY natively shaded neighbours: samples that do not exist this frame must not enter the statistics.
-    // When stationary (isMoving == false), ghosting is physically impossible: variance clipping is bypassed
-    // to preserve pin-sharp subpixel details on static geometry and text (CHECKERBOARD.md).
+    // Clamping is active on both static and moving geometry: static geometry subject to dynamic lighting,
+    // shadows, or moving occluders still requires history bounding to prevent temporal ghosting.
     // -------------------------------------------------------------------------
-    if (!isDisoccluded && g_EnableColorClamping != 0u && isMoving) {
+    if (!isDisoccluded && g_EnableColorClamping != 0u) {
         float3 colorMin = float3(1e6f, 1e6f, 1e6f);
         float3 colorMax = float3(-1e6f, -1e6f, -1e6f);
         float3 m1 = float3(0.0f, 0.0f, 0.0f);
@@ -3881,11 +3892,10 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     float spatialDepth = currentDepth; // depth estimate for reconstructed pixels (fallback path)
 
     if (isCurrentSampleActive) {
-        if (!isDisoccluded && historyColor.a > 0.0f && isMoving) {
-            // Blend with history for temporal stability on moving pixels
+        if (!isDisoccluded && historyColor.a > 0.0f) {
+            // Blend with history for temporal stability
             finalColor = lerp(currentColor, historyColor.rgb, g_HistoryWeight);
         } else {
-            // Static scene / newly revealed: 100% native current sample pass-through (CHECKERBOARD.md)
             finalColor = currentColor;
         }
     } else {

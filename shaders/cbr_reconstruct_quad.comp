@@ -184,8 +184,6 @@ void ResolvePixel(ivec2 pixelCoord, ivec2 targetSize, uint frameParity) {
     bool historyUVBad = velocityBad || isinf(historyUV.x) || isnan(historyUV.x)
         || isinf(historyUV.y) || isnan(historyUV.y);
 
-    bool isMoving = dot(velocity, velocity) > 1e-8;
-
     bool isDisoccluded = false;
     vec4 historyColor = vec4(0.0);
     float previousDepth = currentDepth;
@@ -206,7 +204,7 @@ void ResolvePixel(ivec2 pixelCoord, ivec2 targetSize, uint frameParity) {
         }
     }
 
-    if (!isDisoccluded && pc.u_EnableColorClamping != 0u && isMoving) {
+    if (!isDisoccluded && pc.u_EnableColorClamping != 0u) {
         vec3 colorMin = vec3(1e6);
         vec3 colorMax = vec3(-1e6);
         vec3 m1 = vec3(0.0);
@@ -250,7 +248,7 @@ void ResolvePixel(ivec2 pixelCoord, ivec2 targetSize, uint frameParity) {
     float spatialDepth = currentDepth;
 
     if (isCurrentSampleActive) {
-        if (!isDisoccluded && historyColor.a > 0.0 && isMoving) {
+        if (!isDisoccluded && historyColor.a > 0.0) {
             finalColor = mix(currentColor, historyColor.rgb, pc.u_HistoryWeight);
         } else {
             finalColor = currentColor;

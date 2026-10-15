@@ -106,7 +106,10 @@ struct MinimalVkViewport {
     float maxDepth;
 };
 
-// Configures alternating 2x MSAA sample locations per frame according to CHECKERBOARD.md
+// Configures alternating 2x MSAA sample locations per frame according to CHECKERBOARD.md (Strategy B).
+// NOTE (MUTUAL EXCLUSIVITY): When using programmable sample locations (Strategy B),
+// viewport horizontal jittering (Strategy A via GetQuarterViewportShiftX) MUST be disabled (set to 0).
+// Combining sample location alternation with viewport shifting cancels out checkerboard coverage.
 inline void ConfigureCheckerboardSampleLocations(uint32_t frameIndex,
                                                 MinimalVkSampleLocationsInfoEXT& outInfo,
                                                 MinimalVkSampleLocationEXT outLocations[2]) {

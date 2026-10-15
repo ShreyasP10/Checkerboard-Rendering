@@ -41,8 +41,29 @@ inline constexpr SampleOffset kStandardSample2x[2] = {
     { 0.25f, 0.25f }
 };
 
+// -----------------------------------------------------------------------------------------------
+// MUTUAL EXCLUSIVITY NOTICE (Sampling Strategies):
+// There are two valid, mutually exclusive strategies to alternate checkerboard coverage:
+//
+// Strategy A (Standard Jittering / Viewport Shift):
+//   Keep standard 2x MSAA sample locations (kStandardSample2x) in both frames and shift the
+//   viewport horizontally by 0.5 quarter-res pixel (1.0 target pixel) on odd frames via
+//   GetQuarterViewportShiftX() or JitterManager. MapPixelToSample() implements this mapping.
+//   Coverage: 0 uncovered, 0 doubly covered.
+//
+// Strategy B (Hardware Programmable Sample Locations - VK_EXT_sample_locations):
+//   Keep the viewport stationary (0 shift) and alternate the 2x MSAA sample locations dynamically
+//   per frame (kCheckerboardSampleLocations): frame 0 uses (0.75, 0.75)/(0.25, 0.25), frame 1
+//   uses (0.25, 0.75)/(0.75, 0.25).
+//   Coverage: 0 uncovered, 0 doubly covered.
+//
+// CRITICAL: Strategy A and Strategy B MUST NEVER be combined simultaneously!
+// Applying both simultaneously inverts the diagonal relationship and causes sample cancellation:
+// 50% of pixels become doubly covered and 50% remain unshaded. Choose EITHER Strategy A OR Strategy B.
+// -----------------------------------------------------------------------------------------------
+
 // Alternating frame sample positions when using VK_EXT_sample_locations programmable
-// hardware sample locations (CHECKERBOARD.md: Sample Location Jittering):
+// hardware sample locations (Strategy B: Sample Location Jittering):
 // Frame 0: sample 0 = (0.75, 0.75), sample 1 = (0.25, 0.25)
 // Frame 1: sample 0 = (0.25, 0.75), sample 1 = (0.75, 0.25)
 inline constexpr SampleOffset kCheckerboardSampleLocations[2][2] = {
@@ -52,7 +73,7 @@ inline constexpr SampleOffset kCheckerboardSampleLocations[2][2] = {
 
 // In a quarter-resolution (half-width, half-height) 2x MSAA target, shifting the viewport
 // horizontally by half a pixel corresponds to exactly 1.0 target-resolution pixel shift across frames
-// (CHECKERBOARD.md: Viewport Half-Pixel Offset):
+// (Strategy A: Viewport Half-Pixel Offset):
 constexpr float GetQuarterViewportShiftX(uint32_t frameIndex, int32_t shiftDir = 1) noexcept {
     return (frameIndex & 1u) ? (0.5f * static_cast<float>(shiftDir >= 0 ? 1 : -1)) : 0.0f;
 }

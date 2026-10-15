@@ -238,11 +238,6 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     bool historyUVBad = velocityBad || isinf(historyUV.x) || isnan(historyUV.x)
         || isinf(historyUV.y) || isnan(historyUV.y);
 
-    // Motion indicator (CHECKERBOARD.md: Utilizing Velocity).
-    // Stationary pixels (dot < 1e-8) pass through directly from current and previous checkerboard
-    // without variance clipping blur, preserving 100% native subpixel sharpness.
-    bool isMoving = dot(velocity, velocity) > 1e-8f;
-
     // -------------------------------------------------------------------------
     // 3. Disocclusion & depth delta test (scale-invariant: relative difference of LINEAR depth)
     // -------------------------------------------------------------------------
@@ -270,10 +265,10 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     // -------------------------------------------------------------------------
     // 4. Neighbourhood statistics & variance clipping (anti-ghosting)
     // Uses ONLY natively shaded neighbours: samples that do not exist this frame must not enter the statistics.
-    // When stationary (isMoving == false), ghosting is physically impossible: variance clipping is bypassed
-    // to preserve pin-sharp subpixel details on static geometry and text (CHECKERBOARD.md).
+    // Clamping is active on both static and moving geometry: static geometry subject to dynamic lighting,
+    // shadows, or moving occluders still requires history bounding to prevent temporal ghosting.
     // -------------------------------------------------------------------------
-    if (!isDisoccluded && g_EnableColorClamping != 0u && isMoving) {
+    if (!isDisoccluded && g_EnableColorClamping != 0u) {
         float3 colorMin = float3(1e6f, 1e6f, 1e6f);
         float3 colorMax = float3(-1e6f, -1e6f, -1e6f);
         float3 m1 = float3(0.0f, 0.0f, 0.0f);
@@ -330,11 +325,10 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     float spatialDepth = currentDepth; // depth estimate for reconstructed pixels (fallback path)
 
     if (isCurrentSampleActive) {
-        if (!isDisoccluded && historyColor.a > 0.0f && isMoving) {
-            // Blend with history for temporal stability on moving pixels
+        if (!isDisoccluded && historyColor.a > 0.0f) {
+            // Blend with history for temporal stability
             finalColor = lerp(currentColor, historyColor.rgb, g_HistoryWeight);
         } else {
-            // Static scene / newly revealed: 100% native current sample pass-through (CHECKERBOARD.md)
             finalColor = currentColor;
         }
     } else {

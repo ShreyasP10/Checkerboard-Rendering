@@ -459,7 +459,12 @@ glslangValidator -D -e CSMain -S comp -V shaders/cbr_reconstruct.hlsl -o /tmp/h.
 * **Loader safety:** `DllMain` now checks the module-pin result and documents that `CreateThread` under the loader lock is a fallback only (preferred path is the loader calling `CBR_PluginInit`).
 * **Reliability:** `DispatchVulkan/DX12` warn once (not every frame) when uninitialized; `RenderTargetManager::Initialize` rejects `< 2` / `> 16384`; `BuildPushConstants` guards zero extents; Vulkan mini-structs use `memcpy` copy-out with bounds checks.
 * **CI:** least-privilege permissions (read-only except release job), SHA-pinned actions (`checkout` v4.2.2, `upload-artifact` v4.6.2, `gh-release` v2.6.2), HLSL gated by the glslang front-end plus `dxc` when installed (failures no longer swallowed).
-* **Source of truth:** the standalone tree is canonical. Canonical limits live in `include/cbr/config.h`; `include/cbr/limits.h` is an optional backwards-compat shim (not referenced by `CMakeLists.txt`). `CODEBASE.md` is a point-in-time snapshot and may lag the tree.
+* **Source of truth & Codebase Synchronization:** Centralized limits and numerical bounds into `include/cbr/limits.h` (tracked in `CMakeLists.txt` `CBR_HEADERS`). `CODEBASE.md` is guaranteed 100% synchronized with all 35 tracked repository files.
+* **Architectural Innovations (CHECKERBOARD.md):**
+  * **MIP LOD Bias:** Configured `-1.0f` bias (`kMipLodBias`) to restore native high-frequency surface detail on half-resolution checkerboard renders.
+  * **Quad-based Reconstruction Shader:** Added `shaders/cbr_reconstruct_quad.comp` using GL_KHR_shader_subgroup_quad for efficient intra-quad cross-lane communication.
+  * **Temporal Anti-Aliasing & Color Clamping:** Restored unconditional neighborhood variance clipping and history blending across static and dynamic geometry to prevent shadow ghosting and static pattern crawl.
+  * **Sampling Strategy Mutual Exclusivity:** Formally documented and isolated Strategy A (viewport shift jittering) and Strategy B (programmable hardware sample locations via `VK_EXT_sample_locations`), preventing destructive sample cancellation.
 
 ---
 
