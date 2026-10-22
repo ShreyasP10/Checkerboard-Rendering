@@ -65,6 +65,13 @@ void Logger::SetMinLevel(LogLevel level) {
     m_minLevel = level;
 }
 
+void Logger::Flush() {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (m_initialized && m_logFile.is_open()) {
+        m_logFile.flush();
+    }
+}
+
 void Logger::Log(LogLevel level, const std::string& message) {
     std::lock_guard<std::mutex> lock(m_mutex);
 
@@ -100,9 +107,7 @@ void Logger::Log(LogLevel level, const std::string& message) {
 
     if (m_initialized && m_logFile.is_open()) {
         m_logFile << formatted;
-        if (level >= LogLevel::Warning) {
-            m_logFile.flush();
-        }
+        m_logFile.flush(); // Immediate flush ensures zero loss on game crash
     } else if (!m_initialized && !m_disabled) {
         if (m_pending.size() < kMaxPendingMessages) {
             m_pending.push_back(formatted);

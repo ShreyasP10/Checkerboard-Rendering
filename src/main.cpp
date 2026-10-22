@@ -1,4 +1,5 @@
 #include "cbr/cbr_engine.h"
+#include "cbr/crash_handler.h"
 #include "cbr/logger.h"
 
 #if defined(_WIN32)
@@ -83,12 +84,16 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID /*lpRese
                 &pinned)) {
                 // Pin failed: do not spawn a thread that would execute unmapped code.
                 // Record directory anyway so a later CBR_PluginInit can still initialize.
-                cbr::CBREngine::Get().SetModuleDirectory(GetModuleDirectoryPath(hModule));
+                const auto modDir = GetModuleDirectoryPath(hModule);
+                cbr::CBREngine::Get().SetModuleDirectory(modDir);
+                cbr::CrashHandler::Get().Install(modDir);
                 break;
             }
 
             // Record module directory for resolving cbr.ini and cbr.log relative to the DLL
-            cbr::CBREngine::Get().SetModuleDirectory(GetModuleDirectoryPath(hModule));
+            const auto modDir = GetModuleDirectoryPath(hModule);
+            cbr::CBREngine::Get().SetModuleDirectory(modDir);
+            cbr::CrashHandler::Get().Install(modDir);
 
             // NOTE: CreateThread under the loader lock can deadlock. This is tolerated
             // only because the module is pinned and the thread touches just CBR singletons.

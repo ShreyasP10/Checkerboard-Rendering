@@ -32,6 +32,7 @@ set(CBR_HEADERS
     ${CBR_INCLUDE_DIR}/cbr/cbr_engine.h
     ${CBR_INCLUDE_DIR}/cbr/checkerboard_mapping.h
     ${CBR_INCLUDE_DIR}/cbr/config.h
+    ${CBR_INCLUDE_DIR}/cbr/crash_handler.h
     ${CBR_INCLUDE_DIR}/cbr/depth_convention.h
     ${CBR_INCLUDE_DIR}/cbr/hooks.h
     ${CBR_INCLUDE_DIR}/cbr/jitter_manager.h
@@ -47,6 +48,7 @@ set(CBR_SOURCES
     ${CBR_SOURCE_DIR}/main.cpp
     ${CBR_SOURCE_DIR}/cbr_engine.cpp
     ${CBR_SOURCE_DIR}/config.cpp
+    ${CBR_SOURCE_DIR}/crash_handler.cpp
     ${CBR_SOURCE_DIR}/hooks.cpp
     ${CBR_SOURCE_DIR}/hooks_vulkan.cpp
     ${CBR_SOURCE_DIR}/hooks_dx12.cpp
@@ -161,7 +163,6 @@ if(CBR_DXC)
         COMMENT "Compiling cbr_reconstruct.hlsl to DXIL"
         VERBATIM)
     list(APPEND CBR_COMPILED_SHADERS ${CMAKE_CURRENT_BINARY_DIR}/shaders/$<CONFIG>/cbr_reconstruct.dxil)
-    list(APPEND CBR_COMPILED_SHADERS ${CMAKE_BINARY_DIR}/shaders/cbr_reconstruct.dxil)
 else()
     message(STATUS "dxc not found: DXIL shaders will not be built.")
 endif()
@@ -179,6 +180,7 @@ if(CBR_BUILD_TESTS)
     enable_testing()
     set(CBR_TEST_CORE_SOURCES
         ${CBR_SOURCE_DIR}/config.cpp
+        ${CBR_SOURCE_DIR}/crash_handler.cpp
         ${CBR_SOURCE_DIR}/logger.cpp
         ${CBR_SOURCE_DIR}/jitter_manager.cpp
         ${CBR_SOURCE_DIR}/render_target_manager.cpp

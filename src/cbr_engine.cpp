@@ -6,6 +6,7 @@
 #include "cbr/reconstruction_pass.h"
 #include "cbr/ui_overlay.h"
 #include "cbr/hooks.h"
+#include "cbr/crash_handler.h"
 #include <cctype>
 #include <string>
 
@@ -47,6 +48,8 @@ bool CBREngine::Initialize() {
         }
 
         CBR_LOG_INFO("Initializing CBREngine for Red Dead Redemption 2...");
+        CrashHandler::Get().Install(baseDir);
+        CrashHandler::Get().LogSystemTelemetry();
         m_enabled.store(config.enabled);
         GraphicsApi api = config.preferredApi;
         if (api == GraphicsApi::Auto) {
@@ -88,6 +91,15 @@ bool CBREngine::Initialize() {
 bool CBREngine::TryInstallHooks() {
     if (!m_initialized.load()) return false;
 
+    static uint32_t s_pollAttempt = 0;
+    ++s_pollAttempt;
+    if (s_pollAttempt == 1 || s_pollAttempt % 40 == 0) {
+        CBR_LOG_INFO("Polling graphics hooks (attempt %u)... Vulkan loaded: %s, D3D12 loaded: %s",
+            s_pollAttempt,
+            HookManager::Get().DetectLoadedApi() == GraphicsApi::Vulkan ? "Yes" : "No",
+            HookManager::Get().DetectLoadedApi() == GraphicsApi::D3D12 ? "Yes" : "No");
+    }
+
     std::lock_guard<std::mutex> lock(m_hookMutex);
 
     // Auto mode with no runtime at init time: pick whichever runtime has appeared since
@@ -114,6 +126,7 @@ void CBREngine::Shutdown(bool isProcessExit) {
 
     if (!isProcessExit) {
         CBR_LOG_INFO("Shutting down CBREngine cleanly...");
+        CrashHandler::Get().Uninstall();
         HookManager::Get().Shutdown();
         ReconstructionPass::Get().Shutdown();
         UIOverlay::Get().Shutdown();
@@ -150,6 +163,11 @@ void CBREngine::OnScenePassEnd(void* cmdBufferOrContext) {
     // if the hook ever fires from more than one thread.
     if (m_lastDispatchedFrame.exchange(currentFrame) == currentFrame) return;
 
+    static std::atomic<bool> s_firstPassLogged{ false };
+    if (!s_firstPassLogged.exchange(true)) {
+        CBR_LOG_INFO("First scene render pass intercepted mid-frame (%p). Ready for reconstruction dispatch.", cmdBufferOrContext);
+    }
+
     // Mid-frame dispatch: reconstruct immediately when the quarter-resolution 2x MSAA
     // geometry pass finishes, before post-processing and UI are composited.
     if (m_activeApi.load() == GraphicsApi::Vulkan) {
@@ -179,7 +197,9 @@ void CBREngine::OnPostPresent(void* presentTarget) {
     // dispatch exactly once for the new frame). Do not gate this on m_enabled.
     // The first present seen after start-up / swapchain recreation defines the main target.
     void* expected = nullptr;
-    m_mainPresentTarget.compare_exchange_strong(expected, presentTarget);
+    if (m_mainPresentTarget.compare_exchange_strong(expected, presentTarget)) {
+        CBR_LOG_INFO("Primary swapchain present target acquired: %p. Active output established.", presentTarget);
+    }
 
     if (m_mainPresentTarget.load() == presentTarget) {
         m_frameIndex.fetch_add(1);

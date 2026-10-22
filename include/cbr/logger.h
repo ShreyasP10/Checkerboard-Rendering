@@ -31,6 +31,7 @@ public:
     void Shutdown();
 
     void SetMinLevel(LogLevel level);
+    void Flush();
 
     void Log(LogLevel level, const std::string& message);
 
@@ -80,3 +81,4 @@ private:
 #define CBR_LOG_INFO(fmt, ...)  cbr::Logger::Get().LogFmt(cbr::LogLevel::Info, fmt, ##__VA_ARGS__)
 #define CBR_LOG_WARN(fmt, ...)  cbr::Logger::Get().LogFmt(cbr::LogLevel::Warning, fmt, ##__VA_ARGS__)
 #define CBR_LOG_ERROR(fmt, ...) cbr::Logger::Get().LogFmt(cbr::LogLevel::Error, fmt, ##__VA_ARGS__)
+#define CBR_LOG_FLUSH()         cbr::Logger::Get().Flush()
