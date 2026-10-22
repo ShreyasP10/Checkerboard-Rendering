@@ -5,6 +5,7 @@
 [![API: Vulkan / DX12](https://img.shields.io/badge/API-Vulkan%20%7C%20DX12-green.svg)]()
 [![Target: GTX 1070 Ti](https://img.shields.io/badge/Target-GTX%201070%20Ti%20(Pascal)-orange.svg)]()
 [![License: MIT](https://img.shields.io/badge/License-MIT-lightgrey.svg)](LICENSE)
+[![Latest Release](https://img.shields.io/github/v/release/ShreyasP10/Checkerboard-Rendering?color=blue&label=Release)](https://github.com/ShreyasP10/Checkerboard-Rendering/releases)
 
 A community-driven graphics modification implementing **Checkerboard Rendering (CBR)** in *Red Dead Redemption 2* (PC), bringing the PlayStation 4 Pro's hardware-assisted temporal reconstruction technique to modern PC GPUs—specifically targeting the **NVIDIA GeForce GTX 1070 Ti** and Pascal-architecture hardware.
 
@@ -13,7 +14,26 @@ A community-driven graphics modification implementing **Checkerboard Rendering (
 
 ---
 
+## 📥 Download & Releases
+
+Pre-built binaries and complete all-in-one packages are available for download:
+
+| Package / Asset | Description | Direct Download |
+|---|---|:---:|
+| **`rdr2-cbr-v0.1.0-alpha.zip`** | **Complete Package** (`rdr2-cbr.asi`, `cbr.ini`, `shaders/`, `README_INSTALL.txt`) | [⬇️ **Download ZIP**](https://github.com/ShreyasP10/Checkerboard-Rendering/releases/download/v0.1.0-alpha/rdr2-cbr-v0.1.0-alpha.zip) |
+| **`rdr2-cbr.asi`** | Native ASI Mod Plugin binary only | [⬇️ **Download .asi**](https://github.com/ShreyasP10/Checkerboard-Rendering/releases/download/v0.1.0-alpha/rdr2-cbr.asi) |
+| **`cbr.ini`** | Default configuration settings file | [⬇️ **Download .ini**](https://github.com/ShreyasP10/Checkerboard-Rendering/releases/download/v0.1.0-alpha/cbr.ini) |
+| **Release Page** | Changelogs, checksums (`SHA256SUMS.txt`), and all tagged releases | [🔗 **View GitHub Releases**](https://github.com/ShreyasP10/Checkerboard-Rendering/releases) |
+
+### ⚡ Quick 3-Step Setup
+1. **Download:** Grab [`rdr2-cbr-v0.1.0-alpha.zip`](https://github.com/ShreyasP10/Checkerboard-Rendering/releases/download/v0.1.0-alpha/rdr2-cbr-v0.1.0-alpha.zip) from the table above.
+2. **Install ASI Loader:** Ensure `dinput8.dll` (from official [Script Hook RDR2](https://www.dev-c.com/rdr2/scripthookrdr2/)) is placed in your main game directory (`where RDR2.exe is located`).
+3. **Deploy Mod:** Extract `rdr2-cbr.asi` and `cbr.ini` directly into your main game directory next to `RDR2.exe`. Run the game in **Story Mode**!
+
+---
+
 ## 📖 Table of Contents
+- [Download & Releases](#-download--releases)
 - [About](#about)
 - [Why Checkerboard Rendering? (CBR vs. DLSS / FSR)](#why-checkerboard-rendering-cbr-vs-dlss--fsr)
 - [How It Works](#how-it-works)

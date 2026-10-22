@@ -6,10 +6,11 @@ permissions:
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [ main, master, feature/cbr-pipeline ]
     tags:
       - 'v*'
   pull_request:
+  workflow_dispatch:
 
 jobs:
   tests-and-shaders:
@@ -52,7 +53,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y g++-mingw-w64-x86-64
       - name: Syntax check Windows sources
         run: |
-          for f in logger config jitter_manager render_target_manager reconstruction_pass ui_overlay cbr_engine hooks main hooks_vulkan hooks_dx12; do
+          for f in logger config jitter_manager render_target_manager reconstruction_pass ui_overlay cbr_engine hooks main hooks_vulkan hooks_dx12 crash_handler; do
             echo "Checking src/$f.cpp..."
             x86_64-w64-mingw32-g++ -std=c++20 -fsyntax-only -Wall -Wextra -Wpedantic -Wshadow -Iinclude src/$f.cpp
           done
@@ -67,15 +68,45 @@ jobs:
         run: cmake -S . -B build -A x64
       - name: Build (Release, MSVC hardening flags)
         run: cmake --build build --config Release
-      - name: SHA-256 of release artifacts
+      - name: Package Release Archive
         shell: pwsh
         run: |
-          Get-FileHash build/bin/Release/rdr2-cbr.asi -Algorithm SHA256 |
-            ForEach-Object { "$($_.Hash)  rdr2-cbr.asi" } | Tee-Object build/bin/Release/SHA256SUMS.txt
+          $releaseDir = "build/bin/Release"
+          New-Item -ItemType Directory -Force -Path "package/rdr2-cbr"
+          Copy-Item "$releaseDir/rdr2-cbr.asi" -Destination "package/rdr2-cbr/"
+          Copy-Item "cbr.ini" -Destination "package/rdr2-cbr/"
+          Copy-Item -Recurse "shaders" -Destination "package/rdr2-cbr/"
+          @"
+================================================================================
+RDR2 Checkerboard Rendering Mod (CBR)
+Maintainer: Shreyas Pawar
+================================================================================
+
+INSTALLATION:
+1. Ensure you have an ASI Loader installed:
+   Place 'dinput8.dll' (from ScriptHookRDR2 or an ASI Loader) into your
+   main Red Dead Redemption 2 folder (where RDR2.exe is located).
+2. Copy 'rdr2-cbr.asi' and 'cbr.ini' into the main RDR2 folder:
+   Red Dead Redemption 2/
+   ├── RDR2.exe
+   ├── dinput8.dll
+   ├── rdr2-cbr.asi
+   └── cbr.ini
+3. (Optional) Adjust display resolution in cbr.ini (default 3840x2160 for 4K).
+4. Launch Red Dead Redemption 2 in Story Mode (Single Player).
+   Check 'cbr.log' in the game folder to verify mod initialization.
+
+NOTE: Do NOT launch Red Dead Online with modified game files or ASI loaders.
+================================================================================
+"@ | Out-File -Encoding utf8 "package/rdr2-cbr/README_INSTALL.txt"
+          Compress-Archive -Path "package/rdr2-cbr/*" -DestinationPath "$releaseDir/rdr2-cbr-release.zip" -Force
+          Get-FileHash "$releaseDir/rdr2-cbr-release.zip", "$releaseDir/rdr2-cbr.asi" -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash)  $($_.Path | Split-Path -Leaf)" } | Tee-Object "$releaseDir/SHA256SUMS.txt"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: rdr2-cbr-release
           path: |
+            build/bin/Release/rdr2-cbr-release.zip
             build/bin/Release/rdr2-cbr.asi
             build/bin/Release/cbr.ini
             build/bin/Release/SHA256SUMS.txt
@@ -85,6 +116,7 @@ jobs:
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: |
+            build/bin/Release/rdr2-cbr-release.zip
             build/bin/Release/rdr2-cbr.asi
             build/bin/Release/cbr.ini
             build/bin/Release/SHA256SUMS.txt
