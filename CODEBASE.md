@@ -2819,9 +2819,9 @@ bool HookManager::InstallDX12Hooks() {
 }
 
 void HookManager::UninstallDX12Hooks() {
-    if (m_dx12Hooked) {
+    if (m_dx12Hooked.load()) {
         CBR_LOG_INFO("Restoring original DXGI/DX12 VMT hooks.");
-        m_dx12Hooked = false;
+        m_dx12Hooked.store(false);
     }
 }
 
