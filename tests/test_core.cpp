@@ -446,6 +446,45 @@ static void TestProjectionJitterSign() {
     ConfigManager::Get().Modify([](CBRConfig& c) { c.projectionJitterSign = 1; });
 }
 
+static void TestReconstructionPass(const fs::path& dir) {
+    auto& pass = ReconstructionPass::Get();
+
+    // 1. Loading non-existent or invalid SPIR-V files returns empty
+    CHECK(pass.LoadSpvFile(dir / "missing.spv").empty());
+
+    const fs::path invalidSpv = dir / "bad_magic.spv";
+    uint32_t badWords[4] = { 0x12345678, 1, 2, 3 };
+    {
+        std::ofstream out(invalidSpv, std::ios::binary);
+        out.write(reinterpret_cast<const char*>(badWords), sizeof(badWords));
+    }
+    CHECK(pass.LoadSpvFile(invalidSpv).empty());
+
+    // 2. Loading valid SPIR-V buffer starting with magic 0x07230203
+    const fs::path validSpv = dir / "valid_dummy.spv";
+    uint32_t goodWords[4] = { 0x07230203, 0x00010000, 0, 0 };
+    {
+        std::ofstream out(validSpv, std::ios::binary);
+        out.write(reinterpret_cast<const char*>(goodWords), sizeof(goodWords));
+    }
+    const auto loaded = pass.LoadSpvFile(validSpv);
+    CHECK(loaded.size() == 4);
+    CHECK(loaded[0] == 0x07230203);
+
+    // 3. Deferred Vulkan initialization with null device (mock test environment)
+    pass.Shutdown();
+    CHECK(!pass.IsInitialized());
+    CHECK(pass.InitializeVulkan(nullptr, nullptr));
+    CHECK(pass.IsInitialized());
+
+    // 4. Safe dispatch with null command buffer
+    pass.DispatchVulkan(nullptr, 0);
+
+    // 5. Clean shutdown
+    pass.Shutdown();
+    CHECK(!pass.IsInitialized());
+}
+
 int main() {
     const fs::path dir = fs::temp_directory_path() / "cbr_tests";
     fs::create_directories(dir);
@@ -460,6 +499,7 @@ int main() {
     TestRenderTargets();
     TestPushConstantLayout();
     TestProjectionJitterSign();
+    TestReconstructionPass(dir);
 
     fs::remove_all(dir);
     if (g_failures == 0) {

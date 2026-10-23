@@ -2,7 +2,9 @@
 
 #include <atomic>
 #include <cstdint>
+#include <filesystem>
 #include <string>
+#include <vector>
 
 namespace cbr {
 
@@ -46,14 +48,30 @@ public:
     void DispatchVulkan(void* vkCommandBuffer, uint32_t frameIndex);
     void DispatchDX12(void* d3d12GraphicsCommandList, uint32_t frameIndex);
 
+    void SetShaderDirectory(const std::filesystem::path& dir) { m_shaderDir = dir; }
+    const std::filesystem::path& GetShaderDirectory() const { return m_shaderDir; }
+
     bool IsInitialized() const { return m_initialized.load(); }
+    void* GetPipeline() const { return m_pipeline; }
+    void* GetPipelineLayout() const { return m_pipelineLayout; }
+
+    // Helper to load SPIR-V bytecode from disk
+    static std::vector<uint32_t> LoadSpvFile(const std::filesystem::path& path);
 
 private:
     ReconstructionPass() = default;
     ~ReconstructionPass() = default;
 
-    std::atomic<bool> m_initialized{ false };
-    std::atomic<bool> m_isVulkan{ true };
+    bool CreateVulkanPipeline();
+    void DestroyVulkanPipeline();
+
+    std::atomic<bool>     m_initialized{ false };
+    std::atomic<bool>     m_isVulkan{ true };
+    std::filesystem::path m_shaderDir;
+
+    void* m_device{ nullptr };
+    void* m_pipeline{ nullptr };
+    void* m_pipelineLayout{ nullptr };
 };
 
 } // namespace cbr

@@ -29,17 +29,23 @@ jobs:
           ctest --test-dir build-tests --output-on-failure
       - name: Validate shaders
         run: |
-          glslangValidator -V shaders/cbr_reconstruct.comp -o /tmp/r.spv
-          glslangValidator -V shaders/cbr_reconstruct_quad.comp -o /tmp/q.spv
-          glslangValidator -V shaders/cbr_resolve_simple.comp -o /tmp/s.spv
+          mkdir -p shaders/spv
+          glslangValidator -V shaders/cbr_reconstruct.comp -o shaders/spv/cbr_reconstruct.spv
+          glslangValidator -V shaders/cbr_reconstruct_quad.comp -o shaders/spv/cbr_reconstruct_quad.spv
+          glslangValidator -V shaders/cbr_resolve_simple.comp -o shaders/spv/cbr_resolve_simple.spv
           # glslang's HLSL front-end is a syntax/semantics gate that runs everywhere.
-          glslangValidator -D -e CSMain -S comp -V shaders/cbr_reconstruct.hlsl -o /tmp/h.spv
+          glslangValidator -D -e CSMain -S comp -V shaders/cbr_reconstruct.hlsl -o shaders/spv/cbr_reconstruct_hlsl.spv
           # The production HLSL compiler (dxc) is used when installed. Never swallow its failures.
           if command -v dxc >/dev/null 2>&1; then
-            dxc -T cs_6_0 -E CSMain shaders/cbr_reconstruct.hlsl -Fo /tmp/r.dxil
+            dxc -T cs_6_0 -E CSMain shaders/cbr_reconstruct.hlsl -Fo shaders/spv/cbr_reconstruct.dxil
           else
             echo "::warning::dxc not installed on this runner; HLSL verified with the glslang front-end only"
           fi
+      - name: Upload compiled SPIR-V shaders
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: compiled-spirv
+          path: shaders/spv/
       - name: Verify shader mapping equivalence
         run: python3 tests/check_shader_mapping.py
 
@@ -59,11 +65,17 @@ jobs:
           done
 
   windows-release:
+    needs: [tests-and-shaders]
     runs-on: windows-latest
     permissions:
       contents: write # needed only here to publish GitHub Releases
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Download compiled SPIR-V shaders
+        uses: actions/download-artifact@cc203385981b70ca67e1cc392babf9cc229d5806 # v4.1.9
+        with:
+          name: compiled-spirv
+          path: shaders
       - name: Configure
         run: cmake -S . -B build -A x64
       - name: Build (Release, MSVC hardening flags)

@@ -1,11 +1,86 @@
 #include "cbr/reconstruction_pass.h"
 #include <atomic>
+#include <cstring>
+#include <fstream>
+#include <vector>
+#include "cbr/cbr_engine.h"
 #include "cbr/config.h"
 #include "cbr/depth_convention.h"
 #include "cbr/jitter_manager.h"
 #include "cbr/render_target_manager.h"
 #include "cbr/logger.h"
-#include <chrono>
+
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+
+namespace {
+
+constexpr uint32_t kVkStructureTypeShaderModuleCreateInfo = 16;
+constexpr uint32_t kVkStructureTypePipelineShaderStageCreateInfo = 18;
+constexpr uint32_t kVkStructureTypeComputePipelineCreateInfo = 29;
+constexpr uint32_t kVkStructureTypePipelineLayoutCreateInfo = 30;
+
+constexpr uint32_t kVkShaderStageComputeBit = 0x00000020;
+constexpr uint32_t kVkPipelineBindPointCompute = 1;
+
+struct MinimalVkShaderModuleCreateInfo {
+    uint32_t        sType;
+    const void*     pNext;
+    uint32_t        flags;
+    size_t          codeSize;
+    const uint32_t* pCode;
+};
+
+struct MinimalVkPushConstantRange {
+    uint32_t stageFlags;
+    uint32_t offset;
+    uint32_t size;
+};
+
+struct MinimalVkPipelineLayoutCreateInfo {
+    uint32_t                          sType;
+    const void*                       pNext;
+    uint32_t                          flags;
+    uint32_t                          setLayoutCount;
+    const void*                       pSetLayouts;
+    uint32_t                          pushConstantRangeCount;
+    const MinimalVkPushConstantRange* pPushConstantRanges;
+};
+
+struct MinimalVkPipelineShaderStageCreateInfo {
+    uint32_t    sType;
+    const void* pNext;
+    uint32_t    flags;
+    uint32_t    stage;
+    void*       module;
+    const char* pName;
+    const void* pSpecializationInfo;
+};
+
+struct MinimalVkComputePipelineCreateInfo {
+    uint32_t                               sType;
+    const void*                            pNext;
+    uint32_t                               flags;
+    MinimalVkPipelineShaderStageCreateInfo stage;
+    void*                                  layout;
+    void*                                  basePipelineHandle;
+    int32_t                                basePipelineIndex;
+};
+
+typedef void* (*PFN_vkGetDeviceProcAddr)(void* device, const char* pName);
+typedef int   (*PFN_vkCreateShaderModule)(void* device, const MinimalVkShaderModuleCreateInfo* pCreateInfo, const void* pAllocator, void** pShaderModule);
+typedef void  (*PFN_vkDestroyShaderModule)(void* device, void* shaderModule, const void* pAllocator);
+typedef int   (*PFN_vkCreatePipelineLayout)(void* device, const MinimalVkPipelineLayoutCreateInfo* pCreateInfo, const void* pAllocator, void** pPipelineLayout);
+typedef void  (*PFN_vkDestroyPipelineLayout)(void* device, void* pipelineLayout, const void* pAllocator);
+typedef int   (*PFN_vkCreateComputePipelines)(void* device, void* pipelineCache, uint32_t createInfoCount, const MinimalVkComputePipelineCreateInfo* pCreateInfos, const void* pAllocator, void** pPipelines);
+typedef void  (*PFN_vkDestroyPipeline)(void* device, void* pipeline, const void* pAllocator);
+typedef void  (*PFN_vkCmdBindPipeline)(void* commandBuffer, uint32_t pipelineBindPoint, void* pipeline);
+typedef void  (*PFN_vkCmdPushConstants)(void* commandBuffer, void* layout, uint32_t stageFlags, uint32_t offset, uint32_t size, const void* pValues);
+typedef void  (*PFN_vkCmdDispatch)(void* commandBuffer, uint32_t groupCountX, uint32_t groupCountY, uint32_t groupCountZ);
+
+} // namespace
+#endif
 
 namespace cbr {
 
@@ -14,11 +89,195 @@ ReconstructionPass& ReconstructionPass::Get() {
     return instance;
 }
 
-bool ReconstructionPass::InitializeVulkan(void* /*vkDevice*/, void* /*vkPhysicalDevice*/) {
-    m_isVulkan.store(true);
-    m_initialized.store(true);
-    CBR_LOG_INFO("ReconstructionPass initialized for Vulkan API pipeline.");
+std::vector<uint32_t> ReconstructionPass::LoadSpvFile(const std::filesystem::path& path) {
+    std::ifstream file(path, std::ios::ate | std::ios::binary);
+    if (!file.is_open()) {
+        return {};
+    }
+    const auto fileSize = file.tellg();
+    if (fileSize <= 0 || (fileSize % static_cast<std::streamoff>(sizeof(uint32_t))) != 0) {
+        return {};
+    }
+    const size_t wordCount = static_cast<size_t>(fileSize) / sizeof(uint32_t);
+    std::vector<uint32_t> buffer(wordCount);
+    file.seekg(0);
+    file.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(fileSize));
+    if (buffer.empty() || buffer[0] != 0x07230203) {
+        CBR_LOG_ERROR("Invalid SPIR-V magic header (0x%08X) in %s", buffer.empty() ? 0 : buffer[0], path.string().c_str());
+        return {};
+    }
+    return buffer;
+}
+
+bool ReconstructionPass::CreateVulkanPipeline() {
+#if defined(_WIN32)
+    if (!m_device) {
+        return false;
+    }
+
+    HMODULE vulkanModule = GetModuleHandleA("vulkan-1.dll");
+    if (!vulkanModule) {
+        CBR_LOG_WARN("CreateVulkanPipeline: vulkan-1.dll not loaded.");
+        return false;
+    }
+
+    auto pfnGetDeviceProcAddr = reinterpret_cast<PFN_vkGetDeviceProcAddr>(GetProcAddress(vulkanModule, "vkGetDeviceProcAddr"));
+    auto resolveDeviceFunc = [&](const char* name) -> void* {
+        if (pfnGetDeviceProcAddr && m_device) {
+            void* p = pfnGetDeviceProcAddr(m_device, name);
+            if (p) return p;
+        }
+        return reinterpret_cast<void*>(GetProcAddress(vulkanModule, name));
+    };
+
+    auto pfnCreateShaderModule = reinterpret_cast<PFN_vkCreateShaderModule>(resolveDeviceFunc("vkCreateShaderModule"));
+    auto pfnDestroyShaderModule = reinterpret_cast<PFN_vkDestroyShaderModule>(resolveDeviceFunc("vkDestroyShaderModule"));
+    auto pfnCreatePipelineLayout = reinterpret_cast<PFN_vkCreatePipelineLayout>(resolveDeviceFunc("vkCreatePipelineLayout"));
+    auto pfnCreateComputePipelines = reinterpret_cast<PFN_vkCreateComputePipelines>(resolveDeviceFunc("vkCreateComputePipelines"));
+
+    if (!pfnCreateShaderModule || !pfnDestroyShaderModule || !pfnCreatePipelineLayout || !pfnCreateComputePipelines) {
+        CBR_LOG_ERROR("CreateVulkanPipeline: failed to resolve core Vulkan pipeline functions.");
+        return false;
+    }
+
+    // Candidate search locations for cbr_reconstruct.spv
+    std::vector<std::filesystem::path> searchPaths;
+    if (!m_shaderDir.empty()) {
+        searchPaths.push_back(m_shaderDir / "cbr_reconstruct.spv");
+    }
+    const auto modDir = CBREngine::Get().GetModuleDirectory();
+    if (!modDir.empty()) {
+        searchPaths.push_back(modDir / "shaders" / "cbr_reconstruct.spv");
+        searchPaths.push_back(modDir / "cbr_reconstruct.spv");
+    }
+    searchPaths.push_back("shaders/cbr_reconstruct.spv");
+    searchPaths.push_back("package/rdr2-cbr/shaders/cbr_reconstruct.spv");
+
+    std::vector<uint32_t> spvBytecode;
+    std::filesystem::path resolvedShaderPath;
+    for (const auto& path : searchPaths) {
+        std::error_code ec;
+        if (std::filesystem::exists(path, ec)) {
+            spvBytecode = LoadSpvFile(path);
+            if (!spvBytecode.empty()) {
+                resolvedShaderPath = path;
+                break;
+            }
+        }
+    }
+
+    if (spvBytecode.empty()) {
+        static std::atomic<bool> s_loggedMissing{ false };
+        if (!s_loggedMissing.exchange(true)) {
+            CBR_LOG_WARN("SPIR-V shader binary 'cbr_reconstruct.spv' not found in search paths. Pipeline compilation deferred.");
+        }
+        return true;
+    }
+
+    CBR_LOG_INFO("Loading CBR SPIR-V shader from: %s (%zu bytes)", resolvedShaderPath.string().c_str(), spvBytecode.size() * sizeof(uint32_t));
+
+    MinimalVkShaderModuleCreateInfo smInfo{};
+    smInfo.sType = kVkStructureTypeShaderModuleCreateInfo;
+    smInfo.codeSize = spvBytecode.size() * sizeof(uint32_t);
+    smInfo.pCode = spvBytecode.data();
+
+    void* shaderModule = nullptr;
+    int res = pfnCreateShaderModule(m_device, &smInfo, nullptr, &shaderModule);
+    if (res != 0 || !shaderModule) {
+        CBR_LOG_ERROR("vkCreateShaderModule failed with error code: %d", res);
+        return false;
+    }
+
+    MinimalVkPushConstantRange pcRange{};
+    pcRange.stageFlags = kVkShaderStageComputeBit;
+    pcRange.offset = 0;
+    pcRange.size = sizeof(ReconstructionPushConstants);
+
+    MinimalVkPipelineLayoutCreateInfo layoutInfo{};
+    layoutInfo.sType = kVkStructureTypePipelineLayoutCreateInfo;
+    layoutInfo.setLayoutCount = 0;
+    layoutInfo.pSetLayouts = nullptr;
+    layoutInfo.pushConstantRangeCount = 1;
+    layoutInfo.pPushConstantRanges = &pcRange;
+
+    void* pipelineLayout = nullptr;
+    res = pfnCreatePipelineLayout(m_device, &layoutInfo, nullptr, &pipelineLayout);
+    if (res != 0 || !pipelineLayout) {
+        CBR_LOG_ERROR("vkCreatePipelineLayout failed with error code: %d", res);
+        pfnDestroyShaderModule(m_device, shaderModule, nullptr);
+        return false;
+    }
+
+    MinimalVkComputePipelineCreateInfo pipelineInfo{};
+    pipelineInfo.sType = kVkStructureTypeComputePipelineCreateInfo;
+    pipelineInfo.stage.sType = kVkStructureTypePipelineShaderStageCreateInfo;
+    pipelineInfo.stage.stage = kVkShaderStageComputeBit;
+    pipelineInfo.stage.module = shaderModule;
+    pipelineInfo.stage.pName = "main";
+    pipelineInfo.layout = pipelineLayout;
+    pipelineInfo.basePipelineIndex = -1;
+
+    void* pipeline = nullptr;
+    res = pfnCreateComputePipelines(m_device, nullptr, 1, &pipelineInfo, nullptr, &pipeline);
+    pfnDestroyShaderModule(m_device, shaderModule, nullptr);
+
+    if (res != 0 || !pipeline) {
+        CBR_LOG_ERROR("vkCreateComputePipelines failed with error code: %d", res);
+        auto pfnDestroyPipelineLayout = reinterpret_cast<PFN_vkDestroyPipelineLayout>(resolveDeviceFunc("vkDestroyPipelineLayout"));
+        if (pfnDestroyPipelineLayout) pfnDestroyPipelineLayout(m_device, pipelineLayout, nullptr);
+        return false;
+    }
+
+    m_pipeline = pipeline;
+    m_pipelineLayout = pipelineLayout;
+    CBR_LOG_INFO("Vulkan CBR reconstruction compute pipeline created successfully! (Pipeline: %p, Layout: %p)", m_pipeline, m_pipelineLayout);
     return true;
+#else
+    return true;
+#endif
+}
+
+void ReconstructionPass::DestroyVulkanPipeline() {
+#if defined(_WIN32)
+    if (!m_device) return;
+    HMODULE vulkanModule = GetModuleHandleA("vulkan-1.dll");
+    if (!vulkanModule) return;
+
+    auto pfnGetDeviceProcAddr = reinterpret_cast<PFN_vkGetDeviceProcAddr>(GetProcAddress(vulkanModule, "vkGetDeviceProcAddr"));
+    auto resolveDeviceFunc = [&](const char* name) -> void* {
+        if (pfnGetDeviceProcAddr && m_device) {
+            void* p = pfnGetDeviceProcAddr(m_device, name);
+            if (p) return p;
+        }
+        return reinterpret_cast<void*>(GetProcAddress(vulkanModule, name));
+    };
+
+    auto pfnDestroyPipeline = reinterpret_cast<PFN_vkDestroyPipeline>(resolveDeviceFunc("vkDestroyPipeline"));
+    auto pfnDestroyPipelineLayout = reinterpret_cast<PFN_vkDestroyPipelineLayout>(resolveDeviceFunc("vkDestroyPipelineLayout"));
+
+    if (m_pipeline && pfnDestroyPipeline) {
+        pfnDestroyPipeline(m_device, m_pipeline, nullptr);
+        m_pipeline = nullptr;
+    }
+    if (m_pipelineLayout && pfnDestroyPipelineLayout) {
+        pfnDestroyPipelineLayout(m_device, m_pipelineLayout, nullptr);
+        m_pipelineLayout = nullptr;
+    }
+#endif
+}
+
+bool ReconstructionPass::InitializeVulkan(void* vkDevice, void* /*vkPhysicalDevice*/) {
+    m_isVulkan.store(true);
+    if (!vkDevice) {
+        m_initialized.store(true);
+        CBR_LOG_INFO("ReconstructionPass initialized for Vulkan API pipeline (device handle deferred).");
+        return true;
+    }
+
+    m_device = vkDevice;
+    const bool pipelineCreated = CreateVulkanPipeline();
+    m_initialized.store(pipelineCreated);
+    return pipelineCreated;
 }
 
 bool ReconstructionPass::InitializeDX12(void* /*d3d12Device*/) {
@@ -29,8 +288,12 @@ bool ReconstructionPass::InitializeDX12(void* /*d3d12Device*/) {
 }
 
 void ReconstructionPass::Shutdown() {
+    if (m_isVulkan.load()) {
+        DestroyVulkanPipeline();
+    }
+    m_device = nullptr;
     m_initialized.store(false);
-    CBR_LOG_INFO("ReconstructionPass shut down.");
+    CBR_LOG_INFO("ReconstructionPass shut down cleanly.");
 }
 
 ReconstructionPushConstants BuildReconstructionPushConstants(uint32_t frameIndex) {
@@ -65,30 +328,50 @@ ReconstructionPushConstants BuildReconstructionPushConstants(uint32_t frameIndex
     return pc;
 }
 
-void ReconstructionPass::DispatchVulkan(void* /*vkCommandBuffer*/, uint32_t frameIndex) {
-    if (!m_initialized.load()) {
-        static std::atomic<bool> s_warned{ false };   // once only: this runs every frame
-        if (!s_warned.exchange(true)) CBR_LOG_WARN("DispatchVulkan dropped: ReconstructionPass not initialized.");
+void ReconstructionPass::DispatchVulkan(void* vkCommandBuffer, uint32_t frameIndex) {
+    if (!m_initialized.load() || !vkCommandBuffer) {
+        return;
+    }
+
+    if (!m_pipeline || !m_pipelineLayout) {
+        static std::atomic<bool> s_warned{ false };
+        if (!s_warned.exchange(true)) {
+            CBR_LOG_WARN("DispatchVulkan: compute pipeline not loaded; skipping dispatch.");
+        }
+        return;
+    }
+
+#if defined(_WIN32)
+    HMODULE vulkanModule = GetModuleHandleA("vulkan-1.dll");
+    if (!vulkanModule) return;
+
+    auto pfnCmdBindPipeline = reinterpret_cast<PFN_vkCmdBindPipeline>(GetProcAddress(vulkanModule, "vkCmdBindPipeline"));
+    auto pfnCmdPushConstants = reinterpret_cast<PFN_vkCmdPushConstants>(GetProcAddress(vulkanModule, "vkCmdPushConstants"));
+    auto pfnCmdDispatch = reinterpret_cast<PFN_vkCmdDispatch>(GetProcAddress(vulkanModule, "vkCmdDispatch"));
+
+    if (!pfnCmdBindPipeline || !pfnCmdPushConstants || !pfnCmdDispatch) {
         return;
     }
 
     const ReconstructionPushConstants pushConstants = BuildReconstructionPushConstants(frameIndex);
     const auto dims = RenderTargetManager::Get().GetDimensions();
 
-    const uint32_t groupCountX = (dims.fullWidth + 15u) / 16u;
-    const uint32_t groupCountY = (dims.fullHeight + 15u) / 16u;
+    const uint32_t targetW = dims.fullWidth > 0 ? dims.fullWidth : 3840u;
+    const uint32_t targetH = dims.fullHeight > 0 ? dims.fullHeight : 2160u;
+    const uint32_t groupCountX = (targetW + 15u) / 16u;
+    const uint32_t groupCountY = (targetH + 15u) / 16u;
 
-    // In a live Vulkan context, this binds the compute pipeline, pushes `pushConstants`,
-    // and calls vkCmdDispatch(cmdBuffer, groupCountX, groupCountY, 1);
-    // Followed by a memory barrier transitioning the reconstructed image for sampling.
-    (void)pushConstants;
-    (void)groupCountX;
-    (void)groupCountY;
+    pfnCmdBindPipeline(vkCommandBuffer, kVkPipelineBindPointCompute, m_pipeline);
+    pfnCmdPushConstants(vkCommandBuffer, m_pipelineLayout, kVkShaderStageComputeBit, 0, sizeof(pushConstants), &pushConstants);
+    pfnCmdDispatch(vkCommandBuffer, groupCountX, groupCountY, 1);
+#else
+    (void)frameIndex;
+#endif
 }
 
 void ReconstructionPass::DispatchDX12(void* /*d3d12GraphicsCommandList*/, uint32_t frameIndex) {
     if (!m_initialized.load()) {
-        static std::atomic<bool> s_warned{ false };   // once only: this runs every frame
+        static std::atomic<bool> s_warned{ false };
         if (!s_warned.exchange(true)) CBR_LOG_WARN("DispatchDX12 dropped: ReconstructionPass not initialized.");
         return;
     }
@@ -99,8 +382,6 @@ void ReconstructionPass::DispatchDX12(void* /*d3d12GraphicsCommandList*/, uint32
     const uint32_t groupCountX = (dims.fullWidth + 15u) / 16u;
     const uint32_t groupCountY = (dims.fullHeight + 15u) / 16u;
 
-    // In DX12, sets root signature, pipeline state, descriptor tables, uploads `pushConstants`
-    // as root constants, and calls Dispatch(groupCountX, groupCountY, 1)
     (void)pushConstants;
     (void)groupCountX;
     (void)groupCountY;

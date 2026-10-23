@@ -5,6 +5,7 @@
 #include <MinHook.h>
 #include "cbr/cbr_engine.h"
 #include "cbr/logger.h"
+#include "cbr/reconstruction_pass.h"
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -194,6 +195,7 @@ int Hooked_vkCreateSwapchainKHR(void* device, const void* pCreateInfo, const voi
             }
         }
         try { CBREngine::Get().OnSwapchainRecreated(w, h); } catch (...) {}
+        try { ReconstructionPass::Get().InitializeVulkan(device, nullptr); } catch (...) {}
     }
     return result;
 }
