@@ -183,6 +183,9 @@ Checkerboard-Rendering/
 
 Detailed specifications are maintained in the [`docs/`](docs/) directory:
 
+- 🚀 [**Next Implementation Phase Plan (Master Plan)**](nextImplementationPhase.md) – Active roadmap for Phase 2: Runtime Graphics Detours, Swapchain Interception & Frame Pipeline Execution.
+- 📋 [**In-Game Test Report (RDR2 v1.0.1491.50)**](docs/IN_GAME_TEST_REPORT_v1491.md) – Validation report from live test on GTX 1070 Ti, Alexander Blade loader, and LML.
+- 🛠️ [**Vulkan Hooking Guide**](docs/VULKAN_HOOKING_GUIDE.md) – Technical implementation guide for Vulkan loader detours, barrier management, and compute pass dispatch.
 - 📄 [**Product Requirements Document (PRD)**](docs/PRD.md) – Problem statement, target personas, KPIs, and scope.
 - 📄 [**System Requirements Document (SRD)**](docs/SRD.md) – Subsystem architecture, external interfaces, and VRAM budget.
 - 📄 [**Software Requirements Specification (SRS)**](docs/SRS.md) – Detailed functional requirements, mathematical formulas, and IEEE 830 standards.

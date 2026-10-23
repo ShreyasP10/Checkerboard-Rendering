@@ -36,26 +36,28 @@ The development roadmap is structured into 8 distinct phases designed to de-risk
   - Memory offset documentation sheet for RDR2 build 1436.28+.
   - RenderDoc frame capture analysis report.
 
-### Phase 1: Hooking Infrastructure & ASI Plugin Framework
+### Phase 1: Hooking Infrastructure & ASI Plugin Framework [✅ VERIFIED IN-GAME]
+- **Status:** **Completed & Validated in RDR2 build 1.0.1491.50** (See [Test Report](file:///c:/Users/Dinesh%20B%20Pawar/OneDrive/Desktop/Checkerboard-Rendering/docs/IN_GAME_TEST_REPORT_v1491.md))
 - **Duration:** 4 Weeks
-- **Objectives:**
-  - Build the ASI DLL entry point with `dinput8` loader compatibility.
-  - Implement MinHook wrapper for Vulkan loader functions (`vkGetInstanceProcAddr`, `vkGetDeviceProcAddr`).
-  - Implement DirectX 12 VMT hooking for `IDXGISwapChain3::Present` and command queues.
-  - Implement thread-safe diagnostic logger (`cbr.log`) and config parser (`cbr.ini`).
-  - Integrate Dear ImGui overlay hooked into the swapchain render pass.
-- **Deliverables:**
-  - Functional `rdr2-cbr.asi` loading into RDR2, logging draw calls, and rendering ImGui overlay without crashing.
+- **Objectives Accomplished:**
+  - Built ASI entry point (`rdr2-cbr.asi`) with Alexander Blade `dinput8` and LML compatibility.
+  - Implemented module pinning to prevent loader lock unloading crashes.
+  - Implemented thread-safe diagnostic logger (`cbr.log`) and configuration parser (`cbr.ini`).
+  - Added full crash handler with automated minidump generation (`cbr_crash_*.dmp`).
+  - Validated 2× MSAA quarter-resolution memory allocation footprint (300.59 MiB at 4K).
+  - Verified graceful fallback protection (mod times out quietly after 60s without crashing host).
 
-### Phase 2: Render Target Interception & Memory Management
+### Phase 2: Active Graphics Detours & Render Target Interception [🔄 ACTIVE FOCUS]
+- **Status:** **In Progress** (See [Next Implementation Phase Plan](file:///c:/Users/Dinesh%20B%20Pawar/OneDrive/Desktop/Checkerboard-Rendering/nextImplementationPhase.md))
 - **Duration:** 3 Weeks
 - **Objectives:**
-  - Intercept creation of full-resolution color and depth buffers in Vulkan/D3D12.
-  - Allocate quarter-resolution 2× MSAA intermediate targets.
-  - Implement custom device-local VRAM sub-allocator for ping-pong history textures.
-  - Verify memory footprint remains strictly under 300 MB.
+  - Transition from stubs to active MinHook detours on `vulkan-1.dll` (`vkQueuePresentKHR`, `vkCreateSwapchainKHR`) and DX12 (`IDXGISwapChain::Present`).
+  - Capture swapchain backbuffers and manage layout transitions (`VK_IMAGE_LAYOUT_PRESENT_SRC_KHR` <-> `VK_IMAGE_LAYOUT_GENERAL`).
+  - Dispatch reconstruction compute shader ([shaders/cbr_reconstruct.comp](file:///c:/Users/Dinesh%20B%20Pawar/OneDrive/Desktop/Checkerboard-Rendering/shaders/cbr_reconstruct.comp)) during `OnPrePresent`.
+  - Downscale RAGE scene render pass to quarter-resolution (1920×1080 2× MSAA).
+  - Inject subpixel camera jitter / sample locations across alternate frames.
 - **Deliverables:**
-  - Active render target redirection layer verified in RenderDoc.
+  - Active Vulkan/DX12 frame interception executing reconstruction compute pass prior to swapchain presentation.
 
 ### Phase 3: Projection Jitter & Quarter-Resolution Rendering
 - **Duration:** 2 Weeks
