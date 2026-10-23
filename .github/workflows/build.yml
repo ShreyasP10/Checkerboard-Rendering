@@ -76,29 +76,30 @@ jobs:
           Copy-Item "$releaseDir/rdr2-cbr.asi" -Destination "package/rdr2-cbr/"
           Copy-Item "cbr.ini" -Destination "package/rdr2-cbr/"
           Copy-Item -Recurse "shaders" -Destination "package/rdr2-cbr/"
-          @"
-================================================================================
-RDR2 Checkerboard Rendering Mod (CBR)
-Maintainer: Shreyas Pawar
-================================================================================
-
-INSTALLATION:
-1. Ensure you have an ASI Loader installed:
-   Place 'dinput8.dll' (from ScriptHookRDR2 or an ASI Loader) into your
-   main Red Dead Redemption 2 folder (where RDR2.exe is located).
-2. Copy 'rdr2-cbr.asi' and 'cbr.ini' into the main RDR2 folder:
-   Red Dead Redemption 2/
-   ├── RDR2.exe
-   ├── dinput8.dll
-   ├── rdr2-cbr.asi
-   └── cbr.ini
-3. (Optional) Adjust display resolution in cbr.ini (default 3840x2160 for 4K).
-4. Launch Red Dead Redemption 2 in Story Mode (Single Player).
-   Check 'cbr.log' in the game folder to verify mod initialization.
-
-NOTE: Do NOT launch Red Dead Online with modified game files or ASI loaders.
-================================================================================
-"@ | Out-File -Encoding utf8 "package/rdr2-cbr/README_INSTALL.txt"
+          $installText = @(
+            "================================================================================",
+            "RDR2 Checkerboard Rendering Mod (CBR)",
+            "Maintainer: Shreyas Pawar",
+            "================================================================================",
+            "",
+            "INSTALLATION:",
+            "1. Ensure you have an ASI Loader installed:",
+            "   Place 'dinput8.dll' (from ScriptHookRDR2 or an ASI Loader) into your",
+            "   main Red Dead Redemption 2 folder (where RDR2.exe is located).",
+            "2. Copy 'rdr2-cbr.asi' and 'cbr.ini' into the main RDR2 folder:",
+            "   Red Dead Redemption 2/",
+            "   ├── RDR2.exe",
+            "   ├── dinput8.dll",
+            "   ├── rdr2-cbr.asi",
+            "   └── cbr.ini",
+            "3. (Optional) Adjust display resolution in cbr.ini (default 3840x2160 for 4K).",
+            "4. Launch Red Dead Redemption 2 in Story Mode (Single Player).",
+            "   Check 'cbr.log' in the game folder to verify mod initialization.",
+            "",
+            "NOTE: Do NOT launch Red Dead Online with modified game files or ASI loaders.",
+            "================================================================================"
+          )
+          $installText | Out-File -Encoding utf8 "package/rdr2-cbr/README_INSTALL.txt"
           Compress-Archive -Path "package/rdr2-cbr/*" -DestinationPath "$releaseDir/rdr2-cbr-release.zip" -Force
           Get-FileHash "$releaseDir/rdr2-cbr-release.zip", "$releaseDir/rdr2-cbr.asi" -Algorithm SHA256 |
             ForEach-Object { "$($_.Hash)  $($_.Path | Split-Path -Leaf)" } | Tee-Object "$releaseDir/SHA256SUMS.txt"
