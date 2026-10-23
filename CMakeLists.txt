@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(RDR2_Checkerboard_Rendering VERSION 1.0.0 LANGUAGES CXX)
+project(RDR2_Checkerboard_Rendering VERSION 1.0.0 LANGUAGES C CXX)
 
 # Required for MSVC_RUNTIME_LIBRARY target property (static CRT below)
 cmake_policy(SET CMP0091 NEW)
@@ -22,9 +22,18 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(CBR_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/include)
 set(CBR_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src)
 set(CBR_SHADER_DIR ${CMAKE_CURRENT_SOURCE_DIR}/shaders)
+set(MINHOOK_DIR ${CMAKE_CURRENT_SOURCE_DIR}/vendor/minhook)
+
+set(MINHOOK_SOURCES
+    ${MINHOOK_DIR}/src/buffer.c
+    ${MINHOOK_DIR}/src/hook.c
+    ${MINHOOK_DIR}/src/trampoline.c
+    ${MINHOOK_DIR}/src/hde/hde64.c
+)
 
 include_directories(
     ${CBR_INCLUDE_DIR}
+    ${MINHOOK_DIR}/include
 )
 
 # Header files
@@ -71,7 +80,7 @@ set(CBR_SHADERS
 set_source_files_properties(${CBR_SHADERS} PROPERTIES HEADER_FILE_ONLY TRUE)
 
 # Define shared library (ASI plugin is a renamed DLL)
-add_library(rdr2-cbr SHARED ${CBR_HEADERS} ${CBR_SOURCES} ${CBR_SHADERS})
+add_library(rdr2-cbr SHARED ${CBR_HEADERS} ${CBR_SOURCES} ${CBR_SHADERS} ${MINHOOK_SOURCES})
 
 # Configure output extension as .asi for game loaders
 set_target_properties(rdr2-cbr PROPERTIES

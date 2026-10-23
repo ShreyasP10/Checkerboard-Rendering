@@ -62,7 +62,7 @@ This document contains the complete, unabridged source code for every file in th
 ### `CMakeLists.txt`
 ```cmake
 cmake_minimum_required(VERSION 3.20)
-project(RDR2_Checkerboard_Rendering VERSION 1.0.0 LANGUAGES CXX)
+project(RDR2_Checkerboard_Rendering VERSION 1.0.0 LANGUAGES C CXX)
 
 # Required for MSVC_RUNTIME_LIBRARY target property (static CRT below)
 cmake_policy(SET CMP0091 NEW)
@@ -85,9 +85,18 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(CBR_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/include)
 set(CBR_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src)
 set(CBR_SHADER_DIR ${CMAKE_CURRENT_SOURCE_DIR}/shaders)
+set(MINHOOK_DIR ${CMAKE_CURRENT_SOURCE_DIR}/vendor/minhook)
+
+set(MINHOOK_SOURCES
+    ${MINHOOK_DIR}/src/buffer.c
+    ${MINHOOK_DIR}/src/hook.c
+    ${MINHOOK_DIR}/src/trampoline.c
+    ${MINHOOK_DIR}/src/hde/hde64.c
+)
 
 include_directories(
     ${CBR_INCLUDE_DIR}
+    ${MINHOOK_DIR}/include
 )
 
 # Header files
@@ -134,7 +143,7 @@ set(CBR_SHADERS
 set_source_files_properties(${CBR_SHADERS} PROPERTIES HEADER_FILE_ONLY TRUE)
 
 # Define shared library (ASI plugin is a renamed DLL)
-add_library(rdr2-cbr SHARED ${CBR_HEADERS} ${CBR_SOURCES} ${CBR_SHADERS})
+add_library(rdr2-cbr SHARED ${CBR_HEADERS} ${CBR_SOURCES} ${CBR_SHADERS} ${MINHOOK_SOURCES})
 
 # Configure output extension as .asi for game loaders
 set_target_properties(rdr2-cbr PROPERTIES
@@ -2391,6 +2400,7 @@ void HookManager::Shutdown() {
 #include <atomic>
 #include <cstddef>
 #include <cstring>
+#include <MinHook.h>
 #include "cbr/cbr_engine.h"
 #include "cbr/logger.h"
 
@@ -2409,8 +2419,13 @@ typedef void* (*PFN_vkGetInstanceProcAddr)(void* instance, const char* pName);
 typedef int   (*PFN_vkQueuePresentKHR)(void* queue, const void* pPresentInfo);
 typedef int   (*PFN_vkCreateSwapchainKHR)(void* device, const void* pCreateInfo, const void* pAllocator, void* pSwapchain);
 
-PFN_vkQueuePresentKHR    g_Original_vkQueuePresentKHR = nullptr;
-PFN_vkCreateSwapchainKHR g_Original_vkCreateSwapchainKHR = nullptr;
+PFN_vkGetDeviceProcAddr   g_Original_vkGetDeviceProcAddr = nullptr;
+PFN_vkGetInstanceProcAddr g_Original_vkGetInstanceProcAddr = nullptr;
+PFN_vkQueuePresentKHR     g_Original_vkQueuePresentKHR = nullptr;
+PFN_vkCreateSwapchainKHR  g_Original_vkCreateSwapchainKHR = nullptr;
+
+void* Hooked_vkGetDeviceProcAddr(void* device, const char* pName);
+void* Hooked_vkGetInstanceProcAddr(void* instance, const char* pName);
 
 // VK_ERROR_INITIALIZATION_FAILED: returned if a hook is ever invoked without a valid trampoline,
 // so the failure is visible to the caller instead of silently dropping frames / swapchains.
@@ -2581,6 +2596,62 @@ int Hooked_vkCreateSwapchainKHR(void* device, const void* pCreateInfo, const voi
     return result;
 }
 
+void* Hooked_vkGetDeviceProcAddr(void* device, const char* pName) {
+    if (!pName || !g_Original_vkGetDeviceProcAddr) {
+        return nullptr;
+    }
+
+    void* realProc = g_Original_vkGetDeviceProcAddr(device, pName);
+    if (!realProc) {
+        return nullptr;
+    }
+
+    if (std::strcmp(pName, "vkQueuePresentKHR") == 0) {
+        if (!g_Original_vkQueuePresentKHR) {
+            g_Original_vkQueuePresentKHR = reinterpret_cast<PFN_vkQueuePresentKHR>(realProc);
+        }
+        return reinterpret_cast<void*>(&Hooked_vkQueuePresentKHR);
+    }
+    if (std::strcmp(pName, "vkCreateSwapchainKHR") == 0) {
+        if (!g_Original_vkCreateSwapchainKHR) {
+            g_Original_vkCreateSwapchainKHR = reinterpret_cast<PFN_vkCreateSwapchainKHR>(realProc);
+        }
+        return reinterpret_cast<void*>(&Hooked_vkCreateSwapchainKHR);
+    }
+    return realProc;
+}
+
+void* Hooked_vkGetInstanceProcAddr(void* instance, const char* pName) {
+    if (!pName || !g_Original_vkGetInstanceProcAddr) {
+        return nullptr;
+    }
+
+    void* realProc = g_Original_vkGetInstanceProcAddr(instance, pName);
+    if (!realProc) {
+        return nullptr;
+    }
+
+    if (std::strcmp(pName, "vkQueuePresentKHR") == 0) {
+        if (!g_Original_vkQueuePresentKHR) {
+            g_Original_vkQueuePresentKHR = reinterpret_cast<PFN_vkQueuePresentKHR>(realProc);
+        }
+        return reinterpret_cast<void*>(&Hooked_vkQueuePresentKHR);
+    }
+    if (std::strcmp(pName, "vkCreateSwapchainKHR") == 0) {
+        if (!g_Original_vkCreateSwapchainKHR) {
+            g_Original_vkCreateSwapchainKHR = reinterpret_cast<PFN_vkCreateSwapchainKHR>(realProc);
+        }
+        return reinterpret_cast<void*>(&Hooked_vkCreateSwapchainKHR);
+    }
+    if (std::strcmp(pName, "vkGetDeviceProcAddr") == 0) {
+        if (!g_Original_vkGetDeviceProcAddr) {
+            g_Original_vkGetDeviceProcAddr = reinterpret_cast<PFN_vkGetDeviceProcAddr>(realProc);
+        }
+        return reinterpret_cast<void*>(&Hooked_vkGetDeviceProcAddr);
+    }
+    return realProc;
+}
+
 } // namespace
 
 bool HookManager::InstallVulkanHooks() {
@@ -2595,35 +2666,86 @@ bool HookManager::InstallVulkanHooks() {
 
     static std::atomic<bool> s_warnedFound{ false };
     if (!s_warnedFound.exchange(true)) {
-        CBR_LOG_INFO("Vulkan module located at 0x%p. Initializing Vulkan function interception...", vulkanModule);
+        CBR_LOG_INFO("Vulkan module located at 0x%p. Initializing Vulkan function interception via MinHook...", vulkanModule);
     }
 
-    // Dynamic resolution of vkGetInstanceProcAddr
-    auto pfnGetInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
-        GetProcAddress(vulkanModule, "vkGetInstanceProcAddr"));
-
-    if (!pfnGetInstanceProcAddr) {
-        static std::atomic<bool> s_warnedNoProc{ false };
-        if (!s_warnedNoProc.exchange(true)) {
-            CBR_LOG_ERROR("Failed to locate vkGetInstanceProcAddr in vulkan-1.dll.");
-        }
+    MH_STATUS mhStatus = MH_Initialize();
+    if (mhStatus != MH_OK && mhStatus != MH_ERROR_ALREADY_INITIALIZED) {
+        CBR_LOG_ERROR("Failed to initialize MinHook core (MH_STATUS: %d).", mhStatus);
         return false;
     }
 
-    // TODO: install real detours (e.g. MinHook) on vkQueuePresentKHR / vkCreateSwapchainKHR and store
-    // the trampolines in g_Original_*. Until then NO hook is active, so do not claim success.
-    // Logged once only: this function is retried from a polling loop.
-    static std::atomic<bool> s_warned{ false };
-    if (!s_warned.exchange(true)) {
-        CBR_LOG_WARN("Vulkan hook installation is not implemented yet; no hooks are active.");
+    // Resolve exported function addresses from vulkan-1.dll
+    auto pfnQueuePresent = reinterpret_cast<void*>(GetProcAddress(vulkanModule, "vkQueuePresentKHR"));
+    auto pfnCreateSwapchain = reinterpret_cast<void*>(GetProcAddress(vulkanModule, "vkCreateSwapchainKHR"));
+    auto pfnGetInstanceProcAddr = reinterpret_cast<void*>(GetProcAddress(vulkanModule, "vkGetInstanceProcAddr"));
+
+    bool hookedAny = false;
+
+    // 1. Detour vkQueuePresentKHR
+    if (pfnQueuePresent) {
+        mhStatus = MH_CreateHook(
+            pfnQueuePresent,
+            reinterpret_cast<LPVOID>(&Hooked_vkQueuePresentKHR),
+            reinterpret_cast<LPVOID*>(&g_Original_vkQueuePresentKHR)
+        );
+        if (mhStatus == MH_OK || mhStatus == MH_ERROR_ALREADY_CREATED) {
+            MH_EnableHook(pfnQueuePresent);
+            CBR_LOG_INFO("MinHook: Successfully detoured vkQueuePresentKHR (export at 0x%p).", pfnQueuePresent);
+            hookedAny = true;
+        } else {
+            CBR_LOG_WARN("MinHook: Could not detour vkQueuePresentKHR (status: %d).", mhStatus);
+        }
     }
+
+    // 2. Detour vkCreateSwapchainKHR
+    if (pfnCreateSwapchain) {
+        mhStatus = MH_CreateHook(
+            pfnCreateSwapchain,
+            reinterpret_cast<LPVOID>(&Hooked_vkCreateSwapchainKHR),
+            reinterpret_cast<LPVOID*>(&g_Original_vkCreateSwapchainKHR)
+        );
+        if (mhStatus == MH_OK || mhStatus == MH_ERROR_ALREADY_CREATED) {
+            MH_EnableHook(pfnCreateSwapchain);
+            CBR_LOG_INFO("MinHook: Successfully detoured vkCreateSwapchainKHR (export at 0x%p).", pfnCreateSwapchain);
+            hookedAny = true;
+        } else {
+            CBR_LOG_WARN("MinHook: Could not detour vkCreateSwapchainKHR (status: %d).", mhStatus);
+        }
+    }
+
+    // 3. Detour vkGetInstanceProcAddr to intercept dynamic device/instance queries
+    if (pfnGetInstanceProcAddr) {
+        mhStatus = MH_CreateHook(
+            pfnGetInstanceProcAddr,
+            reinterpret_cast<LPVOID>(&Hooked_vkGetInstanceProcAddr),
+            reinterpret_cast<LPVOID*>(&g_Original_vkGetInstanceProcAddr)
+        );
+        if (mhStatus == MH_OK || mhStatus == MH_ERROR_ALREADY_CREATED) {
+            MH_EnableHook(pfnGetInstanceProcAddr);
+            CBR_LOG_INFO("MinHook: Successfully detoured vkGetInstanceProcAddr (export at 0x%p).", pfnGetInstanceProcAddr);
+            hookedAny = true;
+        } else {
+            CBR_LOG_WARN("MinHook: Could not detour vkGetInstanceProcAddr (status: %d).", mhStatus);
+        }
+    }
+
+    if (hookedAny) {
+        m_vulkanHooked.store(true);
+        CBR_LOG_INFO("Vulkan graphics interception is now ACTIVE.");
+        return true;
+    }
+
+    CBR_LOG_ERROR("Failed to establish any Vulkan detour hooks.");
     return false;
 }
 
 void HookManager::UninstallVulkanHooks() {
-    if (m_vulkanHooked) {
+    if (m_vulkanHooked.load()) {
         CBR_LOG_INFO("Restoring original Vulkan function dispatch table.");
-        m_vulkanHooked = false;
+        MH_DisableHook(MH_ALL_HOOKS);
+        MH_Uninitialize();
+        m_vulkanHooked.store(false);
     }
 }
 
@@ -5451,7 +5573,7 @@ jobs:
         run: |
           for f in logger config jitter_manager render_target_manager reconstruction_pass ui_overlay cbr_engine hooks main hooks_vulkan hooks_dx12 crash_handler; do
             echo "Checking src/$f.cpp..."
-            x86_64-w64-mingw32-g++ -std=c++20 -fsyntax-only -Wall -Wextra -Wpedantic -Wshadow -Iinclude src/$f.cpp
+            x86_64-w64-mingw32-g++ -std=c++20 -fsyntax-only -Wall -Wextra -Wpedantic -Wshadow -Iinclude -Ivendor/minhook/include src/$f.cpp
           done
 
   windows-release:
