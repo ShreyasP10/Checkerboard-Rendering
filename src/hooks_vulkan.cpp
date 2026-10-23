@@ -197,18 +197,27 @@ int Hooked_vkCreateSwapchainKHR(void* device, const void* pCreateInfo, const voi
 bool HookManager::InstallVulkanHooks() {
     HMODULE vulkanModule = GetModuleHandleA("vulkan-1.dll");
     if (!vulkanModule) {
-        CBR_LOG_WARN("vulkan-1.dll not loaded in host process. Deferring Vulkan hooks.");
+        static std::atomic<bool> s_warnedMissing{ false };
+        if (!s_warnedMissing.exchange(true)) {
+            CBR_LOG_WARN("vulkan-1.dll not loaded in host process. Deferring Vulkan hooks.");
+        }
         return false;
     }
 
-    CBR_LOG_INFO("Vulkan module located at 0x%p. Initializing Vulkan function interception...", vulkanModule);
+    static std::atomic<bool> s_warnedFound{ false };
+    if (!s_warnedFound.exchange(true)) {
+        CBR_LOG_INFO("Vulkan module located at 0x%p. Initializing Vulkan function interception...", vulkanModule);
+    }
 
     // Dynamic resolution of vkGetInstanceProcAddr
     auto pfnGetInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
         GetProcAddress(vulkanModule, "vkGetInstanceProcAddr"));
 
     if (!pfnGetInstanceProcAddr) {
-        CBR_LOG_ERROR("Failed to locate vkGetInstanceProcAddr in vulkan-1.dll.");
+        static std::atomic<bool> s_warnedNoProc{ false };
+        if (!s_warnedNoProc.exchange(true)) {
+            CBR_LOG_ERROR("Failed to locate vkGetInstanceProcAddr in vulkan-1.dll.");
+        }
         return false;
     }
 
