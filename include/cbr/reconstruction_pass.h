@@ -55,6 +55,8 @@ public:
     void* GetPipeline() const { return m_pipeline; }
     void* GetPipelineLayout() const { return m_pipelineLayout; }
     void* GetDescriptorSetLayout() const { return m_descriptorSetLayout; }
+    void* GetDescriptorPool() const { return m_descriptorPool; }
+    void* GetDescriptorSet() const { return m_descriptorSet; }
 
     // Helper to load SPIR-V bytecode from disk
     static std::vector<uint32_t> LoadSpvFile(const std::filesystem::path& path);
@@ -74,6 +76,8 @@ private:
     void* m_pipeline{ nullptr };
     void* m_pipelineLayout{ nullptr };
     void* m_descriptorSetLayout{ nullptr };
+    void* m_descriptorPool{ nullptr };
+    void* m_descriptorSet{ nullptr };
 };
 
 } // namespace cbr

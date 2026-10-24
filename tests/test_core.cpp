@@ -3,6 +3,7 @@
 #include "cbr/depth_convention.h"
 #include "cbr/jitter_manager.h"
 #include "cbr/logger.h"
+#include "cbr/pattern_scanner.h"
 #include "cbr/reconstruction_pass.h"
 #include "cbr/render_target_manager.h"
 #include <algorithm>
@@ -70,6 +71,7 @@ static void TestConfigHardening(const fs::path& dir) {
         "JitterCompensation = -5\n"   // out of range      -> clamped to -1
         "JitterDirection = -1\n"
         "ProjectionJitterSign = -1\n"
+        "SamplingStrategy = StrategyB\n" // valid StrategyB
         "JitterScale = 3\n"              // accepted but ignored (warned)
         "[Debug]\n"
         "DebugView = 77\n");          // out of range      -> clamped
@@ -89,6 +91,7 @@ static void TestConfigHardening(const fs::path& dir) {
     CHECK(c.jitterCompensation == -1.0f);
     CHECK(c.jitterDirection == -1);
     CHECK(c.projectionJitterSign == -1);
+    CHECK(c.samplingStrategy == SamplingStrategy::StrategyB);
     CHECK(c.depthConvention == DepthConvention::Standard);
     CHECK(c.depthNear == 0.5f && c.depthFar == 5000.0f);
 
@@ -97,13 +100,15 @@ static void TestConfigHardening(const fs::path& dir) {
     CHECK(fresh.jitterCompensation == 0.0f); // whole-pixel jitter needs NO history compensation
     CHECK(fresh.jitterDirection == 1);
     CHECK(fresh.projectionJitterSign == 1);
+    CHECK(fresh.samplingStrategy == SamplingStrategy::StrategyA);
     CHECK(fresh.depthConvention == DepthConvention::Reversed);
 
     // Invalid enum-like values keep the previous setting
-    WriteFile(dir / "bad2.ini", "[Jitter]\nJitterDirection = 2\nProjectionJitterSign = 42\n[Reconstruction]\nDepthConvention = sideways\n");
+    WriteFile(dir / "bad2.ini", "[Jitter]\nJitterDirection = 2\nProjectionJitterSign = 42\nSamplingStrategy = UnknownStrategy\n[Reconstruction]\nDepthConvention = sideways\n");
     CHECK(ConfigManager::Get().Load(dir / "bad2.ini"));
     CHECK(ConfigManager::Get().GetConfig().jitterDirection == -1);
     CHECK(ConfigManager::Get().GetConfig().projectionJitterSign == -1);
+    CHECK(ConfigManager::Get().GetConfig().samplingStrategy == SamplingStrategy::StrategyB);
     CHECK(ConfigManager::Get().GetConfig().depthConvention == DepthConvention::Standard);
 }
 
@@ -122,6 +127,7 @@ static void TestConfigMissingFileAndRoundTrip(const fs::path& dir) {
     CHECK(after.jitterCompensation == before.jitterCompensation);
     CHECK(after.jitterDirection == before.jitterDirection);
     CHECK(after.projectionJitterSign == before.projectionJitterSign);
+    CHECK(after.samplingStrategy == before.samplingStrategy);
     CHECK(after.depthConvention == before.depthConvention);
     CHECK(after.depthNear == before.depthNear && after.depthFar == before.depthFar);
 }
@@ -475,6 +481,8 @@ static void TestReconstructionPass(const fs::path& dir) {
     pass.Shutdown();
     CHECK(!pass.IsInitialized());
     CHECK(pass.GetDescriptorSetLayout() == nullptr);
+    CHECK(pass.GetDescriptorPool() == nullptr);
+    CHECK(pass.GetDescriptorSet() == nullptr);
     CHECK(pass.InitializeVulkan(nullptr, nullptr));
     CHECK(pass.IsInitialized());
 
@@ -485,6 +493,40 @@ static void TestReconstructionPass(const fs::path& dir) {
     pass.Shutdown();
     CHECK(!pass.IsInitialized());
     CHECK(pass.GetDescriptorSetLayout() == nullptr);
+    CHECK(pass.GetDescriptorPool() == nullptr);
+    CHECK(pass.GetDescriptorSet() == nullptr);
+}
+
+static void TestPatternScanner() {
+    // 1. Parsing IDA-style patterns
+    std::vector<uint8_t> bytes;
+    std::string mask;
+    CHECK(PatternScanner::ParseIdaPattern("48 8B 05 ? ? ? ? 48 8B 48 08", bytes, mask));
+    CHECK(bytes.size() == 11);
+    CHECK(mask == "xxx????xxxx");
+    CHECK(bytes[0] == 0x48 && bytes[1] == 0x8B && bytes[2] == 0x05);
+    CHECK(bytes[3] == 0x00 && bytes[6] == 0x00);
+    CHECK(bytes[7] == 0x48 && bytes[8] == 0x8B && bytes[9] == 0x48 && bytes[10] == 0x08);
+
+    // 2. Searching byte buffer
+    const uint8_t mockMemory[] = {
+        0x90, 0x90, 0xCC,
+        0x48, 0x8B, 0x05, 0x12, 0x34, 0x00, 0x00, 0x48, 0x8B, 0x48, 0x08,
+        0xC3, 0x90
+    };
+    const uint8_t* found = PatternScanner::FindIdaPattern(mockMemory, sizeof(mockMemory), "48 8B 05 ? ? ? ? 48 8B 48 08");
+    CHECK(found != nullptr);
+    CHECK(found == mockMemory + 3);
+
+    // 3. Negative search (pattern not present)
+    const uint8_t* notFound = PatternScanner::FindIdaPattern(mockMemory, sizeof(mockMemory), "FF 15 ? ? ? ?");
+    CHECK(notFound == nullptr);
+
+    // 4. RIP-relative resolution: instruction address + instruction length + displacement
+    // Instruction starts at mockMemory + 3, length is 7 bytes (48 8B 05 12 34 00 00), displacement is 0x00003412
+    const uint8_t* ripTarget = PatternScanner::ResolveRipRelative(mockMemory + 3, 7, 3);
+    const int32_t expectedDisplacement = 0x00003412;
+    CHECK(ripTarget == (mockMemory + 3 + 7 + expectedDisplacement));
 }
 
 int main() {
@@ -502,6 +544,7 @@ int main() {
     TestPushConstantLayout();
     TestProjectionJitterSign();
     TestReconstructionPass(dir);
+    TestPatternScanner();
 
     fs::remove_all(dir);
     if (g_failures == 0) {

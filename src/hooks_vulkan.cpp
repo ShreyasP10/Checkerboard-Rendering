@@ -7,6 +7,7 @@
 #include "cbr/config.h"
 #include "cbr/jitter_manager.h"
 #include "cbr/logger.h"
+#include "cbr/pattern_scanner.h"
 #include "cbr/reconstruction_pass.h"
 #include "cbr/render_target_manager.h"
 
@@ -21,6 +22,7 @@ namespace {
 
 struct MinimalVkViewport;
 struct MinimalVkRect2D;
+struct MinimalVkSampleLocationsInfoEXT;
 
 // Function pointer typedefs matching Vulkan loader signatures
 typedef void* (*PFN_vkGetDeviceProcAddr)(void* device, const char* pName);
@@ -29,21 +31,27 @@ typedef int   (*PFN_vkQueuePresentKHR)(void* queue, const void* pPresentInfo);
 typedef int   (*PFN_vkCreateSwapchainKHR)(void* device, const void* pCreateInfo, const void* pAllocator, void* pSwapchain);
 typedef void  (*PFN_vkCmdSetViewport)(void* commandBuffer, uint32_t firstViewport, uint32_t viewportCount, const MinimalVkViewport* pViewports);
 typedef void  (*PFN_vkCmdSetScissor)(void* commandBuffer, uint32_t firstScissor, uint32_t scissorCount, const MinimalVkRect2D* pScissors);
+typedef void  (*PFN_vkCmdBeginRenderPass)(void* commandBuffer, const void* pRenderPassBegin, uint32_t contents);
 typedef void  (*PFN_vkCmdEndRenderPass)(void* commandBuffer);
+typedef void  (*PFN_vkCmdSetSampleLocationsEXT)(void* commandBuffer, const MinimalVkSampleLocationsInfoEXT* pSampleLocationsInfo);
 
-PFN_vkGetDeviceProcAddr   g_Original_vkGetDeviceProcAddr = nullptr;
-PFN_vkGetInstanceProcAddr g_Original_vkGetInstanceProcAddr = nullptr;
-PFN_vkQueuePresentKHR     g_Original_vkQueuePresentKHR = nullptr;
-PFN_vkCreateSwapchainKHR  g_Original_vkCreateSwapchainKHR = nullptr;
-PFN_vkCmdSetViewport      g_Original_vkCmdSetViewport = nullptr;
-PFN_vkCmdSetScissor       g_Original_vkCmdSetScissor = nullptr;
-PFN_vkCmdEndRenderPass    g_Original_vkCmdEndRenderPass = nullptr;
+PFN_vkGetDeviceProcAddr        g_Original_vkGetDeviceProcAddr = nullptr;
+PFN_vkGetInstanceProcAddr      g_Original_vkGetInstanceProcAddr = nullptr;
+PFN_vkQueuePresentKHR          g_Original_vkQueuePresentKHR = nullptr;
+PFN_vkCreateSwapchainKHR       g_Original_vkCreateSwapchainKHR = nullptr;
+PFN_vkCmdSetViewport           g_Original_vkCmdSetViewport = nullptr;
+PFN_vkCmdSetScissor            g_Original_vkCmdSetScissor = nullptr;
+PFN_vkCmdBeginRenderPass       g_Original_vkCmdBeginRenderPass = nullptr;
+PFN_vkCmdEndRenderPass         g_Original_vkCmdEndRenderPass = nullptr;
+PFN_vkCmdSetSampleLocationsEXT g_Original_vkCmdSetSampleLocationsEXT = nullptr;
 
 void* Hooked_vkGetDeviceProcAddr(void* device, const char* pName);
 void* Hooked_vkGetInstanceProcAddr(void* instance, const char* pName);
 void  Hooked_vkCmdSetViewport(void* commandBuffer, uint32_t firstViewport, uint32_t viewportCount, const MinimalVkViewport* pViewports);
 void  Hooked_vkCmdSetScissor(void* commandBuffer, uint32_t firstScissor, uint32_t scissorCount, const MinimalVkRect2D* pScissors);
+void  Hooked_vkCmdBeginRenderPass(void* commandBuffer, const void* pRenderPassBegin, uint32_t contents);
 void  Hooked_vkCmdEndRenderPass(void* commandBuffer);
+void  Hooked_vkCmdSetSampleLocationsEXT(void* commandBuffer, const MinimalVkSampleLocationsInfoEXT* pSampleLocationsInfo);
 
 // VK_ERROR_INITIALIZATION_FAILED: returned if a hook is ever invoked without a valid trampoline,
 // so the failure is visible to the caller instead of silently dropping frames / swapchains.
@@ -244,10 +252,23 @@ void Hooked_vkCmdSetViewport(void* commandBuffer, uint32_t firstViewport, uint32
         redirected.height = static_cast<float>(dims.quarterHeight);
 
         const auto config = ConfigManager::Get().GetConfig();
-        if (config.jitterDirection != 0) {
-            const uint32_t currentFrame = CBREngine::Get().GetCurrentFrameIndex();
-            const float shift = JitterManager::Get().GetQuarterViewportShiftX(currentFrame);
-            redirected.x += shift;
+        const uint32_t currentFrame = CBREngine::Get().GetCurrentFrameIndex();
+
+        if (config.samplingStrategy == SamplingStrategy::StrategyA) {
+            // Strategy A: Viewport Shift Jittering (0.5px horizontal shift on odd frames)
+            if (config.jitterDirection != 0) {
+                const float shift = JitterManager::Get().GetQuarterViewportShiftX(currentFrame);
+                redirected.x += shift;
+            }
+        } else if (config.samplingStrategy == SamplingStrategy::StrategyB) {
+            // Strategy B: Hardware Programmable Sample Locations (VK_EXT_sample_locations)
+            // Viewport is stationary (shift = 0.0f). Alternate dynamic sample locations.
+            if (g_Original_vkCmdSetSampleLocationsEXT) {
+                MinimalVkSampleLocationsInfoEXT sampleInfo{};
+                MinimalVkSampleLocationEXT sampleLocs[2]{};
+                ConfigureCheckerboardSampleLocations(currentFrame, sampleInfo, sampleLocs);
+                g_Original_vkCmdSetSampleLocationsEXT(commandBuffer, &sampleInfo);
+            }
         }
 
         g_Original_vkCmdSetViewport(commandBuffer, firstViewport, 1, &redirected);
@@ -282,6 +303,23 @@ void Hooked_vkCmdSetScissor(void* commandBuffer, uint32_t firstScissor, uint32_t
     g_Original_vkCmdSetScissor(commandBuffer, firstScissor, scissorCount, pScissors);
 }
 
+void Hooked_vkCmdBeginRenderPass(void* commandBuffer, const void* pRenderPassBegin, uint32_t contents) {
+    if (!g_Original_vkCmdBeginRenderPass) return;
+
+    if (CBREngine::Get().IsEnabled()) {
+        const auto config = ConfigManager::Get().GetConfig();
+        if (config.samplingStrategy == SamplingStrategy::StrategyB && g_Original_vkCmdSetSampleLocationsEXT) {
+            const uint32_t currentFrame = CBREngine::Get().GetCurrentFrameIndex();
+            MinimalVkSampleLocationsInfoEXT sampleInfo{};
+            MinimalVkSampleLocationEXT sampleLocs[2]{};
+            ConfigureCheckerboardSampleLocations(currentFrame, sampleInfo, sampleLocs);
+            g_Original_vkCmdSetSampleLocationsEXT(commandBuffer, &sampleInfo);
+        }
+    }
+
+    g_Original_vkCmdBeginRenderPass(commandBuffer, pRenderPassBegin, contents);
+}
+
 void Hooked_vkCmdEndRenderPass(void* commandBuffer) {
     if (!g_Original_vkCmdEndRenderPass) return;
 
@@ -293,6 +331,24 @@ void Hooked_vkCmdEndRenderPass(void* commandBuffer) {
         } catch (...) {
         }
     }
+}
+
+void Hooked_vkCmdSetSampleLocationsEXT(void* commandBuffer, const MinimalVkSampleLocationsInfoEXT* pSampleLocationsInfo) {
+    if (!g_Original_vkCmdSetSampleLocationsEXT) return;
+
+    if (CBREngine::Get().IsEnabled()) {
+        const auto config = ConfigManager::Get().GetConfig();
+        if (config.samplingStrategy == SamplingStrategy::StrategyB) {
+            const uint32_t currentFrame = CBREngine::Get().GetCurrentFrameIndex();
+            MinimalVkSampleLocationsInfoEXT sampleInfo{};
+            MinimalVkSampleLocationEXT sampleLocs[2]{};
+            ConfigureCheckerboardSampleLocations(currentFrame, sampleInfo, sampleLocs);
+            g_Original_vkCmdSetSampleLocationsEXT(commandBuffer, &sampleInfo);
+            return;
+        }
+    }
+
+    g_Original_vkCmdSetSampleLocationsEXT(commandBuffer, pSampleLocationsInfo);
 }
 
 void* Hooked_vkGetDeviceProcAddr(void* device, const char* pName) {
@@ -335,6 +391,18 @@ void* Hooked_vkGetDeviceProcAddr(void* device, const char* pName) {
         }
         return reinterpret_cast<void*>(&Hooked_vkCmdEndRenderPass);
     }
+    if (std::strcmp(pName, "vkCmdBeginRenderPass") == 0) {
+        if (!g_Original_vkCmdBeginRenderPass) {
+            g_Original_vkCmdBeginRenderPass = reinterpret_cast<PFN_vkCmdBeginRenderPass>(realProc);
+        }
+        return reinterpret_cast<void*>(&Hooked_vkCmdBeginRenderPass);
+    }
+    if (std::strcmp(pName, "vkCmdSetSampleLocationsEXT") == 0) {
+        if (!g_Original_vkCmdSetSampleLocationsEXT) {
+            g_Original_vkCmdSetSampleLocationsEXT = reinterpret_cast<PFN_vkCmdSetSampleLocationsEXT>(realProc);
+        }
+        return reinterpret_cast<void*>(&Hooked_vkCmdSetSampleLocationsEXT);
+    }
     return realProc;
 }
 
@@ -372,11 +440,23 @@ void* Hooked_vkGetInstanceProcAddr(void* instance, const char* pName) {
         }
         return reinterpret_cast<void*>(&Hooked_vkCmdSetScissor);
     }
+    if (std::strcmp(pName, "vkCmdBeginRenderPass") == 0) {
+        if (!g_Original_vkCmdBeginRenderPass) {
+            g_Original_vkCmdBeginRenderPass = reinterpret_cast<PFN_vkCmdBeginRenderPass>(realProc);
+        }
+        return reinterpret_cast<void*>(&Hooked_vkCmdBeginRenderPass);
+    }
     if (std::strcmp(pName, "vkCmdEndRenderPass") == 0) {
         if (!g_Original_vkCmdEndRenderPass) {
             g_Original_vkCmdEndRenderPass = reinterpret_cast<PFN_vkCmdEndRenderPass>(realProc);
         }
         return reinterpret_cast<void*>(&Hooked_vkCmdEndRenderPass);
+    }
+    if (std::strcmp(pName, "vkCmdSetSampleLocationsEXT") == 0) {
+        if (!g_Original_vkCmdSetSampleLocationsEXT) {
+            g_Original_vkCmdSetSampleLocationsEXT = reinterpret_cast<PFN_vkCmdSetSampleLocationsEXT>(realProc);
+        }
+        return reinterpret_cast<void*>(&Hooked_vkCmdSetSampleLocationsEXT);
     }
     if (std::strcmp(pName, "vkGetDeviceProcAddr") == 0) {
         if (!g_Original_vkGetDeviceProcAddr) {
@@ -499,7 +579,24 @@ bool HookManager::InstallVulkanHooks() {
         }
     }
 
-    // 6. Detour vkCmdEndRenderPass for scene pass completion detection
+    // 6. Detour vkCmdBeginRenderPass for geometry pass sample location injection
+    auto pfnCmdBeginRenderPass = reinterpret_cast<void*>(GetProcAddress(vulkanModule, "vkCmdBeginRenderPass"));
+    if (pfnCmdBeginRenderPass) {
+        mhStatus = MH_CreateHook(
+            pfnCmdBeginRenderPass,
+            reinterpret_cast<LPVOID>(&Hooked_vkCmdBeginRenderPass),
+            reinterpret_cast<LPVOID*>(&g_Original_vkCmdBeginRenderPass)
+        );
+        if (mhStatus == MH_OK || mhStatus == MH_ERROR_ALREADY_CREATED) {
+            MH_EnableHook(pfnCmdBeginRenderPass);
+            CBR_LOG_INFO("MinHook: Successfully detoured vkCmdBeginRenderPass (export at 0x%p).", pfnCmdBeginRenderPass);
+            hookedAny = true;
+        } else {
+            CBR_LOG_WARN("MinHook: Could not detour vkCmdBeginRenderPass (status: %d).", mhStatus);
+        }
+    }
+
+    // 7. Detour vkCmdEndRenderPass for scene pass completion detection
     auto pfnCmdEndRenderPass = reinterpret_cast<void*>(GetProcAddress(vulkanModule, "vkCmdEndRenderPass"));
     if (pfnCmdEndRenderPass) {
         mhStatus = MH_CreateHook(
@@ -513,6 +610,23 @@ bool HookManager::InstallVulkanHooks() {
             hookedAny = true;
         } else {
             CBR_LOG_WARN("MinHook: Could not detour vkCmdEndRenderPass (status: %d).", mhStatus);
+        }
+    }
+
+    // 8. Resolve and detour vkCmdSetSampleLocationsEXT for Strategy B
+    auto pfnCmdSetSampleLocationsEXT = reinterpret_cast<void*>(GetProcAddress(vulkanModule, "vkCmdSetSampleLocationsEXT"));
+    if (pfnCmdSetSampleLocationsEXT) {
+        mhStatus = MH_CreateHook(
+            pfnCmdSetSampleLocationsEXT,
+            reinterpret_cast<LPVOID>(&Hooked_vkCmdSetSampleLocationsEXT),
+            reinterpret_cast<LPVOID*>(&g_Original_vkCmdSetSampleLocationsEXT)
+        );
+        if (mhStatus == MH_OK || mhStatus == MH_ERROR_ALREADY_CREATED) {
+            MH_EnableHook(pfnCmdSetSampleLocationsEXT);
+            CBR_LOG_INFO("MinHook: Successfully detoured vkCmdSetSampleLocationsEXT (export at 0x%p).", pfnCmdSetSampleLocationsEXT);
+        } else {
+            g_Original_vkCmdSetSampleLocationsEXT = reinterpret_cast<PFN_vkCmdSetSampleLocationsEXT>(pfnCmdSetSampleLocationsEXT);
+            CBR_LOG_INFO("Directly resolved vkCmdSetSampleLocationsEXT: 0x%p", pfnCmdSetSampleLocationsEXT);
         }
     }
 

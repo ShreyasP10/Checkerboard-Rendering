@@ -26,6 +26,7 @@ This document contains the complete, unabridged source code for every file in th
    - [`include/cbr/jitter_manager.h`](#includecbrjittermanagerh)
    - [`include/cbr/limits.h`](#includecbrlimitsh)
    - [`include/cbr/logger.h`](#includecbrloggerh)
+   - [`include/cbr/pattern_scanner.h`](#includecbrpatternscannerh)
    - [`include/cbr/reconstruction_pass.h`](#includecbrreconstructionpassh)
    - [`include/cbr/render_target_manager.h`](#includecbrrendertargetmanagerh)
    - [`include/cbr/ui_overlay.h`](#includecbruioverlayh)
@@ -39,6 +40,7 @@ This document contains the complete, unabridged source code for every file in th
    - [`src/hooks_dx12.cpp`](#srchooksdx12cpp)
    - [`src/jitter_manager.cpp`](#srcjittermanagercpp)
    - [`src/logger.cpp`](#srcloggercpp)
+   - [`src/pattern_scanner.cpp`](#srcpatternscannercpp)
    - [`src/reconstruction_pass.cpp`](#srcreconstructionpasscpp)
    - [`src/render_target_manager.cpp`](#srcrendertargetmanagercpp)
    - [`src/ui_overlay.cpp`](#srcuioverlaycpp)
@@ -110,6 +112,7 @@ set(CBR_HEADERS
     ${CBR_INCLUDE_DIR}/cbr/jitter_manager.h
     ${CBR_INCLUDE_DIR}/cbr/limits.h
     ${CBR_INCLUDE_DIR}/cbr/logger.h
+    ${CBR_INCLUDE_DIR}/cbr/pattern_scanner.h
     ${CBR_INCLUDE_DIR}/cbr/reconstruction_pass.h
     ${CBR_INCLUDE_DIR}/cbr/render_target_manager.h
     ${CBR_INCLUDE_DIR}/cbr/ui_overlay.h
@@ -126,6 +129,7 @@ set(CBR_SOURCES
     ${CBR_SOURCE_DIR}/hooks_dx12.cpp
     ${CBR_SOURCE_DIR}/jitter_manager.cpp
     ${CBR_SOURCE_DIR}/logger.cpp
+    ${CBR_SOURCE_DIR}/pattern_scanner.cpp
     ${CBR_SOURCE_DIR}/reconstruction_pass.cpp
     ${CBR_SOURCE_DIR}/render_target_manager.cpp
     ${CBR_SOURCE_DIR}/ui_overlay.cpp
@@ -255,6 +259,7 @@ if(CBR_BUILD_TESTS)
         ${CBR_SOURCE_DIR}/crash_handler.cpp
         ${CBR_SOURCE_DIR}/logger.cpp
         ${CBR_SOURCE_DIR}/jitter_manager.cpp
+        ${CBR_SOURCE_DIR}/pattern_scanner.cpp
         ${CBR_SOURCE_DIR}/render_target_manager.cpp
         ${CBR_SOURCE_DIR}/reconstruction_pass.cpp
     )
@@ -378,6 +383,13 @@ ProjectionJitterSign = 1
 ; Default: 0.0 (the whole-pixel 2x MSAA checkerboard shift is absorbed by the sample mapping,
 ; so history reprojection needs no jitter delta compensation).
 JitterCompensation = 0.0
+
+; Sampling Strategy: StrategyA (ViewportShift) or StrategyB (ProgrammableSampleLocations)
+; - StrategyA: Shorter pass jitter via 0.5px horizontal viewport offset on odd frames.
+; - StrategyB: Hardware programmable 2x MSAA sample locations (VK_EXT_sample_locations)
+;              alternated per frame with stationary viewport.
+; NOTE: Strategy A and Strategy B are MUTUALLY EXCLUSIVE. Combining them cancels out coverage.
+SamplingStrategy = StrategyA
 
 [Debug]
 ; Show in-game ImGui overlay (Toggle key: F11 or Insert)
@@ -750,16 +762,22 @@ enum class ColorSpace {
     RGB
 };
 
+enum class SamplingStrategy {
+    StrategyA, // ViewportShift (standard 2x MSAA sample locations + horizontal viewport half-pixel jitter on odd frames)
+    StrategyB  // ProgrammableSampleLocations (VK_EXT_sample_locations 2x MSAA alternation per frame, stationary viewport)
+};
+
 struct CBRConfig {
     // General
-    bool        enabled{ true };
-    uint32_t    targetWidth{ 3840 };
-    uint32_t    targetHeight{ 2160 };
-    GraphicsApi preferredApi{ GraphicsApi::Vulkan };
+    bool             enabled{ true };
+    uint32_t         targetWidth{ 3840 };
+    uint32_t         targetHeight{ 2160 };
+    GraphicsApi      preferredApi{ GraphicsApi::Vulkan };
+    SamplingStrategy samplingStrategy{ SamplingStrategy::StrategyA };
     // MIP LOD Bias: -1.0f mathematically compensates for the 2x larger texture coordinate
     // derivatives in quarter-resolution (half-width, half-height) 2x MSAA rendering
     // (CHECKERBOARD.md lines 365-425 / El Mansouri 2016: LOD' = -1 + LOD).
-    float       mipLodBias{ -1.0f };
+    float            mipLodBias{ -1.0f };
 
     // Reconstruction
     float           depthTolerance{ 0.010f };
@@ -1159,6 +1177,52 @@ private:
 #define CBR_LOG_FLUSH()         cbr::Logger::Get().Flush()
 ```
 
+<a id="includecbrpatternscannerh"></a>
+### `include/cbr/pattern_scanner.h`
+```cpp
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace cbr {
+
+class PatternScanner {
+public:
+    // Core scan method across any raw memory buffer.
+    // 'signature' is raw bytes, 'mask' contains 'x' for exact match and '?' for wildcard.
+    static const uint8_t* FindPattern(const uint8_t* base, size_t size, const char* signature, const char* mask);
+
+    // Parses IDA-style pattern string (e.g. "48 8B 05 ? ? ? ? 48 8B 48 08")
+    // into raw signature bytes and mask string ('x' / '?').
+    static bool ParseIdaPattern(std::string_view idaPattern, std::vector<uint8_t>& outBytes, std::string& outMask);
+
+    // Convenience method scanning memory with an IDA-style pattern string.
+    static const uint8_t* FindIdaPattern(const uint8_t* base, size_t size, std::string_view idaPattern);
+
+    // Resolves standard x64 RIP-relative offset:
+    // instruction at `instructionAddress` of `instructionLength` bytes with 32-bit displacement at `displacementOffset`
+    // Target = instructionAddress + instructionLength + *(int32_t*)(instructionAddress + displacementOffset)
+    static const uint8_t* ResolveRipRelative(const uint8_t* instructionAddress, size_t instructionLength, size_t displacementOffset = 3);
+
+#if defined(_WIN32)
+    // Scans an entire loaded module (e.g. "RDR2.exe" or nullptr for current process executable)
+    static const uint8_t* ScanModule(const char* moduleName, const char* signature, const char* mask);
+    static const uint8_t* ScanModuleIda(const char* moduleName, std::string_view idaPattern);
+
+    // Attempts to locate and cache the RAGE camera projection matrix pointer in RDR2
+    static bool InitializeCameraScanner();
+    static float* GetCameraProjectionMatrix();
+    static bool UpdateCameraJitter(uint32_t frameIndex, bool isVulkan);
+#endif
+};
+
+} // namespace cbr
+```
+
 <a id="includecbrreconstructionpassh"></a>
 ### `include/cbr/reconstruction_pass.h`
 ```cpp
@@ -1219,6 +1283,8 @@ public:
     void* GetPipeline() const { return m_pipeline; }
     void* GetPipelineLayout() const { return m_pipelineLayout; }
     void* GetDescriptorSetLayout() const { return m_descriptorSetLayout; }
+    void* GetDescriptorPool() const { return m_descriptorPool; }
+    void* GetDescriptorSet() const { return m_descriptorSet; }
 
     // Helper to load SPIR-V bytecode from disk
     static std::vector<uint32_t> LoadSpvFile(const std::filesystem::path& path);
@@ -1238,6 +1304,8 @@ private:
     void* m_pipeline{ nullptr };
     void* m_pipelineLayout{ nullptr };
     void* m_descriptorSetLayout{ nullptr };
+    void* m_descriptorPool{ nullptr };
+    void* m_descriptorSet{ nullptr };
 };
 
 } // namespace cbr
@@ -1934,6 +2002,15 @@ bool ConfigManager::Load(const std::filesystem::path& configPath) {
                 }
             } else if (key == "JitterCompensation") {
                 parsed.jitterCompensation = ParseFloat(val, parsed.jitterCompensation, -1.0f, 1.0f);
+            } else if (key == "SamplingStrategy") {
+                const std::string s = ToUpper(Trim(val));
+                if (s == "STRATEGYA" || s == "VIEWPORTSHIFT" || s == "STRATEGY_A") {
+                    parsed.samplingStrategy = SamplingStrategy::StrategyA;
+                } else if (s == "STRATEGYB" || s == "PROGRAMMABLESAMPLELOCATIONS" || s == "STRATEGY_B" || s == "SAMPLELOCATIONS") {
+                    parsed.samplingStrategy = SamplingStrategy::StrategyB;
+                } else {
+                    warnings.emplace_back("Invalid SamplingStrategy '" + val + "'; keeping previous.");
+                }
             } else if (key == "DebugView") {
                 parsed.debugView = ParseUInt(val, parsed.debugView, 0, 5);
             } else if (key == "ShowOverlay") {
@@ -2002,7 +2079,9 @@ bool ConfigManager::Save(const std::filesystem::path& configPath) {
     file << "JitterScale = " << snapshot.jitterScale << "\n";
     file << "JitterDirection = " << snapshot.jitterDirection << "\n";
     file << "ProjectionJitterSign = " << snapshot.projectionJitterSign << "\n";
-    file << "JitterCompensation = " << snapshot.jitterCompensation << "\n\n";
+    file << "JitterCompensation = " << snapshot.jitterCompensation << "\n";
+    file << "SamplingStrategy = "
+         << (snapshot.samplingStrategy == SamplingStrategy::StrategyB ? "StrategyB" : "StrategyA") << "\n\n";
 
     file << "[Debug]\n";
     file << "ShowOverlay = " << (snapshot.showOverlay ? "true" : "false") << "\n";
@@ -2425,6 +2504,7 @@ void HookManager::Shutdown() {
 #include "cbr/config.h"
 #include "cbr/jitter_manager.h"
 #include "cbr/logger.h"
+#include "cbr/pattern_scanner.h"
 #include "cbr/reconstruction_pass.h"
 #include "cbr/render_target_manager.h"
 
@@ -2439,6 +2519,7 @@ namespace {
 
 struct MinimalVkViewport;
 struct MinimalVkRect2D;
+struct MinimalVkSampleLocationsInfoEXT;
 
 // Function pointer typedefs matching Vulkan loader signatures
 typedef void* (*PFN_vkGetDeviceProcAddr)(void* device, const char* pName);
@@ -2447,21 +2528,27 @@ typedef int   (*PFN_vkQueuePresentKHR)(void* queue, const void* pPresentInfo);
 typedef int   (*PFN_vkCreateSwapchainKHR)(void* device, const void* pCreateInfo, const void* pAllocator, void* pSwapchain);
 typedef void  (*PFN_vkCmdSetViewport)(void* commandBuffer, uint32_t firstViewport, uint32_t viewportCount, const MinimalVkViewport* pViewports);
 typedef void  (*PFN_vkCmdSetScissor)(void* commandBuffer, uint32_t firstScissor, uint32_t scissorCount, const MinimalVkRect2D* pScissors);
+typedef void  (*PFN_vkCmdBeginRenderPass)(void* commandBuffer, const void* pRenderPassBegin, uint32_t contents);
 typedef void  (*PFN_vkCmdEndRenderPass)(void* commandBuffer);
+typedef void  (*PFN_vkCmdSetSampleLocationsEXT)(void* commandBuffer, const MinimalVkSampleLocationsInfoEXT* pSampleLocationsInfo);
 
-PFN_vkGetDeviceProcAddr   g_Original_vkGetDeviceProcAddr = nullptr;
-PFN_vkGetInstanceProcAddr g_Original_vkGetInstanceProcAddr = nullptr;
-PFN_vkQueuePresentKHR     g_Original_vkQueuePresentKHR = nullptr;
-PFN_vkCreateSwapchainKHR  g_Original_vkCreateSwapchainKHR = nullptr;
-PFN_vkCmdSetViewport      g_Original_vkCmdSetViewport = nullptr;
-PFN_vkCmdSetScissor       g_Original_vkCmdSetScissor = nullptr;
-PFN_vkCmdEndRenderPass    g_Original_vkCmdEndRenderPass = nullptr;
+PFN_vkGetDeviceProcAddr        g_Original_vkGetDeviceProcAddr = nullptr;
+PFN_vkGetInstanceProcAddr      g_Original_vkGetInstanceProcAddr = nullptr;
+PFN_vkQueuePresentKHR          g_Original_vkQueuePresentKHR = nullptr;
+PFN_vkCreateSwapchainKHR       g_Original_vkCreateSwapchainKHR = nullptr;
+PFN_vkCmdSetViewport           g_Original_vkCmdSetViewport = nullptr;
+PFN_vkCmdSetScissor            g_Original_vkCmdSetScissor = nullptr;
+PFN_vkCmdBeginRenderPass       g_Original_vkCmdBeginRenderPass = nullptr;
+PFN_vkCmdEndRenderPass         g_Original_vkCmdEndRenderPass = nullptr;
+PFN_vkCmdSetSampleLocationsEXT g_Original_vkCmdSetSampleLocationsEXT = nullptr;
 
 void* Hooked_vkGetDeviceProcAddr(void* device, const char* pName);
 void* Hooked_vkGetInstanceProcAddr(void* instance, const char* pName);
 void  Hooked_vkCmdSetViewport(void* commandBuffer, uint32_t firstViewport, uint32_t viewportCount, const MinimalVkViewport* pViewports);
 void  Hooked_vkCmdSetScissor(void* commandBuffer, uint32_t firstScissor, uint32_t scissorCount, const MinimalVkRect2D* pScissors);
+void  Hooked_vkCmdBeginRenderPass(void* commandBuffer, const void* pRenderPassBegin, uint32_t contents);
 void  Hooked_vkCmdEndRenderPass(void* commandBuffer);
+void  Hooked_vkCmdSetSampleLocationsEXT(void* commandBuffer, const MinimalVkSampleLocationsInfoEXT* pSampleLocationsInfo);
 
 // VK_ERROR_INITIALIZATION_FAILED: returned if a hook is ever invoked without a valid trampoline,
 // so the failure is visible to the caller instead of silently dropping frames / swapchains.
@@ -2662,10 +2749,23 @@ void Hooked_vkCmdSetViewport(void* commandBuffer, uint32_t firstViewport, uint32
         redirected.height = static_cast<float>(dims.quarterHeight);
 
         const auto config = ConfigManager::Get().GetConfig();
-        if (config.jitterDirection != 0) {
-            const uint32_t currentFrame = CBREngine::Get().GetCurrentFrameIndex();
-            const float shift = JitterManager::Get().GetQuarterViewportShiftX(currentFrame);
-            redirected.x += shift;
+        const uint32_t currentFrame = CBREngine::Get().GetCurrentFrameIndex();
+
+        if (config.samplingStrategy == SamplingStrategy::StrategyA) {
+            // Strategy A: Viewport Shift Jittering (0.5px horizontal shift on odd frames)
+            if (config.jitterDirection != 0) {
+                const float shift = JitterManager::Get().GetQuarterViewportShiftX(currentFrame);
+                redirected.x += shift;
+            }
+        } else if (config.samplingStrategy == SamplingStrategy::StrategyB) {
+            // Strategy B: Hardware Programmable Sample Locations (VK_EXT_sample_locations)
+            // Viewport is stationary (shift = 0.0f). Alternate dynamic sample locations.
+            if (g_Original_vkCmdSetSampleLocationsEXT) {
+                MinimalVkSampleLocationsInfoEXT sampleInfo{};
+                MinimalVkSampleLocationEXT sampleLocs[2]{};
+                ConfigureCheckerboardSampleLocations(currentFrame, sampleInfo, sampleLocs);
+                g_Original_vkCmdSetSampleLocationsEXT(commandBuffer, &sampleInfo);
+            }
         }
 
         g_Original_vkCmdSetViewport(commandBuffer, firstViewport, 1, &redirected);
@@ -2700,6 +2800,23 @@ void Hooked_vkCmdSetScissor(void* commandBuffer, uint32_t firstScissor, uint32_t
     g_Original_vkCmdSetScissor(commandBuffer, firstScissor, scissorCount, pScissors);
 }
 
+void Hooked_vkCmdBeginRenderPass(void* commandBuffer, const void* pRenderPassBegin, uint32_t contents) {
+    if (!g_Original_vkCmdBeginRenderPass) return;
+
+    if (CBREngine::Get().IsEnabled()) {
+        const auto config = ConfigManager::Get().GetConfig();
+        if (config.samplingStrategy == SamplingStrategy::StrategyB && g_Original_vkCmdSetSampleLocationsEXT) {
+            const uint32_t currentFrame = CBREngine::Get().GetCurrentFrameIndex();
+            MinimalVkSampleLocationsInfoEXT sampleInfo{};
+            MinimalVkSampleLocationEXT sampleLocs[2]{};
+            ConfigureCheckerboardSampleLocations(currentFrame, sampleInfo, sampleLocs);
+            g_Original_vkCmdSetSampleLocationsEXT(commandBuffer, &sampleInfo);
+        }
+    }
+
+    g_Original_vkCmdBeginRenderPass(commandBuffer, pRenderPassBegin, contents);
+}
+
 void Hooked_vkCmdEndRenderPass(void* commandBuffer) {
     if (!g_Original_vkCmdEndRenderPass) return;
 
@@ -2711,6 +2828,24 @@ void Hooked_vkCmdEndRenderPass(void* commandBuffer) {
         } catch (...) {
         }
     }
+}
+
+void Hooked_vkCmdSetSampleLocationsEXT(void* commandBuffer, const MinimalVkSampleLocationsInfoEXT* pSampleLocationsInfo) {
+    if (!g_Original_vkCmdSetSampleLocationsEXT) return;
+
+    if (CBREngine::Get().IsEnabled()) {
+        const auto config = ConfigManager::Get().GetConfig();
+        if (config.samplingStrategy == SamplingStrategy::StrategyB) {
+            const uint32_t currentFrame = CBREngine::Get().GetCurrentFrameIndex();
+            MinimalVkSampleLocationsInfoEXT sampleInfo{};
+            MinimalVkSampleLocationEXT sampleLocs[2]{};
+            ConfigureCheckerboardSampleLocations(currentFrame, sampleInfo, sampleLocs);
+            g_Original_vkCmdSetSampleLocationsEXT(commandBuffer, &sampleInfo);
+            return;
+        }
+    }
+
+    g_Original_vkCmdSetSampleLocationsEXT(commandBuffer, pSampleLocationsInfo);
 }
 
 void* Hooked_vkGetDeviceProcAddr(void* device, const char* pName) {
@@ -2753,6 +2888,18 @@ void* Hooked_vkGetDeviceProcAddr(void* device, const char* pName) {
         }
         return reinterpret_cast<void*>(&Hooked_vkCmdEndRenderPass);
     }
+    if (std::strcmp(pName, "vkCmdBeginRenderPass") == 0) {
+        if (!g_Original_vkCmdBeginRenderPass) {
+            g_Original_vkCmdBeginRenderPass = reinterpret_cast<PFN_vkCmdBeginRenderPass>(realProc);
+        }
+        return reinterpret_cast<void*>(&Hooked_vkCmdBeginRenderPass);
+    }
+    if (std::strcmp(pName, "vkCmdSetSampleLocationsEXT") == 0) {
+        if (!g_Original_vkCmdSetSampleLocationsEXT) {
+            g_Original_vkCmdSetSampleLocationsEXT = reinterpret_cast<PFN_vkCmdSetSampleLocationsEXT>(realProc);
+        }
+        return reinterpret_cast<void*>(&Hooked_vkCmdSetSampleLocationsEXT);
+    }
     return realProc;
 }
 
@@ -2790,11 +2937,23 @@ void* Hooked_vkGetInstanceProcAddr(void* instance, const char* pName) {
         }
         return reinterpret_cast<void*>(&Hooked_vkCmdSetScissor);
     }
+    if (std::strcmp(pName, "vkCmdBeginRenderPass") == 0) {
+        if (!g_Original_vkCmdBeginRenderPass) {
+            g_Original_vkCmdBeginRenderPass = reinterpret_cast<PFN_vkCmdBeginRenderPass>(realProc);
+        }
+        return reinterpret_cast<void*>(&Hooked_vkCmdBeginRenderPass);
+    }
     if (std::strcmp(pName, "vkCmdEndRenderPass") == 0) {
         if (!g_Original_vkCmdEndRenderPass) {
             g_Original_vkCmdEndRenderPass = reinterpret_cast<PFN_vkCmdEndRenderPass>(realProc);
         }
         return reinterpret_cast<void*>(&Hooked_vkCmdEndRenderPass);
+    }
+    if (std::strcmp(pName, "vkCmdSetSampleLocationsEXT") == 0) {
+        if (!g_Original_vkCmdSetSampleLocationsEXT) {
+            g_Original_vkCmdSetSampleLocationsEXT = reinterpret_cast<PFN_vkCmdSetSampleLocationsEXT>(realProc);
+        }
+        return reinterpret_cast<void*>(&Hooked_vkCmdSetSampleLocationsEXT);
     }
     if (std::strcmp(pName, "vkGetDeviceProcAddr") == 0) {
         if (!g_Original_vkGetDeviceProcAddr) {
@@ -2917,7 +3076,24 @@ bool HookManager::InstallVulkanHooks() {
         }
     }
 
-    // 6. Detour vkCmdEndRenderPass for scene pass completion detection
+    // 6. Detour vkCmdBeginRenderPass for geometry pass sample location injection
+    auto pfnCmdBeginRenderPass = reinterpret_cast<void*>(GetProcAddress(vulkanModule, "vkCmdBeginRenderPass"));
+    if (pfnCmdBeginRenderPass) {
+        mhStatus = MH_CreateHook(
+            pfnCmdBeginRenderPass,
+            reinterpret_cast<LPVOID>(&Hooked_vkCmdBeginRenderPass),
+            reinterpret_cast<LPVOID*>(&g_Original_vkCmdBeginRenderPass)
+        );
+        if (mhStatus == MH_OK || mhStatus == MH_ERROR_ALREADY_CREATED) {
+            MH_EnableHook(pfnCmdBeginRenderPass);
+            CBR_LOG_INFO("MinHook: Successfully detoured vkCmdBeginRenderPass (export at 0x%p).", pfnCmdBeginRenderPass);
+            hookedAny = true;
+        } else {
+            CBR_LOG_WARN("MinHook: Could not detour vkCmdBeginRenderPass (status: %d).", mhStatus);
+        }
+    }
+
+    // 7. Detour vkCmdEndRenderPass for scene pass completion detection
     auto pfnCmdEndRenderPass = reinterpret_cast<void*>(GetProcAddress(vulkanModule, "vkCmdEndRenderPass"));
     if (pfnCmdEndRenderPass) {
         mhStatus = MH_CreateHook(
@@ -2931,6 +3107,23 @@ bool HookManager::InstallVulkanHooks() {
             hookedAny = true;
         } else {
             CBR_LOG_WARN("MinHook: Could not detour vkCmdEndRenderPass (status: %d).", mhStatus);
+        }
+    }
+
+    // 8. Resolve and detour vkCmdSetSampleLocationsEXT for Strategy B
+    auto pfnCmdSetSampleLocationsEXT = reinterpret_cast<void*>(GetProcAddress(vulkanModule, "vkCmdSetSampleLocationsEXT"));
+    if (pfnCmdSetSampleLocationsEXT) {
+        mhStatus = MH_CreateHook(
+            pfnCmdSetSampleLocationsEXT,
+            reinterpret_cast<LPVOID>(&Hooked_vkCmdSetSampleLocationsEXT),
+            reinterpret_cast<LPVOID*>(&g_Original_vkCmdSetSampleLocationsEXT)
+        );
+        if (mhStatus == MH_OK || mhStatus == MH_ERROR_ALREADY_CREATED) {
+            MH_EnableHook(pfnCmdSetSampleLocationsEXT);
+            CBR_LOG_INFO("MinHook: Successfully detoured vkCmdSetSampleLocationsEXT (export at 0x%p).", pfnCmdSetSampleLocationsEXT);
+        } else {
+            g_Original_vkCmdSetSampleLocationsEXT = reinterpret_cast<PFN_vkCmdSetSampleLocationsEXT>(pfnCmdSetSampleLocationsEXT);
+            CBR_LOG_INFO("Directly resolved vkCmdSetSampleLocationsEXT: 0x%p", pfnCmdSetSampleLocationsEXT);
         }
     }
 
@@ -3275,6 +3468,220 @@ void Logger::Log(LogLevel level, const std::string& message) {
 } // namespace cbr
 ```
 
+<a id="srcpatternscannercpp"></a>
+### `src/pattern_scanner.cpp`
+```cpp
+#include "cbr/pattern_scanner.h"
+#include <cctype>
+#include <cstring>
+#include "cbr/jitter_manager.h"
+#include "cbr/logger.h"
+
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
+
+namespace cbr {
+
+const uint8_t* PatternScanner::FindPattern(const uint8_t* base, size_t size, const char* signature, const char* mask) {
+    if (!base || size == 0 || !signature || !mask) {
+        return nullptr;
+    }
+
+    const size_t maskLen = std::strlen(mask);
+    if (size < maskLen) {
+        return nullptr;
+    }
+
+    const size_t scanLimit = size - maskLen;
+    for (size_t i = 0; i <= scanLimit; ++i) {
+        bool match = true;
+        for (size_t j = 0; j < maskLen; ++j) {
+            if (mask[j] == 'x' && base[i + j] != static_cast<uint8_t>(signature[j])) {
+                match = false;
+                break;
+            }
+        }
+        if (match) {
+            return base + i;
+        }
+    }
+    return nullptr;
+}
+
+bool PatternScanner::ParseIdaPattern(std::string_view idaPattern, std::vector<uint8_t>& outBytes, std::string& outMask) {
+    outBytes.clear();
+    outMask.clear();
+
+    size_t i = 0;
+    const size_t n = idaPattern.size();
+
+    while (i < n) {
+        // Skip whitespace
+        while (i < n && std::isspace(static_cast<unsigned char>(idaPattern[i]))) {
+            ++i;
+        }
+        if (i >= n) break;
+
+        if (idaPattern[i] == '?') {
+            outBytes.push_back(0x00);
+            outMask.push_back('?');
+            ++i;
+            if (i < n && idaPattern[i] == '?') {
+                ++i; // consume second '?' in "??"
+            }
+        } else {
+            // Hex byte
+            if (i + 1 < n && std::isxdigit(static_cast<unsigned char>(idaPattern[i])) &&
+                std::isxdigit(static_cast<unsigned char>(idaPattern[i + 1]))) {
+                char hex[3] = { idaPattern[i], idaPattern[i + 1], '\0' };
+                uint8_t byteVal = static_cast<uint8_t>(std::strtoul(hex, nullptr, 16));
+                outBytes.push_back(byteVal);
+                outMask.push_back('x');
+                i += 2;
+            } else {
+                return false; // Malformed hex sequence
+            }
+        }
+    }
+
+    return !outBytes.empty();
+}
+
+const uint8_t* PatternScanner::FindIdaPattern(const uint8_t* base, size_t size, std::string_view idaPattern) {
+    std::vector<uint8_t> bytes;
+    std::string mask;
+    if (!ParseIdaPattern(idaPattern, bytes, mask)) {
+        return nullptr;
+    }
+    return FindPattern(base, size, reinterpret_cast<const char*>(bytes.data()), mask.c_str());
+}
+
+const uint8_t* PatternScanner::ResolveRipRelative(const uint8_t* instructionAddress, size_t instructionLength, size_t displacementOffset) {
+    if (!instructionAddress || instructionLength < displacementOffset + sizeof(int32_t)) {
+        return nullptr;
+    }
+
+    int32_t displacement = 0;
+    std::memcpy(&displacement, instructionAddress + displacementOffset, sizeof(int32_t));
+    return instructionAddress + instructionLength + displacement;
+}
+
+#if defined(_WIN32)
+namespace {
+    float* g_cachedCameraMatrix = nullptr;
+    bool   g_cameraScannerAttempted = false;
+}
+
+const uint8_t* PatternScanner::ScanModule(const char* moduleName, const char* signature, const char* mask) {
+    HMODULE hMod = moduleName ? GetModuleHandleA(moduleName) : GetModuleHandleA(nullptr);
+    if (!hMod) return nullptr;
+
+    auto dosHeader = reinterpret_cast<const IMAGE_DOS_HEADER*>(hMod);
+    if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) return nullptr;
+
+    auto ntHeaders = reinterpret_cast<const IMAGE_NT_HEADERS*>(reinterpret_cast<const uint8_t*>(hMod) + dosHeader->e_lfanew);
+    if (ntHeaders->Signature != IMAGE_NT_SIGNATURE) return nullptr;
+
+    const auto sectionHeader = IMAGE_FIRST_SECTION(ntHeaders);
+    const WORD numSections = ntHeaders->FileHeader.NumberOfSections;
+
+    for (WORD s = 0; s < numSections; ++s) {
+        const auto& sec = sectionHeader[s];
+        // Scan executable code sections (e.g. .text)
+        if (sec.Characteristics & (IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_CNT_CODE)) {
+            const auto* secBase = reinterpret_cast<const uint8_t*>(hMod) + sec.VirtualAddress;
+            const size_t secSize = sec.Misc.VirtualSize > 0 ? sec.Misc.VirtualSize : sec.SizeOfRawData;
+
+            const uint8_t* found = FindPattern(secBase, secSize, signature, mask);
+            if (found) {
+                return found;
+            }
+        }
+    }
+    return nullptr;
+}
+
+const uint8_t* PatternScanner::ScanModuleIda(const char* moduleName, std::string_view idaPattern) {
+    std::vector<uint8_t> bytes;
+    std::string mask;
+    if (!ParseIdaPattern(idaPattern, bytes, mask)) {
+        return nullptr;
+    }
+    return ScanModule(moduleName, reinterpret_cast<const char*>(bytes.data()), mask.c_str());
+}
+
+bool PatternScanner::InitializeCameraScanner() {
+    if (g_cameraScannerAttempted) {
+        return g_cachedCameraMatrix != nullptr;
+    }
+    g_cameraScannerAttempted = true;
+
+    // Known candidate camera signatures for RDR2 PC (1.0.1491.50+):
+    // 1. mov rax, cs:g_cameraManager (48 8B 05 ? ? ? ?)
+    // 2. mov rcx, cs:g_cameraManager (48 8B 0D ? ? ? ?)
+    static const char* kCameraPatterns[] = {
+        "48 8B 05 ? ? ? ? 48 8B 48 08",
+        "48 8B 0D ? ? ? ? 48 85 C9 74 ? 48 8B 01",
+        "48 8B 05 ? ? ? ? 48 85 C0 74 ? 48 8B 88"
+    };
+
+    for (const char* pattern : kCameraPatterns) {
+        const uint8_t* match = ScanModuleIda(nullptr, pattern);
+        if (match) {
+            const uint8_t* managerPtr = ResolveRipRelative(match, 7, 3);
+            if (managerPtr) {
+                CBR_LOG_INFO("Camera manager pointer resolved at 0x%p via pattern '%s'", managerPtr, pattern);
+                // In game, g_cameraManager points to camera struct containing projection matrix at offset 0x30 / 0x40
+                // Store base address for projection matrix access
+                MEMORY_BASIC_INFORMATION mbi{};
+                if (VirtualQuery(managerPtr, &mbi, sizeof(mbi)) && (mbi.State == MEM_COMMIT)) {
+                    void* targetManager = nullptr;
+                    std::memcpy(&targetManager, managerPtr, sizeof(void*));
+                    if (targetManager && VirtualQuery(targetManager, &mbi, sizeof(mbi)) && (mbi.State == MEM_COMMIT)) {
+                        g_cachedCameraMatrix = reinterpret_cast<float*>(static_cast<uint8_t*>(targetManager) + 0x40);
+                        CBR_LOG_INFO("RDR2 camera projection matrix acquired at 0x%p", g_cachedCameraMatrix);
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    CBR_LOG_INFO("RAGE camera manager signature not matched in current process; utilizing Viewport Redirection (Strategy A).");
+    return false;
+}
+
+float* PatternScanner::GetCameraProjectionMatrix() {
+    return g_cachedCameraMatrix;
+}
+
+bool PatternScanner::UpdateCameraJitter(uint32_t frameIndex, bool isVulkan) {
+    if (!g_cachedCameraMatrix) {
+        if (!InitializeCameraScanner()) {
+            return false;
+        }
+    }
+
+    if (g_cachedCameraMatrix) {
+        try {
+            JitterManager::Get().Update(frameIndex);
+            JitterManager::Get().ApplyJitterToProjection(g_cachedCameraMatrix, isVulkan);
+            return true;
+        } catch (...) {
+            g_cachedCameraMatrix = nullptr;
+            CBR_LOG_WARN("Camera projection matrix access faulted; falling back to Viewport Redirection.");
+            return false;
+        }
+    }
+    return false;
+}
+#endif
+
+} // namespace cbr
+```
+
 <a id="srcreconstructionpasscpp"></a>
 ### `src/reconstruction_pass.cpp`
 ```cpp
@@ -3301,9 +3708,17 @@ constexpr uint32_t kVkStructureTypePipelineShaderStageCreateInfo = 18;
 constexpr uint32_t kVkStructureTypeComputePipelineCreateInfo = 29;
 constexpr uint32_t kVkStructureTypePipelineLayoutCreateInfo = 30;
 constexpr uint32_t kVkStructureTypeDescriptorSetLayoutCreateInfo = 32;
+constexpr uint32_t kVkStructureTypeDescriptorPoolCreateInfo = 33;
+constexpr uint32_t kVkStructureTypeDescriptorSetAllocateInfo = 34;
+constexpr uint32_t kVkStructureTypeMemoryBarrier = 46;
 
 constexpr uint32_t kVkShaderStageComputeBit = 0x00000020;
 constexpr uint32_t kVkPipelineBindPointCompute = 1;
+constexpr uint32_t kVkPipelineStageComputeShaderBit = 0x00000800;
+constexpr uint32_t kVkPipelineStageAllCommandsBit = 0x00010000;
+constexpr uint32_t kVkAccessShaderWriteBit = 0x00000040;
+constexpr uint32_t kVkAccessShaderReadBit = 0x00000020;
+constexpr uint32_t kVkAccessMemoryReadBit = 0x00008000;
 
 constexpr uint32_t kVkDescriptorTypeCombinedImageSampler = 1;
 constexpr uint32_t kVkDescriptorTypeStorageImage = 3;
@@ -3336,6 +3751,35 @@ struct MinimalVkDescriptorSetLayoutCreateInfo {
     uint32_t                                   flags;
     uint32_t                                   bindingCount;
     const MinimalVkDescriptorSetLayoutBinding* pBindings;
+};
+
+struct MinimalVkDescriptorPoolSize {
+    uint32_t type;
+    uint32_t descriptorCount;
+};
+
+struct MinimalVkDescriptorPoolCreateInfo {
+    uint32_t                           sType;
+    const void*                        pNext;
+    uint32_t                           flags;
+    uint32_t                           maxSets;
+    uint32_t                           poolSizeCount;
+    const MinimalVkDescriptorPoolSize* pPoolSizes;
+};
+
+struct MinimalVkDescriptorSetAllocateInfo {
+    uint32_t    sType;
+    const void* pNext;
+    void*       descriptorPool;
+    uint32_t    descriptorSetCount;
+    const void* pSetLayouts;
+};
+
+struct MinimalVkMemoryBarrier {
+    uint32_t    sType;
+    const void* pNext;
+    uint32_t    srcAccessMask;
+    uint32_t    dstAccessMask;
 };
 
 struct MinimalVkPipelineLayoutCreateInfo {
@@ -3373,13 +3817,18 @@ typedef int   (*PFN_vkCreateShaderModule)(void* device, const MinimalVkShaderMod
 typedef void  (*PFN_vkDestroyShaderModule)(void* device, void* shaderModule, const void* pAllocator);
 typedef int   (*PFN_vkCreateDescriptorSetLayout)(void* device, const MinimalVkDescriptorSetLayoutCreateInfo* pCreateInfo, const void* pAllocator, void** pSetLayout);
 typedef void  (*PFN_vkDestroyDescriptorSetLayout)(void* device, void* setLayout, const void* pAllocator);
+typedef int   (*PFN_vkCreateDescriptorPool)(void* device, const MinimalVkDescriptorPoolCreateInfo* pCreateInfo, const void* pAllocator, void** pDescriptorPool);
+typedef void  (*PFN_vkDestroyDescriptorPool)(void* device, void* descriptorPool, const void* pAllocator);
+typedef int   (*PFN_vkAllocateDescriptorSets)(void* device, const MinimalVkDescriptorSetAllocateInfo* pAllocateInfo, void** pDescriptorSets);
 typedef int   (*PFN_vkCreatePipelineLayout)(void* device, const MinimalVkPipelineLayoutCreateInfo* pCreateInfo, const void* pAllocator, void** pPipelineLayout);
 typedef void  (*PFN_vkDestroyPipelineLayout)(void* device, void* pipelineLayout, const void* pAllocator);
 typedef int   (*PFN_vkCreateComputePipelines)(void* device, void* pipelineCache, uint32_t createInfoCount, const MinimalVkComputePipelineCreateInfo* pCreateInfos, const void* pAllocator, void** pPipelines);
 typedef void  (*PFN_vkDestroyPipeline)(void* device, void* pipeline, const void* pAllocator);
 typedef void  (*PFN_vkCmdBindPipeline)(void* commandBuffer, uint32_t pipelineBindPoint, void* pipeline);
+typedef void  (*PFN_vkCmdBindDescriptorSets)(void* commandBuffer, uint32_t pipelineBindPoint, void* layout, uint32_t firstSet, uint32_t descriptorSetCount, const void** pDescriptorSets, uint32_t dynamicOffsetCount, const uint32_t* pDynamicOffsets);
 typedef void  (*PFN_vkCmdPushConstants)(void* commandBuffer, void* layout, uint32_t stageFlags, uint32_t offset, uint32_t size, const void* pValues);
 typedef void  (*PFN_vkCmdDispatch)(void* commandBuffer, uint32_t groupCountX, uint32_t groupCountY, uint32_t groupCountZ);
+typedef void  (*PFN_vkCmdPipelineBarrier)(void* commandBuffer, uint32_t srcStageMask, uint32_t dstStageMask, uint32_t dependencyFlags, uint32_t memoryBarrierCount, const MinimalVkMemoryBarrier* pMemoryBarriers, uint32_t bufferMemoryBarrierCount, const void* pBufferMemoryBarriers, uint32_t imageMemoryBarrierCount, const void* pImageMemoryBarriers);
 
 } // namespace
 #endif
@@ -3574,8 +4023,45 @@ bool ReconstructionPass::CreateVulkanPipeline() {
     m_pipeline = pipeline;
     m_pipelineLayout = pipelineLayout;
     m_descriptorSetLayout = descriptorSetLayout;
-    CBR_LOG_INFO("Vulkan CBR reconstruction compute pipeline created successfully! (Pipeline: %p, Layout: %p, Descriptors: %p)",
-        m_pipeline, m_pipelineLayout, m_descriptorSetLayout);
+
+    // Create descriptor pool and allocate descriptor set for bindings 0..6
+    auto pfnCreateDescriptorPool = reinterpret_cast<PFN_vkCreateDescriptorPool>(resolveDeviceFunc("vkCreateDescriptorPool"));
+    auto pfnAllocateDescriptorSets = reinterpret_cast<PFN_vkAllocateDescriptorSets>(resolveDeviceFunc("vkAllocateDescriptorSets"));
+    void* descriptorPool = nullptr;
+    void* descriptorSet = nullptr;
+
+    if (descriptorSetLayout && pfnCreateDescriptorPool && pfnAllocateDescriptorSets) {
+        MinimalVkDescriptorPoolSize poolSizes[2]{};
+        poolSizes[0].type = kVkDescriptorTypeCombinedImageSampler;
+        poolSizes[0].descriptorCount = 5;
+        poolSizes[1].type = kVkDescriptorTypeStorageImage;
+        poolSizes[1].descriptorCount = 2;
+
+        MinimalVkDescriptorPoolCreateInfo poolInfo{};
+        poolInfo.sType = kVkStructureTypeDescriptorPoolCreateInfo;
+        poolInfo.maxSets = 1;
+        poolInfo.poolSizeCount = 2;
+        poolInfo.pPoolSizes = poolSizes;
+
+        res = pfnCreateDescriptorPool(m_device, &poolInfo, nullptr, &descriptorPool);
+        if (res == 0 && descriptorPool) {
+            MinimalVkDescriptorSetAllocateInfo allocInfo{};
+            allocInfo.sType = kVkStructureTypeDescriptorSetAllocateInfo;
+            allocInfo.descriptorPool = descriptorPool;
+            allocInfo.descriptorSetCount = 1;
+            allocInfo.pSetLayouts = &descriptorSetLayout;
+
+            res = pfnAllocateDescriptorSets(m_device, &allocInfo, &descriptorSet);
+            if (res != 0 || !descriptorSet) {
+                CBR_LOG_WARN("vkAllocateDescriptorSets warning (code: %d); descriptor set binding deferred.", res);
+            }
+        }
+    }
+
+    m_descriptorPool = descriptorPool;
+    m_descriptorSet = descriptorSet;
+    CBR_LOG_INFO("Vulkan CBR reconstruction compute pipeline created successfully! (Pipeline: %p, Layout: %p, Descriptors: %p, Pool: %p, Set: %p)",
+        m_pipeline, m_pipelineLayout, m_descriptorSetLayout, m_descriptorPool, m_descriptorSet);
     return true;
 #else
     return true;
@@ -3600,7 +4086,13 @@ void ReconstructionPass::DestroyVulkanPipeline() {
     auto pfnDestroyPipeline = reinterpret_cast<PFN_vkDestroyPipeline>(resolveDeviceFunc("vkDestroyPipeline"));
     auto pfnDestroyPipelineLayout = reinterpret_cast<PFN_vkDestroyPipelineLayout>(resolveDeviceFunc("vkDestroyPipelineLayout"));
     auto pfnDestroyDescriptorSetLayout = reinterpret_cast<PFN_vkDestroyDescriptorSetLayout>(resolveDeviceFunc("vkDestroyDescriptorSetLayout"));
+    auto pfnDestroyDescriptorPool = reinterpret_cast<PFN_vkDestroyDescriptorPool>(resolveDeviceFunc("vkDestroyDescriptorPool"));
 
+    if (m_descriptorPool && pfnDestroyDescriptorPool) {
+        pfnDestroyDescriptorPool(m_device, m_descriptorPool, nullptr);
+        m_descriptorPool = nullptr;
+        m_descriptorSet = nullptr;
+    }
     if (m_pipeline && pfnDestroyPipeline) {
         pfnDestroyPipeline(m_device, m_pipeline, nullptr);
         m_pipeline = nullptr;
@@ -3645,6 +4137,8 @@ void ReconstructionPass::Shutdown() {
     m_pipeline = nullptr;
     m_pipelineLayout = nullptr;
     m_descriptorSetLayout = nullptr;
+    m_descriptorPool = nullptr;
+    m_descriptorSet = nullptr;
     m_initialized.store(false);
     CBR_LOG_INFO("ReconstructionPass shut down cleanly.");
 }
@@ -3699,8 +4193,10 @@ void ReconstructionPass::DispatchVulkan(void* vkCommandBuffer, uint32_t frameInd
     if (!vulkanModule) return;
 
     auto pfnCmdBindPipeline = reinterpret_cast<PFN_vkCmdBindPipeline>(GetProcAddress(vulkanModule, "vkCmdBindPipeline"));
+    auto pfnCmdBindDescriptorSets = reinterpret_cast<PFN_vkCmdBindDescriptorSets>(GetProcAddress(vulkanModule, "vkCmdBindDescriptorSets"));
     auto pfnCmdPushConstants = reinterpret_cast<PFN_vkCmdPushConstants>(GetProcAddress(vulkanModule, "vkCmdPushConstants"));
     auto pfnCmdDispatch = reinterpret_cast<PFN_vkCmdDispatch>(GetProcAddress(vulkanModule, "vkCmdDispatch"));
+    auto pfnCmdPipelineBarrier = reinterpret_cast<PFN_vkCmdPipelineBarrier>(GetProcAddress(vulkanModule, "vkCmdPipelineBarrier"));
 
     if (!pfnCmdBindPipeline || !pfnCmdPushConstants || !pfnCmdDispatch) {
         return;
@@ -3715,8 +4211,24 @@ void ReconstructionPass::DispatchVulkan(void* vkCommandBuffer, uint32_t frameInd
     const uint32_t groupCountY = (targetH + 15u) / 16u;
 
     pfnCmdBindPipeline(vkCommandBuffer, kVkPipelineBindPointCompute, m_pipeline);
+
+    if (m_descriptorSet && pfnCmdBindDescriptorSets) {
+        pfnCmdBindDescriptorSets(vkCommandBuffer, kVkPipelineBindPointCompute, m_pipelineLayout, 0, 1, const_cast<const void**>(&m_descriptorSet), 0, nullptr);
+    }
+
     pfnCmdPushConstants(vkCommandBuffer, m_pipelineLayout, kVkShaderStageComputeBit, 0, sizeof(pushConstants), &pushConstants);
     pfnCmdDispatch(vkCommandBuffer, groupCountX, groupCountY, 1);
+
+    if (pfnCmdPipelineBarrier) {
+        MinimalVkMemoryBarrier barrier{};
+        barrier.sType = kVkStructureTypeMemoryBarrier;
+        barrier.srcAccessMask = kVkAccessShaderWriteBit;
+        barrier.dstAccessMask = kVkAccessShaderReadBit | kVkAccessMemoryReadBit;
+        pfnCmdPipelineBarrier(vkCommandBuffer,
+                              kVkPipelineStageComputeShaderBit,
+                              kVkPipelineStageAllCommandsBit,
+                              0, 1, &barrier, 0, nullptr, 0, nullptr);
+    }
 #else
     (void)frameIndex;
 #endif
@@ -5246,6 +5758,7 @@ void main() {
 #include "cbr/depth_convention.h"
 #include "cbr/jitter_manager.h"
 #include "cbr/logger.h"
+#include "cbr/pattern_scanner.h"
 #include "cbr/reconstruction_pass.h"
 #include "cbr/render_target_manager.h"
 #include <algorithm>
@@ -5313,6 +5826,7 @@ static void TestConfigHardening(const fs::path& dir) {
         "JitterCompensation = -5\n"   // out of range      -> clamped to -1
         "JitterDirection = -1\n"
         "ProjectionJitterSign = -1\n"
+        "SamplingStrategy = StrategyB\n" // valid StrategyB
         "JitterScale = 3\n"              // accepted but ignored (warned)
         "[Debug]\n"
         "DebugView = 77\n");          // out of range      -> clamped
@@ -5332,6 +5846,7 @@ static void TestConfigHardening(const fs::path& dir) {
     CHECK(c.jitterCompensation == -1.0f);
     CHECK(c.jitterDirection == -1);
     CHECK(c.projectionJitterSign == -1);
+    CHECK(c.samplingStrategy == SamplingStrategy::StrategyB);
     CHECK(c.depthConvention == DepthConvention::Standard);
     CHECK(c.depthNear == 0.5f && c.depthFar == 5000.0f);
 
@@ -5340,13 +5855,15 @@ static void TestConfigHardening(const fs::path& dir) {
     CHECK(fresh.jitterCompensation == 0.0f); // whole-pixel jitter needs NO history compensation
     CHECK(fresh.jitterDirection == 1);
     CHECK(fresh.projectionJitterSign == 1);
+    CHECK(fresh.samplingStrategy == SamplingStrategy::StrategyA);
     CHECK(fresh.depthConvention == DepthConvention::Reversed);
 
     // Invalid enum-like values keep the previous setting
-    WriteFile(dir / "bad2.ini", "[Jitter]\nJitterDirection = 2\nProjectionJitterSign = 42\n[Reconstruction]\nDepthConvention = sideways\n");
+    WriteFile(dir / "bad2.ini", "[Jitter]\nJitterDirection = 2\nProjectionJitterSign = 42\nSamplingStrategy = UnknownStrategy\n[Reconstruction]\nDepthConvention = sideways\n");
     CHECK(ConfigManager::Get().Load(dir / "bad2.ini"));
     CHECK(ConfigManager::Get().GetConfig().jitterDirection == -1);
     CHECK(ConfigManager::Get().GetConfig().projectionJitterSign == -1);
+    CHECK(ConfigManager::Get().GetConfig().samplingStrategy == SamplingStrategy::StrategyB);
     CHECK(ConfigManager::Get().GetConfig().depthConvention == DepthConvention::Standard);
 }
 
@@ -5365,6 +5882,7 @@ static void TestConfigMissingFileAndRoundTrip(const fs::path& dir) {
     CHECK(after.jitterCompensation == before.jitterCompensation);
     CHECK(after.jitterDirection == before.jitterDirection);
     CHECK(after.projectionJitterSign == before.projectionJitterSign);
+    CHECK(after.samplingStrategy == before.samplingStrategy);
     CHECK(after.depthConvention == before.depthConvention);
     CHECK(after.depthNear == before.depthNear && after.depthFar == before.depthFar);
 }
@@ -5718,6 +6236,8 @@ static void TestReconstructionPass(const fs::path& dir) {
     pass.Shutdown();
     CHECK(!pass.IsInitialized());
     CHECK(pass.GetDescriptorSetLayout() == nullptr);
+    CHECK(pass.GetDescriptorPool() == nullptr);
+    CHECK(pass.GetDescriptorSet() == nullptr);
     CHECK(pass.InitializeVulkan(nullptr, nullptr));
     CHECK(pass.IsInitialized());
 
@@ -5728,6 +6248,40 @@ static void TestReconstructionPass(const fs::path& dir) {
     pass.Shutdown();
     CHECK(!pass.IsInitialized());
     CHECK(pass.GetDescriptorSetLayout() == nullptr);
+    CHECK(pass.GetDescriptorPool() == nullptr);
+    CHECK(pass.GetDescriptorSet() == nullptr);
+}
+
+static void TestPatternScanner() {
+    // 1. Parsing IDA-style patterns
+    std::vector<uint8_t> bytes;
+    std::string mask;
+    CHECK(PatternScanner::ParseIdaPattern("48 8B 05 ? ? ? ? 48 8B 48 08", bytes, mask));
+    CHECK(bytes.size() == 11);
+    CHECK(mask == "xxx????xxxx");
+    CHECK(bytes[0] == 0x48 && bytes[1] == 0x8B && bytes[2] == 0x05);
+    CHECK(bytes[3] == 0x00 && bytes[6] == 0x00);
+    CHECK(bytes[7] == 0x48 && bytes[8] == 0x8B && bytes[9] == 0x48 && bytes[10] == 0x08);
+
+    // 2. Searching byte buffer
+    const uint8_t mockMemory[] = {
+        0x90, 0x90, 0xCC,
+        0x48, 0x8B, 0x05, 0x12, 0x34, 0x00, 0x00, 0x48, 0x8B, 0x48, 0x08,
+        0xC3, 0x90
+    };
+    const uint8_t* found = PatternScanner::FindIdaPattern(mockMemory, sizeof(mockMemory), "48 8B 05 ? ? ? ? 48 8B 48 08");
+    CHECK(found != nullptr);
+    CHECK(found == mockMemory + 3);
+
+    // 3. Negative search (pattern not present)
+    const uint8_t* notFound = PatternScanner::FindIdaPattern(mockMemory, sizeof(mockMemory), "FF 15 ? ? ? ?");
+    CHECK(notFound == nullptr);
+
+    // 4. RIP-relative resolution: instruction address + instruction length + displacement
+    // Instruction starts at mockMemory + 3, length is 7 bytes (48 8B 05 12 34 00 00), displacement is 0x00003412
+    const uint8_t* ripTarget = PatternScanner::ResolveRipRelative(mockMemory + 3, 7, 3);
+    const int32_t expectedDisplacement = 0x00003412;
+    CHECK(ripTarget == (mockMemory + 3 + 7 + expectedDisplacement));
 }
 
 int main() {
@@ -5745,6 +6299,7 @@ int main() {
     TestPushConstantLayout();
     TestProjectionJitterSign();
     TestReconstructionPass(dir);
+    TestPatternScanner();
 
     fs::remove_all(dir);
     if (g_failures == 0) {

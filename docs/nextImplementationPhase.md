@@ -134,14 +134,14 @@ For checkerboard reconstruction to resolve clean geometry, alternating pixels mu
 
 ## 3. Implementation Roadmap & Timeline
 
-| Phase Subtask | Description | Estimated Effort | Target Outcome |
+| Phase Subtask | Description | Status | Target Outcome |
 |---|---|---|---|
-| **Phase 2.1** | MinHook Integration & Vulkan Proc Table Detours | 3-4 days | Intercept `vkQueuePresentKHR` & swapchain events reliably |
-| **Phase 2.2** | Swapchain Image Tracking & Layout Management | 2-3 days | Acquire swapchain backbuffers and manage pipeline barriers |
-| **Phase 2.3** | SPIR-V Loader & Compute Pipeline Dispatch | 4-5 days | Execute reconstruction compute pass during present call |
-| **Phase 2.4** | Render Target Hooking & Resolution Redirection | 4-5 days | Downscale RDR2 internal pass to 1080p 2× MSAA |
-| **Phase 2.5** | Camera Jitter Injection / Sample Locations | 3-4 days | Alternate subpixel spatial coverage per frame |
-| **Phase 2.6** | Telemetry, UI Overlay & Performance Tuning | 2-3 days | Real-time FPS, frame-time graphs & interactive toggles |
+| **Phase 2.1** | MinHook Integration & Vulkan Proc Table Detours | **COMPLETE** | Intercept `vkQueuePresentKHR` & swapchain events reliably |
+| **Phase 2.2** | Swapchain Image Tracking & Layout Management | **COMPLETE** | Acquire swapchain backbuffers and manage pipeline barriers |
+| **Phase 2.3** | SPIR-V Loader & Compute Pipeline Dispatch | **COMPLETE** | Execute reconstruction compute pass during present call |
+| **Phase 2.4** | Render Target Hooking & Resolution Redirection | **COMPLETE** | Downscale RDR2 internal pass to 1080p 2× MSAA |
+| **Phase 2.5** | Camera Jitter Injection / Sample Locations | **COMPLETE** | Alternate subpixel spatial coverage per frame (Strategy A/B & AOB scanner) |
+| **Phase 2.6** | Telemetry, UI Overlay & Performance Tuning | **IN PROGRESS** | Real-time FPS, frame-time graphs & interactive toggles |
 
 ---
 

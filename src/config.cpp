@@ -216,6 +216,15 @@ bool ConfigManager::Load(const std::filesystem::path& configPath) {
                 }
             } else if (key == "JitterCompensation") {
                 parsed.jitterCompensation = ParseFloat(val, parsed.jitterCompensation, -1.0f, 1.0f);
+            } else if (key == "SamplingStrategy") {
+                const std::string s = ToUpper(Trim(val));
+                if (s == "STRATEGYA" || s == "VIEWPORTSHIFT" || s == "STRATEGY_A") {
+                    parsed.samplingStrategy = SamplingStrategy::StrategyA;
+                } else if (s == "STRATEGYB" || s == "PROGRAMMABLESAMPLELOCATIONS" || s == "STRATEGY_B" || s == "SAMPLELOCATIONS") {
+                    parsed.samplingStrategy = SamplingStrategy::StrategyB;
+                } else {
+                    warnings.emplace_back("Invalid SamplingStrategy '" + val + "'; keeping previous.");
+                }
             } else if (key == "DebugView") {
                 parsed.debugView = ParseUInt(val, parsed.debugView, 0, 5);
             } else if (key == "ShowOverlay") {
@@ -284,7 +293,9 @@ bool ConfigManager::Save(const std::filesystem::path& configPath) {
     file << "JitterScale = " << snapshot.jitterScale << "\n";
     file << "JitterDirection = " << snapshot.jitterDirection << "\n";
     file << "ProjectionJitterSign = " << snapshot.projectionJitterSign << "\n";
-    file << "JitterCompensation = " << snapshot.jitterCompensation << "\n\n";
+    file << "JitterCompensation = " << snapshot.jitterCompensation << "\n";
+    file << "SamplingStrategy = "
+         << (snapshot.samplingStrategy == SamplingStrategy::StrategyB ? "StrategyB" : "StrategyA") << "\n\n";
 
     file << "[Debug]\n";
     file << "ShowOverlay = " << (snapshot.showOverlay ? "true" : "false") << "\n";

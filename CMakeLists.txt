@@ -47,6 +47,7 @@ set(CBR_HEADERS
     ${CBR_INCLUDE_DIR}/cbr/jitter_manager.h
     ${CBR_INCLUDE_DIR}/cbr/limits.h
     ${CBR_INCLUDE_DIR}/cbr/logger.h
+    ${CBR_INCLUDE_DIR}/cbr/pattern_scanner.h
     ${CBR_INCLUDE_DIR}/cbr/reconstruction_pass.h
     ${CBR_INCLUDE_DIR}/cbr/render_target_manager.h
     ${CBR_INCLUDE_DIR}/cbr/ui_overlay.h
@@ -63,6 +64,7 @@ set(CBR_SOURCES
     ${CBR_SOURCE_DIR}/hooks_dx12.cpp
     ${CBR_SOURCE_DIR}/jitter_manager.cpp
     ${CBR_SOURCE_DIR}/logger.cpp
+    ${CBR_SOURCE_DIR}/pattern_scanner.cpp
     ${CBR_SOURCE_DIR}/reconstruction_pass.cpp
     ${CBR_SOURCE_DIR}/render_target_manager.cpp
     ${CBR_SOURCE_DIR}/ui_overlay.cpp
@@ -192,6 +194,7 @@ if(CBR_BUILD_TESTS)
         ${CBR_SOURCE_DIR}/crash_handler.cpp
         ${CBR_SOURCE_DIR}/logger.cpp
         ${CBR_SOURCE_DIR}/jitter_manager.cpp
+        ${CBR_SOURCE_DIR}/pattern_scanner.cpp
         ${CBR_SOURCE_DIR}/render_target_manager.cpp
         ${CBR_SOURCE_DIR}/reconstruction_pass.cpp
     )

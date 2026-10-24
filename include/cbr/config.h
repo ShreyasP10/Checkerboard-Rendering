@@ -31,16 +31,22 @@ enum class ColorSpace {
     RGB
 };
 
+enum class SamplingStrategy {
+    StrategyA, // ViewportShift (standard 2x MSAA sample locations + horizontal viewport half-pixel jitter on odd frames)
+    StrategyB  // ProgrammableSampleLocations (VK_EXT_sample_locations 2x MSAA alternation per frame, stationary viewport)
+};
+
 struct CBRConfig {
     // General
-    bool        enabled{ true };
-    uint32_t    targetWidth{ 3840 };
-    uint32_t    targetHeight{ 2160 };
-    GraphicsApi preferredApi{ GraphicsApi::Vulkan };
+    bool             enabled{ true };
+    uint32_t         targetWidth{ 3840 };
+    uint32_t         targetHeight{ 2160 };
+    GraphicsApi      preferredApi{ GraphicsApi::Vulkan };
+    SamplingStrategy samplingStrategy{ SamplingStrategy::StrategyA };
     // MIP LOD Bias: -1.0f mathematically compensates for the 2x larger texture coordinate
     // derivatives in quarter-resolution (half-width, half-height) 2x MSAA rendering
     // (CHECKERBOARD.md lines 365-425 / El Mansouri 2016: LOD' = -1 + LOD).
-    float       mipLodBias{ -1.0f };
+    float            mipLodBias{ -1.0f };
 
     // Reconstruction
     float           depthTolerance{ 0.010f };
