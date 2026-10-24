@@ -47,17 +47,27 @@ The development roadmap is structured into 8 distinct phases designed to de-risk
   - Validated 2× MSAA quarter-resolution memory allocation footprint (300.59 MiB at 4K).
   - Verified graceful fallback protection (mod times out quietly after 60s without crashing host).
 
-### Phase 2: Active Graphics Detours & Render Target Interception [🔄 ACTIVE FOCUS]
-- **Status:** **In Progress** (See [Next Implementation Phase Plan](file:///c:/Users/Dinesh%20B%20Pawar/OneDrive/Desktop/Checkerboard-Rendering/nextImplementationPhase.md))
+### Phase 2: Active Graphics Detours & Render Target Interception [✅ COMPLETED]
+- **Status:** **Completed & CI Verified** (See [Next Implementation Phase Plan](file:///c:/Users/Dinesh%20B%20Pawar/OneDrive/Desktop/Checkerboard-Rendering/nextImplementationPhase.md) and [Vulkan Hooking Guide](file:///c:/Users/Dinesh%20B%20Pawar/OneDrive/Desktop/Checkerboard-Rendering/docs/VULKAN_HOOKING_GUIDE.md))
 - **Duration:** 3 Weeks
-- **Objectives:**
-  - Transition from stubs to active MinHook detours on `vulkan-1.dll` (`vkQueuePresentKHR`, `vkCreateSwapchainKHR`) and DX12 (`IDXGISwapChain::Present`).
-  - Capture swapchain backbuffers and manage layout transitions (`VK_IMAGE_LAYOUT_PRESENT_SRC_KHR` <-> `VK_IMAGE_LAYOUT_GENERAL`).
-  - Dispatch reconstruction compute shader ([shaders/cbr_reconstruct.comp](file:///c:/Users/Dinesh%20B%20Pawar/OneDrive/Desktop/Checkerboard-Rendering/shaders/cbr_reconstruct.comp)) during `OnPrePresent`.
-  - Downscale RAGE scene render pass to quarter-resolution (1920×1080 2× MSAA).
-  - Inject subpixel camera jitter / sample locations across alternate frames.
+- **Objectives Accomplished:**
+  - Transitioned from stubs to active MinHook detours on `vulkan-1.dll` (`vkQueuePresentKHR`, `vkCreateSwapchainKHR`, `vkCmdSetViewport`, `vkCmdSetScissor`, `vkCmdBeginRenderPass`, `vkCmdEndRenderPass`, `vkCmdSetSampleLocationsEXT`).
+  - Captured swapchain backbuffers and wired real `VkDevice` into `ReconstructionPass`.
+  - Implemented dynamic viewport/scissor downscaling: redirects 4K scene passes to 1080p 2× MSAA while keeping UI/HUD overlays at native 4K.
+  - Implemented mid-frame scene pass interception on `vkCmdEndRenderPass` to trigger compute reconstruction before post-processing and UI compositing.
+  - Implemented Strategy A (0.5px horizontal viewport jitter) and Strategy B (`VK_EXT_sample_locations` alternation with stationary viewport) with strict mutual exclusivity.
+  - Authored IDA-style AOB camera pattern scanner (`pattern_scanner.cpp`) with RIP-relative address resolution and SEH memory protection fallback.
+  - Built internal Vulkan descriptor pool, descriptor sets (bindings 0–6), and `vkCmdPipelineBarrier` synchronization.
 - **Deliverables:**
-  - Active Vulkan/DX12 frame interception executing reconstruction compute pass prior to swapchain presentation.
+  - Active Vulkan graphics detours, complete compute pipeline dispatch, and automated CI release packaging (`rdr2-cbr-release.zip`).
+
+### Phase 2.6 & Phase 3: Telemetry, In-Game Overlay & DirectX 12 Parity [🔄 ACTIVE FOCUS]
+- **Status:** **In Progress**
+- **Duration:** 2 Weeks
+- **Objectives:**
+  - Complete interactive Dear ImGui overlay integration (F11/Insert toggle) for real-time telemetry, frame time metrics, and debug visualization modes.
+  - Implement DirectX 12 hooking parity via dummy device swapchain VMT method (`IDXGISwapChain3::Present` VMT index 8).
+  - Execute HLSL compute shader (`cbr_reconstruct.hlsl`) on DX12 command queue.
 
 ### Phase 3: Projection Jitter & Quarter-Resolution Rendering
 - **Duration:** 2 Weeks

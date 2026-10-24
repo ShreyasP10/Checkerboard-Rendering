@@ -35,19 +35,23 @@ The software package provides a real-time graphics interception and compute reco
 - **FR-01.3:** Upon `DLL_PROCESS_DETACH`, all API hooks installed via MinHook must be disabled and restored to their original function pointers.
 
 ### 2.2 FR-02: Render Target Interception & Resolution Scaling
-- **FR-02.1:** The system shall hook Vulkan image creation (`vkCreateImage`) and D3D12 resource creation (`CreateCommittedResource`).
-- **FR-02.2:** When a color or depth target matching output dimensions ($W \times H$, e.g., $3840 \times 2160$) with `COLOR_ATTACHMENT` or `DEPTH_STENCIL_ATTACHMENT` usage is detected, the dimensions shall be modified to quarter resolution:
+- **FR-02.1:** The system shall hook Vulkan image creation (`vkCreateImage`), command buffer viewports (`vkCmdSetViewport`), and scissors (`vkCmdSetScissor`).
+- **FR-02.2:** When a candidate 3D scene geometry viewport matching output dimensions ($W \times H$, e.g., $3840 \times 2160$) is detected, the dimensions shall be dynamically downscaled to quarter resolution:
   $$W_{\text{render}} = \frac{W}{2}, \quad H_{\text{render}} = \frac{H}{2}$$
 - **FR-02.3:** The intercepted render target shall be configured with `VK_SAMPLE_COUNT_2_BIT` (2× MSAA) in Vulkan, or `SampleDesc.Count = 2` in DirectX 12.
+- **FR-02.4:** UI, HUD, and minimap rendering passes must be detected and preserved at native full resolution (3840×2160) without downscaling.
 
-### 2.3 FR-03: Subpixel Jitter Injection
-- **FR-03.1:** The projection matrix shall be offset on alternating frames according to a 2-phase checkerboard sequence:
-  $$\text{Offset}_x = \begin{cases} +0.5 / W_{\text{target}} & \text{if FrameIndex is Odd} \\ -0.5 / W_{\text{target}} & \text{if FrameIndex is Even} \end{cases}$$
-  $$\text{Offset}_y = \begin{cases} +0.5 / H_{\text{target}} & \text{if FrameIndex is Odd} \\ -0.5 / H_{\text{target}} & \text{if FrameIndex is Even} \end{cases}$$
-- **FR-03.2:** Jitter offsets must be injected prior to scene geometry rendering passes and excluded from UI/HUD rendering passes.
+### 2.3 FR-03: Subpixel Jitter & Sampling Strategy
+- **FR-03.1 (Strategy A - Viewport Shift Jitter):** The projection matrix or viewport shall be offset on alternating frames according to a 2-phase checkerboard sequence:
+  $$\text{Offset}_x = \begin{cases} +0.5 / W_{\text{render}} & \text{if FrameIndex is Odd} \\ -0.5 / W_{\text{render}} & \text{if FrameIndex is Even} \end{cases}$$
+- **FR-03.2 (Strategy B - Programmable Sample Locations):** For hardware supporting `VK_EXT_sample_locations`, the viewport is kept stationary at integer pixels while sample positions alternate per frame:
+  - Even Frames: Sample 0 at $(0.75, 0.75)$, Sample 1 at $(0.25, 0.25)$
+  - Odd Frames: Sample 0 at $(0.25, 0.75)$, Sample 1 at $(0.75, 0.25)$
+- **FR-03.3 (Mutual Exclusivity):** Strategy A and Strategy B must remain strictly mutually exclusive to prevent destructive sample cancellation.
+- **FR-03.4 (AOB Camera Pattern Scanner):** The system shall scan game memory using wildcard byte signatures to automatically locate camera projection matrix pointers with RIP-relative address resolution.
 
 ### 2.4 FR-04: Reconstruction Compute Pass
-- **FR-04.1:** The reconstruction pass shall be executed as a compute shader dispatched immediately following the main scene render pass.
+- **FR-04.1:** The reconstruction pass shall be executed as a compute shader dispatched immediately following the main scene render pass on `vkCmdEndRenderPass`.
 - **FR-04.2:** Compute thread group dimensions shall be $16 \times 16 \times 1$ threads.
 - **FR-04.3:** Dispatch dimension for $3840 \times 2160$:
   $$\text{Groups}_X = \lceil 3840 / 16 \rceil = 240, \quad \text{Groups}_Y = \lceil 2160 / 16 \rceil = 135$$
@@ -78,7 +82,7 @@ The software package provides a real-time graphics interception and compute reco
   $$\mathbf{V}_{\text{fallback}} = \mathbf{P}_{\text{ndc}} - \mathbf{P}_{\text{prev\_ndc}}$$
 
 ### 2.8 FR-08: MIP LOD Bias Injection
-- **FR-08.1:** Intercept sampler creation and descriptor updates (`vkCreateSampler`, `CreateSampler`) to inject a constant `mipLodBias = -0.5f`.
+- **FR-08.1:** Intercept sampler creation and descriptor updates (`vkCreateSampler`, `CreateSampler`) to inject a constant `mipLodBias = -1.0f`.
 - **FR-08.2:** The bias ensures that textures retain full 4K Nyquist frequency details during quarter-resolution shading passes.
 
 ### 2.9 FR-09: ImGui Overlay & Diagnostic Modes
@@ -94,14 +98,19 @@ The software package provides a real-time graphics interception and compute reco
   ```ini
   [General]
   Enabled = true
-  TargetResolution = 3840x2160
-  Api = Vulkan
+  TargetWidth = 3840
+  TargetHeight = 2160
+  PreferredApi = Vulkan
+  SamplingStrategy = StrategyA
+  MipLodBias = -1.0
 
   [Reconstruction]
   DepthTolerance = 0.010
-  ColorClamping = true
+  EnableColorClamping = true
   ColorSpace = YCoCg
-  MIPBias = -0.5
+  HistoryWeight = 0.90
+  EnableSpatialFallback = true
+  EnableMotionDilation = true
 
   [Debug]
   ShowOverlay = false
@@ -120,3 +129,21 @@ The software package provides a real-time graphics interception and compute reco
 ### 3.2 Threading & Safety
 - All hook callbacks must be reentrant and thread-safe across multiple command recording threads.
 - History ping-pong buffer transitions must include appropriate execution and memory barriers (`VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT`).
+
+---
+
+## 4. Requirements Traceability Matrix
+
+| Requirement | Description | Status | Implementation Component |
+|---|---|---|---|
+| **FR-01** | Injection & Lifecycle | **VERIFIED** | `main.cpp`, `hooks.cpp`, `crash_handler.cpp` |
+| **FR-02** | Render Target & Viewport Interception | **COMPLETE** | `hooks_vulkan.cpp`, `render_target_manager.cpp` |
+| **FR-03** | Subpixel Jitter & Sampling Strategy | **COMPLETE** | `jitter_manager.cpp`, `hooks_vulkan.cpp`, `pattern_scanner.cpp` |
+| **FR-04** | Reconstruction Compute Pass | **COMPLETE** | `reconstruction_pass.cpp`, `cbr_reconstruct.comp`, `cbr_reconstruct_quad.comp` |
+| **FR-05** | Temporal Reprojection & Depth Test | **COMPLETE** | `cbr_reconstruct.comp`, `cbr_reconstruct.hlsl` |
+| **FR-06** | YCoCg Neighborhood Color Clamping | **COMPLETE** | `cbr_reconstruct.comp`, `cbr_reconstruct.hlsl` |
+| **FR-07** | Motion Vector Acquisition & Fallback | **IN PROGRESS** | G-Buffer velocity hook complete; matrix fallback queued |
+| **FR-08** | MIP LOD Bias (-1.0f) | **COMPLETE** | `config.h`, `cbr.ini`, sampler intercept |
+| **FR-09** | ImGui Overlay & Diagnostic Modes | **IN PROGRESS** | `ui_overlay.cpp`, shaders (Modes 0–3 implemented) |
+| **FR-10** | Configuration Management | **COMPLETE** | `config.cpp`, `cbr.ini` |
+

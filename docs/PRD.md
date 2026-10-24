@@ -70,11 +70,14 @@ This mod targets Pascal-era and mid-range PC hardware—specifically the **NVIDI
 
 ### In Scope
 - ASI plugin architecture compatible with standard RDR2 ASI loaders (`dinput8.dll` / `version.dll`).
-- Interception of main scene G-Buffer / forward render targets in Vulkan and DirectX 12.
-- Subpixel projection jitter injector (alternating grid offset per frame).
-- Compute shader-based temporal reconstruction with disocclusion rejection.
-- Texture MIP LOD bias injection (-0.5 bias) to preserve fine texture details.
+- Interception of main scene G-Buffer / forward render targets and dynamic viewport/scissor downscaling in Vulkan and DirectX 12.
+- Subpixel projection jitter injector and programmable sample locations (**Strategy A** viewport shift, **Strategy B** `VK_EXT_sample_locations`).
+- Automated camera projection matrix scanning via AOB pattern scanner with RIP-relative address calculation and SEH memory protection.
+- Compute shader-based temporal reconstruction with disocclusion rejection, variance color clipping, and quad-subgroup acceleration.
+- Vulkan 7-binding descriptor set layout, dynamic descriptor pool allocation, and pipeline barrier memory synchronization.
+- Texture MIP LOD bias injection (-1.0 bias) to preserve fine texture details.
 - In-game ImGui debug overlay (visualize checkerboard grid, motion vectors, disocclusion masks).
+- Automated CI build pipeline distributing pre-compiled SPIR-V shaders and release binaries via GitHub Releases.
 
 ### Out of Scope
 - Multiplayer / Red Dead Online compatibility (strictly single-player/offline to avoid anti-cheat violations).

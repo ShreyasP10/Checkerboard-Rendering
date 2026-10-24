@@ -23,16 +23,16 @@ $$\text{Risk Score} = \text{Probability (1–5)} \times \text{Impact (1–5)}$$
 
 ## 2. Risk Matrix & Summary Table
 
-| Risk ID | Category | Description | Prob (1-5) | Imp (1-5) | Score | Severity |
-|---|---|---|---|---|---|---|
-| **RSK-01** | Technical | RAGE internal motion vectors are inaccessible or encrypted in memory. | 4 | 5 | **20** | **Critical** |
-| **RSK-02** | Technical | RAGE render target allocation calls use custom heap allocators bypassing standard API hooks. | 3 | 4 | **12** | **High** |
-| **RSK-03** | Technical | Pascal GPU architecture memory bandwidth overhead negates frame-time savings at 4K. | 3 | 4 | **12** | **High** |
-| **RSK-04** | Technical | Hair and foliage dithering in RDR2 clashes with subpixel checkerboard patterns. | 4 | 3 | **12** | **High** |
-| **RSK-05** | Platform | RDR2 title updates alter memory layout, invalidating hook patterns and offsets. | 4 | 3 | **12** | **High** |
-| **RSK-06** | Legal/Policy | Accidental loading into Red Dead Online triggers BattlEye or Rockstar anti-cheat ban. | 2 | 5 | **10** | **High** |
-| **RSK-07** | Quality | Temporal ghosting on rapid camera cuts or fast horse traversal. | 3 | 3 | **9** | **Medium** |
-| **RSK-08** | Performance | Compute shader register spilling degrades occupancy on Pascal GP104. | 2 | 3 | **6** | **Medium** |
+| Risk ID | Category | Description | Prob (1-5) | Imp (1-5) | Score | Severity | Mitigation Status |
+|---|---|---|---|---|---|---|---|
+| **RSK-01** | Technical | RAGE internal motion vectors are inaccessible or encrypted in memory. | 4 | 5 | **20** | **Critical** | In Progress (GBuffer hook wired, fallback queued) |
+| **RSK-02** | Technical | RAGE render target allocation calls use custom heap allocators bypassing standard API hooks. | 3 | 4 | **12** | **High** | **MITIGATED** (Detoured `vkCmdSetViewport`/`vkCmdSetScissor`/`vkCmdEndRenderPass`) |
+| **RSK-03** | Technical | Pascal GPU architecture memory bandwidth overhead negates frame-time savings at 4K. | 3 | 4 | **12** | **High** | Under Monitoring (Quad-subgroup shader added) |
+| **RSK-04** | Technical | Hair and foliage dithering in RDR2 clashes with subpixel checkerboard patterns. | 4 | 3 | **12** | **High** | **MITIGATED** (Early pass before native TAA + YCoCg clamping) |
+| **RSK-05** | Platform | RDR2 title updates alter memory layout, invalidating hook patterns and offsets. | 4 | 3 | **12** | **High** | **MITIGATED** (AOB pattern scanner with SEH safe bounds) |
+| **RSK-06** | Legal/Policy | Accidental loading into Red Dead Online triggers BattlEye or Rockstar anti-cheat ban. | 2 | 5 | **10** | **High** | Active Warning & Offline Check |
+| **RSK-07** | Quality | Temporal ghosting on rapid camera cuts or fast horse traversal. | 3 | 3 | **9** | **Medium** | **MITIGATED** (Depth delta disocclusion & cross-bilateral filter) |
+| **RSK-08** | Performance | Compute shader register spilling degrades occupancy on Pascal GP104. | 2 | 3 | **6** | **Medium** | **MITIGATED** (≤32 VGPR design, 16×16 workgroups) |
 
 ---
 

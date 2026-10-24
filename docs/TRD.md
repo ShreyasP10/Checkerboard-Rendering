@@ -53,9 +53,12 @@ For comprehensive step-by-step guidance, refer to:
 ### 2.1 Vulkan Interception Architecture
 The mod intercepts the Vulkan runtime via `vulkan-1.dll` (located at `0x00007FFE66510000` in RDR2 build `1.0.1491.50`):
 1. **Dynamic DLL Hooking via MinHook:** Intercepts exported symbols from `vulkan-1.dll`:
-   - `vkQueuePresentKHR`: Captures frame completion and coordinates compute reconstruction.
+   - `vkQueuePresentKHR`: Coordinates frame lifecycle, tracking presentation intervals and frame index.
    - `vkCreateSwapchainKHR` & `vkDestroySwapchainKHR`: Captures backbuffer resolution, format, and swapchain recreation events.
    - `vkAcquireNextImageKHR`: Tracks the active presentation backbuffer index.
+   - `vkCmdSetViewport` & `vkCmdSetScissor`: Intercepts 4K geometry passes, downscaling them to 1080p 2× MSAA while keeping UI/HUD overlays at native 4K.
+   - `vkCmdBeginRenderPass` & `vkCmdEndRenderPass`: Detects scene geometry pass completion mid-frame to execute the SPIR-V reconstruction compute pass prior to post-processing and UI compositing.
+   - `vkCmdSetSampleLocationsEXT`: Toggles hardware subpixel sample locations on alternate frames when Strategy B is active.
 2. **Hook Table Interception:** Wraps the device dispatch table pointers:
    - `vkCreateDevice`
    - `vkCmdBeginRenderPass`, `vkCmdEndRenderPass`
@@ -83,7 +86,23 @@ int Hooked_vkQueuePresentKHR(void* queue, const void* pPresentInfo) {
 }
 ```
 
-### 2.2 DirectX 12 Interception Architecture
+### 2.2 Sampling Strategy Differentiation
+To prevent destructive sample cancellation, the mod strictly isolates two mutually exclusive sampling mechanisms:
+1. **Strategy A (Viewport Shift Jitter):**
+   - Applies a ±0.5px horizontal subpixel jitter offset in `vkCmdSetViewport` on alternate frames.
+   - Works universally across all Vulkan drivers without requiring extension support.
+2. **Strategy B (Programmable Sample Locations):**
+   - Keeps the viewport stationary at integer pixel coordinates.
+   - Programmatically alters 2× MSAA sample positions using `vkCmdSetSampleLocationsEXT` (`VK_EXT_sample_locations`).
+   - Even frames: $(0.75, 0.75)$ and $(0.25, 0.25)$; Odd frames: $(0.25, 0.75)$ and $(0.75, 0.25)$.
+
+### 2.3 AOB Camera Pattern Scanner
+For automated camera projection matrix interception:
+- `pattern_scanner.cpp` performs IDA-style byte signature scanning with wildcards across the game executable memory space.
+- Resolves RIP-relative instruction offsets (`ResolveRipRelative`) to acquire camera projection matrices dynamically.
+- Protected by Structured Exception Handling (`__try` / `__except`) and `VirtualQuery` memory page bounds checking.
+
+### 2.4 DirectX 12 Interception Architecture
 On DX12, the mod hooks the VMT (Virtual Method Table) of:
 - `IDXGISwapChain3::Present` (VMT Index 8, obtained via lightweight dummy device)
 - `ID3D12CommandQueue::ExecuteCommandLists`

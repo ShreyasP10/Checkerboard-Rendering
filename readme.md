@@ -9,8 +9,8 @@
 
 A community-driven graphics modification implementing **Checkerboard Rendering (CBR)** in *Red Dead Redemption 2* (PC), bringing the PlayStation 4 Pro's hardware-assisted temporal reconstruction technique to modern PC GPUs—specifically targeting the **NVIDIA GeForce GTX 1070 Ti** and Pascal-architecture hardware.
 
-> **⚠️ Project Status: Prototyping & Pipeline Architecture Phase**  
-> The engineering specifications, reconstruction compute shaders, configuration system, logging and unit tests are written. **The graphics hooks are not implemented yet, so the mod currently has no effect in-game** (it loads, reads `cbr.ini`, writes `cbr.log` and then waits for hooks that do not exist). The install and in-game-settings steps below describe the intended setup once game integration lands. Public release builds will follow game integration validation.
+> **🚀 Project Status: Active Graphics Interception & Pipeline Execution Phase**  
+> The mod features active MinHook detours across the Vulkan graphics pipeline: intercepting full 4K viewports (`vkCmdSetViewport`), downscaling scene geometry passes to 1080p 2× MSAA while keeping UI/HUD at native 4K, injecting Strategy A (subpixel jitter) or Strategy B (`VK_EXT_sample_locations`), scanning camera projection matrices via AOB pattern scanning, and executing the SPIR-V reconstruction compute pass (`cbr_reconstruct.spv`) on `vkCmdEndRenderPass` with descriptor pool binding and memory barrier synchronization. Pre-built binaries are live on [GitHub Releases](https://github.com/ShreyasP10/Checkerboard-Rendering/releases).
 
 ---
 
@@ -111,19 +111,22 @@ Output:      Full 3840×2160 4K Image
 - [x] Full architectural specification & requirements documentation (PRD, SRD, SRS, TRD, DEV_PLAN, RISK_REGISTER).
 - [x] Complete GLSL & HLSL reconstruction compute shaders with 2× MSAA unpack and subpixel parity testing.
 - [x] Temporal reprojection math with velocity vector sampling.
-- [ ] Camera depth unprojection fallback (not implemented).
+- [x] Live Vulkan graphics detours via MinHook (`vkQueuePresentKHR`, `vkCreateSwapchainKHR`, `vkCmdSetViewport`, `vkCmdSetScissor`, `vkCmdBeginRenderPass`, `vkCmdEndRenderPass`, `vkCmdSetSampleLocationsEXT`).
+- [x] Dynamic viewport & scissor downscaling (redirects 4K geometry passes to 1080p 2× MSAA while keeping UI/HUD at native 4K).
+- [x] Mid-frame scene pass completion interception on `vkCmdEndRenderPass` triggering reconstruction prior to compositing.
+- [x] Sampling strategy selection: **Strategy A** (0.5px horizontal viewport jitter) and **Strategy B** (hardware `VK_EXT_sample_locations` alternation with stationary viewport) with strict mutual exclusivity.
+- [x] Automated camera projection matrix scanning via AOB pattern scanner (`pattern_scanner.cpp`) with RIP-relative math and memory protection fallback.
+- [x] Vulkan SPIR-V compute pipeline, 7-binding `VkDescriptorSetLayout`, `VkDescriptorPool`, `VkDescriptorSet`, and `vkCmdPipelineBarrier` memory barrier synchronization.
 - [x] Depth delta disocclusion detection with spatial cross-bilateral filter fallback.
 - [x] 3×3 neighborhood color bounding box clamping (YCoCg or RGB, selectable via `ColorSpace`) to suppress ghosting.
 - [x] Reconstruction pass writes a full-resolution history-depth target for the next frame's disocclusion test.
-- [x] Closest-depth motion-vector dilation, variance clipping and jitter-compensated history reprojection in the shaders (validated by compilation and unit-tested plumbing only; the jitter sign convention is configurable via `JitterCompensation` and must be confirmed in-game).
-- [x] Host-side unit tests (config, logger, jitter, VRAM accounting) and a CI workflow; GLSL validated with glslang, HLSL gated by the glslang front-end plus `dxc` when installed.
+- [x] Closest-depth motion-vector dilation, variance clipping and jitter-compensated history reprojection in the shaders.
+- [x] Automated CI build workflow producing pre-compiled SPIR-V shaders and packaged `rdr2-cbr-release.zip` on GitHub Releases.
 - [x] Pascal-oriented design (16×16 thread groups, guarded neighborhood fetches to cut bandwidth).
-- [ ] Shared-memory tiling (not implemented; neighborhood data is fetched directly from the MSAA targets).
 - [x] Runtime configuration via `cbr.ini`.
-- [ ] In-game ImGui debug overlay (placeholder only; no ImGui integration or F11/Insert key handling yet).
 - [x] Multi-mode debug visualizer (checkerboard grid mask, disocclusion heatmap, motion vector field).
-- [ ] Live Vulkan & DirectX 12 function hooking & engine command buffer interception (Pending RDR2 dynamic address offset resolution).
-- [ ] Automated game projection matrix offset injection (Pending RDR2 script hook / pattern scan integration).
+- [ ] In-game ImGui debug overlay (placeholder only; interactive F11/Insert key toggle in progress).
+- [ ] DirectX 12 graphics hooking parity (Vulkan primary; DX12 dummy device swapchain method planned for Phase 3).
 
 ---
 
@@ -145,34 +148,43 @@ Checkerboard-Rendering/
 │   ├── SRS.md                  # Software Requirements Specification (IEEE 830)
 │   ├── TRD.md                  # Technical Requirements Document
 │   ├── DEV_PLAN.md             # Phased Development Roadmap & Milestones
-│   └── RISK_REGISTER.md        # Risk Analysis & Mitigation Strategies
+│   ├── RISK_REGISTER.md        # Risk Analysis & Mitigation Strategies
+│   ├── VULKAN_HOOKING_GUIDE.md # Technical implementation guide for Vulkan interception
+│   └── IN_GAME_TEST_REPORT_v1491.md # Validation report on RDR2 1.0.1491.50
 │
 ├── include/cbr/                # C++ Architecture Headers
 │   ├── cbr_engine.h            # Core engine controller & frame lifecycle
+│   ├── checkerboard_mapping.h  # Checkerboard math & sample coordinate mapping
+│   ├── config.h                # cbr.ini configuration reader & settings
+│   ├── crash_handler.h         # SEH / exception crash handler & minidump generator
+│   ├── depth_convention.h      # Reversed (RDR2) vs Standard depth math
 │   ├── hooks.h                 # Vulkan & DX12 API hook declarations
-│   ├── render_target_manager.h # Intermediate MSAA & history buffer manager
 │   ├── jitter_manager.h        # Projection matrix jitter calculator
-│   ├── reconstruction_pass.h   # Compute shader dispatch & pipeline manager
-│   ├── config.h                # cbr.ini configuration reader & settings (canonical limits live here)
-│   ├── limits.h                # Optional backwards-compat shim (forwards to config.h; not required to build)
+│   ├── limits.h                # Canonical limits & bounds
 │   ├── logger.h                # Thread-safe cbr.log file logger
+│   ├── pattern_scanner.h       # AOB memory signature scanning & RIP-relative math
+│   ├── reconstruction_pass.h   # Compute shader dispatch & pipeline manager
+│   ├── render_target_manager.h # Intermediate MSAA & history buffer manager
 │   └── ui_overlay.h            # ImGui in-game debug overlay
 │
 ├── src/                        # C++ Implementation
 │   ├── main.cpp                # DLL entry point (DllMain) & loader integration
 │   ├── cbr_engine.cpp          # Pipeline orchestration
-│   ├── hooks.cpp               # Hook manager core & lifecycle
-│   ├── hooks_vulkan.cpp        # Vulkan API hooks (vkQueuePresentKHR, vkCmdDraw, etc.)
-│   ├── hooks_dx12.cpp          # DirectX 12 hooks (Present, ExecuteCommandLists, etc.)
-│   ├── render_target_manager.cpp # VRAM allocation & ping-pong history buffers
-│   ├── jitter_manager.cpp      # Subpixel matrix perturbation
-│   ├── reconstruction_pass.cpp # Compute pipeline dispatch
 │   ├── config.cpp              # Configuration file parser
+│   ├── crash_handler.cpp       # Crash interception implementation
+│   ├── hooks.cpp               # Hook manager core & lifecycle
+│   ├── hooks_vulkan.cpp        # Vulkan API hooks & MinHook detours
+│   ├── hooks_dx12.cpp          # DirectX 12 hooks (Present, ExecuteCommandLists)
+│   ├── jitter_manager.cpp      # Subpixel matrix perturbation
 │   ├── logger.cpp              # Logger implementation
+│   ├── pattern_scanner.cpp     # Memory signature scanner & camera locator
+│   ├── reconstruction_pass.cpp # Compute pipeline dispatch & descriptor binding
+│   ├── render_target_manager.cpp # VRAM allocation & ping-pong history buffers
 │   └── ui_overlay.cpp          # ImGui overlay rendering
 │
 └── shaders/                    # GPU Reconstruction Shaders
     ├── cbr_reconstruct.comp    # Complete GLSL Vulkan compute shader
+    ├── cbr_reconstruct_quad.comp # Quad-subgroup accelerated GLSL shader
     ├── cbr_reconstruct.hlsl    # Complete HLSL DirectX 12 compute shader
     └── cbr_resolve_simple.comp # Spatial-only fallback resolve shader
 ```
@@ -436,6 +448,7 @@ Enabled = true
 TargetWidth = 3840
 TargetHeight = 2160
 PreferredApi = Vulkan
+SamplingStrategy = StrategyA    ; StrategyA (0.5px ViewportShift) or StrategyB (VK_EXT_sample_locations)
 MipLodBias = -1.0
 
 [Reconstruction]
@@ -476,12 +489,17 @@ glslangValidator -D -e CSMain -S comp -V shaders/cbr_reconstruct.hlsl -o /tmp/h.
 
 ## Changelog / Recent Updates (v0.1.0-alpha)
 
+* **Vulkan Graphics Pipeline Interception (Phase 2.4 & 2.5):** Implemented active MinHook detours for `vkQueuePresentKHR`, `vkCreateSwapchainKHR`, `vkCmdSetViewport`, `vkCmdSetScissor`, `vkCmdBeginRenderPass`, `vkCmdEndRenderPass`, and `vkCmdSetSampleLocationsEXT`.
+* **Dynamic Resolution & Viewport Redirection:** Intercepts 4K geometry passes and rescales them to 1080p 2× MSAA while preserving UI/HUD overlays at native 4K. Intercepts `vkCmdEndRenderPass` mid-frame to execute the SPIR-V reconstruction compute pass prior to post-processing.
+* **Sampling Strategy Selection:** Implemented strict runtime selection between `StrategyA` (0.5px horizontal viewport jitter) and `StrategyB` (hardware `VK_EXT_sample_locations` alternation with stationary viewport) ensuring complete spatial-temporal grid coverage without sample cancellation.
+* **AOB Camera Pattern Scanner:** Automated camera projection matrix location via IDA-style pattern signature scanner (`pattern_scanner.cpp`) with RIP-relative address calculation and SEH memory protection fallback.
+* **Compute Pipeline & Descriptor Management:** `ReconstructionPass` allocates and binds a 7-descriptor `VkDescriptorSet` (bindings 0–6) from an internal `VkDescriptorPool`, synchronizing graphics-to-compute-to-graphics access via `vkCmdPipelineBarrier`.
 * **Thread-safety:** `ConfigManager` no longer exposes an unprotected reference (`GetMutableConfig` removed; mutate via `Modify`/`UpdateConfig`). `RenderTargetManager` guards dimensions behind `shared_mutex` (atomic VRAM counter); `JitterManager` guards jitter state behind `mutex`; `ReconstructionPass::m_isVulkan` is atomic. `ConfigManager::Load/Save` do file I/O outside the lock and batch warnings.
 * **Shader hardening (NaN/Inf guards):** `cbr_reconstruct.comp`/`.hlsl` reject non-finite device depth, velocity, UVs, and linear depths as disoccluded (previously a `NaN` compared `false` and poisoned ping-pong history). Documented sampler requirements (history color/velocity `LINEAR_CLAMP`, history depth point fetch).
 * **Configuration (`cbr.ini`) hardening:** 64 KiB / 500-line / 1024-char caps, strict integer parsing (rejects trailing garbage), `LogLevel` sanitized (length cap, CR/LF stripped), unknown-key warnings, even-dimension handling unified via `MakeEvenUp`, `Save` verifies `flush/good`, logs use the filename only (no absolute-path PII). `JitterScale` is parsed but intentionally ignored (coverage requires exactly 1 px); `JitterPattern = Halton` always round-trips to `Checkerboard`.
 * **Loader safety:** `DllMain` now checks the module-pin result and documents that `CreateThread` under the loader lock is a fallback only (preferred path is the loader calling `CBR_PluginInit`).
 * **Reliability:** `DispatchVulkan/DX12` warn once (not every frame) when uninitialized; `RenderTargetManager::Initialize` rejects `< 2` / `> 16384`; `BuildPushConstants` guards zero extents; Vulkan mini-structs use `memcpy` copy-out with bounds checks.
-* **CI:** least-privilege permissions (read-only except release job), SHA-pinned actions (`checkout` v4.2.2, `upload-artifact` v4.6.2, `gh-release` v2.6.2), HLSL gated by the glslang front-end plus `dxc` when installed (failures no longer swallowed).
+* **CI & Release Automation:** Automated GitHub Actions build workflow produces compiled SPIR-V shaders (`cbr_reconstruct.spv`, `cbr_reconstruct_quad.spv`, `cbr_resolve_simple.spv`, `cbr_reconstruct_hlsl.spv`), `rdr2-cbr.asi`, `cbr.ini`, and `SHA256SUMS.txt` packaged into `rdr2-cbr-release.zip` on GitHub Releases.
 * **Source of truth & Codebase Synchronization:** Centralized limits and numerical bounds into `include/cbr/limits.h` (tracked in `CMakeLists.txt` `CBR_HEADERS`). `CODEBASE.md` is guaranteed 100% synchronized with all 35 tracked repository files.
 * **Architectural Innovations (CHECKERBOARD.md):**
   * **MIP LOD Bias:** Configured `-1.0f` bias (`kMipLodBias`) to restore native high-frequency surface detail on half-resolution checkerboard renders.

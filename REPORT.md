@@ -14,22 +14,27 @@
 
 ## 2. System Requirements Specification (SRS)
 * **OS:** Windows 10/11 64-bit.
-* **Graphics API:** Vulkan 1.3 or DirectX 12 Feature Level 12_0.
+* **Graphics API:** Vulkan 1.2/1.3 or DirectX 12 Feature Level 12_0.
 * **Game Engine:** RAGE Engine (RDR2 specific offsets).
-* **Dependencies:** `dinput8.dll` (ASI Loader), MinHook (planned).
+* **Dependencies:** `dinput8.dll` (ASI Loader), MinHook (integrated).
 * **Shader Languages:** GLSL (Compute), HLSL (Compute Shader Model 6.0).
 
 ## 3. Technical Requirements Document (TRD) & Architecture
-The plugin intercepts the presentation layer of the RAGE Engine to insert a custom GPU compute pass.
-* **ConfigManager:** Thread-safe singleton parsing `cbr.ini`.
-* **JitterManager:** Calculates and injects sub-pixel offsets (+0.5, -0.5) to the projection matrix on alternating frames.
-* **RenderTargetManager:** Manages Vulkan/DX12 VRAM allocations (~315 MB for 4K CBR).
-* **Reconstruction Pass:** 
-  - **Step 1:** Native depth bounds sampling.
-  - **Step 2:** Motion Vector Dilation (Velocity sampling).
-  - **Step 3:** Temporal reprojection and History Depth Occlusion.
-  - **Step 4:** Neighborhood Variance Clipping (YCoCg color space clamping) to eliminate temporal ghosting.
-  - **Step 5:** Final spatial fallback and resolve.
+The plugin intercepts the presentation layer and command recording passes of the RAGE Engine to downscale geometry passes and execute the GPU compute pass.
+* **ConfigManager:** Thread-safe singleton parsing `cbr.ini` with strict bounds checking and sanitized input.
+* **HooksManager:** MinHook inline detours on `vulkan-1.dll`:
+  - `vkQueuePresentKHR` & `vkCreateSwapchainKHR` for swapchain and presentation coordination.
+  - `vkCmdSetViewport` & `vkCmdSetScissor` for dynamic 4K -> 1080p 2× MSAA geometry downscaling while preserving native 4K UI/HUD passes.
+  - `vkCmdBeginRenderPass` & `vkCmdEndRenderPass` for mid-frame scene pass completion interception.
+  - `vkCmdSetSampleLocationsEXT` for hardware programmable sample location toggling.
+* **SamplingStrategy:** Configurable isolation between **Strategy A** (±0.5px horizontal viewport jitter) and **Strategy B** (`VK_EXT_sample_locations` with stationary viewport) to prevent sample cancellation.
+* **PatternScanner:** IDA-style wildcard AOB scanner with RIP-relative resolution and SEH memory protection to automatically discover camera projection matrices.
+* **RenderTargetManager:** Manages Vulkan/DX12 VRAM allocations (~300.59 MiB for 4K CBR).
+* **ReconstructionPass:** 
+  - Manages internal `VkDescriptorPool` and 7-binding `VkDescriptorSet` (MSAA color/depth, history color/depth, velocity, output storage).
+  - Synchronizes execution using explicit `vkCmdPipelineBarrier` memory transitions.
+  - Dispatches `cbr_reconstruct.comp` (or `cbr_reconstruct_quad.comp` using `GL_KHR_shader_subgroup_quad`).
+  - Implemented closest-depth motion-vector dilation, temporal history reprojection, depth delta disocclusion testing, and YCoCg neighborhood variance clipping.
 
 ## 4. Software Requirements Document (SRD) - Security & Robustness
 The latest audit (v0.1.0-alpha) identified and resolved key operational risks for ASI mods:
@@ -39,17 +44,19 @@ The latest audit (v0.1.0-alpha) identified and resolved key operational risks fo
 
 ## 5. Development Plan (DEV_PLAN) & Changelog
 * **Phase 1 (Complete):** Core architecture, config systems, memory allocation logic, and robust temporal reconstruction shaders (GLSL & HLSL).
-* **Phase 2 (Complete):** Security, reliability, race-condition hardening, and GitHub CI/CD automation (v0.1.0-alpha).
-* **Phase 3 (Upcoming):** Hooking into the RAGE engine's internal D3D12/Vulkan swapchain structures via MinHook to extract native projection matrices and inject the jitter payload.
+* **Phase 2 (Complete):** Live Vulkan MinHook detours (`vkQueuePresentKHR`, `vkCreateSwapchainKHR`, `vkCmdSetViewport`, `vkCmdSetScissor`, `vkCmdBeginRenderPass`, `vkCmdEndRenderPass`, `vkCmdSetSampleLocationsEXT`), dynamic resolution redirection, Strategy A & B sampling, AOB pattern scanner, descriptor pool/set allocation, barrier synchronization, and GitHub CI/CD automated release packaging (`v0.1.0-alpha`).
+* **Phase 2.6 & Phase 3 (Active Focus):** Real-time Dear ImGui telemetry overlay (F11/Insert toggle) and DirectX 12 parity hooking via dummy device swapchain VMT method.
 
 ## 6. Risk Register
-| Risk | Impact | Mitigation |
+| Risk | Impact | Mitigation Status |
 | :--- | :--- | :--- |
 | **Data Races on Config** | High (Crash) | Replaced exposed pointers with lambda-based `Modify()` locks. |
 | **NaN Shader Poisoning** | High (Visual) | Implemented strict `isinf`/`isnan` bounds in GLSL/HLSL and C++ host. |
 | **DllMain Deadlock** | Critical (Crash) | Deferred `CreateThread` and hooks to lazy initialization. |
 | **Config Injection (cbr.ini)** | Low (OOM/PII) | Strict bounds check (64KB limit, line count limit) and sanitization applied. |
 | **Supply Chain Hijacking** | High (Malware) | Pinned GitHub actions, minimized `contents:write` scopes. |
+| **RAGE Custom Suballocators** | High (Hook Miss) | Detoured command buffer viewports & render passes instead of raw image creation. |
+| **Game Update Invalidation** | High (Crash) | Implemented SEH-safe wildcard AOB pattern scanner (`pattern_scanner.cpp`). |
 
 ---
 *Report generated and validated for v0.1.0-alpha codebase.*

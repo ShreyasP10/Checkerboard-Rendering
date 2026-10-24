@@ -136,12 +136,12 @@ For checkerboard reconstruction to resolve clean geometry, alternating pixels mu
 
 | Phase Subtask | Description | Status | Target Outcome |
 |---|---|---|---|
-| **Phase 2.1** | MinHook Integration & Vulkan Proc Table Detours | **COMPLETED** | Intercept `vkQueuePresentKHR` & swapchain events reliably via MinHook |
-| **Phase 2.2** | Swapchain Image Tracking & Hook Wiring | **COMPLETED** | Intercept `vkCreateSwapchainKHR`, wire real `VkDevice`, track extent & recreation |
-| **Phase 2.3** | SPIR-V Loader & Compute Pipeline Dispatch | **COMPLETED** | Robust SPIR-V loader, `VkComputePipeline` creation, push constants (80B), and `vkCmdDispatch` |
-| **Phase 2.4** | Render Target Hooking & Resolution Redirection | **COMPLETED** | Intercept `vkCmdSetViewport`, `vkCmdSetScissor`, `vkCmdEndRenderPass`, scale down to 1080p 2× MSAA |
-| **Phase 2.5** | Camera Jitter Injection / Sample Locations | *In Progress / Next* | Alternate subpixel spatial coverage per frame |
-| **Phase 2.6** | Telemetry, UI Overlay & Performance Tuning | *Queued* | Real-time FPS, frame-time graphs & interactive toggles |
+| **Phase 2.1** | MinHook Integration & Vulkan Proc Table Detours | **COMPLETE** | Intercept `vkQueuePresentKHR` & swapchain events reliably |
+| **Phase 2.2** | Swapchain Image Tracking & Hook Wiring | **COMPLETE** | Intercept `vkCreateSwapchainKHR`, wire real `VkDevice`, track extent & recreation |
+| **Phase 2.3** | SPIR-V Loader & Compute Pipeline Dispatch | **COMPLETE** | Robust SPIR-V loader, `VkComputePipeline` creation, push constants (80B), and `vkCmdDispatch` |
+| **Phase 2.4** | Render Target Hooking & Resolution Redirection | **COMPLETE** | Intercept `vkCmdSetViewport`, `vkCmdSetScissor`, `vkCmdEndRenderPass`, scale down to 1080p 2× MSAA |
+| **Phase 2.5** | Camera Jitter Injection / Sample Locations | **COMPLETE** | Strategy A (0.5px viewport jitter) & Strategy B (`VK_EXT_sample_locations`) + AOB camera pattern scanner |
+| **Phase 2.6** | Telemetry, UI Overlay & Performance Tuning | **IN PROGRESS** | Real-time FPS, frame-time graphs & interactive ImGui toggles |
 
 ---
 

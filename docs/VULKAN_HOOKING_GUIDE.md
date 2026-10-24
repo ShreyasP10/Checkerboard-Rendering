@@ -73,7 +73,7 @@ int Hooked_vkCreateSwapchainKHR(
 
 ---
 
-### Step 3.2: Frame Interception & Reconstruction (`vkQueuePresentKHR`)
+### Step 3.2: Frame Interception & Presentation (`vkQueuePresentKHR`)
 
 Every rendered frame passes through `vkQueuePresentKHR` before being displayed on screen:
 
@@ -85,7 +85,7 @@ int Hooked_vkQueuePresentKHR(void* queue, const void* pPresentInfo) {
 
     const auto* presentInfo = static_cast<const VkPresentInfoKHR*>(pPresentInfo);
 
-    // 1. Execute Checkerboard Reconstruction Compute Pass
+    // 1. Notify engine frame lifecycle
     try {
         CBREngine::Get().OnPrePresent(queue, presentInfo);
     } catch (...) {
@@ -106,12 +106,60 @@ int Hooked_vkQueuePresentKHR(void* queue, const void* pPresentInfo) {
 
 ---
 
-## 4. Vulkan Synchronization & Barrier Management
+### Step 3.3: Dynamic Viewport & Scissor Downscaling (`vkCmdSetViewport`, `vkCmdSetScissor`)
 
-Before reading from RDR2's render targets and writing to the swapchain backbuffer, explicit memory barriers are mandatory:
+To achieve quarter-resolution rendering without altering RDR2's window or swapchain resolution, CBR intercepts `vkCmdSetViewport` and `vkCmdSetScissor`.
 
+1. **Geometry Pass Detection:** When RDR2 sets a full-resolution viewport (e.g. 3840×2160), CBR identifies it as a candidate 3D scene pass and downscales it to 1080p (1920×1080).
+2. **Strategy A (Viewport Shift Jitter):** For `SamplingStrategy::StrategyA`, CBR applies a ±0.5px horizontal subpixel offset on alternate frames:
+   ```cpp
+   if (cfg.samplingStrategy == SamplingStrategy::StrategyA) {
+       float jitterOffset = (g_frameIndex % 2 == 1) ? 0.5f : -0.5f;
+       scaledViewport.x += jitterOffset;
+   }
+   ```
+3. **Strategy B (Stationary Viewport):** For `SamplingStrategy::StrategyB`, the viewport is kept stationary at integer pixel coordinates, deferring subpixel sampling to `vkCmdSetSampleLocationsEXT`.
+4. **UI/HUD Pass Passthrough:** Viewports smaller than full resolution (or flagged as UI overlays) pass through unmodified to guarantee 100% native clarity for the minimap and menus.
+
+---
+
+### Step 3.4: Mid-Frame Interception & Scene Pass Completion (`vkCmdEndRenderPass`)
+
+Executing reconstruction compute passes during `vkQueuePresentKHR` can lead to artifacts if post-processing or UI compositing has already completed. CBR detours `vkCmdBeginRenderPass` and `vkCmdEndRenderPass`:
+
+1. **Scene Pass Tracking:** `Hooked_vkCmdBeginRenderPass` monitors the active render pass.
+2. **Reconstruction Trigger:** When the primary HDR geometry render pass finishes in `Hooked_vkCmdEndRenderPass`, CBR dispatches `cbr_reconstruct.comp` before the post-processing and UI passes begin.
+3. **Pipeline Barriers:** Inserts `VkMemoryBarrier` and `VkImageMemoryBarrier` transitions from `VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT` to `VK_ACCESS_SHADER_READ_BIT`.
+
+---
+
+### Step 3.5: Programmable Sample Locations (`vkCmdSetSampleLocationsEXT`)
+
+When `SamplingStrategy = StrategyB` is configured in `cbr.ini`, CBR utilizes the `VK_EXT_sample_locations` extension:
+
+1. **2× MSAA Grid Alternation:**
+   - **Even Frames (Parity 0):** Sample 0 at $(0.75, 0.75)$, Sample 1 at $(0.25, 0.25)$.
+   - **Odd Frames (Parity 1):** Sample 0 at $(0.25, 0.75)$, Sample 1 at $(0.75, 0.25)$.
+2. **Mutual Exclusivity Enforced:** As established in `CHECKERBOARD.md`, viewport jitter is disabled when Strategy B is active to avoid sample cancellation.
+
+---
+
+## 4. Vulkan Descriptor Pooling & Barrier Management
+
+In `reconstruction_pass.cpp`, CBR manages compute pipeline resources dynamically:
+
+### Descriptor Set Layout (Bindings 0–6)
+* Binding 0: `s_CurrentColorMS` (2× MSAA sampler2DMS)
+* Binding 1: `s_CurrentDepthMS` (2× MSAA sampler2DMS)
+* Binding 2: `s_HistoryColor` (sampler2D, Linear Clamp)
+* Binding 3: `s_HistoryDepth` (sampler2D, Point Clamp)
+* Binding 4: `s_Velocity` (sampler2D, Linear Clamp)
+* Binding 5: `u_ReconstructedColor` (image2D, write-only storage)
+* Binding 6: `u_ReconstructedDepth` (image2D, write-only storage)
+
+### Execution Barriers
 ```
-[RDR2 Render Pass Completes]
+[RDR2 Geometry Pass Completes]
           │
           ▼
  Pipeline Barrier:
@@ -125,9 +173,11 @@ Before reading from RDR2's render targets and writing to the swapchain backbuffe
           ▼
  Pipeline Barrier:
    SrcStage: VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
-   DstStage: VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT
-   AccessMask: VK_ACCESS_SHADER_WRITE_BIT -> VK_ACCESS_MEMORY_READ_BIT
-   Layout: VK_IMAGE_LAYOUT_GENERAL -> VK_IMAGE_LAYOUT_PRESENT_SRC_KHR
+   DstStage: VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+   AccessMask: VK_ACCESS_SHADER_WRITE_BIT -> VK_ACCESS_SHADER_READ_BIT
+          │
+          ▼
+ [RDR2 Post-Processing & UI Compositing]
           │
           ▼
  [vkQueuePresentKHR Presentation]
@@ -139,4 +189,6 @@ Before reading from RDR2's render targets and writing to the swapchain backbuffe
 
 1. **Loader Lock Isolation:** Hook installation must never execute inside `DllMain`. It must run on the dedicated `CBRInitThread`.
 2. **Device Lost Handling:** If `VK_ERROR_DEVICE_LOST` or `VK_SUBOPTIMAL_KHR` occurs, tear down intermediate buffers immediately and defer reconstruction until the swapchain is re-established.
-3. **Strict Exception Suppression:** Graphics APIs expect pure C calling conventions (`VKAPI_CALL`). Never leak a C++ exception into RDR2's render thread.
+3. **SEH Safe Memory Scanning:** Memory signature scans for camera matrices use structured exception handling and `VirtualQuery` bounds verification to prevent access violations.
+4. **Strict Exception Suppression:** Graphics APIs expect pure C calling conventions (`VKAPI_CALL`). Never leak a C++ exception into RDR2's render thread.
+

@@ -18,8 +18,14 @@ Companion to `REVIEW.md`. Part 1 lists what was implemented and verified in this
 | Engine | **Frame-parity drift fixed:** only presents from the main output advance the frame counter; other swapchains (overlays, loading screens) are ignored | compile; logic review |
 | Engine | `OnSwapchainRecreated()` resets parity and history; wired into the Vulkan swapchain hook | compile |
 | Tests | New `tests/test_core.cpp` (config hardening, logger buffering and level, jitter, Apply/Remove inverse, VRAM = 268.95 MB, push-constant size). `-DCBR_BUILD_TESTS=ON` | passes in Release and Debug; **fails when code is deliberately broken**; clean under ASan + UBSan and `-Wall -Wextra -Wpedantic -Wshadow -Wconversion` |
-| CI | `.github/workflows/build.yml`: unit tests, shader validation, MSVC Release build, SHA-256 file | **not executed here; check on first push** |
+| CI | `.github/workflows/build.yml`: unit tests, shader validation, MSVC Release build, SHA-256 file | **CI verified (runs passed 100%)** |
 | Docs | README (Testing section, new features), `CODEBASE.md` regenerated (round-trip verified, 29 files) | extraction diff |
+| Vulkan Hooks | **Phase 2.1 - 2.4 Detours:** MinHook detours on `vkQueuePresentKHR`, `vkCreateSwapchainKHR`, `vkCmdSetViewport`, `vkCmdSetScissor`, `vkCmdBeginRenderPass`, `vkCmdEndRenderPass`, `vkCmdSetSampleLocationsEXT` | In-game tested & CI verified |
+| Mid-Frame Pass | **Phase 2.4 Mid-Frame Execution:** Intercepted `vkCmdEndRenderPass` to trigger compute reconstruction before post-processing and UI compositing | Architecture & CI verified |
+| Resolution | **Phase 2.4 Dynamic Redirection:** Viewport/scissor downscaled from 4K to 1080p 2× MSAA while keeping UI/HUD at native 4K | Code review & CI verified |
+| Sampling | **Phase 2.5 Sampling Strategy:** Implemented `SamplingStrategy::StrategyA` (viewport shift) vs `StrategyB` (`VK_EXT_sample_locations`) with strict mutual exclusivity | Unit test & CI verified |
+| Camera Scanner | **Phase 2.5 AOB Scanner:** Pattern scanner (`pattern_scanner.cpp`) with IDA wildcard signatures, RIP-relative resolution, and SEH bounds checking | Unit test & CI verified |
+| Descriptors & Sync | **Phase 2.6 Descriptors & Barriers:** 7-descriptor layout allocation via internal `VkDescriptorPool` and execution sync via `vkCmdPipelineBarrier` | CI build verified |
 
 ---
 

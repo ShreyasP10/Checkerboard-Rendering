@@ -73,15 +73,16 @@ The system intercepts render target allocations, alters viewport and projection 
 
 ## 3. High-Level Functional Requirements
 
-| ID | Requirement Description | Priority |
-|---|---|---|
-| **SRD-F-01** | **Target Interception:** The system shall detect and intercept the creation of full-resolution (3840×2160) scene color and depth targets, instantiating quarter-resolution (1920×1080) targets with 2× MSAA or half-width (1920×2160) targets. | High |
-| **SRD-F-02** | **Projection Jitter Injection:** The system shall inject alternating subpixel offsets into the camera projection matrix each frame (odd: $+0.5\,\text{px}$, even: $-0.5\,\text{px}$) to align 2× MSAA sample positions with the global checkerboard grid. | High |
-| **SRD-F-03** | **Texture MIP LOD Bias:** The system shall apply a $-0.5$ MIP LOD bias across active scene samplers during the reduced-resolution pass to guarantee full-resolution texture sampling. | High |
-| **SRD-F-04** | **Reconstruction Compute Pass:** The system shall dispatch a compute shader immediately following scene rendering to reconstruct a full 4K frame using current MSAA samples, previous frame history, and motion vectors. | High |
-| **SRD-F-05** | **Double-Buffered History Management:** The system shall maintain ping-pong full-resolution history buffers (Color, Depth, Motion Vectors) without causing GPU pipeline stalls. | High |
-| **SRD-F-06** | **Disocclusion Rejection:** The system shall detect disoccluded pixels via depth delta testing and extrapolate color from adjacent current-frame samples rather than reprojecting invalid history. | High |
-| **SRD-F-07** | **Runtime Toggling & Fallback:** The system shall allow instant runtime toggling (via hotkey or `cbr.ini`) returning the pipeline directly to standard native or scaled rendering. | Medium |
+| ID | Requirement Description | Priority | Status |
+|---|---|---|---|
+| **SRD-F-01** | **Target Interception & Viewport Redirection:** The system shall detect and intercept full-resolution (3840×2160) scene geometry passes via `vkCmdSetViewport` and `vkCmdSetScissor`, dynamically downscaling them to quarter resolution (1920×1080 2× MSAA) while leaving UI/HUD passes at native 4K. | High | **COMPLETE** |
+| **SRD-F-02** | **Sampling Strategy Selection:** The system shall support mutually exclusive sampling modes: **Strategy A** (±0.5px horizontal viewport jitter) and **Strategy B** (hardware `VK_EXT_sample_locations` with stationary viewport) to achieve 100% 4-quadrant coverage without sample cancellation. | High | **COMPLETE** |
+| **SRD-F-03** | **Texture MIP LOD Bias:** The system shall apply a $-1.0$ MIP LOD bias across active scene samplers during the reduced-resolution pass to guarantee full-resolution texture sampling. | High | **COMPLETE** |
+| **SRD-F-04** | **Reconstruction Compute Pass:** The system shall dispatch a compute shader on `vkCmdEndRenderPass` immediately following scene rendering to reconstruct a full 4K frame using current MSAA samples, previous frame history, and motion vectors. | High | **COMPLETE** |
+| **SRD-F-05** | **Double-Buffered History Management:** The system shall maintain ping-pong full-resolution history buffers (Color, Depth, Motion Vectors) without causing GPU pipeline stalls. | High | **COMPLETE** |
+| **SRD-F-06** | **Disocclusion Rejection:** The system shall detect disoccluded pixels via depth delta testing and extrapolate color from adjacent current-frame samples rather than reprojecting invalid history. | High | **COMPLETE** |
+| **SRD-F-07** | **AOB Camera Pattern Scanner:** Automated IDA-style signature scanner with RIP-relative address resolution and SEH memory protection to discover camera projection matrices dynamically. | High | **COMPLETE** |
+| **SRD-F-08** | **Runtime Toggling & Fallback:** The system shall allow instant runtime toggling (via hotkey or `cbr.ini`) returning the pipeline directly to standard native or scaled rendering. | Medium | **IN PROGRESS** |
 
 ---
 

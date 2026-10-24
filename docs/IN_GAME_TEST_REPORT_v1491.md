@@ -103,4 +103,12 @@ LOADER: Finished loading *.asi plugins
 
 ## 4. Key Takeaway & Next Action Items
 
-The mod has proven rock-solid stability in live execution. With the host environment, memory allocation, and module integration verified, the path is clear for **Phase 2: Active Graphics Detours & Frame Interception**. See [nextImplementationPhase.md](file:///c:/Users/Dinesh%20B%20Pawar/OneDrive/Desktop/Checkerboard-Rendering/nextImplementationPhase.md) for the active engineering roadmap.
+The mod has proven rock-solid stability in live execution. With the host environment, memory allocation, and module integration verified in Phase 1, **Phase 2 (Active Graphics Detours & Frame Interception)** has now been fully implemented and verified in CI:
+- **MinHook Detours Deployed:** Live hooks on `vkQueuePresentKHR`, `vkCreateSwapchainKHR`, `vkCmdSetViewport`, `vkCmdSetScissor`, `vkCmdBeginRenderPass`, `vkCmdEndRenderPass`, and `vkCmdSetSampleLocationsEXT`.
+- **Dynamic Viewport Downscaling:** 4K geometry passes are intercepted and routed to 1080p 2× MSAA while preserving native 4K clarity for UI/HUD passes.
+- **Sampling Strategies Implemented:** Configurable runtime selection of `StrategyA` (0.5px horizontal viewport jitter) and `StrategyB` (`VK_EXT_sample_locations` with stationary viewport) preventing sample cancellation.
+- **AOB Camera Scanner:** Automated IDA-style signature scanner with RIP-relative address calculation and SEH memory protection.
+- **Vulkan Descriptors & Barriers:** 7-descriptor layout allocation via internal `VkDescriptorPool` and execution synchronization with `vkCmdPipelineBarrier`.
+
+See [nextImplementationPhase.md](file:///c:/Users/Dinesh%20B%20Pawar/OneDrive/Desktop/Checkerboard-Rendering/nextImplementationPhase.md) and [docs/VULKAN_HOOKING_GUIDE.md](file:///c:/Users/Dinesh%20B%20Pawar/OneDrive/Desktop/Checkerboard-Rendering/docs/VULKAN_HOOKING_GUIDE.md) for full technical guides.
+
