@@ -54,6 +54,7 @@ public:
     bool IsInitialized() const { return m_initialized.load(); }
     void* GetPipeline() const { return m_pipeline; }
     void* GetPipelineLayout() const { return m_pipelineLayout; }
+    void* GetDescriptorSetLayout() const { return m_descriptorSetLayout; }
 
     // Helper to load SPIR-V bytecode from disk
     static std::vector<uint32_t> LoadSpvFile(const std::filesystem::path& path);
@@ -72,6 +73,7 @@ private:
     void* m_device{ nullptr };
     void* m_pipeline{ nullptr };
     void* m_pipelineLayout{ nullptr };
+    void* m_descriptorSetLayout{ nullptr };
 };
 
 } // namespace cbr

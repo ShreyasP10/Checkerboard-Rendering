@@ -20,9 +20,13 @@ constexpr uint32_t kVkStructureTypeShaderModuleCreateInfo = 16;
 constexpr uint32_t kVkStructureTypePipelineShaderStageCreateInfo = 18;
 constexpr uint32_t kVkStructureTypeComputePipelineCreateInfo = 29;
 constexpr uint32_t kVkStructureTypePipelineLayoutCreateInfo = 30;
+constexpr uint32_t kVkStructureTypeDescriptorSetLayoutCreateInfo = 32;
 
 constexpr uint32_t kVkShaderStageComputeBit = 0x00000020;
 constexpr uint32_t kVkPipelineBindPointCompute = 1;
+
+constexpr uint32_t kVkDescriptorTypeCombinedImageSampler = 1;
+constexpr uint32_t kVkDescriptorTypeStorageImage = 3;
 
 struct MinimalVkShaderModuleCreateInfo {
     uint32_t        sType;
@@ -36,6 +40,22 @@ struct MinimalVkPushConstantRange {
     uint32_t stageFlags;
     uint32_t offset;
     uint32_t size;
+};
+
+struct MinimalVkDescriptorSetLayoutBinding {
+    uint32_t    binding;
+    uint32_t    descriptorType;
+    uint32_t    descriptorCount;
+    uint32_t    stageFlags;
+    const void* pImmutableSamplers;
+};
+
+struct MinimalVkDescriptorSetLayoutCreateInfo {
+    uint32_t                                   sType;
+    const void*                                pNext;
+    uint32_t                                   flags;
+    uint32_t                                   bindingCount;
+    const MinimalVkDescriptorSetLayoutBinding* pBindings;
 };
 
 struct MinimalVkPipelineLayoutCreateInfo {
@@ -71,6 +91,8 @@ struct MinimalVkComputePipelineCreateInfo {
 typedef void* (*PFN_vkGetDeviceProcAddr)(void* device, const char* pName);
 typedef int   (*PFN_vkCreateShaderModule)(void* device, const MinimalVkShaderModuleCreateInfo* pCreateInfo, const void* pAllocator, void** pShaderModule);
 typedef void  (*PFN_vkDestroyShaderModule)(void* device, void* shaderModule, const void* pAllocator);
+typedef int   (*PFN_vkCreateDescriptorSetLayout)(void* device, const MinimalVkDescriptorSetLayoutCreateInfo* pCreateInfo, const void* pAllocator, void** pSetLayout);
+typedef void  (*PFN_vkDestroyDescriptorSetLayout)(void* device, void* setLayout, const void* pAllocator);
 typedef int   (*PFN_vkCreatePipelineLayout)(void* device, const MinimalVkPipelineLayoutCreateInfo* pCreateInfo, const void* pAllocator, void** pPipelineLayout);
 typedef void  (*PFN_vkDestroyPipelineLayout)(void* device, void* pipelineLayout, const void* pAllocator);
 typedef int   (*PFN_vkCreateComputePipelines)(void* device, void* pipelineCache, uint32_t createInfoCount, const MinimalVkComputePipelineCreateInfo* pCreateInfos, const void* pAllocator, void** pPipelines);
@@ -193,10 +215,45 @@ bool ReconstructionPass::CreateVulkanPipeline() {
     pcRange.offset = 0;
     pcRange.size = sizeof(ReconstructionPushConstants);
 
+    auto pfnCreateDescriptorSetLayout = reinterpret_cast<PFN_vkCreateDescriptorSetLayout>(resolveDeviceFunc("vkCreateDescriptorSetLayout"));
+    auto pfnDestroyDescriptorSetLayout = reinterpret_cast<PFN_vkDestroyDescriptorSetLayout>(resolveDeviceFunc("vkDestroyDescriptorSetLayout"));
+
+    // 7 bindings matching cbr_reconstruct.comp (set = 0):
+    // Bindings 0..4: combined image samplers
+    // Bindings 5..6: storage images (OutputImage, OutputDepth)
+    MinimalVkDescriptorSetLayoutBinding dsBindings[7]{};
+    for (uint32_t i = 0; i < 5; ++i) {
+        dsBindings[i].binding = i;
+        dsBindings[i].descriptorType = kVkDescriptorTypeCombinedImageSampler;
+        dsBindings[i].descriptorCount = 1;
+        dsBindings[i].stageFlags = kVkShaderStageComputeBit;
+    }
+    for (uint32_t i = 5; i < 7; ++i) {
+        dsBindings[i].binding = i;
+        dsBindings[i].descriptorType = kVkDescriptorTypeStorageImage;
+        dsBindings[i].descriptorCount = 1;
+        dsBindings[i].stageFlags = kVkShaderStageComputeBit;
+    }
+
+    MinimalVkDescriptorSetLayoutCreateInfo dsLayoutInfo{};
+    dsLayoutInfo.sType = kVkStructureTypeDescriptorSetLayoutCreateInfo;
+    dsLayoutInfo.bindingCount = 7;
+    dsLayoutInfo.pBindings = dsBindings;
+
+    void* descriptorSetLayout = nullptr;
+    if (pfnCreateDescriptorSetLayout) {
+        res = pfnCreateDescriptorSetLayout(m_device, &dsLayoutInfo, nullptr, &descriptorSetLayout);
+        if (res != 0 || !descriptorSetLayout) {
+            CBR_LOG_ERROR("vkCreateDescriptorSetLayout failed with error code: %d", res);
+            pfnDestroyShaderModule(m_device, shaderModule, nullptr);
+            return false;
+        }
+    }
+
     MinimalVkPipelineLayoutCreateInfo layoutInfo{};
     layoutInfo.sType = kVkStructureTypePipelineLayoutCreateInfo;
-    layoutInfo.setLayoutCount = 0;
-    layoutInfo.pSetLayouts = nullptr;
+    layoutInfo.setLayoutCount = descriptorSetLayout ? 1 : 0;
+    layoutInfo.pSetLayouts = descriptorSetLayout ? &descriptorSetLayout : nullptr;
     layoutInfo.pushConstantRangeCount = 1;
     layoutInfo.pPushConstantRanges = &pcRange;
 
@@ -204,6 +261,9 @@ bool ReconstructionPass::CreateVulkanPipeline() {
     res = pfnCreatePipelineLayout(m_device, &layoutInfo, nullptr, &pipelineLayout);
     if (res != 0 || !pipelineLayout) {
         CBR_LOG_ERROR("vkCreatePipelineLayout failed with error code: %d", res);
+        if (descriptorSetLayout && pfnDestroyDescriptorSetLayout) {
+            pfnDestroyDescriptorSetLayout(m_device, descriptorSetLayout, nullptr);
+        }
         pfnDestroyShaderModule(m_device, shaderModule, nullptr);
         return false;
     }
@@ -225,12 +285,17 @@ bool ReconstructionPass::CreateVulkanPipeline() {
         CBR_LOG_ERROR("vkCreateComputePipelines failed with error code: %d", res);
         auto pfnDestroyPipelineLayout = reinterpret_cast<PFN_vkDestroyPipelineLayout>(resolveDeviceFunc("vkDestroyPipelineLayout"));
         if (pfnDestroyPipelineLayout) pfnDestroyPipelineLayout(m_device, pipelineLayout, nullptr);
+        if (descriptorSetLayout && pfnDestroyDescriptorSetLayout) {
+            pfnDestroyDescriptorSetLayout(m_device, descriptorSetLayout, nullptr);
+        }
         return false;
     }
 
     m_pipeline = pipeline;
     m_pipelineLayout = pipelineLayout;
-    CBR_LOG_INFO("Vulkan CBR reconstruction compute pipeline created successfully! (Pipeline: %p, Layout: %p)", m_pipeline, m_pipelineLayout);
+    m_descriptorSetLayout = descriptorSetLayout;
+    CBR_LOG_INFO("Vulkan CBR reconstruction compute pipeline created successfully! (Pipeline: %p, Layout: %p, Descriptors: %p)",
+        m_pipeline, m_pipelineLayout, m_descriptorSetLayout);
     return true;
 #else
     return true;
@@ -254,6 +319,7 @@ void ReconstructionPass::DestroyVulkanPipeline() {
 
     auto pfnDestroyPipeline = reinterpret_cast<PFN_vkDestroyPipeline>(resolveDeviceFunc("vkDestroyPipeline"));
     auto pfnDestroyPipelineLayout = reinterpret_cast<PFN_vkDestroyPipelineLayout>(resolveDeviceFunc("vkDestroyPipelineLayout"));
+    auto pfnDestroyDescriptorSetLayout = reinterpret_cast<PFN_vkDestroyDescriptorSetLayout>(resolveDeviceFunc("vkDestroyDescriptorSetLayout"));
 
     if (m_pipeline && pfnDestroyPipeline) {
         pfnDestroyPipeline(m_device, m_pipeline, nullptr);
@@ -262,6 +328,10 @@ void ReconstructionPass::DestroyVulkanPipeline() {
     if (m_pipelineLayout && pfnDestroyPipelineLayout) {
         pfnDestroyPipelineLayout(m_device, m_pipelineLayout, nullptr);
         m_pipelineLayout = nullptr;
+    }
+    if (m_descriptorSetLayout && pfnDestroyDescriptorSetLayout) {
+        pfnDestroyDescriptorSetLayout(m_device, m_descriptorSetLayout, nullptr);
+        m_descriptorSetLayout = nullptr;
     }
 #endif
 }
@@ -292,6 +362,9 @@ void ReconstructionPass::Shutdown() {
         DestroyVulkanPipeline();
     }
     m_device = nullptr;
+    m_pipeline = nullptr;
+    m_pipelineLayout = nullptr;
+    m_descriptorSetLayout = nullptr;
     m_initialized.store(false);
     CBR_LOG_INFO("ReconstructionPass shut down cleanly.");
 }

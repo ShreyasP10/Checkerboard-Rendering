@@ -474,6 +474,7 @@ static void TestReconstructionPass(const fs::path& dir) {
     // 3. Deferred Vulkan initialization with null device (mock test environment)
     pass.Shutdown();
     CHECK(!pass.IsInitialized());
+    CHECK(pass.GetDescriptorSetLayout() == nullptr);
     CHECK(pass.InitializeVulkan(nullptr, nullptr));
     CHECK(pass.IsInitialized());
 
@@ -483,6 +484,7 @@ static void TestReconstructionPass(const fs::path& dir) {
     // 5. Clean shutdown
     pass.Shutdown();
     CHECK(!pass.IsInitialized());
+    CHECK(pass.GetDescriptorSetLayout() == nullptr);
 }
 
 int main() {
