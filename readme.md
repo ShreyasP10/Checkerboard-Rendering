@@ -137,7 +137,7 @@ Checkerboard-Rendering/
 ├── CMakeLists.txt              # CMake build script for rdr2-cbr.asi
 ├── LICENSE                     # MIT License
 ├── README.md                   # Project overview and instructions
-├── CODEBASE.md                 # Consolidated single document of all source code & shaders
+├── CODEBASE.md                 # Consolidated single document of all source code, shaders & documentation
 ├── CONTRIBUTING.md             # Contribution guidelines & coding standards
 ├── cbr.ini                     # Runtime configuration file
 ├── .gitignore                  # Git ignore rules
@@ -500,7 +500,7 @@ glslangValidator -D -e CSMain -S comp -V shaders/cbr_reconstruct.hlsl -o /tmp/h.
 * **Loader safety:** `DllMain` now checks the module-pin result and documents that `CreateThread` under the loader lock is a fallback only (preferred path is the loader calling `CBR_PluginInit`).
 * **Reliability:** `DispatchVulkan/DX12` warn once (not every frame) when uninitialized; `RenderTargetManager::Initialize` rejects `< 2` / `> 16384`; `BuildPushConstants` guards zero extents; Vulkan mini-structs use `memcpy` copy-out with bounds checks.
 * **CI & Release Automation:** Automated GitHub Actions build workflow produces compiled SPIR-V shaders (`cbr_reconstruct.spv`, `cbr_reconstruct_quad.spv`, `cbr_resolve_simple.spv`, `cbr_reconstruct_hlsl.spv`), `rdr2-cbr.asi`, `cbr.ini`, and `SHA256SUMS.txt` packaged into `rdr2-cbr-release.zip` on GitHub Releases.
-* **Source of truth & Codebase Synchronization:** Centralized limits and numerical bounds into `include/cbr/limits.h` (tracked in `CMakeLists.txt` `CBR_HEADERS`). `CODEBASE.md` is guaranteed 100% synchronized with all 35 tracked repository files.
+* **Source of truth & Codebase Synchronization:** Centralized limits and numerical bounds into `include/cbr/limits.h` (tracked in `CMakeLists.txt` `CBR_HEADERS`). `CODEBASE.md` is guaranteed 100% synchronized with all 56 tracked repository source, shader, test, config, and documentation files.
 * **Architectural Innovations (CHECKERBOARD.md):**
   * **MIP LOD Bias:** Configured `-1.0f` bias (`kMipLodBias`) to restore native high-frequency surface detail on half-resolution checkerboard renders.
   * **Quad-based Reconstruction Shader:** Added `shaders/cbr_reconstruct_quad.comp` using GL_KHR_shader_subgroup_quad for efficient intra-quad cross-lane communication.
