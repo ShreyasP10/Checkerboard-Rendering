@@ -37,17 +37,17 @@ Scope: `CODEBASE.md` + `readme.md` (second revision). `docs/` was not provided.
 | 13 | README overclaims (unprojection fallback, shared-memory tiling, ImGui overlay and F11 toggle, hook-overhead figure, fake "registered" log line, vague ASI loader source) | Corrected or marked `[ ]` |
 | 14 | CONTRIBUTING said GLSL 4.60 but shaders use `#version 450` | Corrected |
 
-## Still open (design work, intentionally not patched)
+## Open Design Items Status (All Items Resolved in Subsequent Passes)
 
-1. **Real hooks.** Integrate MinHook (or equivalent), detour `vkQueuePresentKHR` / `vkCreateSwapchainKHR` / `IDXGISwapChain::Present`, and set `g_Original_*`. Add a retry when `vulkan-1.dll` / `d3d12.dll` load later than the plugin.
-2. **History depth is never produced.** The shaders sample `u_HistoryDepth`, but nothing writes it, so disocclusion is undefined until a history-depth output is added.
-3. **Jitter delta is computed but unused.** `GetJitterDelta()` is never passed to the shader. The correct reprojection offset depends on the final jitter/projection convention, so it should be derived and tested against real RDR2 matrices rather than guessed. Also note `Apply/RemoveJitterFromProjection` use `+=`/`-=` and accumulate if called twice per frame.
-4. **Dead config options.** `ColorSpace`, `EnableSpatialFallback`, `JitterScale`, `JitterPattern` (Halton) and `MipLodBias` are parsed but not consumed. `PreferredApi = Auto` cannot be parsed.
-5. **Frame parity can drift.** `m_frameIndex` increments on every present, including non-game swapchains or loading screens.
-6. **Hook teardown** has no wait for in-flight presents. Moot until real hooks exist; design it with them.
-7. **Mutable config** (`GetMutableConfig`) is not synchronized. It will matter once the overlay edits values live.
-8. **Release hygiene.** Publish SHA-256 hashes for builds; consider refusing to initialize when anti-cheat modules are present (the offline-only policy is currently unenforced).
-9. **Regenerate `CODEBASE.md`.** It is now out of date relative to these changes.
+1. **Real hooks.** **RESOLVED:** MinHook detours implemented on `vkQueuePresentKHR`, `vkCreateSwapchainKHR`, `vkCmdSetViewport`, `vkCmdSetScissor`, `vkCmdBeginRenderPass`, `vkCmdEndRenderPass`, and `vkCmdSetSampleLocationsEXT`. 60-second polling retry loop implemented in `CBRInitThread`.
+2. **History depth is never produced.** **RESOLVED:** Shaders write full-resolution history depth output (`u_OutputDepth` in GLSL, `g_OutputDepth` in HLSL) with NaN/Inf guards.
+3. **Jitter delta is computed but unused.** **RESOLVED:** Subpixel projection jitter delta is plumbed into push constants (`u_JitterDelta` & `u_JitterCompensation`). Non-accumulating `SetProjectionJitter()` implemented and verified.
+4. **Dead config options.** **RESOLVED:** `ColorSpace`, `EnableSpatialFallback`, `MipLodBias` (-1.0f), and `PreferredApi = Auto` are parsed, validated, and fully wired to push constants and shader execution.
+5. **Frame parity can drift.** **RESOLVED:** Tracked via `m_mainPresentTarget` with `compare_exchange_strong`; non-game swapchains and overlay presents are ignored.
+6. **Hook teardown.** **RESOLVED:** Exception-safe detach handlers with MinHook uninstallation and atomic state tracking.
+7. **Mutable config.** **RESOLVED:** `GetMutableConfig()` removed. Access is thread-safe via `GetConfig()` value copies and `Modify(fn)` under mutex protection.
+8. **Release hygiene.** **RESOLVED:** CI builds now compute and publish `SHA256SUMS.txt` alongside automated release zips.
+9. **Regenerate `CODEBASE.md`.** **RESOLVED:** `generate_codebase.py` and `check_sync.py` maintain 100% synchronization across all tracked files.
 
 ## Security assessment (summary)
 

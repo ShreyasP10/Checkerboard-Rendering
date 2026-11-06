@@ -59,10 +59,10 @@ This mod targets Pascal-era and mid-range PC hardware—specifically the **NVIDI
 2. **Visual Fidelity:**
    - Structural Similarity Index (SSIM) ≥ 0.88 against native 4K ground truth in static scenes.
    - Elimination of visible checkerboard crawling/flicker at 60 Hz display refresh.
-   - Suppression of ghosting on high-contrast moving edges (horses, hair, foliage) via neighborhood color clamping.
+   - Suppression of ghosting on high-contrast moving edges and moving lights on static geometry via unconditional variance color clipping ($\mu \pm 1.25\sigma$).
 3. **Stability & Usability:**
    - 100% crash-free operation over a 2-hour continuous open-world gameplay session.
-   - Hot-reloading and runtime toggle via `cbr.ini` and an in-game ImGui overlay.
+   - Thread-safe runtime configuration via `cbr.ini` with deadlock prevention and an in-game ImGui overlay.
 
 ---
 
@@ -71,12 +71,13 @@ This mod targets Pascal-era and mid-range PC hardware—specifically the **NVIDI
 ### In Scope
 - ASI plugin architecture compatible with standard RDR2 ASI loaders (`dinput8.dll` / `version.dll`).
 - Interception of main scene G-Buffer / forward render targets and dynamic viewport/scissor downscaling in Vulkan and DirectX 12.
-- Subpixel projection jitter injector and programmable sample locations (**Strategy A** viewport shift, **Strategy B** `VK_EXT_sample_locations`).
+- Subpixel projection jitter injector and programmable sample locations (**Strategy A** viewport shift, **Strategy B** `VK_EXT_sample_locations`) with strict mutual exclusivity.
 - Automated camera projection matrix scanning via AOB pattern scanner with RIP-relative address calculation and SEH memory protection.
-- Compute shader-based temporal reconstruction with disocclusion rejection, variance color clipping, and quad-subgroup acceleration.
+- Compute shader-based temporal reconstruction with linearized depth disocclusion testing, unconditional variance color clipping ($\mu \pm 1.25\sigma$), and quad-based acceleration (`cbr_reconstruct_quad.comp`).
+- 6 full-fidelity diagnostic and visualization modes (Normal, Mask, Disocclusion Heatmap, Motion Vectors, Raw Quarter-Resolution, Spatial Baseline Resolve).
 - Vulkan 7-binding descriptor set layout, dynamic descriptor pool allocation, and pipeline barrier memory synchronization.
-- Texture MIP LOD bias injection (-1.0 bias) to preserve fine texture details.
-- In-game ImGui debug overlay (visualize checkerboard grid, motion vectors, disocclusion masks).
+- Texture MIP LOD bias injection (-1.0f bias) to preserve fine texture details.
+- Centralized limits and boundaries in `include/cbr/limits.h`.
 - Automated CI build pipeline distributing pre-compiled SPIR-V shaders and release binaries via GitHub Releases.
 
 ### Out of Scope
@@ -92,3 +93,13 @@ This mod targets Pascal-era and mid-range PC hardware—specifically the **NVIDI
 - **APIs:** Vulkan (primary, optimal for Pascal) and DirectX 12 (secondary).
 - **Motion Vectors:** Intercepted from the game's internal TAA buffer or reconstructed via camera matrix reprojection + depth differences.
 - **Legal:** Strictly offline, educational, and open-source under the MIT license.
+
+---
+
+## 8. Current Implementation Status
+- **Phase 1 (Hook Framework & Lifecycle):** **VERIFIED IN-GAME** (Build 1.0.1491.50).
+- **Phase 2 (Viewport Downscaling & Render Pass Interception):** **COMPLETE**.
+- **Phase 3 (Jitter Manager & Limits Centralization):** **COMPLETE**.
+- **Phase 4 (Reconstruction Compute Shaders & Variance Clipping):** **COMPLETE** (Single-pixel GLSL/HLSL and Quad-based GLSL).
+- **Phase 4.5 (Code Audit & System Hardening):** **COMPLETE** (Commit `80382d5`, 19 audit findings resolved).
+- **Phase 5 (Post-Processing & In-Engine TAA Interplay):** **ACTIVE FOCUS**.

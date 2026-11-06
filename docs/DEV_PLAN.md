@@ -61,39 +61,49 @@ The development roadmap is structured into 8 distinct phases designed to de-risk
 - **Deliverables:**
   - Active Vulkan graphics detours, complete compute pipeline dispatch, and automated CI release packaging (`rdr2-cbr-release.zip`).
 
-### Phase 2.6 & Phase 3: Telemetry, In-Game Overlay & DirectX 12 Parity [🔄 ACTIVE FOCUS]
+### Phase 3: Projection Jitter, Limits Centralization & Quarter-Resolution Rendering [✅ COMPLETED]
+- **Status:** **Completed & Verified**
+- **Duration:** 2 Weeks
+- **Objectives Accomplished:**
+  - Implemented 2-phase checkerboard jitter sequence in `JitterManager` with non-accumulating `SetProjectionJitter`.
+  - Unified all hardware, configuration, buffer, and variance clipping constants into `include/cbr/limits.h` (`kVarianceClipGamma = 1.25f`, `kMinSwapchainExtent = 320`, `kMaxSwapchainExtent = 16384`).
+  - Standardized texture MIP LOD bias to `-1.0f` to compensate for quarter-resolution 2× MSAA.
+  - Eliminated lock-order inversion between `JitterManager` and `ConfigManager` to guarantee deadlock-free frame updates.
+  - Formally proven 100% 4-quadrant geometric coverage across alternating frames (verified via `tests/check_shader_mapping.py` across 36,864 coordinate permutations).
+- **Deliverables:**
+  - Jitter subsystem, projection offsets, centralized limits header, and unit tests.
+
+### Phase 4: Compute Reconstruction Shader Pipeline [✅ COMPLETED]
+- **Status:** **Completed & CI Verified**
+- **Duration:** 6–8 Weeks
+- **Objectives Accomplished:**
+  - Authored full single-pixel GLSL compute shader (`cbr_reconstruct.comp`, 16×16 workgroup) and HLSL equivalent (`cbr_reconstruct.hlsl`).
+  - Authored quad-based reconstruction compute shader (`cbr_reconstruct_quad.comp`, 8×8 workgroup, 1 Quad / 4 pixels per thread) to maximize texture cache hit rates.
+  - Implemented 2× MSAA sample unpack matching hardware grid geometries.
+  - Implemented linearized depth disocclusion testing (`LinearizeDepth()`, `RelativeDepthDelta()`) supporting Reversed-Z with infinite far plane.
+  - Implemented variance color clipping ($\mu \pm 1.25\sigma$) in YCoCg space to suppress ghosting while preserving sharp edges.
+  - Removed problematic `&& isMoving` guard to eliminate static geometry ghosting and TAA checkerboard shimmer.
+  - Implemented all 6 debug visualization modes (0: Normal, 1: Mask, 2: Disocclusion, 3: Motion, 4: Raw, 5: Spatial Baseline Resolve) across all shaders.
+  - Added NaN/Inf guards for depth averaging, history reprojection, and depth buffer outputs.
+- **Deliverables:**
+  - Complete SPIR-V and HLSL compute reconstruction pipeline with unit and equivalence test suites.
+
+### Phase 4.5: Codebase Audit & System Hardening [✅ COMPLETED]
+- **Status:** **Completed (Commit `80382d5`)**
+- **Objectives Accomplished:**
+  - Resolved all 19 findings identified during comprehensive code audit.
+  - Added compile-time static assertion on `MinimalVkSwapchainCreateInfoKHR::imageExtent` byte offset (44 on 64-bit) and validated `sType`.
+  - Moved `m_initialized` visibility flag inside `unique_lock` in `RenderTargetManager` to prevent memory ordering races.
+  - Eliminated render-thread per-message disk I/O stalls by restricting logger `flush()` to Warning and Error levels.
+  - Hardened config parser, logger string truncation, and plugin initialization gating.
+
+### Phase 5 & Phase 2.6: Post-Processing, In-Game Overlay & DirectX 12 Parity [🔄 ACTIVE FOCUS]
 - **Status:** **In Progress**
-- **Duration:** 2 Weeks
-- **Objectives:**
-  - Complete interactive Dear ImGui overlay integration (F11/Insert toggle) for real-time telemetry, frame time metrics, and debug visualization modes.
-  - Implement DirectX 12 hooking parity via dummy device swapchain VMT method (`IDXGISwapChain3::Present` VMT index 8).
-  - Execute HLSL compute shader (`cbr_reconstruct.hlsl`) on DX12 command queue.
-
-### Phase 3: Projection Jitter & Quarter-Resolution Rendering
-- **Duration:** 2 Weeks
-- **Objectives:**
-  - Patch camera projection matrix with subpixel alternating jitter offsets.
-  - Ensure UI, minimap, and HUD passes remain unjittered.
-  - Inject `-0.5` MIP LOD bias across all scene texture samplers.
-  - Render the scene into quarter-resolution MSAA targets.
-- **Deliverables:**
-  - Half-shading-cost scene rendering with alternating subpixel grid alignments.
-
-### Phase 4: Compute Reconstruction Shader Pipeline
-- **Duration:** 6–8 Weeks (Critical Path)
-- **Objectives:**
-  - Author GLSL compute shader (`cbr_reconstruct.comp`) and HLSL equivalent (`cbr_reconstruct.hlsl`).
-  - Implement 2× MSAA sample unpack and checkerboard parity test.
-  - Implement temporal reprojection using screen-space velocity vectors.
-  - Implement depth-delta disocclusion test with spatial bilateral fallback.
-  - Implement YCoCg 3×3 color bounding box clamping to suppress ghosting.
-- **Deliverables:**
-  - Fully functional 4K reconstruction compute pass operating in under 2 ms on GTX 1070 Ti.
-
-### Phase 5: Post-Processing & TAA Integration
 - **Duration:** 3 Weeks
 - **Objectives:**
-  - Insert reconstruction pass output before tone mapping, bloom, depth-of-field, and UI composition.
+  - Insert reconstruction pass output before tone mapping, bloom, depth-of-field, and UI composition in live game render graph.
+  - Complete interactive Dear ImGui overlay integration (F11/Insert toggle) for real-time telemetry, frame time metrics, and debug visualization modes.
+  - Complete DirectX 12 hooking parity via dummy device swapchain VMT method (`IDXGISwapChain3::Present` VMT index 8).
   - Tune interaction between CBR reconstruction and RDR2's native TAA pass.
   - Address edge artifacts around alpha-tested foliage, fur, and horse tails.
 - **Deliverables:**
@@ -122,12 +132,13 @@ The development roadmap is structured into 8 distinct phases designed to de-risk
 
 ## 3. Milestones & Timeline Summary
 
-| Milestone | Target Completion | Critical Dependency |
+| Milestone | Status | Critical Dependency / Verification |
 |---|---|---|
-| **M1: Hook & Overlay Active** | Month 1 | MinHook & Vulkan Loader hook stability |
-| **M2: Quarter-Res Target Intercept** | Month 2 | Stable RAGE render target signatures |
-| **M3: Jitter & LOD Bias Verified** | Month 2.5 | Camera matrix offset verification |
-| **M4: First CBR Reconstruction** | Month 4.5 | Motion vector extraction or fallback |
-| **M5: Post-Processing Clean** | Month 5.5 | Proper render graph insertion order |
-| **M6: Pascal Optimization Complete** | Month 6.5 | Nsight profiling & register reduction |
-| **M7: Release v1.0** | Month 7 | Beta community testing |
+| **M1: Hook & Lifecycle Framework** | **COMPLETED** | Verified in RDR2 build 1.0.1491.50 |
+| **M2: Quarter-Res Target Intercept & Redirection** | **COMPLETED** | MinHook detours on viewport & end render pass |
+| **M3: Jitter & LOD Bias (-1.0f) Verified** | **COMPLETED** | Tested via `test_core.cpp` & `check_shader_mapping.py` |
+| **M4: Compute Reconstruction Pass (Single & Quad)** | **COMPLETED** | GLSL / HLSL shaders with variance clipping & 6 debug modes |
+| **M4.5: Codebase Audit & System Hardening** | **COMPLETED** | 19 audit findings resolved (commit `80382d5`) |
+| **M5: Post-Processing & In-Engine TAA Interplay** | **IN PROGRESS** | Proper render graph insertion order |
+| **M6: Pascal & APU Hardware Optimization** | **IN PROGRESS** | Nsight profiling, quad shader evaluation, ASO mode |
+| **M7: Public Release v1.0** | Planned | Beta community testing |

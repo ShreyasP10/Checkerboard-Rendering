@@ -52,27 +52,34 @@ The software package provides a real-time graphics interception and compute reco
 
 ### 2.4 FR-04: Reconstruction Compute Pass
 - **FR-04.1:** The reconstruction pass shall be executed as a compute shader dispatched immediately following the main scene render pass on `vkCmdEndRenderPass`.
-- **FR-04.2:** Compute thread group dimensions shall be $16 \times 16 \times 1$ threads.
-- **FR-04.3:** Dispatch dimension for $3840 \times 2160$:
-  $$\text{Groups}_X = \lceil 3840 / 16 \rceil = 240, \quad \text{Groups}_Y = \lceil 2160 / 16 \rceil = 135$$
+- **FR-04.2 (Single-Pixel Pipeline):** Standard single-pixel compute pipeline (`cbr_reconstruct.comp`, `cbr_reconstruct.hlsl`) with $16 \times 16 \times 1$ thread group dimensions.
+  - Dispatch dimension for $3840 \times 2160$:
+    $$\text{Groups}_X = \lceil 3840 / 16 \rceil = 240, \quad \text{Groups}_Y = \lceil 2160 / 16 \rceil = 135$$
+- **FR-04.3 (Quad-Based Pipeline):** Quad-based compute pipeline (`cbr_reconstruct_quad.comp`) processing 1 Quad ($2 \times 2 = 4$ pixels) per thread with $8 \times 8 \times 1$ thread group dimensions (64 threads = 256 pixels total per workgroup).
+  - Maximizes L1/L2 texture cache spatial locality matching Wave64 (AMD Vega) and dual Wave32 (NVIDIA Pascal).
+  - Dispatch dimension for $3840 \times 2160$:
+    $$\text{Groups}_X = \lceil 3840 / 16 \rceil = 240, \quad \text{Groups}_Y = \lceil 2160 / 16 \rceil = 135$$
 - **FR-04.4:** For each full-resolution pixel $(x, y)$, the shader evaluates its checkerboard phase parity:
   $$\text{PixelParity} = (x + y) \pmod 2$$
   - If $\text{PixelParity} == (\text{FrameIndex} \pmod 2)$, the pixel is **Active Current Sample** and resolved directly from the 2× MSAA buffer.
   - If $\text{PixelParity} \neq (\text{FrameIndex} \pmod 2)$, the pixel is **Missing Sample** and must be reconstructed from temporal history.
 
-### 2.5 FR-05: Temporal History Reprojection & Depth Validation
-- **FR-05.1:** For missing samples, the previous frame screen coordinate is calculated using screen-space velocity:
-  $$\mathbf{UV}_{\text{prev}} = \mathbf{UV}_{\text{curr}} - \mathbf{V}(x, y)$$
-- **FR-05.2:** The shader performs a depth validation test:
-  $$\Delta Z = |Z_{\text{curr}}(x, y) - Z_{\text{prev}}(\mathbf{UV}_{\text{prev}})|$$
-  - If $\Delta Z \le \epsilon_{\text{depth}}$ (default $\epsilon = 0.01$), reprojection is deemed **Valid**, and the color is sampled bilinearly from History Buffer $N-1$.
-  - If $\Delta Z > \epsilon_{\text{depth}}$, the pixel is deemed **Disoccluded**, and the color is reconstructed via spatial cross-bilateral filter from the current frame's 4 adjacent active checkerboard samples.
+### 2.5 FR-05: Temporal History Reprojection & Linearized Depth Validation
+- **FR-05.1:** For missing samples, the previous frame screen coordinate is calculated using screen-space velocity and projection jitter compensation:
+  $$\mathbf{UV}_{\text{prev}} = \mathbf{UV}_{\text{curr}} - \mathbf{V}(x, y) - \mathbf{\Delta Jitter} \times \text{JitterCompensation}$$
+- **FR-05.2:** The shader performs a linearized depth validation test supporting standard and Reversed-Z with infinite far plane (`depth_convention.h`):
+  $$\Delta Z_{\text{lin}} = \frac{|Z_{\text{lin,curr}}(x, y) - Z_{\text{lin,prev}}(\mathbf{UV}_{\text{prev}})|}{\max(Z_{\text{lin,curr}}, 10^{-5}) \cdot \max(\text{DepthTolerance}, 10^{-4})}$$
+  - If $\Delta Z_{\text{lin}} \le 1.0$, reprojection is deemed **Valid**, and the color is sampled bilinearly from History Buffer $N-1$.
+  - If $\Delta Z_{\text{lin}} > 1.0$, the pixel is deemed **Disoccluded**, and the color is reconstructed via spatial cross-bilateral filter from the current frame's 4 adjacent active checkerboard samples.
+  - Active samples that trigger fallback safely preserve their native sample color and depth.
 
-### 2.6 FR-06: 3×3 Neighborhood Color Clamping
-- **FR-06.1:** To suppress temporal ghosting on dynamic objects, reprojected history color $C_{\text{prev}}$ must be clamped within the color bounding box of current frame neighbors:
-  $$C_{\min} = \min_{i \in \text{Kernel}} C_{\text{curr}}(i), \quad C_{\max} = \max_{i \in \text{Kernel}} C_{\text{curr}}(i)$$
+### 2.6 FR-06: Neighborhood Variance Color Clipping
+- **FR-06.1:** To suppress temporal ghosting on dynamic objects and dynamic lighting across static surfaces, reprojected history color $C_{\text{prev}}$ must be clamped within the statistical variance bounding box of current frame neighbors:
+  $$\mu = \frac{1}{N}\sum_{i \in \text{Kernel}} C_{\text{curr}}(i), \quad \sigma = \sqrt{\frac{1}{N}\sum_{i \in \text{Kernel}} (C_{\text{curr}}(i) - \mu)^2}$$
+  $$C_{\min} = \mu - \gamma \sigma, \quad C_{\max} = \mu + \gamma \sigma \quad (\gamma = 1.25\text{ via } \texttt{kVarianceClipGamma})$$
   $$C_{\text{final}} = \text{clamp}(C_{\text{prev}}, C_{\min}, C_{\max})$$
-- **FR-06.2:** Clamping shall be performed in the YCoCg color space to prevent chroma fringing and color bleeding.
+- **FR-06.2:** Variance clipping is applied unconditionally (without `isMoving` guards) to prevent checkerboard crawl on static geometry while suppressing ghosting from dynamic shadows.
+- **FR-06.3:** Clamping is performed in the YCoCg color space (or RGB when configured) to prevent chroma fringing and color bleeding.
 
 ### 2.7 FR-07: Motion Vector Acquisition & Depth Unprojection Fallback
 - **FR-07.1:** The primary motion vector source shall be intercepted from the RAGE engine's internal velocity buffer.
@@ -81,17 +88,20 @@ The software package provides a real-time graphics interception and compute reco
   $$\mathbf{P}_{\text{prev\_ndc}} = \text{ViewProjectionMatrix}_{\text{prev}} \times \mathbf{P}_{\text{world}}$$
   $$\mathbf{V}_{\text{fallback}} = \mathbf{P}_{\text{ndc}} - \mathbf{P}_{\text{prev\_ndc}}$$
 
-### 2.8 FR-08: MIP LOD Bias Injection
+### 2.8 FR-08: MIP LOD Bias Injection & Centralized Limits
 - **FR-08.1:** Intercept sampler creation and descriptor updates (`vkCreateSampler`, `CreateSampler`) to inject a constant `mipLodBias = -1.0f`.
-- **FR-08.2:** The bias ensures that textures retain full 4K Nyquist frequency details during quarter-resolution shading passes.
+- **FR-08.2:** The $-1.0\text{f}$ bias guarantees full 4K Nyquist frequency detail during quarter-resolution shading passes.
+- **FR-08.3:** All dimension, configuration, buffer, and clipping limits are centralized in `include/cbr/limits.h` (`kVarianceClipGamma = 1.25f`, `kMinSwapchainExtent = 320`, `kMaxSwapchainExtent = 16384`).
 
 ### 2.9 FR-09: ImGui Overlay & Diagnostic Modes
 - **FR-09.1:** Toggleable overlay activated via keypress (default: `F11` or `Insert`).
-- **FR-09.2:** Supported debug visualizers:
-  - Mode 0: Normal CBR Output.
-  - Mode 1: Checkerboard Sample Pattern (visualizing alternating subpixel grid).
-  - Mode 2: Disocclusion Heatmap (Green = Valid Reprojection, Red = Disoccluded Fallback).
-  - Mode 3: Motion Vector Vector Field.
+- **FR-09.2:** Supported debug visualizers (Modes 0–5 implemented in both single-pixel and quad shaders):
+  - Mode 0: Normal CBR Output
+  - Mode 1: Checkerboard Sample Pattern (visualizing alternating subpixel grid)
+  - Mode 2: Disocclusion Heatmap (Green = Valid Reprojection, Red = Disoccluded Fallback)
+  - Mode 3: Motion Vector Field
+  - Mode 4: Quarter-Resolution Raw Color
+  - Mode 5: Spatial Baseline Resolve (average of 4 cardinal samples)
 
 ### 2.10 FR-10: Configuration File
 - **FR-10.1:** Settings read from `cbr.ini` placed alongside `RDR2.exe`:
@@ -136,14 +146,14 @@ The software package provides a real-time graphics interception and compute reco
 
 | Requirement | Description | Status | Implementation Component |
 |---|---|---|---|
-| **FR-01** | Injection & Lifecycle | **VERIFIED** | `main.cpp`, `hooks.cpp`, `crash_handler.cpp` |
-| **FR-02** | Render Target & Viewport Interception | **COMPLETE** | `hooks_vulkan.cpp`, `render_target_manager.cpp` |
-| **FR-03** | Subpixel Jitter & Sampling Strategy | **COMPLETE** | `jitter_manager.cpp`, `hooks_vulkan.cpp`, `pattern_scanner.cpp` |
-| **FR-04** | Reconstruction Compute Pass | **COMPLETE** | `reconstruction_pass.cpp`, `cbr_reconstruct.comp`, `cbr_reconstruct_quad.comp` |
-| **FR-05** | Temporal Reprojection & Depth Test | **COMPLETE** | `cbr_reconstruct.comp`, `cbr_reconstruct.hlsl` |
-| **FR-06** | YCoCg Neighborhood Color Clamping | **COMPLETE** | `cbr_reconstruct.comp`, `cbr_reconstruct.hlsl` |
+| **FR-01** | Injection & Lifecycle | **VERIFIED & AUDITED** | `main.cpp`, `hooks.cpp`, `crash_handler.cpp` |
+| **FR-02** | Render Target & Viewport Interception | **COMPLETE & AUDITED** | `hooks_vulkan.cpp`, `render_target_manager.cpp` |
+| **FR-03** | Subpixel Jitter & Sampling Strategy | **COMPLETE & AUDITED** | `jitter_manager.cpp`, `hooks_vulkan.cpp`, `pattern_scanner.cpp` |
+| **FR-04** | Reconstruction Compute Pass (Single & Quad) | **COMPLETE & AUDITED** | `reconstruction_pass.cpp`, `cbr_reconstruct.comp`, `cbr_reconstruct_quad.comp`, `cbr_reconstruct.hlsl` |
+| **FR-05** | Temporal Reprojection & Linear Depth Test | **COMPLETE & AUDITED** | `cbr_reconstruct.comp`, `cbr_reconstruct_quad.comp`, `cbr_reconstruct.hlsl`, `depth_convention.h` |
+| **FR-06** | YCoCg Neighborhood Variance Clipping | **COMPLETE & AUDITED** | `cbr_reconstruct.comp`, `cbr_reconstruct_quad.comp`, `cbr_reconstruct.hlsl`, `limits.h` |
 | **FR-07** | Motion Vector Acquisition & Fallback | **IN PROGRESS** | G-Buffer velocity hook complete; matrix fallback queued |
-| **FR-08** | MIP LOD Bias (-1.0f) | **COMPLETE** | `config.h`, `cbr.ini`, sampler intercept |
-| **FR-09** | ImGui Overlay & Diagnostic Modes | **IN PROGRESS** | `ui_overlay.cpp`, shaders (Modes 0–3 implemented) |
-| **FR-10** | Configuration Management | **COMPLETE** | `config.cpp`, `cbr.ini` |
+| **FR-08** | MIP LOD Bias (-1.0f) & Centralized Limits | **COMPLETE & AUDITED** | `config.h`, `limits.h`, `cbr.ini`, sampler intercept |
+| **FR-09** | ImGui Overlay & Diagnostic Modes | **IN PROGRESS** | `ui_overlay.cpp`, shaders (Modes 0–5 fully implemented) |
+| **FR-10** | Configuration Management | **COMPLETE & AUDITED** | `config.cpp`, `cbr.ini`, `limits.h` |
 

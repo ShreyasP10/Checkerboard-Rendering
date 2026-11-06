@@ -110,5 +110,13 @@ The mod has proven rock-solid stability in live execution. With the host environ
 - **AOB Camera Scanner:** Automated IDA-style signature scanner with RIP-relative address calculation and SEH memory protection.
 - **Vulkan Descriptors & Barriers:** 7-descriptor layout allocation via internal `VkDescriptorPool` and execution synchronization with `vkCmdPipelineBarrier`.
 
+### 4.1 Post-Test Architectural Progression & Audit Status
+Following the live Phase 1 in-game test, the codebase advanced through subsequent implementation milestones and passed a comprehensive 19-finding security/correctness audit (Commit `80382d5`):
+- **Quad-Based Compute Pipeline (`cbr_reconstruct_quad.comp`):** Authored 1 Quad (2×2 = 4 pixels) per thread kernel with 8×8 workgroups to maximize texture cache spatial locality for Pascal and Vega GPUs.
+- **Unconditional Variance Clipping:** Eliminated the `&& isMoving` branch in variance clipping and history blending, solving ghosting from dynamic lighting on static geometry.
+- **Linearized Reversed-Z Disocclusion:** Integrated `depth_convention.h` with scale-invariant linear depth testing and infinite far plane support.
+- **ABI & Memory Safety Hardening:** Enforced compile-time `static_assert` on `MinimalVkSwapchainCreateInfoKHR::imageExtent` byte offset (44 on 64-bit), `sType` validation, mutex-protected `m_initialized` visibility in `RenderTargetManager`, and deadlock-free lock ordering in `JitterManager`.
+- **Render-Thread Latency Protection:** Eliminated per-message disk I/O flushes in `Logger`, restricting flushes to Warning and Error levels.
+
 See [nextImplementationPhase.md](file:///c:/Users/Dinesh%20B%20Pawar/OneDrive/Desktop/Checkerboard-Rendering/nextImplementationPhase.md) and [docs/VULKAN_HOOKING_GUIDE.md](file:///c:/Users/Dinesh%20B%20Pawar/OneDrive/Desktop/Checkerboard-Rendering/docs/VULKAN_HOOKING_GUIDE.md) for full technical guides.
 

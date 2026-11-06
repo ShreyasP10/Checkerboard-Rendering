@@ -152,47 +152,69 @@ Using screen-space coordinates $(u, v) \in [0, 1]^2$:
 $$\mathbf{v} = \text{Sample}(\text{VelocityTexture}, u, v).\text{xy}$$
 $$(u_{\text{hist}}, v_{\text{hist}}) = (u, v) - \mathbf{v}$$
 
-### 4.4 Disocclusion & Depth Delta Validation
-Let $Z_{\text{curr}} = \text{Sample}(\text{DepthCurrent}, u, v)$ and $Z_{\text{prev}} = \text{Sample}(\text{DepthHistory}, u_{\text{hist}}, v_{\text{hist}})$:
-$$\Delta Z = \frac{|Z_{\text{curr}} - Z_{\text{prev}}|}{\max(Z_{\text{curr}}, 10^{-5})}$$
-If $\Delta Z > \text{Threshold}$ (default $0.01$):
-- **Disocclusion Triggered:** History sample is invalid. Color is derived via spatial cross-bilateral filter from the 4 cross-diagonal active samples:
-  $$C_{\text{spatial}} = \sum_{k=1}^4 w_k \cdot C_k, \quad w_k = \frac{\exp(-\|p_k - p\|^2 / 2\sigma_d^2) \cdot \exp(-|Z_k - Z|^2 / 2\sigma_z^2)}{\sum_j w_j}$$
+### 4.4 Disocclusion & Linearized Depth Delta Validation
+Let $Z_{\text{lin,curr}} = \text{LinearizeDepth}(Z_{\text{curr}})$ and $Z_{\text{lin,prev}} = \text{LinearizeDepth}(Z_{\text{prev}})$ (supporting standard and Reversed-Z with infinite far plane via `depth_convention.h`):
+$$\Delta Z_{\text{lin}} = \frac{|Z_{\text{lin,curr}} - Z_{\text{lin,prev}}|}{\max(Z_{\text{lin,curr}}, 10^{-5}) \cdot \max(\text{DepthTolerance}, 10^{-4})}$$
+If $\Delta Z_{\text{lin}} > 1.0$:
+- **Disocclusion Triggered:** History sample is invalid. Color is derived via spatial cross-bilateral filter from the cardinal/diagonal active samples:
+  $$C_{\text{spatial}} = \frac{\sum_{k=1}^4 w_k \cdot C_k}{\sum_{k=1}^4 w_k}, \quad w_k = \exp\left(-\frac{|Z_{\text{lin,curr}} - Z_{\text{lin},k}|}{\max(Z_{\text{lin,curr}}, 10^{-5}) \cdot \max(\text{DepthTolerance}, 10^{-4})}\right)$$
+  - For active samples triggering fallback, the native current color and depth are preserved directly rather than reading uninitialized neighbor buffers.
 
-### 4.5 YCoCg Color Clamping
-To eliminate ghosting on moving edges, the temporal history sample $C_{\text{hist}}$ is converted to YCoCg:
+### 4.5 Neighborhood Variance Color Clipping
+To eliminate ghosting on dynamic objects and moving shadows across static surfaces without over-clamping sharp details, the temporal history sample $C_{\text{hist}}$ is converted to YCoCg (or RGB when configured):
 $$Y = \frac{R}{4} + \frac{G}{2} + \frac{B}{4}, \quad Co = \frac{R}{2} - \frac{B}{2}, \quad Cg = -\frac{R}{4} + \frac{G}{2} - \frac{B}{4}$$
-Given the $3 \times 3$ bounding box of current frame samples $[\mathbf{YCoCg}_{\min}, \mathbf{YCoCg}_{\max}]$:
+The sample neighborhood mean $\mathbf{\mu}$ and standard deviation $\mathbf{\sigma}$ are computed across the active samples:
+$$\mathbf{\mu} = \frac{1}{N} \sum_{i=1}^N \mathbf{YCoCg}_i, \quad \mathbf{\sigma} = \sqrt{\frac{1}{N} \sum_{i=1}^N (\mathbf{YCoCg}_i - \mathbf{\mu})^2}$$
+$$\mathbf{YCoCg}_{\min} = \mathbf{\mu} - \gamma \mathbf{\sigma}, \quad \mathbf{YCoCg}_{\max} = \mathbf{\mu} + \gamma \mathbf{\sigma} \quad (\gamma = 1.25\text{ via } \texttt{kVarianceClipGamma})$$
 $$\mathbf{YCoCg}_{\text{clamped}} = \text{clamp}(\mathbf{YCoCg}_{\text{hist}}, \mathbf{YCoCg}_{\min}, \mathbf{YCoCg}_{\max})$$
-Converted back to RGB before final write.
+Converted back to RGB before history blending and output image storage.
+- Variance clipping is applied unconditionally (without `isMoving` guards) to maintain checkerboard stability on static frames.
+
+### 4.6 Debug Visualization Modes (Modes 0–5)
+Both the single-pixel and quad-based compute shaders implement 6 real-time visualization modes controlled via `u_DebugView`:
+- **Mode 0 (Normal):** Fully reconstructed high-fidelity CBR image.
+- **Mode 1 (Checkerboard Mask):** White ($1.0, 1.0, 1.0$) for natively shaded samples this frame; dark grey ($0.05, 0.05, 0.05$) for temporally reconstructed pixels.
+- **Mode 2 (Disocclusion Heatmap):** Green ($0.1, 0.9, 0.1$) for valid temporal history reprojection; Red ($1.0, 0.1, 0.1$) for disoccluded pixels resolving via spatial cross-bilateral filter.
+- **Mode 3 (Motion Vectors):** Normalized screen-space velocity vector field scaled by 50×.
+- **Mode 4 (Raw Quarter-Resolution):** Unfiltered quarter-resolution color showing raw native samples.
+- **Mode 5 (Spatial Baseline Resolve):** Pure spatial resolve (unweighted average of 4 cardinal native samples) enabling direct A/B image quality comparisons against temporal CBR.
 
 ---
 
-## 5. Pascal GPU Architecture Optimizations (GTX 1070 Ti)
+## 5. GPU Architecture Optimizations & Compute Kernels
 
+### 5.1 Single-Pixel Compute Pipeline (`cbr_reconstruct.comp` / `cbr_reconstruct.hlsl`)
 1. **Warp Size & Thread Group Dimensions:**
-   - Pascal GP104 utilizes 32-thread warps.
-   - Workgroup size is configured to $16 \times 16 = 256$ threads ($8$ warps per workgroup), providing 100% occupancy on Pascal Streaming Multiprocessors (SMs).
+   - Workgroup size configured to $16 \times 16 = 256$ threads ($8$ warps per workgroup), providing 100% occupancy on Pascal Streaming Multiprocessors (SMs) and 4 full wavefronts on AMD GCN 5.0 (Vega Wave64).
 2. **Register Pressure Management:**
-   - Shaders are limited to $\le 32$ VGPRs per thread to prevent register spilling to local memory.
+   - Shaders limited to $\le 32$ VGPRs per thread to prevent local memory register spills.
 3. **Half-Precision (FP16) Considerations:**
-   - Pascal has 1:64 FP16 rate; therefore, internal compute operations use 32-bit `float` for mathematical correctness and speed, storing the final output in packed `R16G16B16A16_SFLOAT`.
-4. **Shared Memory Tiling:**
-   - An $18 \times 18$ shared memory tile with a 1-pixel boundary apron caches neighboring depth and color samples, cutting texture fetch bandwidth by 72%.
+   - Pascal GP104 lacks hardware FP16 (1:64 rate); internal calculations use FP32 floats, packing final outputs into `R16G16B16A16_SFLOAT`.
+
+### 5.2 Quad-Based Compute Pipeline (`cbr_reconstruct_quad.comp`)
+1. **1 Quad (2×2 Pixels) per Thread:**
+   - Each thread resolves 4 adjacent target pixels simultaneously, using an $8 \times 8 \times 1$ workgroup (64 threads = 256 pixels).
+   - Exploits spatial proximity to drastically increase L1/L2 texture cache hit rates when sampling quarter-resolution MSAA textures.
+2. **Shared Subgroup Alignment:**
+   - Perfectly aligns with Wave64 (AMD Vega) and dual Wave32 (NVIDIA Pascal), reducing workgroup dispatch overhead.
 
 ---
 
-## 6. Build & Integration Requirements
+## 6. Build, Integration & ABI Hardening Requirements
 
-- **Compiler:** MSVC v143 (Visual Studio 2022) with `/std:c++20` and `/O2 /Oi /Ot`.
+- **Compiler:** MSVC v143 (Visual Studio 2022) with `/std:c++20` and `/O2 /Oi /Ot`, or MinGW-w64 with `-std=c++20`.
 - **Target Platform:** `x64` Windows.
-- **Dependencies:**
-  - MinHook (v1.3.3+)
-  - Vulkan SDK (1.3.268+)
-  - Dear ImGui (v1.90+ Docking branch)
-  - GLSLangValidator or shaderc for compiling GLSL to SPIR-V bytecode.
-
----
+- **ABI Safety & Assertions:**
+  - Headerless ABI extraction struct `MinimalVkSwapchainCreateInfoKHR` is asserted at compile time:
+    ```cpp
+    static_assert(offsetof(MinimalVkSwapchainCreateInfoKHR, imageExtent) == (sizeof(void*) == 8 ? 44 : 28), "ABI drift: imageExtent offset");
+    ```
+  - `sType` validation verifies `sType == 1000001000` (`VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR`) before pointer dereferencing.
+  - Push-constant struct `ReconstructionPushConstants` is `static_assert`ed to 80 bytes (16-byte aligned) matching shader layouts.
+- **Thread Safety & Deadlock Prevention:**
+  - `RenderTargetManager`: `m_initialized` write is guarded within `std::unique_lock<std::shared_mutex>` to prevent stale dimension reads.
+  - `JitterManager`: Acquires `ConfigManager::GetConfig()` prior to taking `m_mutex`, enforcing a strict lock hierarchy to prevent deadlocks.
+  - `Logger`: Disk `flush()` executed exclusively on `Warning` and `Error` to eliminate render-thread I/O stalls during frame execution.
 
 ## 7. Industry References & Prior Art
 

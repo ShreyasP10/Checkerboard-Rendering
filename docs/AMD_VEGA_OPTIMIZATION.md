@@ -48,13 +48,19 @@ Pascal GP104 lacks hardware FP16 support (executing at 1:64 rate), requiring ful
 * Color space transformations (`RGB <-> YCoCg`), variance clipping calculations, and cardinal blending can execute entirely in packed 16-bit floats.
 * Doubles arithmetic instruction throughput on Vega 7's 448 stream processors while reducing register pressure from 32-bit VGPRs to 16-bit VGPRs.
 
-### 3.3 Memory Bandwidth Conservation: Enforcing ASO Mode
+### 3.3 Memory Bandwidth Conservation: Disabling Motion Dilation (ASO Mode)
 Because DDR4 memory bandwidth (~50 GB/s) is shared between the CPU and GPU, texture fetching is the primary performance bottleneck on Vega 7.
 * **The Cost of CSO:** Standard Check Shading Occlusion (CSO) with 3×3 closest-depth motion dilation requires **9 additional depth texture fetches per reconstructed pixel**. At 1080p, this consumes over 9.3 million depth texture reads per frame (~37 MB/s additional bus traffic).
 * **Vega Optimization (ASO Mode):** By setting `EnableMotionDilation = false` in `cbr.ini`:
-  - The shader bypasses the 3×3 dilation loop entirely.
-  - If a pixel is in motion ($|\mathbf{V}| > 0$), it assumes occlusion (ASO) and immediately uses cardinal blending.
-  - This eliminates 100% of extraneous depth reads, cutting memory bus bandwidth by ~35% on Vega APUs.
+  - The shader bypasses the 3×3 dilation loop entirely, fetching velocity directly from the pixel's un-dilated UV.
+  - History blending and variance clipping continue to run unconditionally, preventing checkerboard shimmer while eliminating 100% of extraneous dilation depth reads.
+  - This cuts texture read bus traffic by ~35% on Vega APUs.
+
+### 3.4 Quad-Based Reconstruction Alignment (`cbr_reconstruct_quad.comp`)
+Vega's GCN 5.0 compute units execute in 64-thread wavefronts (Wave64).
+* The quad-based compute shader (`cbr_reconstruct_quad.comp`) operates with an $8 \times 8 \times 1$ workgroup layout ($64$ threads exactly = 1 Wavefront).
+* Each thread processes 1 Quad ($2 \times 2 = 4$ pixels), writing 256 pixels per workgroup.
+* This achieves **100% wave occupancy** without wave divergence, while quadrupling spatial cache locality for texture samplers across the DDR4 unified memory bus.
 
 ---
 
