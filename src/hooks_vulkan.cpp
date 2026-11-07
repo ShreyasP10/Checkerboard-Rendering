@@ -2,6 +2,9 @@
 #include <atomic>
 #include <cstddef>
 #include <cstring>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
 #include <MinHook.h>
 #include "cbr/cbr_engine.h"
 #include "cbr/config.h"
@@ -35,25 +38,34 @@ typedef void  (*PFN_vkCmdBeginRenderPass)(void* commandBuffer, const void* pRend
 typedef void  (*PFN_vkCmdEndRenderPass)(void* commandBuffer);
 typedef void  (*PFN_vkCmdSetSampleLocationsEXT)(void* commandBuffer, const MinimalVkSampleLocationsInfoEXT* pSampleLocationsInfo);
 typedef int   (*PFN_vkGetSwapchainImagesKHR)(void* device, void* swapchain, uint32_t* pSwapchainImageCount, void** pSwapchainImages);
+typedef int   (*PFN_vkAcquireNextImageKHR)(void* device, void* swapchain, uint64_t timeout, void* semaphore, void* fence, uint32_t* pImageIndex);
+typedef void  (*PFN_vkCmdDraw)(void* commandBuffer, uint32_t vertexCount, uint32_t instanceCount, uint32_t firstVertex, uint32_t firstInstance);
+typedef void  (*PFN_vkCmdDrawIndexed)(void* commandBuffer, uint32_t indexCount, uint32_t instanceCount, uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance);
 
 PFN_vkGetDeviceProcAddr        g_Original_vkGetDeviceProcAddr = nullptr;
 PFN_vkGetInstanceProcAddr      g_Original_vkGetInstanceProcAddr = nullptr;
 PFN_vkQueuePresentKHR          g_Original_vkQueuePresentKHR = nullptr;
 PFN_vkCreateSwapchainKHR       g_Original_vkCreateSwapchainKHR = nullptr;
 PFN_vkGetSwapchainImagesKHR    g_Original_vkGetSwapchainImagesKHR = nullptr;
+PFN_vkAcquireNextImageKHR      g_Original_vkAcquireNextImageKHR = nullptr;
 PFN_vkCmdSetViewport           g_Original_vkCmdSetViewport = nullptr;
 PFN_vkCmdSetScissor            g_Original_vkCmdSetScissor = nullptr;
 PFN_vkCmdBeginRenderPass       g_Original_vkCmdBeginRenderPass = nullptr;
 PFN_vkCmdEndRenderPass         g_Original_vkCmdEndRenderPass = nullptr;
+PFN_vkCmdDraw                  g_Original_vkCmdDraw = nullptr;
+PFN_vkCmdDrawIndexed           g_Original_vkCmdDrawIndexed = nullptr;
 PFN_vkCmdSetSampleLocationsEXT g_Original_vkCmdSetSampleLocationsEXT = nullptr;
 
 void* Hooked_vkGetDeviceProcAddr(void* device, const char* pName);
 void* Hooked_vkGetInstanceProcAddr(void* instance, const char* pName);
 int   Hooked_vkGetSwapchainImagesKHR(void* device, void* swapchain, uint32_t* pSwapchainImageCount, void** pSwapchainImages);
+int   Hooked_vkAcquireNextImageKHR(void* device, void* swapchain, uint64_t timeout, void* semaphore, void* fence, uint32_t* pImageIndex);
 void  Hooked_vkCmdSetViewport(void* commandBuffer, uint32_t firstViewport, uint32_t viewportCount, const MinimalVkViewport* pViewports);
 void  Hooked_vkCmdSetScissor(void* commandBuffer, uint32_t firstScissor, uint32_t scissorCount, const MinimalVkRect2D* pScissors);
 void  Hooked_vkCmdBeginRenderPass(void* commandBuffer, const void* pRenderPassBegin, uint32_t contents);
 void  Hooked_vkCmdEndRenderPass(void* commandBuffer);
+void  Hooked_vkCmdDraw(void* commandBuffer, uint32_t vertexCount, uint32_t instanceCount, uint32_t firstVertex, uint32_t firstInstance);
+void  Hooked_vkCmdDrawIndexed(void* commandBuffer, uint32_t indexCount, uint32_t instanceCount, uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance);
 void  Hooked_vkCmdSetSampleLocationsEXT(void* commandBuffer, const MinimalVkSampleLocationsInfoEXT* pSampleLocationsInfo);
 
 // VK_ERROR_INITIALIZATION_FAILED: returned if a hook is ever invoked without a valid trampoline,
@@ -175,6 +187,45 @@ inline void ConfigureCheckerboardSampleLocations(uint32_t frameIndex,
     outInfo.pSampleLocations = outLocations;
 }
 
+struct MinimalVkRenderPassBeginInfo {
+    uint32_t        sType;
+    const void*     pNext;
+    void*           renderPass;
+    void*           framebuffer;
+    MinimalVkRect2D renderArea;
+    uint32_t        clearValueCount;
+    const void*     pClearValues;
+};
+
+// Swapchain backbuffer tracking
+std::mutex g_swapchainMutex;
+std::unordered_map<void*, std::vector<void*>> g_swapchainImages;
+std::atomic<void*> g_activeSwapchain{ nullptr };
+std::atomic<uint32_t> g_activeImageIndex{ 0 };
+
+inline void* GetActiveSwapchainImage() {
+    std::lock_guard<std::mutex> lock(g_swapchainMutex);
+    void* swp = g_activeSwapchain.load();
+    auto it = g_swapchainImages.find(swp);
+    if (it != g_swapchainImages.end()) {
+        uint32_t idx = g_activeImageIndex.load();
+        if (idx < it->second.size()) {
+            return it->second[idx];
+        }
+    }
+    return nullptr;
+}
+
+// Scene pass identification and draw tracking
+struct PassTrackingState {
+    bool     hasMatchingExtent{ false };
+    bool     viewportDownscaled{ false };
+    uint32_t drawCount{ 0 };
+};
+
+std::mutex g_passTrackingMutex;
+std::unordered_map<void*, PassTrackingState> g_passTracking;
+
 int Hooked_vkQueuePresentKHR(void* queue, const void* pPresentInfo) {
     if (!g_Original_vkQueuePresentKHR) {
         return kVkErrorInitializationFailed;
@@ -189,7 +240,15 @@ int Hooked_vkQueuePresentKHR(void* queue, const void* pPresentInfo) {
         if (info.swapchainCount > 0 && info.swapchainCount < 16 && info.pSwapchains) {
             void* first = nullptr;
             std::memcpy(&first, info.pSwapchains, sizeof(first));
-            if (first) presentTarget = first;
+            if (first) {
+                presentTarget = first;
+                g_activeSwapchain.store(first);
+            }
+            if (info.pImageIndices) {
+                uint32_t idx = 0;
+                std::memcpy(&idx, info.pImageIndices, sizeof(idx));
+                g_activeImageIndex.store(idx);
+            }
         }
     }
 
@@ -230,8 +289,20 @@ int Hooked_vkCreateSwapchainKHR(void* device, const void* pCreateInfo, const voi
                 CBR_LOG_WARN("vkCreateSwapchainKHR: unexpected sType (%u), skipping extent extraction.", sType);
             }
         }
-        try { CBREngine::Get().OnSwapchainRecreated(w, h); } catch (...) {}
-        try { ReconstructionPass::Get().InitializeVulkan(device, nullptr); } catch (...) {}
+        try {
+            CBREngine::Get().OnSwapchainRecreated(w, h);
+            RenderTargetManager::Get().CreateVulkanResources(device, nullptr);
+            ReconstructionPass::Get().InitializeVulkan(device, nullptr);
+            const auto& res = RenderTargetManager::Get().GetVulkanResources();
+            ReconstructionPass::Get().UpdateVulkanPingPongDescriptors(
+                res.quarterColor.view, res.quarterDepth.view,
+                res.historyColor[0].view, res.historyDepth[0].view,
+                res.historyColor[1].view, res.historyDepth[1].view,
+                res.velocity.view,
+                res.outputColor.view, res.outputDepth.view,
+                res.linearSampler, res.pointSampler
+            );
+        } catch (...) {}
     }
     return result;
 }
@@ -242,8 +313,26 @@ int Hooked_vkGetSwapchainImagesKHR(void* device, void* swapchain, uint32_t* pSwa
     }
     int result = g_Original_vkGetSwapchainImagesKHR(device, swapchain, pSwapchainImageCount, pSwapchainImages);
     if (result == 0 && pSwapchainImages && pSwapchainImageCount && *pSwapchainImageCount > 0) {
-        CBR_LOG_INFO("vkGetSwapchainImagesKHR: %u swapchain image(s) captured for device %p.",
-                     *pSwapchainImageCount, device);
+        std::lock_guard<std::mutex> lock(g_swapchainMutex);
+        auto& imgs = g_swapchainImages[swapchain];
+        imgs.clear();
+        for (uint32_t i = 0; i < *pSwapchainImageCount; ++i) {
+            imgs.push_back(pSwapchainImages[i]);
+        }
+        CBR_LOG_INFO("vkGetSwapchainImagesKHR: %u swapchain image(s) captured for swapchain %p (device %p).",
+                     *pSwapchainImageCount, swapchain, device);
+    }
+    return result;
+}
+
+int Hooked_vkAcquireNextImageKHR(void* device, void* swapchain, uint64_t timeout, void* semaphore, void* fence, uint32_t* pImageIndex) {
+    if (!g_Original_vkAcquireNextImageKHR) {
+        return kVkErrorInitializationFailed;
+    }
+    int result = g_Original_vkAcquireNextImageKHR(device, swapchain, timeout, semaphore, fence, pImageIndex);
+    if (result == 0 && pImageIndex) {
+        g_activeSwapchain.store(swapchain);
+        g_activeImageIndex.store(*pImageIndex);
     }
     return result;
 }
@@ -264,6 +353,11 @@ void Hooked_vkCmdSetViewport(void* commandBuffer, uint32_t firstViewport, uint32
 
         // Mark this command buffer as actively executing the intercepted scene geometry pass
         CBREngine::Get().MarkCandidatePassActive(commandBuffer);
+
+        {
+            std::lock_guard<std::mutex> lock(g_passTrackingMutex);
+            g_passTracking[commandBuffer].viewportDownscaled = true;
+        }
 
         MinimalVkViewport redirected = pViewports[0];
         redirected.width = static_cast<float>(dims.quarterWidth);
@@ -326,7 +420,51 @@ void Hooked_vkCmdSetScissor(void* commandBuffer, uint32_t firstScissor, uint32_t
 void Hooked_vkCmdBeginRenderPass(void* commandBuffer, const void* pRenderPassBegin, uint32_t contents) {
     if (!g_Original_vkCmdBeginRenderPass) return;
 
+    if (pRenderPassBegin && CBREngine::Get().IsEnabled()) {
+        uint32_t sType = 0;
+        std::memcpy(&sType, pRenderPassBegin, sizeof(sType));
+        constexpr uint32_t kVkStructureTypeRenderPassBeginInfo = 43;
+        if (sType == kVkStructureTypeRenderPassBeginInfo) {
+            MinimalVkRenderPassBeginInfo info{};
+            std::memcpy(&info, pRenderPassBegin, sizeof(info));
+            const auto dims = RenderTargetManager::Get().GetDimensions();
+            const uint32_t w = info.renderArea.extent.width;
+            const uint32_t h = info.renderArea.extent.height;
+
+            std::lock_guard<std::mutex> lock(g_passTrackingMutex);
+            auto& state = g_passTracking[commandBuffer];
+            state.hasMatchingExtent = ((w == dims.fullWidth && h == dims.fullHeight) ||
+                                       (w == dims.quarterWidth && h == dims.quarterHeight));
+            state.viewportDownscaled = false;
+            state.drawCount = 0;
+        }
+    }
+
     g_Original_vkCmdBeginRenderPass(commandBuffer, pRenderPassBegin, contents);
+}
+
+void Hooked_vkCmdDraw(void* commandBuffer, uint32_t vertexCount, uint32_t instanceCount, uint32_t firstVertex, uint32_t firstInstance) {
+    if (!g_Original_vkCmdDraw) return;
+    if (CBREngine::Get().IsEnabled()) {
+        std::lock_guard<std::mutex> lock(g_passTrackingMutex);
+        auto it = g_passTracking.find(commandBuffer);
+        if (it != g_passTracking.end()) {
+            it->second.drawCount++;
+        }
+    }
+    g_Original_vkCmdDraw(commandBuffer, vertexCount, instanceCount, firstVertex, firstInstance);
+}
+
+void Hooked_vkCmdDrawIndexed(void* commandBuffer, uint32_t indexCount, uint32_t instanceCount, uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance) {
+    if (!g_Original_vkCmdDrawIndexed) return;
+    if (CBREngine::Get().IsEnabled()) {
+        std::lock_guard<std::mutex> lock(g_passTrackingMutex);
+        auto it = g_passTracking.find(commandBuffer);
+        if (it != g_passTracking.end()) {
+            it->second.drawCount++;
+        }
+    }
+    g_Original_vkCmdDrawIndexed(commandBuffer, indexCount, instanceCount, firstIndex, vertexOffset, firstInstance);
 }
 
 void Hooked_vkCmdEndRenderPass(void* commandBuffer) {
@@ -336,9 +474,34 @@ void Hooked_vkCmdEndRenderPass(void* commandBuffer) {
 
     if (CBREngine::Get().IsEnabled()) {
         try {
-            // Only trigger reconstruction if this command buffer executed the intercepted scene pass!
-            if (CBREngine::Get().ConsumeCandidatePassActive(commandBuffer)) {
+            bool isScenePass = false;
+            {
+                std::lock_guard<std::mutex> lock(g_passTrackingMutex);
+                auto it = g_passTracking.find(commandBuffer);
+                if (it != g_passTracking.end()) {
+                    isScenePass = it->second.viewportDownscaled ||
+                                  (it->second.hasMatchingExtent && it->second.drawCount >= 20);
+                    g_passTracking.erase(it);
+                }
+            }
+
+            // Trigger reconstruction if identified as scene pass or engine marked active
+            if (isScenePass || CBREngine::Get().ConsumeCandidatePassActive(commandBuffer)) {
                 CBREngine::Get().OnScenePassEnd(commandBuffer);
+
+                // Presentation path: blit reconstructed output to swapchain backbuffer image
+                void* backbuffer = GetActiveSwapchainImage();
+                if (backbuffer && RenderTargetManager::Get().AreVulkanResourcesCreated()) {
+                    const auto& res = RenderTargetManager::Get().GetVulkanResources();
+                    const auto dims = RenderTargetManager::Get().GetDimensions();
+                    ReconstructionPass::BlitToImage(
+                        commandBuffer,
+                        res.outputColor.image,
+                        backbuffer,
+                        dims.fullWidth, dims.fullHeight,
+                        dims.fullWidth, dims.fullHeight
+                    );
+                }
             }
         } catch (...) {
         }
@@ -422,6 +585,24 @@ void* Hooked_vkGetDeviceProcAddr(void* device, const char* pName) {
         }
         return reinterpret_cast<void*>(&Hooked_vkCmdSetSampleLocationsEXT);
     }
+    if (std::strcmp(pName, "vkAcquireNextImageKHR") == 0) {
+        if (!g_Original_vkAcquireNextImageKHR) {
+            g_Original_vkAcquireNextImageKHR = reinterpret_cast<PFN_vkAcquireNextImageKHR>(realProc);
+        }
+        return reinterpret_cast<void*>(&Hooked_vkAcquireNextImageKHR);
+    }
+    if (std::strcmp(pName, "vkCmdDraw") == 0) {
+        if (!g_Original_vkCmdDraw) {
+            g_Original_vkCmdDraw = reinterpret_cast<PFN_vkCmdDraw>(realProc);
+        }
+        return reinterpret_cast<void*>(&Hooked_vkCmdDraw);
+    }
+    if (std::strcmp(pName, "vkCmdDrawIndexed") == 0) {
+        if (!g_Original_vkCmdDrawIndexed) {
+            g_Original_vkCmdDrawIndexed = reinterpret_cast<PFN_vkCmdDrawIndexed>(realProc);
+        }
+        return reinterpret_cast<void*>(&Hooked_vkCmdDrawIndexed);
+    }
     return realProc;
 }
 
@@ -453,6 +634,12 @@ void* Hooked_vkGetInstanceProcAddr(void* instance, const char* pName) {
         }
         return reinterpret_cast<void*>(&Hooked_vkGetSwapchainImagesKHR);
     }
+    if (std::strcmp(pName, "vkAcquireNextImageKHR") == 0) {
+        if (!g_Original_vkAcquireNextImageKHR) {
+            g_Original_vkAcquireNextImageKHR = reinterpret_cast<PFN_vkAcquireNextImageKHR>(realProc);
+        }
+        return reinterpret_cast<void*>(&Hooked_vkAcquireNextImageKHR);
+    }
     if (std::strcmp(pName, "vkCmdSetViewport") == 0) {
         if (!g_Original_vkCmdSetViewport) {
             g_Original_vkCmdSetViewport = reinterpret_cast<PFN_vkCmdSetViewport>(realProc);
@@ -476,6 +663,18 @@ void* Hooked_vkGetInstanceProcAddr(void* instance, const char* pName) {
             g_Original_vkCmdEndRenderPass = reinterpret_cast<PFN_vkCmdEndRenderPass>(realProc);
         }
         return reinterpret_cast<void*>(&Hooked_vkCmdEndRenderPass);
+    }
+    if (std::strcmp(pName, "vkCmdDraw") == 0) {
+        if (!g_Original_vkCmdDraw) {
+            g_Original_vkCmdDraw = reinterpret_cast<PFN_vkCmdDraw>(realProc);
+        }
+        return reinterpret_cast<void*>(&Hooked_vkCmdDraw);
+    }
+    if (std::strcmp(pName, "vkCmdDrawIndexed") == 0) {
+        if (!g_Original_vkCmdDrawIndexed) {
+            g_Original_vkCmdDrawIndexed = reinterpret_cast<PFN_vkCmdDrawIndexed>(realProc);
+        }
+        return reinterpret_cast<void*>(&Hooked_vkCmdDrawIndexed);
     }
     if (std::strcmp(pName, "vkCmdSetSampleLocationsEXT") == 0) {
         if (!g_Original_vkCmdSetSampleLocationsEXT) {
@@ -569,6 +768,21 @@ bool HookManager::InstallVulkanHooks() {
         }
     }
 
+    // 2c. Detour vkAcquireNextImageKHR
+    auto pfnAcquireNextImage = reinterpret_cast<void*>(GetProcAddress(vulkanModule, "vkAcquireNextImageKHR"));
+    if (pfnAcquireNextImage) {
+        mhStatus = MH_CreateHook(
+            pfnAcquireNextImage,
+            reinterpret_cast<LPVOID>(&Hooked_vkAcquireNextImageKHR),
+            reinterpret_cast<LPVOID*>(&g_Original_vkAcquireNextImageKHR)
+        );
+        if (mhStatus == MH_OK || mhStatus == MH_ERROR_ALREADY_CREATED) {
+            MH_EnableHook(pfnAcquireNextImage);
+            CBR_LOG_INFO("MinHook: Successfully detoured vkAcquireNextImageKHR (export at 0x%p).", pfnAcquireNextImage);
+            hookedAny = true;
+        }
+    }
+
     // 3. Detour vkGetInstanceProcAddr to intercept dynamic device/instance queries
     if (pfnGetInstanceProcAddr) {
         mhStatus = MH_CreateHook(
@@ -633,6 +847,36 @@ bool HookManager::InstallVulkanHooks() {
             hookedAny = true;
         } else {
             CBR_LOG_WARN("MinHook: Could not detour vkCmdBeginRenderPass (status: %d).", mhStatus);
+        }
+    }
+
+    // 6b. Detour vkCmdDraw for scene pass draw call tracking
+    auto pfnCmdDraw = reinterpret_cast<void*>(GetProcAddress(vulkanModule, "vkCmdDraw"));
+    if (pfnCmdDraw) {
+        mhStatus = MH_CreateHook(
+            pfnCmdDraw,
+            reinterpret_cast<LPVOID>(&Hooked_vkCmdDraw),
+            reinterpret_cast<LPVOID*>(&g_Original_vkCmdDraw)
+        );
+        if (mhStatus == MH_OK || mhStatus == MH_ERROR_ALREADY_CREATED) {
+            MH_EnableHook(pfnCmdDraw);
+            CBR_LOG_INFO("MinHook: Successfully detoured vkCmdDraw (export at 0x%p).", pfnCmdDraw);
+            hookedAny = true;
+        }
+    }
+
+    // 6c. Detour vkCmdDrawIndexed for scene pass draw call tracking
+    auto pfnCmdDrawIndexed = reinterpret_cast<void*>(GetProcAddress(vulkanModule, "vkCmdDrawIndexed"));
+    if (pfnCmdDrawIndexed) {
+        mhStatus = MH_CreateHook(
+            pfnCmdDrawIndexed,
+            reinterpret_cast<LPVOID>(&Hooked_vkCmdDrawIndexed),
+            reinterpret_cast<LPVOID*>(&g_Original_vkCmdDrawIndexed)
+        );
+        if (mhStatus == MH_OK || mhStatus == MH_ERROR_ALREADY_CREATED) {
+            MH_EnableHook(pfnCmdDrawIndexed);
+            CBR_LOG_INFO("MinHook: Successfully detoured vkCmdDrawIndexed (export at 0x%p).", pfnCmdDrawIndexed);
+            hookedAny = true;
         }
     }
 

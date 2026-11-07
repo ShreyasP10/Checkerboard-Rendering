@@ -25,18 +25,28 @@ constexpr uint32_t kVkStructureTypeDescriptorPoolCreateInfo = 33;
 constexpr uint32_t kVkStructureTypeDescriptorSetAllocateInfo = 34;
 constexpr uint32_t kVkStructureTypeWriteDescriptorSet = 35;
 constexpr uint32_t kVkStructureTypeMemoryBarrier = 46;
-constexpr uint32_t kVkStructureTypeImageMemoryBarrier = 47;
+constexpr uint32_t kVkStructureTypeImageMemoryBarrier = 45;
 
-constexpr uint32_t kVkImageLayoutGeneral = 3;
+constexpr uint32_t kVkImageLayoutGeneral = 1;
 constexpr uint32_t kVkImageLayoutShaderReadOnlyOptimal = 5;
+constexpr uint32_t kVkImageLayoutTransferSrcOptimal = 6;
+constexpr uint32_t kVkImageLayoutTransferDstOptimal = 7;
+constexpr uint32_t kVkImageLayoutPresentSrcKHR = 1000001002;
+constexpr uint32_t kVkFilterLinear = 1;
+constexpr uint32_t kVkImageAspectColorBit = 0x00000001;
 
-constexpr uint32_t kVkShaderStageComputeBit = 0x00000020;
-constexpr uint32_t kVkPipelineBindPointCompute = 1;
 constexpr uint32_t kVkPipelineStageComputeShaderBit = 0x00000800;
+constexpr uint32_t kVkPipelineStageTransferBit = 0x00001000;
+constexpr uint32_t kVkPipelineStageBottomOfPipeBit = 0x00002000;
 constexpr uint32_t kVkPipelineStageAllCommandsBit = 0x00010000;
 constexpr uint32_t kVkAccessShaderWriteBit = 0x00000040;
 constexpr uint32_t kVkAccessShaderReadBit = 0x00000020;
+constexpr uint32_t kVkAccessTransferReadBit = 0x00000800;
+constexpr uint32_t kVkAccessTransferWriteBit = 0x00001000;
 constexpr uint32_t kVkAccessMemoryReadBit = 0x00008000;
+
+constexpr uint32_t kVkShaderStageComputeBit = 0x00000020;
+constexpr uint32_t kVkPipelineBindPointCompute = 1;
 
 constexpr uint32_t kVkDescriptorTypeCombinedImageSampler = 1;
 constexpr uint32_t kVkDescriptorTypeStorageImage = 3;
@@ -188,6 +198,32 @@ typedef void  (*PFN_vkCmdBindDescriptorSets)(void* commandBuffer, uint32_t pipel
 typedef void  (*PFN_vkCmdPushConstants)(void* commandBuffer, void* layout, uint32_t stageFlags, uint32_t offset, uint32_t size, const void* pValues);
 typedef void  (*PFN_vkCmdDispatch)(void* commandBuffer, uint32_t groupCountX, uint32_t groupCountY, uint32_t groupCountZ);
 typedef void  (*PFN_vkCmdPipelineBarrier)(void* commandBuffer, uint32_t srcStageMask, uint32_t dstStageMask, uint32_t dependencyFlags, uint32_t memoryBarrierCount, const MinimalVkMemoryBarrier* pMemoryBarriers, uint32_t bufferMemoryBarrierCount, const void* pBufferMemoryBarriers, uint32_t imageMemoryBarrierCount, const void* pImageMemoryBarriers);
+
+struct MinimalVkImageSubresourceLayers {
+    uint32_t aspectMask;
+    uint32_t mipLevel;
+    uint32_t baseArrayLayer;
+    uint32_t layerCount;
+};
+
+struct MinimalVkOffset3D {
+    int32_t x;
+    int32_t y;
+    int32_t z;
+};
+
+struct MinimalVkImageBlit {
+    MinimalVkImageSubresourceLayers srcSubresource;
+    MinimalVkOffset3D               srcOffsets[2];
+    MinimalVkImageSubresourceLayers dstSubresource;
+    MinimalVkOffset3D               dstOffsets[2];
+};
+
+typedef void (*PFN_vkCmdBlitImage)(void* commandBuffer,
+                                   void* srcImage, uint32_t srcImageLayout,
+                                   void* dstImage, uint32_t dstImageLayout,
+                                   uint32_t regionCount, const MinimalVkImageBlit* pRegions,
+                                   uint32_t filter);
 
 } // namespace
 #endif
@@ -387,40 +423,42 @@ bool ReconstructionPass::CreateVulkanPipeline() {
     auto pfnCreateDescriptorPool = reinterpret_cast<PFN_vkCreateDescriptorPool>(resolveDeviceFunc("vkCreateDescriptorPool"));
     auto pfnAllocateDescriptorSets = reinterpret_cast<PFN_vkAllocateDescriptorSets>(resolveDeviceFunc("vkAllocateDescriptorSets"));
     void* descriptorPool = nullptr;
-    void* descriptorSet = nullptr;
+    void* descriptorSets[2] = { nullptr, nullptr };
 
     if (descriptorSetLayout && pfnCreateDescriptorPool && pfnAllocateDescriptorSets) {
         MinimalVkDescriptorPoolSize poolSizes[2]{};
         poolSizes[0].type = kVkDescriptorTypeCombinedImageSampler;
-        poolSizes[0].descriptorCount = 5;
+        poolSizes[0].descriptorCount = 10; // 5 samplers * 2 sets
         poolSizes[1].type = kVkDescriptorTypeStorageImage;
-        poolSizes[1].descriptorCount = 2;
+        poolSizes[1].descriptorCount = 4;  // 2 storage images * 2 sets
 
         MinimalVkDescriptorPoolCreateInfo poolInfo{};
         poolInfo.sType = kVkStructureTypeDescriptorPoolCreateInfo;
-        poolInfo.maxSets = 1;
+        poolInfo.maxSets = 2; // Separate descriptor sets for ping-pong history buffers
         poolInfo.poolSizeCount = 2;
         poolInfo.pPoolSizes = poolSizes;
 
         res = pfnCreateDescriptorPool(m_device, &poolInfo, nullptr, &descriptorPool);
         if (res == 0 && descriptorPool) {
+            void* layouts[2] = { descriptorSetLayout, descriptorSetLayout };
             MinimalVkDescriptorSetAllocateInfo allocInfo{};
             allocInfo.sType = kVkStructureTypeDescriptorSetAllocateInfo;
             allocInfo.descriptorPool = descriptorPool;
-            allocInfo.descriptorSetCount = 1;
-            allocInfo.pSetLayouts = &descriptorSetLayout;
+            allocInfo.descriptorSetCount = 2;
+            allocInfo.pSetLayouts = layouts;
 
-            res = pfnAllocateDescriptorSets(m_device, &allocInfo, &descriptorSet);
-            if (res != 0 || !descriptorSet) {
+            res = pfnAllocateDescriptorSets(m_device, &allocInfo, descriptorSets);
+            if (res != 0 || !descriptorSets[0]) {
                 CBR_LOG_WARN("vkAllocateDescriptorSets warning (code: %d); descriptor set binding deferred.", res);
             }
         }
     }
 
     m_descriptorPool = descriptorPool;
-    m_descriptorSet = descriptorSet;
-    CBR_LOG_INFO("Vulkan CBR reconstruction compute pipeline created successfully! (Pipeline: %p, Layout: %p, Descriptors: %p, Pool: %p, Set: %p)",
-        m_pipeline, m_pipelineLayout, m_descriptorSetLayout, m_descriptorPool, m_descriptorSet);
+    m_descriptorSets[0] = descriptorSets[0];
+    m_descriptorSets[1] = descriptorSets[1];
+    CBR_LOG_INFO("Vulkan CBR reconstruction compute pipeline created successfully! (Pipeline: %p, Layout: %p, Descriptors: %p, Pool: %p, Sets: %p / %p)",
+        m_pipeline, m_pipelineLayout, m_descriptorSetLayout, m_descriptorPool, m_descriptorSets[0], m_descriptorSets[1]);
     return true;
 #else
     return true;
@@ -450,7 +488,8 @@ void ReconstructionPass::DestroyVulkanPipeline() {
     if (m_descriptorPool && pfnDestroyDescriptorPool) {
         pfnDestroyDescriptorPool(m_device, m_descriptorPool, nullptr);
         m_descriptorPool = nullptr;
-        m_descriptorSet = nullptr;
+        m_descriptorSets[0] = nullptr;
+        m_descriptorSets[1] = nullptr;
     }
     if (m_pipeline && pfnDestroyPipeline) {
         pfnDestroyPipeline(m_device, m_pipeline, nullptr);
@@ -508,7 +547,8 @@ void ReconstructionPass::Shutdown() {
     m_pipelineLayout = nullptr;
     m_descriptorSetLayout = nullptr;
     m_descriptorPool = nullptr;
-    m_descriptorSet = nullptr;
+    m_descriptorSets[0] = nullptr;
+    m_descriptorSets[1] = nullptr;
     m_descriptorsBound.store(false);
     m_initialized.store(false);
     CBR_LOG_INFO("ReconstructionPass shut down cleanly.");
@@ -520,7 +560,8 @@ bool ReconstructionPass::UpdateVulkanDescriptors(void* quarterColorView, void* q
                                                 void* outputImageView, void* outputDepthView,
                                                 void* linearSampler, void* pointSampler) {
 #if defined(_WIN32)
-    if (!m_device || !m_descriptorSet) return false;
+    void* targetSet = m_descriptorSets[0] ? m_descriptorSets[0] : nullptr;
+    if (!m_device || !targetSet) return false;
 
     HMODULE vulkanModule = GetModuleHandleA("vulkan-1.dll");
     if (!vulkanModule) return false;
@@ -554,7 +595,6 @@ bool ReconstructionPass::UpdateVulkanDescriptors(void* quarterColorView, void* q
     imageInfos[3].imageView = historyDepthView;
     imageInfos[3].imageLayout = kVkImageLayoutShaderReadOnlyOptimal;
 
-    // 4: u_Velocity (use point clamp sampler to prevent cross-edge velocity bleeding)
     imageInfos[4].sampler = pointSampler;
     imageInfos[4].imageView = velocityView;
     imageInfos[4].imageLayout = kVkImageLayoutShaderReadOnlyOptimal;
@@ -570,7 +610,7 @@ bool ReconstructionPass::UpdateVulkanDescriptors(void* quarterColorView, void* q
     MinimalVkWriteDescriptorSet writes[7]{};
     for (uint32_t i = 0; i < 7; ++i) {
         writes[i].sType = kVkStructureTypeWriteDescriptorSet;
-        writes[i].dstSet = m_descriptorSet;
+        writes[i].dstSet = targetSet;
         writes[i].dstBinding = i;
         writes[i].dstArrayElement = 0;
         writes[i].descriptorCount = 1;
@@ -587,6 +627,181 @@ bool ReconstructionPass::UpdateVulkanDescriptors(void* quarterColorView, void* q
     (void)historyDepthView; (void)velocityView; (void)outputImageView;
     (void)outputDepthView; (void)linearSampler; (void)pointSampler;
     return true;
+#endif
+}
+
+bool ReconstructionPass::UpdateVulkanPingPongDescriptors(void* quarterColorView, void* quarterDepthView,
+                                                        void* historyColorViewA, void* historyDepthViewA,
+                                                        void* historyColorViewB, void* historyDepthViewB,
+                                                        void* velocityView,
+                                                        void* outputImageView, void* outputDepthView,
+                                                        void* linearSampler, void* pointSampler) {
+#if defined(_WIN32)
+    if (!m_device || !m_descriptorSets[0] || !m_descriptorSets[1]) return false;
+
+    HMODULE vulkanModule = GetModuleHandleA("vulkan-1.dll");
+    if (!vulkanModule) return false;
+
+    auto pfnGetDeviceProcAddr = reinterpret_cast<PFN_vkGetDeviceProcAddr>(GetProcAddress(vulkanModule, "vkGetDeviceProcAddr"));
+    auto resolveDeviceFunc = [&](const char* name) -> void* {
+        if (pfnGetDeviceProcAddr && m_device) {
+            void* p = pfnGetDeviceProcAddr(m_device, name);
+            if (p) return p;
+        }
+        return reinterpret_cast<void*>(GetProcAddress(vulkanModule, name));
+    };
+
+    auto pfnUpdateDescriptorSets = reinterpret_cast<PFN_vkUpdateDescriptorSets>(resolveDeviceFunc("vkUpdateDescriptorSets"));
+    if (!pfnUpdateDescriptorSets) return false;
+
+    // Set 0: Reads History A, writes to Output / History B
+    MinimalVkDescriptorImageInfo imageInfos0[7]{};
+    imageInfos0[0] = { pointSampler, quarterColorView, kVkImageLayoutShaderReadOnlyOptimal };
+    imageInfos0[1] = { pointSampler, quarterDepthView, kVkImageLayoutShaderReadOnlyOptimal };
+    imageInfos0[2] = { linearSampler, historyColorViewA, kVkImageLayoutShaderReadOnlyOptimal };
+    imageInfos0[3] = { pointSampler, historyDepthViewA, kVkImageLayoutShaderReadOnlyOptimal };
+    imageInfos0[4] = { pointSampler, velocityView, kVkImageLayoutShaderReadOnlyOptimal };
+    imageInfos0[5] = { nullptr, outputImageView ? outputImageView : historyColorViewB, kVkImageLayoutGeneral };
+    imageInfos0[6] = { nullptr, outputDepthView ? outputDepthView : historyDepthViewB, kVkImageLayoutGeneral };
+
+    // Set 1: Reads History B, writes to Output / History A
+    MinimalVkDescriptorImageInfo imageInfos1[7]{};
+    imageInfos1[0] = { pointSampler, quarterColorView, kVkImageLayoutShaderReadOnlyOptimal };
+    imageInfos1[1] = { pointSampler, quarterDepthView, kVkImageLayoutShaderReadOnlyOptimal };
+    imageInfos1[2] = { linearSampler, historyColorViewB, kVkImageLayoutShaderReadOnlyOptimal };
+    imageInfos1[3] = { pointSampler, historyDepthViewB, kVkImageLayoutShaderReadOnlyOptimal };
+    imageInfos1[4] = { pointSampler, velocityView, kVkImageLayoutShaderReadOnlyOptimal };
+    imageInfos1[5] = { nullptr, outputImageView ? outputImageView : historyColorViewA, kVkImageLayoutGeneral };
+    imageInfos1[6] = { nullptr, outputDepthView ? outputDepthView : historyDepthViewA, kVkImageLayoutGeneral };
+
+    MinimalVkWriteDescriptorSet writes[14]{};
+    for (uint32_t i = 0; i < 7; ++i) {
+        writes[i].sType = kVkStructureTypeWriteDescriptorSet;
+        writes[i].dstSet = m_descriptorSets[0];
+        writes[i].dstBinding = i;
+        writes[i].dstArrayElement = 0;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = (i < 5) ? kVkDescriptorTypeCombinedImageSampler : kVkDescriptorTypeStorageImage;
+        writes[i].pImageInfo = &imageInfos0[i];
+
+        writes[i + 7].sType = kVkStructureTypeWriteDescriptorSet;
+        writes[i + 7].dstSet = m_descriptorSets[1];
+        writes[i + 7].dstBinding = i;
+        writes[i + 7].dstArrayElement = 0;
+        writes[i + 7].descriptorCount = 1;
+        writes[i + 7].descriptorType = (i < 5) ? kVkDescriptorTypeCombinedImageSampler : kVkDescriptorTypeStorageImage;
+        writes[i + 7].pImageInfo = &imageInfos1[i];
+    }
+
+    pfnUpdateDescriptorSets(m_device, 14, writes, 0, nullptr);
+    m_descriptorsBound.store(true);
+    CBR_LOG_INFO("ReconstructionPass: Dual ping-pong Vulkan descriptor sets (Set 0 & 1) updated.");
+    return true;
+#else
+    (void)quarterColorView; (void)quarterDepthView; (void)historyColorViewA;
+    (void)historyDepthViewA; (void)historyColorViewB; (void)historyDepthViewB;
+    (void)velocityView; (void)outputImageView; (void)outputDepthView;
+    (void)linearSampler; (void)pointSampler;
+    return true;
+#endif
+}
+
+void ReconstructionPass::TransitionImageLayout(void* vkCommandBuffer, void* vkImage,
+                                              uint32_t oldLayout, uint32_t newLayout,
+                                              uint32_t srcStage, uint32_t dstStage,
+                                              uint32_t srcAccess, uint32_t dstAccess,
+                                              uint32_t aspectMask) {
+#if defined(_WIN32)
+    if (!vkCommandBuffer || !vkImage) return;
+    HMODULE vulkanModule = GetModuleHandleA("vulkan-1.dll");
+    if (!vulkanModule) return;
+    auto pfnCmdPipelineBarrier = reinterpret_cast<PFN_vkCmdPipelineBarrier>(GetProcAddress(vulkanModule, "vkCmdPipelineBarrier"));
+    if (!pfnCmdPipelineBarrier) return;
+
+    constexpr uint32_t kVkStructureTypeImageMemoryBarrier = 45;
+    MinimalVkImageMemoryBarrier barrier{};
+    barrier.sType = kVkStructureTypeImageMemoryBarrier;
+    barrier.pNext = nullptr;
+    barrier.srcAccessMask = srcAccess;
+    barrier.dstAccessMask = dstAccess;
+    barrier.oldLayout = oldLayout;
+    barrier.newLayout = newLayout;
+    barrier.srcQueueFamilyIndex = ~0u; // VK_QUEUE_FAMILY_IGNORED
+    barrier.dstQueueFamilyIndex = ~0u;
+    barrier.image = vkImage;
+    barrier.subresourceRange.aspectMask = aspectMask;
+    barrier.subresourceRange.baseMipLevel = 0;
+    barrier.subresourceRange.levelCount = 1;
+    barrier.subresourceRange.baseArrayLayer = 0;
+    barrier.subresourceRange.layerCount = 1;
+
+    pfnCmdPipelineBarrier(vkCommandBuffer, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+#else
+    (void)vkCommandBuffer; (void)vkImage; (void)oldLayout; (void)newLayout;
+    (void)srcStage; (void)dstStage; (void)srcAccess; (void)dstAccess; (void)aspectMask;
+#endif
+}
+
+void ReconstructionPass::BlitToImage(void* vkCommandBuffer, void* srcImage, void* dstImage,
+                                    uint32_t srcWidth, uint32_t srcHeight,
+                                    uint32_t dstWidth, uint32_t dstHeight) {
+#if defined(_WIN32)
+    if (!vkCommandBuffer || !srcImage || !dstImage) return;
+    HMODULE vulkanModule = GetModuleHandleA("vulkan-1.dll");
+    if (!vulkanModule) return;
+    auto pfnCmdBlitImage = reinterpret_cast<PFN_vkCmdBlitImage>(GetProcAddress(vulkanModule, "vkCmdBlitImage"));
+    if (!pfnCmdBlitImage) return;
+
+    // Transition srcImage to TRANSFER_SRC_OPTIMAL
+    TransitionImageLayout(vkCommandBuffer, srcImage,
+                          kVkImageLayoutGeneral, kVkImageLayoutTransferSrcOptimal,
+                          kVkPipelineStageComputeShaderBit, kVkPipelineStageTransferBit,
+                          kVkAccessShaderWriteBit, kVkAccessTransferReadBit,
+                          kVkImageAspectColorBit);
+
+    // Transition dstImage to TRANSFER_DST_OPTIMAL
+    TransitionImageLayout(vkCommandBuffer, dstImage,
+                          0 /* UNDEFINED */, kVkImageLayoutTransferDstOptimal,
+                          kVkPipelineStageBottomOfPipeBit, kVkPipelineStageTransferBit,
+                          0, kVkAccessTransferWriteBit,
+                          kVkImageAspectColorBit);
+
+    MinimalVkImageBlit blitRegion{};
+    blitRegion.srcSubresource.aspectMask = kVkImageAspectColorBit;
+    blitRegion.srcSubresource.mipLevel = 0;
+    blitRegion.srcSubresource.baseArrayLayer = 0;
+    blitRegion.srcSubresource.layerCount = 1;
+    blitRegion.srcOffsets[0] = { 0, 0, 0 };
+    blitRegion.srcOffsets[1] = { static_cast<int32_t>(srcWidth), static_cast<int32_t>(srcHeight), 1 };
+
+    blitRegion.dstSubresource.aspectMask = kVkImageAspectColorBit;
+    blitRegion.dstSubresource.mipLevel = 0;
+    blitRegion.dstSubresource.baseArrayLayer = 0;
+    blitRegion.dstSubresource.layerCount = 1;
+    blitRegion.dstOffsets[0] = { 0, 0, 0 };
+    blitRegion.dstOffsets[1] = { static_cast<int32_t>(dstWidth), static_cast<int32_t>(dstHeight), 1 };
+
+    pfnCmdBlitImage(vkCommandBuffer,
+                    srcImage, kVkImageLayoutTransferSrcOptimal,
+                    dstImage, kVkImageLayoutTransferDstOptimal,
+                    1, &blitRegion, kVkFilterLinear);
+
+    // Transition dstImage to PRESENT_SRC_KHR
+    TransitionImageLayout(vkCommandBuffer, dstImage,
+                          kVkImageLayoutTransferDstOptimal, kVkImageLayoutPresentSrcKHR,
+                          kVkPipelineStageTransferBit, kVkPipelineStageBottomOfPipeBit,
+                          kVkAccessTransferWriteBit, 0,
+                          kVkImageAspectColorBit);
+
+    // Transition srcImage back to GENERAL
+    TransitionImageLayout(vkCommandBuffer, srcImage,
+                          kVkImageLayoutTransferSrcOptimal, kVkImageLayoutGeneral,
+                          kVkPipelineStageTransferBit, kVkPipelineStageComputeShaderBit,
+                          kVkAccessTransferReadBit, kVkAccessShaderWriteBit,
+                          kVkImageAspectColorBit);
+#else
+    (void)vkCommandBuffer; (void)srcImage; (void)dstImage;
+    (void)srcWidth; (void)srcHeight; (void)dstWidth; (void)dstHeight;
 #endif
 }
 
@@ -667,8 +882,11 @@ void ReconstructionPass::DispatchVulkan(void* vkCommandBuffer, uint32_t frameInd
 
     pfnCmdBindPipeline(vkCommandBuffer, kVkPipelineBindPointCompute, m_pipeline);
 
-    if (m_descriptorSet && pfnCmdBindDescriptorSets) {
-        const void* descriptorSets[] = { m_descriptorSet };
+    const uint32_t activeSetIdx = RenderTargetManager::Get().GetCurrentHistoryIndex() % 2;
+    void* activeSet = m_descriptorSets[activeSetIdx] ? m_descriptorSets[activeSetIdx] : m_descriptorSets[0];
+
+    if (activeSet && pfnCmdBindDescriptorSets) {
+        const void* descriptorSets[] = { activeSet };
         pfnCmdBindDescriptorSets(vkCommandBuffer, kVkPipelineBindPointCompute, m_pipelineLayout, 0, 1, descriptorSets, 0, nullptr);
     }
 

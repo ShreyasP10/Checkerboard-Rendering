@@ -48,12 +48,33 @@ public:
     void DispatchVulkan(void* vkCommandBuffer, uint32_t frameIndex);
     void DispatchDX12(void* d3d12GraphicsCommandList, uint32_t frameIndex);
 
-    // Updates descriptor set 0 with active Vulkan image views and samplers
+    // Updates descriptor set with active Vulkan image views and samplers
     bool UpdateVulkanDescriptors(void* quarterColorView, void* quarterDepthView,
                                 void* historyColorView, void* historyDepthView,
                                 void* velocityView,
                                 void* outputImageView, void* outputDepthView,
                                 void* linearSampler, void* pointSampler);
+
+    // Updates both ping-pong descriptor sets (set 0: read A/write B, set 1: read B/write A)
+    bool UpdateVulkanPingPongDescriptors(void* quarterColorView, void* quarterDepthView,
+                                        void* historyColorViewA, void* historyDepthViewA,
+                                        void* historyColorViewB, void* historyDepthViewB,
+                                        void* velocityView,
+                                        void* outputImageView, void* outputDepthView,
+                                        void* linearSampler, void* pointSampler);
+
+    // Helper function to transition image layouts and insert memory barriers with correct stage/access masks
+    static void TransitionImageLayout(void* vkCommandBuffer, void* vkImage,
+                                      uint32_t oldLayout, uint32_t newLayout,
+                                      uint32_t srcStage, uint32_t dstStage,
+                                      uint32_t srcAccess, uint32_t dstAccess,
+                                      uint32_t aspectMask = 1);
+
+    // Helper function to blit reconstructed color image to a destination image (e.g. swapchain backbuffer)
+    static void BlitToImage(void* vkCommandBuffer, void* srcImage, void* dstImage,
+                            uint32_t srcWidth, uint32_t srcHeight,
+                            uint32_t dstWidth, uint32_t dstHeight);
+
     bool AreDescriptorsBound() const { return m_descriptorsBound.load(); }
 
     void SetShaderDirectory(const std::filesystem::path& dir) { m_shaderDir = dir; }
@@ -64,7 +85,7 @@ public:
     void* GetPipelineLayout() const { return m_pipelineLayout; }
     void* GetDescriptorSetLayout() const { return m_descriptorSetLayout; }
     void* GetDescriptorPool() const { return m_descriptorPool; }
-    void* GetDescriptorSet() const { return m_descriptorSet; }
+    void* GetDescriptorSet(uint32_t index = 0) const { return m_descriptorSets[index < 2 ? index : 0]; }
 
     // Helper to load SPIR-V bytecode from disk
     static std::vector<uint32_t> LoadSpvFile(const std::filesystem::path& path);
@@ -86,7 +107,7 @@ private:
     void* m_pipelineLayout{ nullptr };
     void* m_descriptorSetLayout{ nullptr };
     void* m_descriptorPool{ nullptr };
-    void* m_descriptorSet{ nullptr };
+    void* m_descriptorSets[2]{ nullptr, nullptr };
 };
 
 } // namespace cbr

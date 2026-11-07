@@ -1327,12 +1327,33 @@ public:
     void DispatchVulkan(void* vkCommandBuffer, uint32_t frameIndex);
     void DispatchDX12(void* d3d12GraphicsCommandList, uint32_t frameIndex);
 
-    // Updates descriptor set 0 with active Vulkan image views and samplers
+    // Updates descriptor set with active Vulkan image views and samplers
     bool UpdateVulkanDescriptors(void* quarterColorView, void* quarterDepthView,
                                 void* historyColorView, void* historyDepthView,
                                 void* velocityView,
                                 void* outputImageView, void* outputDepthView,
                                 void* linearSampler, void* pointSampler);
+
+    // Updates both ping-pong descriptor sets (set 0: read A/write B, set 1: read B/write A)
+    bool UpdateVulkanPingPongDescriptors(void* quarterColorView, void* quarterDepthView,
+                                        void* historyColorViewA, void* historyDepthViewA,
+                                        void* historyColorViewB, void* historyDepthViewB,
+                                        void* velocityView,
+                                        void* outputImageView, void* outputDepthView,
+                                        void* linearSampler, void* pointSampler);
+
+    // Helper function to transition image layouts and insert memory barriers with correct stage/access masks
+    static void TransitionImageLayout(void* vkCommandBuffer, void* vkImage,
+                                      uint32_t oldLayout, uint32_t newLayout,
+                                      uint32_t srcStage, uint32_t dstStage,
+                                      uint32_t srcAccess, uint32_t dstAccess,
+                                      uint32_t aspectMask = 1);
+
+    // Helper function to blit reconstructed color image to a destination image (e.g. swapchain backbuffer)
+    static void BlitToImage(void* vkCommandBuffer, void* srcImage, void* dstImage,
+                            uint32_t srcWidth, uint32_t srcHeight,
+                            uint32_t dstWidth, uint32_t dstHeight);
+
     bool AreDescriptorsBound() const { return m_descriptorsBound.load(); }
 
     void SetShaderDirectory(const std::filesystem::path& dir) { m_shaderDir = dir; }
@@ -1343,7 +1364,7 @@ public:
     void* GetPipelineLayout() const { return m_pipelineLayout; }
     void* GetDescriptorSetLayout() const { return m_descriptorSetLayout; }
     void* GetDescriptorPool() const { return m_descriptorPool; }
-    void* GetDescriptorSet() const { return m_descriptorSet; }
+    void* GetDescriptorSet(uint32_t index = 0) const { return m_descriptorSets[index < 2 ? index : 0]; }
 
     // Helper to load SPIR-V bytecode from disk
     static std::vector<uint32_t> LoadSpvFile(const std::filesystem::path& path);
@@ -1365,7 +1386,7 @@ private:
     void* m_pipelineLayout{ nullptr };
     void* m_descriptorSetLayout{ nullptr };
     void* m_descriptorPool{ nullptr };
-    void* m_descriptorSet{ nullptr };
+    void* m_descriptorSets[2]{ nullptr, nullptr };
 };
 
 } // namespace cbr
@@ -1391,12 +1412,39 @@ struct TargetDimensions {
     uint32_t msaaSamples{ 2 };
 };
 
+struct VulkanTextureResource {
+    void*    image{ nullptr };
+    void*    memory{ nullptr };
+    void*    view{ nullptr };
+    uint32_t width{ 0 };
+    uint32_t height{ 0 };
+    uint32_t format{ 0 };
+};
+
+struct VulkanRenderTargetSet {
+    VulkanTextureResource quarterColor;
+    VulkanTextureResource quarterDepth;
+    VulkanTextureResource velocity;
+    VulkanTextureResource historyColor[2];
+    VulkanTextureResource historyDepth[2];
+    VulkanTextureResource outputColor;
+    VulkanTextureResource outputDepth;
+    void*                 linearSampler{ nullptr };
+    void*                 pointSampler{ nullptr };
+};
+
 class RenderTargetManager {
 public:
     static RenderTargetManager& Get();
 
     void Initialize(uint32_t width, uint32_t height);
     void Shutdown();
+
+    // Vulkan GPU resource management (VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+    bool CreateVulkanResources(void* vkDevice, void* vkPhysicalDevice);
+    void DestroyVulkanResources();
+    const VulkanRenderTargetSet& GetVulkanResources() const { return m_vkResources; }
+    bool AreVulkanResourcesCreated() const { return m_vkResourcesCreated.load(); }
 
     TargetDimensions GetDimensions() const {
         std::shared_lock<std::shared_mutex> lock(m_mutex);
@@ -1420,10 +1468,13 @@ private:
     ~RenderTargetManager() = default;
 
     mutable std::shared_mutex m_mutex;
-    TargetDimensions m_dims;
-    std::atomic<uint32_t> m_historyPingPong{ 0 };
-    std::atomic<size_t> m_totalAllocatedVramBytes{ 0 };
-    std::atomic<bool> m_initialized{ false };
+    TargetDimensions          m_dims;
+    VulkanRenderTargetSet     m_vkResources{};
+    void*                     m_vkDevice{ nullptr };
+    std::atomic<bool>         m_vkResourcesCreated{ false };
+    std::atomic<uint32_t>     m_historyPingPong{ 0 };
+    std::atomic<size_t>       m_totalAllocatedVramBytes{ 0 };
+    std::atomic<bool>         m_initialized{ false };
 };
 
 } // namespace cbr
@@ -2719,6 +2770,9 @@ void HookManager::Shutdown() {
 #include <atomic>
 #include <cstddef>
 #include <cstring>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
 #include <MinHook.h>
 #include "cbr/cbr_engine.h"
 #include "cbr/config.h"
@@ -2752,25 +2806,34 @@ typedef void  (*PFN_vkCmdBeginRenderPass)(void* commandBuffer, const void* pRend
 typedef void  (*PFN_vkCmdEndRenderPass)(void* commandBuffer);
 typedef void  (*PFN_vkCmdSetSampleLocationsEXT)(void* commandBuffer, const MinimalVkSampleLocationsInfoEXT* pSampleLocationsInfo);
 typedef int   (*PFN_vkGetSwapchainImagesKHR)(void* device, void* swapchain, uint32_t* pSwapchainImageCount, void** pSwapchainImages);
+typedef int   (*PFN_vkAcquireNextImageKHR)(void* device, void* swapchain, uint64_t timeout, void* semaphore, void* fence, uint32_t* pImageIndex);
+typedef void  (*PFN_vkCmdDraw)(void* commandBuffer, uint32_t vertexCount, uint32_t instanceCount, uint32_t firstVertex, uint32_t firstInstance);
+typedef void  (*PFN_vkCmdDrawIndexed)(void* commandBuffer, uint32_t indexCount, uint32_t instanceCount, uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance);
 
 PFN_vkGetDeviceProcAddr        g_Original_vkGetDeviceProcAddr = nullptr;
 PFN_vkGetInstanceProcAddr      g_Original_vkGetInstanceProcAddr = nullptr;
 PFN_vkQueuePresentKHR          g_Original_vkQueuePresentKHR = nullptr;
 PFN_vkCreateSwapchainKHR       g_Original_vkCreateSwapchainKHR = nullptr;
 PFN_vkGetSwapchainImagesKHR    g_Original_vkGetSwapchainImagesKHR = nullptr;
+PFN_vkAcquireNextImageKHR      g_Original_vkAcquireNextImageKHR = nullptr;
 PFN_vkCmdSetViewport           g_Original_vkCmdSetViewport = nullptr;
 PFN_vkCmdSetScissor            g_Original_vkCmdSetScissor = nullptr;
 PFN_vkCmdBeginRenderPass       g_Original_vkCmdBeginRenderPass = nullptr;
 PFN_vkCmdEndRenderPass         g_Original_vkCmdEndRenderPass = nullptr;
+PFN_vkCmdDraw                  g_Original_vkCmdDraw = nullptr;
+PFN_vkCmdDrawIndexed           g_Original_vkCmdDrawIndexed = nullptr;
 PFN_vkCmdSetSampleLocationsEXT g_Original_vkCmdSetSampleLocationsEXT = nullptr;
 
 void* Hooked_vkGetDeviceProcAddr(void* device, const char* pName);
 void* Hooked_vkGetInstanceProcAddr(void* instance, const char* pName);
 int   Hooked_vkGetSwapchainImagesKHR(void* device, void* swapchain, uint32_t* pSwapchainImageCount, void** pSwapchainImages);
+int   Hooked_vkAcquireNextImageKHR(void* device, void* swapchain, uint64_t timeout, void* semaphore, void* fence, uint32_t* pImageIndex);
 void  Hooked_vkCmdSetViewport(void* commandBuffer, uint32_t firstViewport, uint32_t viewportCount, const MinimalVkViewport* pViewports);
 void  Hooked_vkCmdSetScissor(void* commandBuffer, uint32_t firstScissor, uint32_t scissorCount, const MinimalVkRect2D* pScissors);
 void  Hooked_vkCmdBeginRenderPass(void* commandBuffer, const void* pRenderPassBegin, uint32_t contents);
 void  Hooked_vkCmdEndRenderPass(void* commandBuffer);
+void  Hooked_vkCmdDraw(void* commandBuffer, uint32_t vertexCount, uint32_t instanceCount, uint32_t firstVertex, uint32_t firstInstance);
+void  Hooked_vkCmdDrawIndexed(void* commandBuffer, uint32_t indexCount, uint32_t instanceCount, uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance);
 void  Hooked_vkCmdSetSampleLocationsEXT(void* commandBuffer, const MinimalVkSampleLocationsInfoEXT* pSampleLocationsInfo);
 
 // VK_ERROR_INITIALIZATION_FAILED: returned if a hook is ever invoked without a valid trampoline,
@@ -2892,6 +2955,45 @@ inline void ConfigureCheckerboardSampleLocations(uint32_t frameIndex,
     outInfo.pSampleLocations = outLocations;
 }
 
+struct MinimalVkRenderPassBeginInfo {
+    uint32_t        sType;
+    const void*     pNext;
+    void*           renderPass;
+    void*           framebuffer;
+    MinimalVkRect2D renderArea;
+    uint32_t        clearValueCount;
+    const void*     pClearValues;
+};
+
+// Swapchain backbuffer tracking
+std::mutex g_swapchainMutex;
+std::unordered_map<void*, std::vector<void*>> g_swapchainImages;
+std::atomic<void*> g_activeSwapchain{ nullptr };
+std::atomic<uint32_t> g_activeImageIndex{ 0 };
+
+inline void* GetActiveSwapchainImage() {
+    std::lock_guard<std::mutex> lock(g_swapchainMutex);
+    void* swp = g_activeSwapchain.load();
+    auto it = g_swapchainImages.find(swp);
+    if (it != g_swapchainImages.end()) {
+        uint32_t idx = g_activeImageIndex.load();
+        if (idx < it->second.size()) {
+            return it->second[idx];
+        }
+    }
+    return nullptr;
+}
+
+// Scene pass identification and draw tracking
+struct PassTrackingState {
+    bool     hasMatchingExtent{ false };
+    bool     viewportDownscaled{ false };
+    uint32_t drawCount{ 0 };
+};
+
+std::mutex g_passTrackingMutex;
+std::unordered_map<void*, PassTrackingState> g_passTracking;
+
 int Hooked_vkQueuePresentKHR(void* queue, const void* pPresentInfo) {
     if (!g_Original_vkQueuePresentKHR) {
         return kVkErrorInitializationFailed;
@@ -2906,7 +3008,15 @@ int Hooked_vkQueuePresentKHR(void* queue, const void* pPresentInfo) {
         if (info.swapchainCount > 0 && info.swapchainCount < 16 && info.pSwapchains) {
             void* first = nullptr;
             std::memcpy(&first, info.pSwapchains, sizeof(first));
-            if (first) presentTarget = first;
+            if (first) {
+                presentTarget = first;
+                g_activeSwapchain.store(first);
+            }
+            if (info.pImageIndices) {
+                uint32_t idx = 0;
+                std::memcpy(&idx, info.pImageIndices, sizeof(idx));
+                g_activeImageIndex.store(idx);
+            }
         }
     }
 
@@ -2947,8 +3057,20 @@ int Hooked_vkCreateSwapchainKHR(void* device, const void* pCreateInfo, const voi
                 CBR_LOG_WARN("vkCreateSwapchainKHR: unexpected sType (%u), skipping extent extraction.", sType);
             }
         }
-        try { CBREngine::Get().OnSwapchainRecreated(w, h); } catch (...) {}
-        try { ReconstructionPass::Get().InitializeVulkan(device, nullptr); } catch (...) {}
+        try {
+            CBREngine::Get().OnSwapchainRecreated(w, h);
+            RenderTargetManager::Get().CreateVulkanResources(device, nullptr);
+            ReconstructionPass::Get().InitializeVulkan(device, nullptr);
+            const auto& res = RenderTargetManager::Get().GetVulkanResources();
+            ReconstructionPass::Get().UpdateVulkanPingPongDescriptors(
+                res.quarterColor.view, res.quarterDepth.view,
+                res.historyColor[0].view, res.historyDepth[0].view,
+                res.historyColor[1].view, res.historyDepth[1].view,
+                res.velocity.view,
+                res.outputColor.view, res.outputDepth.view,
+                res.linearSampler, res.pointSampler
+            );
+        } catch (...) {}
     }
     return result;
 }
@@ -2959,8 +3081,26 @@ int Hooked_vkGetSwapchainImagesKHR(void* device, void* swapchain, uint32_t* pSwa
     }
     int result = g_Original_vkGetSwapchainImagesKHR(device, swapchain, pSwapchainImageCount, pSwapchainImages);
     if (result == 0 && pSwapchainImages && pSwapchainImageCount && *pSwapchainImageCount > 0) {
-        CBR_LOG_INFO("vkGetSwapchainImagesKHR: %u swapchain image(s) captured for device %p.",
-                     *pSwapchainImageCount, device);
+        std::lock_guard<std::mutex> lock(g_swapchainMutex);
+        auto& imgs = g_swapchainImages[swapchain];
+        imgs.clear();
+        for (uint32_t i = 0; i < *pSwapchainImageCount; ++i) {
+            imgs.push_back(pSwapchainImages[i]);
+        }
+        CBR_LOG_INFO("vkGetSwapchainImagesKHR: %u swapchain image(s) captured for swapchain %p (device %p).",
+                     *pSwapchainImageCount, swapchain, device);
+    }
+    return result;
+}
+
+int Hooked_vkAcquireNextImageKHR(void* device, void* swapchain, uint64_t timeout, void* semaphore, void* fence, uint32_t* pImageIndex) {
+    if (!g_Original_vkAcquireNextImageKHR) {
+        return kVkErrorInitializationFailed;
+    }
+    int result = g_Original_vkAcquireNextImageKHR(device, swapchain, timeout, semaphore, fence, pImageIndex);
+    if (result == 0 && pImageIndex) {
+        g_activeSwapchain.store(swapchain);
+        g_activeImageIndex.store(*pImageIndex);
     }
     return result;
 }
@@ -2981,6 +3121,11 @@ void Hooked_vkCmdSetViewport(void* commandBuffer, uint32_t firstViewport, uint32
 
         // Mark this command buffer as actively executing the intercepted scene geometry pass
         CBREngine::Get().MarkCandidatePassActive(commandBuffer);
+
+        {
+            std::lock_guard<std::mutex> lock(g_passTrackingMutex);
+            g_passTracking[commandBuffer].viewportDownscaled = true;
+        }
 
         MinimalVkViewport redirected = pViewports[0];
         redirected.width = static_cast<float>(dims.quarterWidth);
@@ -3043,7 +3188,51 @@ void Hooked_vkCmdSetScissor(void* commandBuffer, uint32_t firstScissor, uint32_t
 void Hooked_vkCmdBeginRenderPass(void* commandBuffer, const void* pRenderPassBegin, uint32_t contents) {
     if (!g_Original_vkCmdBeginRenderPass) return;
 
+    if (pRenderPassBegin && CBREngine::Get().IsEnabled()) {
+        uint32_t sType = 0;
+        std::memcpy(&sType, pRenderPassBegin, sizeof(sType));
+        constexpr uint32_t kVkStructureTypeRenderPassBeginInfo = 43;
+        if (sType == kVkStructureTypeRenderPassBeginInfo) {
+            MinimalVkRenderPassBeginInfo info{};
+            std::memcpy(&info, pRenderPassBegin, sizeof(info));
+            const auto dims = RenderTargetManager::Get().GetDimensions();
+            const uint32_t w = info.renderArea.extent.width;
+            const uint32_t h = info.renderArea.extent.height;
+
+            std::lock_guard<std::mutex> lock(g_passTrackingMutex);
+            auto& state = g_passTracking[commandBuffer];
+            state.hasMatchingExtent = ((w == dims.fullWidth && h == dims.fullHeight) ||
+                                       (w == dims.quarterWidth && h == dims.quarterHeight));
+            state.viewportDownscaled = false;
+            state.drawCount = 0;
+        }
+    }
+
     g_Original_vkCmdBeginRenderPass(commandBuffer, pRenderPassBegin, contents);
+}
+
+void Hooked_vkCmdDraw(void* commandBuffer, uint32_t vertexCount, uint32_t instanceCount, uint32_t firstVertex, uint32_t firstInstance) {
+    if (!g_Original_vkCmdDraw) return;
+    if (CBREngine::Get().IsEnabled()) {
+        std::lock_guard<std::mutex> lock(g_passTrackingMutex);
+        auto it = g_passTracking.find(commandBuffer);
+        if (it != g_passTracking.end()) {
+            it->second.drawCount++;
+        }
+    }
+    g_Original_vkCmdDraw(commandBuffer, vertexCount, instanceCount, firstVertex, firstInstance);
+}
+
+void Hooked_vkCmdDrawIndexed(void* commandBuffer, uint32_t indexCount, uint32_t instanceCount, uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance) {
+    if (!g_Original_vkCmdDrawIndexed) return;
+    if (CBREngine::Get().IsEnabled()) {
+        std::lock_guard<std::mutex> lock(g_passTrackingMutex);
+        auto it = g_passTracking.find(commandBuffer);
+        if (it != g_passTracking.end()) {
+            it->second.drawCount++;
+        }
+    }
+    g_Original_vkCmdDrawIndexed(commandBuffer, indexCount, instanceCount, firstIndex, vertexOffset, firstInstance);
 }
 
 void Hooked_vkCmdEndRenderPass(void* commandBuffer) {
@@ -3053,9 +3242,34 @@ void Hooked_vkCmdEndRenderPass(void* commandBuffer) {
 
     if (CBREngine::Get().IsEnabled()) {
         try {
-            // Only trigger reconstruction if this command buffer executed the intercepted scene pass!
-            if (CBREngine::Get().ConsumeCandidatePassActive(commandBuffer)) {
+            bool isScenePass = false;
+            {
+                std::lock_guard<std::mutex> lock(g_passTrackingMutex);
+                auto it = g_passTracking.find(commandBuffer);
+                if (it != g_passTracking.end()) {
+                    isScenePass = it->second.viewportDownscaled ||
+                                  (it->second.hasMatchingExtent && it->second.drawCount >= 20);
+                    g_passTracking.erase(it);
+                }
+            }
+
+            // Trigger reconstruction if identified as scene pass or engine marked active
+            if (isScenePass || CBREngine::Get().ConsumeCandidatePassActive(commandBuffer)) {
                 CBREngine::Get().OnScenePassEnd(commandBuffer);
+
+                // Presentation path: blit reconstructed output to swapchain backbuffer image
+                void* backbuffer = GetActiveSwapchainImage();
+                if (backbuffer && RenderTargetManager::Get().AreVulkanResourcesCreated()) {
+                    const auto& res = RenderTargetManager::Get().GetVulkanResources();
+                    const auto dims = RenderTargetManager::Get().GetDimensions();
+                    ReconstructionPass::BlitToImage(
+                        commandBuffer,
+                        res.outputColor.image,
+                        backbuffer,
+                        dims.fullWidth, dims.fullHeight,
+                        dims.fullWidth, dims.fullHeight
+                    );
+                }
             }
         } catch (...) {
         }
@@ -3139,6 +3353,24 @@ void* Hooked_vkGetDeviceProcAddr(void* device, const char* pName) {
         }
         return reinterpret_cast<void*>(&Hooked_vkCmdSetSampleLocationsEXT);
     }
+    if (std::strcmp(pName, "vkAcquireNextImageKHR") == 0) {
+        if (!g_Original_vkAcquireNextImageKHR) {
+            g_Original_vkAcquireNextImageKHR = reinterpret_cast<PFN_vkAcquireNextImageKHR>(realProc);
+        }
+        return reinterpret_cast<void*>(&Hooked_vkAcquireNextImageKHR);
+    }
+    if (std::strcmp(pName, "vkCmdDraw") == 0) {
+        if (!g_Original_vkCmdDraw) {
+            g_Original_vkCmdDraw = reinterpret_cast<PFN_vkCmdDraw>(realProc);
+        }
+        return reinterpret_cast<void*>(&Hooked_vkCmdDraw);
+    }
+    if (std::strcmp(pName, "vkCmdDrawIndexed") == 0) {
+        if (!g_Original_vkCmdDrawIndexed) {
+            g_Original_vkCmdDrawIndexed = reinterpret_cast<PFN_vkCmdDrawIndexed>(realProc);
+        }
+        return reinterpret_cast<void*>(&Hooked_vkCmdDrawIndexed);
+    }
     return realProc;
 }
 
@@ -3170,6 +3402,12 @@ void* Hooked_vkGetInstanceProcAddr(void* instance, const char* pName) {
         }
         return reinterpret_cast<void*>(&Hooked_vkGetSwapchainImagesKHR);
     }
+    if (std::strcmp(pName, "vkAcquireNextImageKHR") == 0) {
+        if (!g_Original_vkAcquireNextImageKHR) {
+            g_Original_vkAcquireNextImageKHR = reinterpret_cast<PFN_vkAcquireNextImageKHR>(realProc);
+        }
+        return reinterpret_cast<void*>(&Hooked_vkAcquireNextImageKHR);
+    }
     if (std::strcmp(pName, "vkCmdSetViewport") == 0) {
         if (!g_Original_vkCmdSetViewport) {
             g_Original_vkCmdSetViewport = reinterpret_cast<PFN_vkCmdSetViewport>(realProc);
@@ -3193,6 +3431,18 @@ void* Hooked_vkGetInstanceProcAddr(void* instance, const char* pName) {
             g_Original_vkCmdEndRenderPass = reinterpret_cast<PFN_vkCmdEndRenderPass>(realProc);
         }
         return reinterpret_cast<void*>(&Hooked_vkCmdEndRenderPass);
+    }
+    if (std::strcmp(pName, "vkCmdDraw") == 0) {
+        if (!g_Original_vkCmdDraw) {
+            g_Original_vkCmdDraw = reinterpret_cast<PFN_vkCmdDraw>(realProc);
+        }
+        return reinterpret_cast<void*>(&Hooked_vkCmdDraw);
+    }
+    if (std::strcmp(pName, "vkCmdDrawIndexed") == 0) {
+        if (!g_Original_vkCmdDrawIndexed) {
+            g_Original_vkCmdDrawIndexed = reinterpret_cast<PFN_vkCmdDrawIndexed>(realProc);
+        }
+        return reinterpret_cast<void*>(&Hooked_vkCmdDrawIndexed);
     }
     if (std::strcmp(pName, "vkCmdSetSampleLocationsEXT") == 0) {
         if (!g_Original_vkCmdSetSampleLocationsEXT) {
@@ -3286,6 +3536,21 @@ bool HookManager::InstallVulkanHooks() {
         }
     }
 
+    // 2c. Detour vkAcquireNextImageKHR
+    auto pfnAcquireNextImage = reinterpret_cast<void*>(GetProcAddress(vulkanModule, "vkAcquireNextImageKHR"));
+    if (pfnAcquireNextImage) {
+        mhStatus = MH_CreateHook(
+            pfnAcquireNextImage,
+            reinterpret_cast<LPVOID>(&Hooked_vkAcquireNextImageKHR),
+            reinterpret_cast<LPVOID*>(&g_Original_vkAcquireNextImageKHR)
+        );
+        if (mhStatus == MH_OK || mhStatus == MH_ERROR_ALREADY_CREATED) {
+            MH_EnableHook(pfnAcquireNextImage);
+            CBR_LOG_INFO("MinHook: Successfully detoured vkAcquireNextImageKHR (export at 0x%p).", pfnAcquireNextImage);
+            hookedAny = true;
+        }
+    }
+
     // 3. Detour vkGetInstanceProcAddr to intercept dynamic device/instance queries
     if (pfnGetInstanceProcAddr) {
         mhStatus = MH_CreateHook(
@@ -3350,6 +3615,36 @@ bool HookManager::InstallVulkanHooks() {
             hookedAny = true;
         } else {
             CBR_LOG_WARN("MinHook: Could not detour vkCmdBeginRenderPass (status: %d).", mhStatus);
+        }
+    }
+
+    // 6b. Detour vkCmdDraw for scene pass draw call tracking
+    auto pfnCmdDraw = reinterpret_cast<void*>(GetProcAddress(vulkanModule, "vkCmdDraw"));
+    if (pfnCmdDraw) {
+        mhStatus = MH_CreateHook(
+            pfnCmdDraw,
+            reinterpret_cast<LPVOID>(&Hooked_vkCmdDraw),
+            reinterpret_cast<LPVOID*>(&g_Original_vkCmdDraw)
+        );
+        if (mhStatus == MH_OK || mhStatus == MH_ERROR_ALREADY_CREATED) {
+            MH_EnableHook(pfnCmdDraw);
+            CBR_LOG_INFO("MinHook: Successfully detoured vkCmdDraw (export at 0x%p).", pfnCmdDraw);
+            hookedAny = true;
+        }
+    }
+
+    // 6c. Detour vkCmdDrawIndexed for scene pass draw call tracking
+    auto pfnCmdDrawIndexed = reinterpret_cast<void*>(GetProcAddress(vulkanModule, "vkCmdDrawIndexed"));
+    if (pfnCmdDrawIndexed) {
+        mhStatus = MH_CreateHook(
+            pfnCmdDrawIndexed,
+            reinterpret_cast<LPVOID>(&Hooked_vkCmdDrawIndexed),
+            reinterpret_cast<LPVOID*>(&g_Original_vkCmdDrawIndexed)
+        );
+        if (mhStatus == MH_OK || mhStatus == MH_ERROR_ALREADY_CREATED) {
+            MH_EnableHook(pfnCmdDrawIndexed);
+            CBR_LOG_INFO("MinHook: Successfully detoured vkCmdDrawIndexed (export at 0x%p).", pfnCmdDrawIndexed);
+            hookedAny = true;
         }
     }
 
@@ -4105,18 +4400,28 @@ constexpr uint32_t kVkStructureTypeDescriptorPoolCreateInfo = 33;
 constexpr uint32_t kVkStructureTypeDescriptorSetAllocateInfo = 34;
 constexpr uint32_t kVkStructureTypeWriteDescriptorSet = 35;
 constexpr uint32_t kVkStructureTypeMemoryBarrier = 46;
-constexpr uint32_t kVkStructureTypeImageMemoryBarrier = 47;
+constexpr uint32_t kVkStructureTypeImageMemoryBarrier = 45;
 
-constexpr uint32_t kVkImageLayoutGeneral = 3;
+constexpr uint32_t kVkImageLayoutGeneral = 1;
 constexpr uint32_t kVkImageLayoutShaderReadOnlyOptimal = 5;
+constexpr uint32_t kVkImageLayoutTransferSrcOptimal = 6;
+constexpr uint32_t kVkImageLayoutTransferDstOptimal = 7;
+constexpr uint32_t kVkImageLayoutPresentSrcKHR = 1000001002;
+constexpr uint32_t kVkFilterLinear = 1;
+constexpr uint32_t kVkImageAspectColorBit = 0x00000001;
 
-constexpr uint32_t kVkShaderStageComputeBit = 0x00000020;
-constexpr uint32_t kVkPipelineBindPointCompute = 1;
 constexpr uint32_t kVkPipelineStageComputeShaderBit = 0x00000800;
+constexpr uint32_t kVkPipelineStageTransferBit = 0x00001000;
+constexpr uint32_t kVkPipelineStageBottomOfPipeBit = 0x00002000;
 constexpr uint32_t kVkPipelineStageAllCommandsBit = 0x00010000;
 constexpr uint32_t kVkAccessShaderWriteBit = 0x00000040;
 constexpr uint32_t kVkAccessShaderReadBit = 0x00000020;
+constexpr uint32_t kVkAccessTransferReadBit = 0x00000800;
+constexpr uint32_t kVkAccessTransferWriteBit = 0x00001000;
 constexpr uint32_t kVkAccessMemoryReadBit = 0x00008000;
+
+constexpr uint32_t kVkShaderStageComputeBit = 0x00000020;
+constexpr uint32_t kVkPipelineBindPointCompute = 1;
 
 constexpr uint32_t kVkDescriptorTypeCombinedImageSampler = 1;
 constexpr uint32_t kVkDescriptorTypeStorageImage = 3;
@@ -4268,6 +4573,32 @@ typedef void  (*PFN_vkCmdBindDescriptorSets)(void* commandBuffer, uint32_t pipel
 typedef void  (*PFN_vkCmdPushConstants)(void* commandBuffer, void* layout, uint32_t stageFlags, uint32_t offset, uint32_t size, const void* pValues);
 typedef void  (*PFN_vkCmdDispatch)(void* commandBuffer, uint32_t groupCountX, uint32_t groupCountY, uint32_t groupCountZ);
 typedef void  (*PFN_vkCmdPipelineBarrier)(void* commandBuffer, uint32_t srcStageMask, uint32_t dstStageMask, uint32_t dependencyFlags, uint32_t memoryBarrierCount, const MinimalVkMemoryBarrier* pMemoryBarriers, uint32_t bufferMemoryBarrierCount, const void* pBufferMemoryBarriers, uint32_t imageMemoryBarrierCount, const void* pImageMemoryBarriers);
+
+struct MinimalVkImageSubresourceLayers {
+    uint32_t aspectMask;
+    uint32_t mipLevel;
+    uint32_t baseArrayLayer;
+    uint32_t layerCount;
+};
+
+struct MinimalVkOffset3D {
+    int32_t x;
+    int32_t y;
+    int32_t z;
+};
+
+struct MinimalVkImageBlit {
+    MinimalVkImageSubresourceLayers srcSubresource;
+    MinimalVkOffset3D               srcOffsets[2];
+    MinimalVkImageSubresourceLayers dstSubresource;
+    MinimalVkOffset3D               dstOffsets[2];
+};
+
+typedef void (*PFN_vkCmdBlitImage)(void* commandBuffer,
+                                   void* srcImage, uint32_t srcImageLayout,
+                                   void* dstImage, uint32_t dstImageLayout,
+                                   uint32_t regionCount, const MinimalVkImageBlit* pRegions,
+                                   uint32_t filter);
 
 } // namespace
 #endif
@@ -4467,40 +4798,42 @@ bool ReconstructionPass::CreateVulkanPipeline() {
     auto pfnCreateDescriptorPool = reinterpret_cast<PFN_vkCreateDescriptorPool>(resolveDeviceFunc("vkCreateDescriptorPool"));
     auto pfnAllocateDescriptorSets = reinterpret_cast<PFN_vkAllocateDescriptorSets>(resolveDeviceFunc("vkAllocateDescriptorSets"));
     void* descriptorPool = nullptr;
-    void* descriptorSet = nullptr;
+    void* descriptorSets[2] = { nullptr, nullptr };
 
     if (descriptorSetLayout && pfnCreateDescriptorPool && pfnAllocateDescriptorSets) {
         MinimalVkDescriptorPoolSize poolSizes[2]{};
         poolSizes[0].type = kVkDescriptorTypeCombinedImageSampler;
-        poolSizes[0].descriptorCount = 5;
+        poolSizes[0].descriptorCount = 10; // 5 samplers * 2 sets
         poolSizes[1].type = kVkDescriptorTypeStorageImage;
-        poolSizes[1].descriptorCount = 2;
+        poolSizes[1].descriptorCount = 4;  // 2 storage images * 2 sets
 
         MinimalVkDescriptorPoolCreateInfo poolInfo{};
         poolInfo.sType = kVkStructureTypeDescriptorPoolCreateInfo;
-        poolInfo.maxSets = 1;
+        poolInfo.maxSets = 2; // Separate descriptor sets for ping-pong history buffers
         poolInfo.poolSizeCount = 2;
         poolInfo.pPoolSizes = poolSizes;
 
         res = pfnCreateDescriptorPool(m_device, &poolInfo, nullptr, &descriptorPool);
         if (res == 0 && descriptorPool) {
+            void* layouts[2] = { descriptorSetLayout, descriptorSetLayout };
             MinimalVkDescriptorSetAllocateInfo allocInfo{};
             allocInfo.sType = kVkStructureTypeDescriptorSetAllocateInfo;
             allocInfo.descriptorPool = descriptorPool;
-            allocInfo.descriptorSetCount = 1;
-            allocInfo.pSetLayouts = &descriptorSetLayout;
+            allocInfo.descriptorSetCount = 2;
+            allocInfo.pSetLayouts = layouts;
 
-            res = pfnAllocateDescriptorSets(m_device, &allocInfo, &descriptorSet);
-            if (res != 0 || !descriptorSet) {
+            res = pfnAllocateDescriptorSets(m_device, &allocInfo, descriptorSets);
+            if (res != 0 || !descriptorSets[0]) {
                 CBR_LOG_WARN("vkAllocateDescriptorSets warning (code: %d); descriptor set binding deferred.", res);
             }
         }
     }
 
     m_descriptorPool = descriptorPool;
-    m_descriptorSet = descriptorSet;
-    CBR_LOG_INFO("Vulkan CBR reconstruction compute pipeline created successfully! (Pipeline: %p, Layout: %p, Descriptors: %p, Pool: %p, Set: %p)",
-        m_pipeline, m_pipelineLayout, m_descriptorSetLayout, m_descriptorPool, m_descriptorSet);
+    m_descriptorSets[0] = descriptorSets[0];
+    m_descriptorSets[1] = descriptorSets[1];
+    CBR_LOG_INFO("Vulkan CBR reconstruction compute pipeline created successfully! (Pipeline: %p, Layout: %p, Descriptors: %p, Pool: %p, Sets: %p / %p)",
+        m_pipeline, m_pipelineLayout, m_descriptorSetLayout, m_descriptorPool, m_descriptorSets[0], m_descriptorSets[1]);
     return true;
 #else
     return true;
@@ -4530,7 +4863,8 @@ void ReconstructionPass::DestroyVulkanPipeline() {
     if (m_descriptorPool && pfnDestroyDescriptorPool) {
         pfnDestroyDescriptorPool(m_device, m_descriptorPool, nullptr);
         m_descriptorPool = nullptr;
-        m_descriptorSet = nullptr;
+        m_descriptorSets[0] = nullptr;
+        m_descriptorSets[1] = nullptr;
     }
     if (m_pipeline && pfnDestroyPipeline) {
         pfnDestroyPipeline(m_device, m_pipeline, nullptr);
@@ -4588,7 +4922,8 @@ void ReconstructionPass::Shutdown() {
     m_pipelineLayout = nullptr;
     m_descriptorSetLayout = nullptr;
     m_descriptorPool = nullptr;
-    m_descriptorSet = nullptr;
+    m_descriptorSets[0] = nullptr;
+    m_descriptorSets[1] = nullptr;
     m_descriptorsBound.store(false);
     m_initialized.store(false);
     CBR_LOG_INFO("ReconstructionPass shut down cleanly.");
@@ -4600,7 +4935,8 @@ bool ReconstructionPass::UpdateVulkanDescriptors(void* quarterColorView, void* q
                                                 void* outputImageView, void* outputDepthView,
                                                 void* linearSampler, void* pointSampler) {
 #if defined(_WIN32)
-    if (!m_device || !m_descriptorSet) return false;
+    void* targetSet = m_descriptorSets[0] ? m_descriptorSets[0] : nullptr;
+    if (!m_device || !targetSet) return false;
 
     HMODULE vulkanModule = GetModuleHandleA("vulkan-1.dll");
     if (!vulkanModule) return false;
@@ -4634,7 +4970,6 @@ bool ReconstructionPass::UpdateVulkanDescriptors(void* quarterColorView, void* q
     imageInfos[3].imageView = historyDepthView;
     imageInfos[3].imageLayout = kVkImageLayoutShaderReadOnlyOptimal;
 
-    // 4: u_Velocity (use point clamp sampler to prevent cross-edge velocity bleeding)
     imageInfos[4].sampler = pointSampler;
     imageInfos[4].imageView = velocityView;
     imageInfos[4].imageLayout = kVkImageLayoutShaderReadOnlyOptimal;
@@ -4650,7 +4985,7 @@ bool ReconstructionPass::UpdateVulkanDescriptors(void* quarterColorView, void* q
     MinimalVkWriteDescriptorSet writes[7]{};
     for (uint32_t i = 0; i < 7; ++i) {
         writes[i].sType = kVkStructureTypeWriteDescriptorSet;
-        writes[i].dstSet = m_descriptorSet;
+        writes[i].dstSet = targetSet;
         writes[i].dstBinding = i;
         writes[i].dstArrayElement = 0;
         writes[i].descriptorCount = 1;
@@ -4667,6 +5002,181 @@ bool ReconstructionPass::UpdateVulkanDescriptors(void* quarterColorView, void* q
     (void)historyDepthView; (void)velocityView; (void)outputImageView;
     (void)outputDepthView; (void)linearSampler; (void)pointSampler;
     return true;
+#endif
+}
+
+bool ReconstructionPass::UpdateVulkanPingPongDescriptors(void* quarterColorView, void* quarterDepthView,
+                                                        void* historyColorViewA, void* historyDepthViewA,
+                                                        void* historyColorViewB, void* historyDepthViewB,
+                                                        void* velocityView,
+                                                        void* outputImageView, void* outputDepthView,
+                                                        void* linearSampler, void* pointSampler) {
+#if defined(_WIN32)
+    if (!m_device || !m_descriptorSets[0] || !m_descriptorSets[1]) return false;
+
+    HMODULE vulkanModule = GetModuleHandleA("vulkan-1.dll");
+    if (!vulkanModule) return false;
+
+    auto pfnGetDeviceProcAddr = reinterpret_cast<PFN_vkGetDeviceProcAddr>(GetProcAddress(vulkanModule, "vkGetDeviceProcAddr"));
+    auto resolveDeviceFunc = [&](const char* name) -> void* {
+        if (pfnGetDeviceProcAddr && m_device) {
+            void* p = pfnGetDeviceProcAddr(m_device, name);
+            if (p) return p;
+        }
+        return reinterpret_cast<void*>(GetProcAddress(vulkanModule, name));
+    };
+
+    auto pfnUpdateDescriptorSets = reinterpret_cast<PFN_vkUpdateDescriptorSets>(resolveDeviceFunc("vkUpdateDescriptorSets"));
+    if (!pfnUpdateDescriptorSets) return false;
+
+    // Set 0: Reads History A, writes to Output / History B
+    MinimalVkDescriptorImageInfo imageInfos0[7]{};
+    imageInfos0[0] = { pointSampler, quarterColorView, kVkImageLayoutShaderReadOnlyOptimal };
+    imageInfos0[1] = { pointSampler, quarterDepthView, kVkImageLayoutShaderReadOnlyOptimal };
+    imageInfos0[2] = { linearSampler, historyColorViewA, kVkImageLayoutShaderReadOnlyOptimal };
+    imageInfos0[3] = { pointSampler, historyDepthViewA, kVkImageLayoutShaderReadOnlyOptimal };
+    imageInfos0[4] = { pointSampler, velocityView, kVkImageLayoutShaderReadOnlyOptimal };
+    imageInfos0[5] = { nullptr, outputImageView ? outputImageView : historyColorViewB, kVkImageLayoutGeneral };
+    imageInfos0[6] = { nullptr, outputDepthView ? outputDepthView : historyDepthViewB, kVkImageLayoutGeneral };
+
+    // Set 1: Reads History B, writes to Output / History A
+    MinimalVkDescriptorImageInfo imageInfos1[7]{};
+    imageInfos1[0] = { pointSampler, quarterColorView, kVkImageLayoutShaderReadOnlyOptimal };
+    imageInfos1[1] = { pointSampler, quarterDepthView, kVkImageLayoutShaderReadOnlyOptimal };
+    imageInfos1[2] = { linearSampler, historyColorViewB, kVkImageLayoutShaderReadOnlyOptimal };
+    imageInfos1[3] = { pointSampler, historyDepthViewB, kVkImageLayoutShaderReadOnlyOptimal };
+    imageInfos1[4] = { pointSampler, velocityView, kVkImageLayoutShaderReadOnlyOptimal };
+    imageInfos1[5] = { nullptr, outputImageView ? outputImageView : historyColorViewA, kVkImageLayoutGeneral };
+    imageInfos1[6] = { nullptr, outputDepthView ? outputDepthView : historyDepthViewA, kVkImageLayoutGeneral };
+
+    MinimalVkWriteDescriptorSet writes[14]{};
+    for (uint32_t i = 0; i < 7; ++i) {
+        writes[i].sType = kVkStructureTypeWriteDescriptorSet;
+        writes[i].dstSet = m_descriptorSets[0];
+        writes[i].dstBinding = i;
+        writes[i].dstArrayElement = 0;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = (i < 5) ? kVkDescriptorTypeCombinedImageSampler : kVkDescriptorTypeStorageImage;
+        writes[i].pImageInfo = &imageInfos0[i];
+
+        writes[i + 7].sType = kVkStructureTypeWriteDescriptorSet;
+        writes[i + 7].dstSet = m_descriptorSets[1];
+        writes[i + 7].dstBinding = i;
+        writes[i + 7].dstArrayElement = 0;
+        writes[i + 7].descriptorCount = 1;
+        writes[i + 7].descriptorType = (i < 5) ? kVkDescriptorTypeCombinedImageSampler : kVkDescriptorTypeStorageImage;
+        writes[i + 7].pImageInfo = &imageInfos1[i];
+    }
+
+    pfnUpdateDescriptorSets(m_device, 14, writes, 0, nullptr);
+    m_descriptorsBound.store(true);
+    CBR_LOG_INFO("ReconstructionPass: Dual ping-pong Vulkan descriptor sets (Set 0 & 1) updated.");
+    return true;
+#else
+    (void)quarterColorView; (void)quarterDepthView; (void)historyColorViewA;
+    (void)historyDepthViewA; (void)historyColorViewB; (void)historyDepthViewB;
+    (void)velocityView; (void)outputImageView; (void)outputDepthView;
+    (void)linearSampler; (void)pointSampler;
+    return true;
+#endif
+}
+
+void ReconstructionPass::TransitionImageLayout(void* vkCommandBuffer, void* vkImage,
+                                              uint32_t oldLayout, uint32_t newLayout,
+                                              uint32_t srcStage, uint32_t dstStage,
+                                              uint32_t srcAccess, uint32_t dstAccess,
+                                              uint32_t aspectMask) {
+#if defined(_WIN32)
+    if (!vkCommandBuffer || !vkImage) return;
+    HMODULE vulkanModule = GetModuleHandleA("vulkan-1.dll");
+    if (!vulkanModule) return;
+    auto pfnCmdPipelineBarrier = reinterpret_cast<PFN_vkCmdPipelineBarrier>(GetProcAddress(vulkanModule, "vkCmdPipelineBarrier"));
+    if (!pfnCmdPipelineBarrier) return;
+
+    constexpr uint32_t kVkStructureTypeImageMemoryBarrier = 45;
+    MinimalVkImageMemoryBarrier barrier{};
+    barrier.sType = kVkStructureTypeImageMemoryBarrier;
+    barrier.pNext = nullptr;
+    barrier.srcAccessMask = srcAccess;
+    barrier.dstAccessMask = dstAccess;
+    barrier.oldLayout = oldLayout;
+    barrier.newLayout = newLayout;
+    barrier.srcQueueFamilyIndex = ~0u; // VK_QUEUE_FAMILY_IGNORED
+    barrier.dstQueueFamilyIndex = ~0u;
+    barrier.image = vkImage;
+    barrier.subresourceRange.aspectMask = aspectMask;
+    barrier.subresourceRange.baseMipLevel = 0;
+    barrier.subresourceRange.levelCount = 1;
+    barrier.subresourceRange.baseArrayLayer = 0;
+    barrier.subresourceRange.layerCount = 1;
+
+    pfnCmdPipelineBarrier(vkCommandBuffer, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+#else
+    (void)vkCommandBuffer; (void)vkImage; (void)oldLayout; (void)newLayout;
+    (void)srcStage; (void)dstStage; (void)srcAccess; (void)dstAccess; (void)aspectMask;
+#endif
+}
+
+void ReconstructionPass::BlitToImage(void* vkCommandBuffer, void* srcImage, void* dstImage,
+                                    uint32_t srcWidth, uint32_t srcHeight,
+                                    uint32_t dstWidth, uint32_t dstHeight) {
+#if defined(_WIN32)
+    if (!vkCommandBuffer || !srcImage || !dstImage) return;
+    HMODULE vulkanModule = GetModuleHandleA("vulkan-1.dll");
+    if (!vulkanModule) return;
+    auto pfnCmdBlitImage = reinterpret_cast<PFN_vkCmdBlitImage>(GetProcAddress(vulkanModule, "vkCmdBlitImage"));
+    if (!pfnCmdBlitImage) return;
+
+    // Transition srcImage to TRANSFER_SRC_OPTIMAL
+    TransitionImageLayout(vkCommandBuffer, srcImage,
+                          kVkImageLayoutGeneral, kVkImageLayoutTransferSrcOptimal,
+                          kVkPipelineStageComputeShaderBit, kVkPipelineStageTransferBit,
+                          kVkAccessShaderWriteBit, kVkAccessTransferReadBit,
+                          kVkImageAspectColorBit);
+
+    // Transition dstImage to TRANSFER_DST_OPTIMAL
+    TransitionImageLayout(vkCommandBuffer, dstImage,
+                          0 /* UNDEFINED */, kVkImageLayoutTransferDstOptimal,
+                          kVkPipelineStageBottomOfPipeBit, kVkPipelineStageTransferBit,
+                          0, kVkAccessTransferWriteBit,
+                          kVkImageAspectColorBit);
+
+    MinimalVkImageBlit blitRegion{};
+    blitRegion.srcSubresource.aspectMask = kVkImageAspectColorBit;
+    blitRegion.srcSubresource.mipLevel = 0;
+    blitRegion.srcSubresource.baseArrayLayer = 0;
+    blitRegion.srcSubresource.layerCount = 1;
+    blitRegion.srcOffsets[0] = { 0, 0, 0 };
+    blitRegion.srcOffsets[1] = { static_cast<int32_t>(srcWidth), static_cast<int32_t>(srcHeight), 1 };
+
+    blitRegion.dstSubresource.aspectMask = kVkImageAspectColorBit;
+    blitRegion.dstSubresource.mipLevel = 0;
+    blitRegion.dstSubresource.baseArrayLayer = 0;
+    blitRegion.dstSubresource.layerCount = 1;
+    blitRegion.dstOffsets[0] = { 0, 0, 0 };
+    blitRegion.dstOffsets[1] = { static_cast<int32_t>(dstWidth), static_cast<int32_t>(dstHeight), 1 };
+
+    pfnCmdBlitImage(vkCommandBuffer,
+                    srcImage, kVkImageLayoutTransferSrcOptimal,
+                    dstImage, kVkImageLayoutTransferDstOptimal,
+                    1, &blitRegion, kVkFilterLinear);
+
+    // Transition dstImage to PRESENT_SRC_KHR
+    TransitionImageLayout(vkCommandBuffer, dstImage,
+                          kVkImageLayoutTransferDstOptimal, kVkImageLayoutPresentSrcKHR,
+                          kVkPipelineStageTransferBit, kVkPipelineStageBottomOfPipeBit,
+                          kVkAccessTransferWriteBit, 0,
+                          kVkImageAspectColorBit);
+
+    // Transition srcImage back to GENERAL
+    TransitionImageLayout(vkCommandBuffer, srcImage,
+                          kVkImageLayoutTransferSrcOptimal, kVkImageLayoutGeneral,
+                          kVkPipelineStageTransferBit, kVkPipelineStageComputeShaderBit,
+                          kVkAccessTransferReadBit, kVkAccessShaderWriteBit,
+                          kVkImageAspectColorBit);
+#else
+    (void)vkCommandBuffer; (void)srcImage; (void)dstImage;
+    (void)srcWidth; (void)srcHeight; (void)dstWidth; (void)dstHeight;
 #endif
 }
 
@@ -4747,8 +5257,11 @@ void ReconstructionPass::DispatchVulkan(void* vkCommandBuffer, uint32_t frameInd
 
     pfnCmdBindPipeline(vkCommandBuffer, kVkPipelineBindPointCompute, m_pipeline);
 
-    if (m_descriptorSet && pfnCmdBindDescriptorSets) {
-        const void* descriptorSets[] = { m_descriptorSet };
+    const uint32_t activeSetIdx = RenderTargetManager::Get().GetCurrentHistoryIndex() % 2;
+    void* activeSet = m_descriptorSets[activeSetIdx] ? m_descriptorSets[activeSetIdx] : m_descriptorSets[0];
+
+    if (activeSet && pfnCmdBindDescriptorSets) {
+        const void* descriptorSets[] = { activeSet };
         pfnCmdBindDescriptorSets(vkCommandBuffer, kVkPipelineBindPointCompute, m_pipelineLayout, 0, 1, descriptorSets, 0, nullptr);
     }
 
@@ -4796,6 +5309,162 @@ void ReconstructionPass::DispatchDX12(void* /*d3d12GraphicsCommandList*/, uint32
 ```cpp
 #include "cbr/render_target_manager.h"
 #include "cbr/logger.h"
+#include <cstring>
+
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+
+namespace {
+
+constexpr uint32_t kVkStructureTypeMemoryAllocateInfo   = 5;
+constexpr uint32_t kVkStructureTypeImageCreateInfo        = 14;
+constexpr uint32_t kVkStructureTypeImageViewCreateInfo    = 15;
+constexpr uint32_t kVkStructureTypeSamplerCreateInfo      = 31;
+
+constexpr uint32_t kVkImageType2D                         = 1;
+constexpr uint32_t kVkImageViewType2D                     = 1;
+
+constexpr uint32_t kVkFormatR16G16B16A16Sfloat            = 97;
+constexpr uint32_t kVkFormatR32Sfloat                     = 100;
+
+constexpr uint32_t kVkImageTilingOptimal                  = 0;
+constexpr uint32_t kVkSharingModeExclusive                = 0;
+constexpr uint32_t kVkImageLayoutUndefined                = 0;
+constexpr uint32_t kVkSampleCount1Bit                     = 0x00000001;
+
+constexpr uint32_t kVkImageUsageTransferSrcBit            = 0x00000001;
+constexpr uint32_t kVkImageUsageTransferDstBit            = 0x00000002;
+constexpr uint32_t kVkImageUsageSampledBit                = 0x00000004;
+constexpr uint32_t kVkImageUsageStorageBit                = 0x00000008;
+
+constexpr uint32_t kVkImageAspectColorBit                 = 0x00000001;
+constexpr uint32_t kVkImageAspectDepthBit                 = 0x00000002;
+
+constexpr uint32_t kVkMemoryPropertyDeviceLocalBit        = 0x00000001;
+
+constexpr uint32_t kVkFilterNearest                       = 0;
+constexpr uint32_t kVkFilterLinear                        = 1;
+constexpr uint32_t kVkSamplerMipmapModeLinear             = 1;
+constexpr uint32_t kVkSamplerAddressModeClampToEdge       = 2;
+constexpr uint32_t kVkBorderColorFloatTransparentBlack    = 0;
+
+struct MinimalVkExtent3D {
+    uint32_t width;
+    uint32_t height;
+    uint32_t depth;
+};
+
+struct MinimalVkImageCreateInfo {
+    uint32_t          sType;
+    const void*       pNext;
+    uint32_t          flags;
+    uint32_t          imageType;
+    uint32_t          format;
+    MinimalVkExtent3D extent;
+    uint32_t          mipLevels;
+    uint32_t          arrayLayers;
+    uint32_t          samples;
+    uint32_t          tiling;
+    uint32_t          usage;
+    uint32_t          sharingMode;
+    uint32_t          queueFamilyIndexCount;
+    const uint32_t*   pQueueFamilyIndices;
+    uint32_t          initialLayout;
+};
+
+struct MinimalVkMemoryRequirements {
+    uint64_t size;
+    uint64_t alignment;
+    uint32_t memoryTypeBits;
+};
+
+struct MinimalVkMemoryAllocateInfo {
+    uint32_t    sType;
+    const void* pNext;
+    uint64_t    allocationSize;
+    uint32_t    memoryTypeIndex;
+};
+
+struct MinimalVkComponentMapping {
+    uint32_t r;
+    uint32_t g;
+    uint32_t b;
+    uint32_t a;
+};
+
+struct MinimalVkImageSubresourceRange {
+    uint32_t aspectMask;
+    uint32_t baseMipLevel;
+    uint32_t levelCount;
+    uint32_t baseArrayLayer;
+    uint32_t layerCount;
+};
+
+struct MinimalVkImageViewCreateInfo {
+    uint32_t                       sType;
+    const void*                    pNext;
+    uint32_t                       flags;
+    void*                          image;
+    uint32_t                       viewType;
+    uint32_t                       format;
+    MinimalVkComponentMapping      components;
+    MinimalVkImageSubresourceRange subresourceRange;
+};
+
+struct MinimalVkSamplerCreateInfo {
+    uint32_t    sType;
+    const void* pNext;
+    uint32_t    flags;
+    uint32_t    magFilter;
+    uint32_t    minFilter;
+    uint32_t    mipmapMode;
+    uint32_t    addressModeU;
+    uint32_t    addressModeV;
+    uint32_t    addressModeW;
+    float       mipLodBias;
+    uint32_t    anisotropyEnable;
+    float       maxAnisotropy;
+    uint32_t    compareEnable;
+    uint32_t    compareOp;
+    float       minLod;
+    float       maxLod;
+    uint32_t    borderColor;
+    uint32_t    unnormalizedCoordinates;
+};
+
+struct MinimalVkMemoryType {
+    uint32_t propertyFlags;
+    uint32_t heapIndex;
+};
+
+struct MinimalVkMemoryHeap {
+    uint64_t size;
+    uint32_t flags;
+};
+
+struct MinimalVkPhysicalDeviceMemoryProperties {
+    uint32_t            memoryTypeCount;
+    MinimalVkMemoryType memoryTypes[32];
+    uint32_t            memoryHeapCount;
+    MinimalVkMemoryHeap memoryHeaps[16];
+};
+
+typedef void* (*PFN_vkGetDeviceProcAddr)(void* device, const char* pName);
+typedef int   (*PFN_vkCreateImage)(void* device, const MinimalVkImageCreateInfo* pCreateInfo, const void* pAllocator, void** pImage);
+typedef void  (*PFN_vkDestroyImage)(void* device, void* image, const void* pAllocator);
+typedef void  (*PFN_vkGetImageMemoryRequirements)(void* device, void* image, MinimalVkMemoryRequirements* pMemoryRequirements);
+typedef int   (*PFN_vkAllocateMemory)(void* device, const MinimalVkMemoryAllocateInfo* pAllocateInfo, const void* pAllocator, void** pMemory);
+typedef void  (*PFN_vkFreeMemory)(void* device, void* memory, const void* pAllocator);
+typedef int   (*PFN_vkBindImageMemory)(void* device, void* image, void* memory, uint64_t memoryOffset);
+typedef int   (*PFN_vkCreateImageView)(void* device, const MinimalVkImageViewCreateInfo* pCreateInfo, const void* pAllocator, void** pView);
+typedef void  (*PFN_vkDestroyImageView)(void* device, void* imageView, const void* pAllocator);
+typedef int   (*PFN_vkCreateSampler)(void* device, const MinimalVkSamplerCreateInfo* pCreateInfo, const void* pAllocator, void** pSampler);
+typedef void  (*PFN_vkDestroySampler)(void* device, void* sampler, const void* pAllocator);
+typedef void  (*PFN_vkGetPhysicalDeviceMemoryProperties)(void* physicalDevice, MinimalVkPhysicalDeviceMemoryProperties* pMemoryProperties);
+
+} // namespace
+#endif
 
 namespace cbr {
 
@@ -4818,15 +5487,10 @@ void RenderTargetManager::Initialize(uint32_t width, uint32_t height) {
     m_historyPingPong.store(0);
 
     // Calculate VRAM footprint:
-    // 1. Quarter-Res 2x MSAA Color (RGBA16F = 8 bytes/sample * 2 samples):
     size_t qColor = static_cast<size_t>(dims.quarterWidth) * dims.quarterHeight * 8 * 2;
-    // 2. Quarter-Res 2x MSAA Depth (D32F = 4 bytes/sample * 2 samples):
     size_t qDepth = static_cast<size_t>(dims.quarterWidth) * dims.quarterHeight * 4 * 2;
-    // 3. Full-Res History A & B (RGBA16F = 8 bytes):
     size_t histColor = static_cast<size_t>(dims.fullWidth) * dims.fullHeight * 8 * 2;
-    // 4. Full-Res Depth History A & B (R32F = 4 bytes * 2 buffers):
     size_t histDepth = static_cast<size_t>(dims.fullWidth) * dims.fullHeight * 4 * 2;
-    // 5. Full-Res Output Image (RGBA16F = 8 bytes):
     size_t outColor = static_cast<size_t>(dims.fullWidth) * dims.fullHeight * 8;
 
     const size_t total = qColor + qDepth + histColor + histDepth + outColor;
@@ -4845,6 +5509,7 @@ void RenderTargetManager::Initialize(uint32_t width, uint32_t height) {
 }
 
 void RenderTargetManager::Shutdown() {
+    DestroyVulkanResources();
     {
         std::unique_lock<std::shared_mutex> lock(m_mutex);
         m_initialized.store(false);
@@ -4853,18 +5518,292 @@ void RenderTargetManager::Shutdown() {
     CBR_LOG_INFO("RenderTargetManager shut down.");
 }
 
+bool RenderTargetManager::CreateVulkanResources(void* vkDevice, void* vkPhysicalDevice) {
+#if defined(_WIN32)
+    if (!vkDevice) {
+        return false;
+    }
+
+    DestroyVulkanResources();
+    m_vkDevice = vkDevice;
+
+    HMODULE vulkanModule = GetModuleHandleA("vulkan-1.dll");
+    if (!vulkanModule) {
+        CBR_LOG_WARN("CreateVulkanResources: vulkan-1.dll not loaded.");
+        return false;
+    }
+
+    auto pfnGetDeviceProcAddr = reinterpret_cast<PFN_vkGetDeviceProcAddr>(GetProcAddress(vulkanModule, "vkGetDeviceProcAddr"));
+    auto resolveDeviceFunc = [&](const char* name) -> void* {
+        if (pfnGetDeviceProcAddr && vkDevice) {
+            void* p = pfnGetDeviceProcAddr(vkDevice, name);
+            if (p) return p;
+        }
+        return reinterpret_cast<void*>(GetProcAddress(vulkanModule, name));
+    };
+
+    auto pfnCreateImage = reinterpret_cast<PFN_vkCreateImage>(resolveDeviceFunc("vkCreateImage"));
+    auto pfnDestroyImage = reinterpret_cast<PFN_vkDestroyImage>(resolveDeviceFunc("vkDestroyImage"));
+    auto pfnGetImageMemoryRequirements = reinterpret_cast<PFN_vkGetImageMemoryRequirements>(resolveDeviceFunc("vkGetImageMemoryRequirements"));
+    auto pfnAllocateMemory = reinterpret_cast<PFN_vkAllocateMemory>(resolveDeviceFunc("vkAllocateMemory"));
+    auto pfnFreeMemory = reinterpret_cast<PFN_vkFreeMemory>(resolveDeviceFunc("vkFreeMemory"));
+    auto pfnBindImageMemory = reinterpret_cast<PFN_vkBindImageMemory>(resolveDeviceFunc("vkBindImageMemory"));
+    auto pfnCreateImageView = reinterpret_cast<PFN_vkCreateImageView>(resolveDeviceFunc("vkCreateImageView"));
+    auto pfnDestroyImageView = reinterpret_cast<PFN_vkDestroyImageView>(resolveDeviceFunc("vkDestroyImageView"));
+    auto pfnCreateSampler = reinterpret_cast<PFN_vkCreateSampler>(resolveDeviceFunc("vkCreateSampler"));
+    auto pfnDestroySampler = reinterpret_cast<PFN_vkDestroySampler>(resolveDeviceFunc("vkDestroySampler"));
+    auto pfnGetPhysMemProps = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties>(
+        GetProcAddress(vulkanModule, "vkGetPhysicalDeviceMemoryProperties"));
+
+    if (!pfnCreateImage || !pfnGetImageMemoryRequirements || !pfnAllocateMemory ||
+        !pfnBindImageMemory || !pfnCreateImageView || !pfnCreateSampler) {
+        CBR_LOG_ERROR("CreateVulkanResources: failed to resolve required Vulkan allocation functions.");
+        return false;
+    }
+
+    MinimalVkPhysicalDeviceMemoryProperties memProps{};
+    bool hasMemProps = false;
+    if (vkPhysicalDevice && pfnGetPhysMemProps) {
+        pfnGetPhysMemProps(vkPhysicalDevice, &memProps);
+        hasMemProps = true;
+    }
+
+    auto findMemoryType = [&](uint32_t typeBits, uint32_t properties) -> uint32_t {
+        if (hasMemProps) {
+            for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
+                if ((typeBits & (1u << i)) &&
+                    (memProps.memoryTypes[i].propertyFlags & properties) == properties) {
+                    return i;
+                }
+            }
+        }
+        for (uint32_t i = 0; i < 32; ++i) {
+            if (typeBits & (1u << i)) return i;
+        }
+        return 0;
+    };
+
+    const TargetDimensions dims = GetDimensions();
+
+    auto createTexture = [&](uint32_t width, uint32_t height, uint32_t format,
+                             uint32_t usage, uint32_t aspectMask, VulkanTextureResource& out) -> bool {
+        MinimalVkImageCreateInfo imageInfo{};
+        imageInfo.sType = kVkStructureTypeImageCreateInfo;
+        imageInfo.imageType = kVkImageType2D;
+        imageInfo.format = format;
+        imageInfo.extent = { width, height, 1 };
+        imageInfo.mipLevels = 1;
+        imageInfo.arrayLayers = 1;
+        imageInfo.samples = kVkSampleCount1Bit;
+        imageInfo.tiling = kVkImageTilingOptimal;
+        imageInfo.usage = usage;
+        imageInfo.sharingMode = kVkSharingModeExclusive;
+        imageInfo.initialLayout = kVkImageLayoutUndefined;
+
+        void* image = nullptr;
+        if (pfnCreateImage(vkDevice, &imageInfo, nullptr, &image) != 0 || !image) {
+            return false;
+        }
+
+        MinimalVkMemoryRequirements memReqs{};
+        pfnGetImageMemoryRequirements(vkDevice, image, &memReqs);
+
+        MinimalVkMemoryAllocateInfo allocInfo{};
+        allocInfo.sType = kVkStructureTypeMemoryAllocateInfo;
+        allocInfo.allocationSize = memReqs.size;
+        allocInfo.memoryTypeIndex = findMemoryType(memReqs.memoryTypeBits, kVkMemoryPropertyDeviceLocalBit);
+
+        void* memory = nullptr;
+        if (pfnAllocateMemory(vkDevice, &allocInfo, nullptr, &memory) != 0 || !memory) {
+            pfnDestroyImage(vkDevice, image, nullptr);
+            return false;
+        }
+
+        pfnBindImageMemory(vkDevice, image, memory, 0);
+
+        MinimalVkImageViewCreateInfo viewInfo{};
+        viewInfo.sType = kVkStructureTypeImageViewCreateInfo;
+        viewInfo.image = image;
+        viewInfo.viewType = kVkImageViewType2D;
+        viewInfo.format = format;
+        viewInfo.subresourceRange.aspectMask = aspectMask;
+        viewInfo.subresourceRange.baseMipLevel = 0;
+        viewInfo.subresourceRange.levelCount = 1;
+        viewInfo.subresourceRange.baseArrayLayer = 0;
+        viewInfo.subresourceRange.layerCount = 1;
+
+        void* view = nullptr;
+        if (pfnCreateImageView(vkDevice, &viewInfo, nullptr, &view) != 0 || !view) {
+            pfnFreeMemory(vkDevice, memory, nullptr);
+            pfnDestroyImage(vkDevice, image, nullptr);
+            return false;
+        }
+
+        out.image = image;
+        out.memory = memory;
+        out.view = view;
+        out.width = width;
+        out.height = height;
+        out.format = format;
+        return true;
+    };
+
+    constexpr uint32_t colorUsage = kVkImageUsageSampledBit | kVkImageUsageStorageBit |
+                                    kVkImageUsageTransferSrcBit | kVkImageUsageTransferDstBit;
+    constexpr uint32_t depthUsage = kVkImageUsageSampledBit | kVkImageUsageStorageBit |
+                                    kVkImageUsageTransferSrcBit | kVkImageUsageTransferDstBit;
+
+    // 1. Create Quarter-Res 2x MSAA / Input Color, Depth, and Velocity targets
+    if (!createTexture(dims.quarterWidth, dims.quarterHeight, kVkFormatR16G16B16A16Sfloat,
+                       colorUsage, kVkImageAspectColorBit, m_vkResources.quarterColor)) {
+        CBR_LOG_ERROR("Failed to allocate device-local QuarterColor buffer");
+        return false;
+    }
+    if (!createTexture(dims.quarterWidth, dims.quarterHeight, kVkFormatR32Sfloat,
+                       depthUsage, kVkImageAspectColorBit, m_vkResources.quarterDepth)) {
+        CBR_LOG_ERROR("Failed to allocate device-local QuarterDepth buffer");
+        return false;
+    }
+    if (!createTexture(dims.quarterWidth, dims.quarterHeight, kVkFormatR16G16B16A16Sfloat,
+                       colorUsage, kVkImageAspectColorBit, m_vkResources.velocity)) {
+        CBR_LOG_ERROR("Failed to allocate device-local Velocity buffer");
+        return false;
+    }
+
+    // 2. Create Ping-Pong History Color (A & B)
+    for (int i = 0; i < 2; ++i) {
+        if (!createTexture(dims.fullWidth, dims.fullHeight, kVkFormatR16G16B16A16Sfloat,
+                           colorUsage, kVkImageAspectColorBit, m_vkResources.historyColor[i])) {
+            CBR_LOG_ERROR("Failed to allocate device-local HistoryColor buffer [%d]", i);
+            return false;
+        }
+    }
+
+    // 3. Create Ping-Pong History Depth (A & B)
+    for (int i = 0; i < 2; ++i) {
+        if (!createTexture(dims.fullWidth, dims.fullHeight, kVkFormatR32Sfloat,
+                           depthUsage, kVkImageAspectColorBit, m_vkResources.historyDepth[i])) {
+            CBR_LOG_ERROR("Failed to allocate device-local HistoryDepth buffer [%d]", i);
+            return false;
+        }
+    }
+
+    // 4. Create Full-Res Output Storage Color & Depth
+    if (!createTexture(dims.fullWidth, dims.fullHeight, kVkFormatR16G16B16A16Sfloat,
+                       colorUsage, kVkImageAspectColorBit, m_vkResources.outputColor)) {
+        CBR_LOG_ERROR("Failed to allocate device-local OutputColor image");
+        return false;
+    }
+    if (!createTexture(dims.fullWidth, dims.fullHeight, kVkFormatR32Sfloat,
+                       depthUsage, kVkImageAspectColorBit, m_vkResources.outputDepth)) {
+        CBR_LOG_ERROR("Failed to allocate device-local OutputDepth image");
+        return false;
+    }
+
+    // 5. Create Linear & Point Samplers (Clamp-to-Edge)
+    MinimalVkSamplerCreateInfo samplerInfo{};
+    samplerInfo.sType = kVkStructureTypeSamplerCreateInfo;
+    samplerInfo.magFilter = kVkFilterLinear;
+    samplerInfo.minFilter = kVkFilterLinear;
+    samplerInfo.mipmapMode = kVkSamplerMipmapModeLinear;
+    samplerInfo.addressModeU = kVkSamplerAddressModeClampToEdge;
+    samplerInfo.addressModeV = kVkSamplerAddressModeClampToEdge;
+    samplerInfo.addressModeW = kVkSamplerAddressModeClampToEdge;
+    samplerInfo.borderColor = kVkBorderColorFloatTransparentBlack;
+    samplerInfo.maxLod = 1.0f;
+
+    void* linearSampler = nullptr;
+    pfnCreateSampler(vkDevice, &samplerInfo, nullptr, &linearSampler);
+    m_vkResources.linearSampler = linearSampler;
+
+    samplerInfo.magFilter = kVkFilterNearest;
+    samplerInfo.minFilter = kVkFilterNearest;
+    void* pointSampler = nullptr;
+    pfnCreateSampler(vkDevice, &samplerInfo, nullptr, &pointSampler);
+    m_vkResources.pointSampler = pointSampler;
+
+    m_vkResourcesCreated.store(true);
+    CBR_LOG_INFO("Vulkan device-local render targets & samplers successfully instantiated (%ux%u).",
+                 dims.fullWidth, dims.fullHeight);
+    return true;
+#else
+    m_vkResourcesCreated.store(true);
+    return true;
+#endif
+}
+
+void RenderTargetManager::DestroyVulkanResources() {
+#if defined(_WIN32)
+    if (!m_vkDevice || !m_vkResourcesCreated.load()) {
+        return;
+    }
+
+    HMODULE vulkanModule = GetModuleHandleA("vulkan-1.dll");
+    if (!vulkanModule) return;
+
+    auto pfnGetDeviceProcAddr = reinterpret_cast<PFN_vkGetDeviceProcAddr>(GetProcAddress(vulkanModule, "vkGetDeviceProcAddr"));
+    auto resolveDeviceFunc = [&](const char* name) -> void* {
+        if (pfnGetDeviceProcAddr && m_vkDevice) {
+            void* p = pfnGetDeviceProcAddr(m_vkDevice, name);
+            if (p) return p;
+        }
+        return reinterpret_cast<void*>(GetProcAddress(vulkanModule, name));
+    };
+
+    auto pfnDestroyImage = reinterpret_cast<PFN_vkDestroyImage>(resolveDeviceFunc("vkDestroyImage"));
+    auto pfnFreeMemory = reinterpret_cast<PFN_vkFreeMemory>(resolveDeviceFunc("vkFreeMemory"));
+    auto pfnDestroyImageView = reinterpret_cast<PFN_vkDestroyImageView>(resolveDeviceFunc("vkDestroyImageView"));
+    auto pfnDestroySampler = reinterpret_cast<PFN_vkDestroySampler>(resolveDeviceFunc("vkDestroySampler"));
+
+    auto destroyTexture = [&](VulkanTextureResource& tex) {
+        if (pfnDestroyImageView && tex.view) {
+            pfnDestroyImageView(m_vkDevice, tex.view, nullptr);
+            tex.view = nullptr;
+        }
+        if (pfnFreeMemory && tex.memory) {
+            pfnFreeMemory(m_vkDevice, tex.memory, nullptr);
+            tex.memory = nullptr;
+        }
+        if (pfnDestroyImage && tex.image) {
+            pfnDestroyImage(m_vkDevice, tex.image, nullptr);
+            tex.image = nullptr;
+        }
+    };
+
+    destroyTexture(m_vkResources.quarterColor);
+    destroyTexture(m_vkResources.quarterDepth);
+    destroyTexture(m_vkResources.velocity);
+    for (int i = 0; i < 2; ++i) {
+        destroyTexture(m_vkResources.historyColor[i]);
+        destroyTexture(m_vkResources.historyDepth[i]);
+    }
+    destroyTexture(m_vkResources.outputColor);
+    destroyTexture(m_vkResources.outputDepth);
+
+    if (pfnDestroySampler) {
+        if (m_vkResources.linearSampler) {
+            pfnDestroySampler(m_vkDevice, m_vkResources.linearSampler, nullptr);
+            m_vkResources.linearSampler = nullptr;
+        }
+        if (m_vkResources.pointSampler) {
+            pfnDestroySampler(m_vkDevice, m_vkResources.pointSampler, nullptr);
+            m_vkResources.pointSampler = nullptr;
+        }
+    }
+
+    m_vkResourcesCreated.store(false);
+    m_vkDevice = nullptr;
+    CBR_LOG_INFO("Vulkan render targets & samplers released.");
+#else
+    m_vkResourcesCreated.store(false);
+#endif
+}
+
 bool RenderTargetManager::IsTargetInterceptCandidate(uint32_t width, uint32_t height, uint32_t format) const {
     if (!m_initialized.load()) return false;
-
-    // NOTE: format is currently ignored (all full-res targets match). Revisit when
-    // depth vs color formats must be distinguished to avoid false positives.
     (void)format;
     const TargetDimensions dims = GetDimensions();
-    // Matches if the target resolution is identical or close to full output resolution
-    bool matchesWidth = (width == dims.fullWidth);
-    bool matchesHeight = (height == dims.fullHeight);
-
-    return matchesWidth && matchesHeight;
+    return (width == dims.fullWidth) && (height == dims.fullHeight);
 }
 
 bool RenderTargetManager::IsQuarterPassCandidate(uint32_t width, uint32_t height) const {
@@ -6711,6 +7650,12 @@ static void TestRenderTargets() {
     r.SwapHistoryBuffers();
     CHECK(r.GetCurrentHistoryIndex() == 1 && r.GetPreviousHistoryIndex() == 0);
     r.ResetHistory();
+
+    // Vulkan resource lifecycle sanity checks
+    CHECK(!r.AreVulkanResourcesCreated());
+    CHECK(!r.CreateVulkanResources(nullptr, nullptr));
+    r.DestroyVulkanResources();
+    CHECK(!r.AreVulkanResourcesCreated());
     CHECK(r.GetCurrentHistoryIndex() == 0);
 }
 
@@ -6781,19 +7726,23 @@ static void TestReconstructionPass(const fs::path& dir) {
     CHECK(!pass.IsInitialized());
     CHECK(pass.GetDescriptorSetLayout() == nullptr);
     CHECK(pass.GetDescriptorPool() == nullptr);
-    CHECK(pass.GetDescriptorSet() == nullptr);
+    CHECK(pass.GetDescriptorSet(0) == nullptr);
+    CHECK(pass.GetDescriptorSet(1) == nullptr);
     CHECK(pass.InitializeVulkan(nullptr, nullptr));
     CHECK(pass.IsInitialized());
 
-    // 4. Safe dispatch with null command buffer
+    // 4. Safe dispatch, barrier transition, and blit with null command buffer
     pass.DispatchVulkan(nullptr, 0);
+    pass.TransitionImageLayout(nullptr, nullptr, 0, 1, 0, 0, 0, 0);
+    pass.BlitToImage(nullptr, nullptr, nullptr, 1920, 1080, 3840, 2160);
 
     // 5. Clean shutdown
     pass.Shutdown();
     CHECK(!pass.IsInitialized());
     CHECK(pass.GetDescriptorSetLayout() == nullptr);
     CHECK(pass.GetDescriptorPool() == nullptr);
-    CHECK(pass.GetDescriptorSet() == nullptr);
+    CHECK(pass.GetDescriptorSet(0) == nullptr);
+    CHECK(pass.GetDescriptorSet(1) == nullptr);
 }
 
 static void TestPatternScanner() {

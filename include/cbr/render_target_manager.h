@@ -15,12 +15,39 @@ struct TargetDimensions {
     uint32_t msaaSamples{ 2 };
 };
 
+struct VulkanTextureResource {
+    void*    image{ nullptr };
+    void*    memory{ nullptr };
+    void*    view{ nullptr };
+    uint32_t width{ 0 };
+    uint32_t height{ 0 };
+    uint32_t format{ 0 };
+};
+
+struct VulkanRenderTargetSet {
+    VulkanTextureResource quarterColor;
+    VulkanTextureResource quarterDepth;
+    VulkanTextureResource velocity;
+    VulkanTextureResource historyColor[2];
+    VulkanTextureResource historyDepth[2];
+    VulkanTextureResource outputColor;
+    VulkanTextureResource outputDepth;
+    void*                 linearSampler{ nullptr };
+    void*                 pointSampler{ nullptr };
+};
+
 class RenderTargetManager {
 public:
     static RenderTargetManager& Get();
 
     void Initialize(uint32_t width, uint32_t height);
     void Shutdown();
+
+    // Vulkan GPU resource management (VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+    bool CreateVulkanResources(void* vkDevice, void* vkPhysicalDevice);
+    void DestroyVulkanResources();
+    const VulkanRenderTargetSet& GetVulkanResources() const { return m_vkResources; }
+    bool AreVulkanResourcesCreated() const { return m_vkResourcesCreated.load(); }
 
     TargetDimensions GetDimensions() const {
         std::shared_lock<std::shared_mutex> lock(m_mutex);
@@ -44,10 +71,13 @@ private:
     ~RenderTargetManager() = default;
 
     mutable std::shared_mutex m_mutex;
-    TargetDimensions m_dims;
-    std::atomic<uint32_t> m_historyPingPong{ 0 };
-    std::atomic<size_t> m_totalAllocatedVramBytes{ 0 };
-    std::atomic<bool> m_initialized{ false };
+    TargetDimensions          m_dims;
+    VulkanRenderTargetSet     m_vkResources{};
+    void*                     m_vkDevice{ nullptr };
+    std::atomic<bool>         m_vkResourcesCreated{ false };
+    std::atomic<uint32_t>     m_historyPingPong{ 0 };
+    std::atomic<size_t>       m_totalAllocatedVramBytes{ 0 };
+    std::atomic<bool>         m_initialized{ false };
 };
 
 } // namespace cbr

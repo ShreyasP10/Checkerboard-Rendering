@@ -418,6 +418,12 @@ static void TestRenderTargets() {
     r.SwapHistoryBuffers();
     CHECK(r.GetCurrentHistoryIndex() == 1 && r.GetPreviousHistoryIndex() == 0);
     r.ResetHistory();
+
+    // Vulkan resource lifecycle sanity checks
+    CHECK(!r.AreVulkanResourcesCreated());
+    CHECK(!r.CreateVulkanResources(nullptr, nullptr));
+    r.DestroyVulkanResources();
+    CHECK(!r.AreVulkanResourcesCreated());
     CHECK(r.GetCurrentHistoryIndex() == 0);
 }
 
@@ -488,19 +494,23 @@ static void TestReconstructionPass(const fs::path& dir) {
     CHECK(!pass.IsInitialized());
     CHECK(pass.GetDescriptorSetLayout() == nullptr);
     CHECK(pass.GetDescriptorPool() == nullptr);
-    CHECK(pass.GetDescriptorSet() == nullptr);
+    CHECK(pass.GetDescriptorSet(0) == nullptr);
+    CHECK(pass.GetDescriptorSet(1) == nullptr);
     CHECK(pass.InitializeVulkan(nullptr, nullptr));
     CHECK(pass.IsInitialized());
 
-    // 4. Safe dispatch with null command buffer
+    // 4. Safe dispatch, barrier transition, and blit with null command buffer
     pass.DispatchVulkan(nullptr, 0);
+    pass.TransitionImageLayout(nullptr, nullptr, 0, 1, 0, 0, 0, 0);
+    pass.BlitToImage(nullptr, nullptr, nullptr, 1920, 1080, 3840, 2160);
 
     // 5. Clean shutdown
     pass.Shutdown();
     CHECK(!pass.IsInitialized());
     CHECK(pass.GetDescriptorSetLayout() == nullptr);
     CHECK(pass.GetDescriptorPool() == nullptr);
-    CHECK(pass.GetDescriptorSet() == nullptr);
+    CHECK(pass.GetDescriptorSet(0) == nullptr);
+    CHECK(pass.GetDescriptorSet(1) == nullptr);
 }
 
 static void TestPatternScanner() {
