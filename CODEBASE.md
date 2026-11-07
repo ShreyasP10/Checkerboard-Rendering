@@ -5519,11 +5519,11 @@ void RenderTargetManager::Shutdown() {
 }
 
 bool RenderTargetManager::CreateVulkanResources(void* vkDevice, void* vkPhysicalDevice) {
-#if defined(_WIN32)
     if (!vkDevice) {
         return false;
     }
 
+#if defined(_WIN32)
     DestroyVulkanResources();
     m_vkDevice = vkDevice;
 
