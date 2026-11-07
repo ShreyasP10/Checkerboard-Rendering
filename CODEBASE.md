@@ -1070,6 +1070,9 @@ private:
     JitterManager() = default;
     ~JitterManager() = default;
 
+    // LOCK HIERARCHY: ConfigManager mutex must NEVER be acquired while holding JitterManager::m_mutex.
+    // Methods that query ConfigManager (such as Update or ComputeProjectionOffset) query configuration
+    // outside of m_mutex locking scopes to prevent inversion deadlocks.
     mutable std::mutex m_mutex;
     uint32_t     m_targetWidth{ 3840 };
     uint32_t     m_targetHeight{ 2160 };
@@ -1245,6 +1248,7 @@ public:
     static float* GetCameraProjectionMatrix();
     static bool UpdateCameraJitter(uint32_t frameIndex, bool isVulkan);
 #else
+    static float* GetCameraProjectionMatrix() { return nullptr; }
     static bool UpdateCameraJitter(uint32_t /*frameIndex*/, bool /*isVulkan*/) { return false; }
 #endif
 };
@@ -2842,7 +2846,9 @@ void Hooked_vkCmdSetViewport(void* commandBuffer, uint32_t firstViewport, uint32
 
         if (config.samplingStrategy == SamplingStrategy::StrategyA) {
             // Strategy A: Viewport Shift Jittering (0.5px horizontal shift on odd frames)
-            if (config.jitterDirection != 0) {
+            // Mutual exclusivity guard: If the game's camera projection matrix is actively hooked and
+            // jittered by PatternScanner, do NOT apply viewport shifting to prevent double-jittering.
+            if (config.jitterDirection != 0 && PatternScanner::GetCameraProjectionMatrix() == nullptr) {
                 const float shift = JitterManager::Get().GetQuarterViewportShiftX(currentFrame);
                 redirected.x += shift;
             }
@@ -4291,6 +4297,11 @@ bool ReconstructionPass::InitializeVulkan(void* vkDevice, void* /*vkPhysicalDevi
         return true;
     }
 
+    // Reuse existing pipeline if already initialized on the same device (dimensions are resolution-independent)
+    if (m_initialized.load() && m_pipeline != nullptr && m_device == vkDevice) {
+        return true;
+    }
+
     // Destroy existing pipeline objects on swapchain recreation to prevent driver resource leakage
     if (m_pipeline || m_descriptorPool || m_pipelineLayout || m_descriptorSetLayout) {
         DestroyVulkanPipeline();
@@ -4364,7 +4375,8 @@ bool ReconstructionPass::UpdateVulkanDescriptors(void* quarterColorView, void* q
     imageInfos[3].imageView = historyDepthView;
     imageInfos[3].imageLayout = kVkImageLayoutShaderReadOnlyOptimal;
 
-    imageInfos[4].sampler = linearSampler;
+    // 4: u_Velocity (use point clamp sampler to prevent cross-edge velocity bleeding)
+    imageInfos[4].sampler = pointSampler;
     imageInfos[4].imageView = velocityView;
     imageInfos[4].imageLayout = kVkImageLayoutShaderReadOnlyOptimal;
 
@@ -4477,7 +4489,8 @@ void ReconstructionPass::DispatchVulkan(void* vkCommandBuffer, uint32_t frameInd
     pfnCmdBindPipeline(vkCommandBuffer, kVkPipelineBindPointCompute, m_pipeline);
 
     if (m_descriptorSet && pfnCmdBindDescriptorSets) {
-        pfnCmdBindDescriptorSets(vkCommandBuffer, kVkPipelineBindPointCompute, m_pipelineLayout, 0, 1, const_cast<const void**>(&m_descriptorSet), 0, nullptr);
+        const void* descriptorSets[] = { m_descriptorSet };
+        pfnCmdBindDescriptorSets(vkCommandBuffer, kVkPipelineBindPointCompute, m_pipelineLayout, 0, 1, descriptorSets, 0, nullptr);
     }
 
     pfnCmdPushConstants(vkCommandBuffer, m_pipelineLayout, kVkShaderStageComputeBit, 0, sizeof(pushConstants), &pushConstants);
@@ -4758,7 +4771,7 @@ layout(set = 0, binding = 1) uniform sampler2DMS u_QuarterDepthMSAA;
 // History frame: full-resolution reconstructed color & depth buffers
 // SAMPLER REQUIREMENT (must match HLSL LinearClamp/PointClamp):
 //   u_HistoryColor -> LINEAR + CLAMP_TO_EDGE, u_HistoryDepth -> NEAREST + CLAMP_TO_EDGE,
-//   u_Velocity -> LINEAR + CLAMP_TO_EDGE. Depth history uses texelFetch (sampler-independent).
+//   u_Velocity -> POINT + CLAMP_TO_EDGE (texelFetch avoids cross-edge velocity interpolation).
 layout(set = 0, binding = 2) uniform sampler2D   u_HistoryColor;
 layout(set = 0, binding = 3) uniform sampler2D   u_HistoryDepth;
 
@@ -4981,8 +4994,8 @@ void main() {
         }
     }
 
-    vec2 dilatedUV = (vec2(motionCoord) + 0.5) * pc.u_InvTargetResolution;
-    vec2 velocity = textureLod(u_Velocity, dilatedUV, 0.0).xy;
+    // Point-sample velocity via texelFetch at integer motionCoord to prevent cross-edge velocity bleeding
+    vec2 velocity = texelFetch(u_Velocity, motionCoord, 0).xy;
     // NaN/Inf velocity or UV must disocclude: ivec2(NaN) is UB and NaN comparisons are false.
     bool velocityBad = isinf(velocity.x) || isnan(velocity.x) || isinf(velocity.y) || isnan(velocity.y)
         || isinf(uv.x) || isnan(uv.x) || isinf(uv.y) || isnan(uv.y);
@@ -5162,6 +5175,8 @@ void main() {
     if (isnan(outDepth) || isinf(outDepth)) {
         outDepth = (pc.u_DepthMode == 1u) ? 0.0 : 1.0;
     }
+    // GLSL 4.50 specification (section 8.14) mandates a 4-component vector for all floating-point
+    // imageStore invocations (including single-channel r32f). Hardware discards y, z, w.
     imageStore(u_OutputDepth, pixelCoord, vec4(outDepth, 0.0, 0.0, 0.0));
 }
 ```
@@ -5761,8 +5776,8 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
         }
     }
 
-    float2 dilatedUV = (float2(motionCoord) + 0.5f) * g_InvTargetResolution;
-    float2 velocity = g_Velocity.SampleLevel(g_LinearClampSampler, dilatedUV, 0.0f).xy;
+    // Exact texel fetch of velocity using integer motionCoord prevents cross-edge interpolation
+    float2 velocity = g_Velocity.Load(int3(motionCoord, 0)).xy;
     bool velocityBad = isinf(velocity.x) || isnan(velocity.x) || isinf(velocity.y) || isnan(velocity.y)
         || isinf(uv.x) || isnan(uv.x) || isinf(uv.y) || isnan(uv.y);
     float2 historyUV = uv - velocity - g_JitterDelta * g_JitterCompensation;

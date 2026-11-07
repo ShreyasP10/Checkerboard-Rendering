@@ -53,6 +53,9 @@ private:
     JitterManager() = default;
     ~JitterManager() = default;
 
+    // LOCK HIERARCHY: ConfigManager mutex must NEVER be acquired while holding JitterManager::m_mutex.
+    // Methods that query ConfigManager (such as Update or ComputeProjectionOffset) query configuration
+    // outside of m_mutex locking scopes to prevent inversion deadlocks.
     mutable std::mutex m_mutex;
     uint32_t     m_targetWidth{ 3840 };
     uint32_t     m_targetHeight{ 2160 };

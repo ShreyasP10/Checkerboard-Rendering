@@ -274,7 +274,9 @@ void Hooked_vkCmdSetViewport(void* commandBuffer, uint32_t firstViewport, uint32
 
         if (config.samplingStrategy == SamplingStrategy::StrategyA) {
             // Strategy A: Viewport Shift Jittering (0.5px horizontal shift on odd frames)
-            if (config.jitterDirection != 0) {
+            // Mutual exclusivity guard: If the game's camera projection matrix is actively hooked and
+            // jittered by PatternScanner, do NOT apply viewport shifting to prevent double-jittering.
+            if (config.jitterDirection != 0 && PatternScanner::GetCameraProjectionMatrix() == nullptr) {
                 const float shift = JitterManager::Get().GetQuarterViewportShiftX(currentFrame);
                 redirected.x += shift;
             }

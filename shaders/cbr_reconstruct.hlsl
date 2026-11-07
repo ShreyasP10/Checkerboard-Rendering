@@ -244,8 +244,8 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
         }
     }
 
-    float2 dilatedUV = (float2(motionCoord) + 0.5f) * g_InvTargetResolution;
-    float2 velocity = g_Velocity.SampleLevel(g_LinearClampSampler, dilatedUV, 0.0f).xy;
+    // Exact texel fetch of velocity using integer motionCoord prevents cross-edge interpolation
+    float2 velocity = g_Velocity.Load(int3(motionCoord, 0)).xy;
     bool velocityBad = isinf(velocity.x) || isnan(velocity.x) || isinf(velocity.y) || isnan(velocity.y)
         || isinf(uv.x) || isnan(uv.x) || isinf(uv.y) || isnan(uv.y);
     float2 historyUV = uv - velocity - g_JitterDelta * g_JitterCompensation;

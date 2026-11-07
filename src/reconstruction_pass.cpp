@@ -476,6 +476,11 @@ bool ReconstructionPass::InitializeVulkan(void* vkDevice, void* /*vkPhysicalDevi
         return true;
     }
 
+    // Reuse existing pipeline if already initialized on the same device (dimensions are resolution-independent)
+    if (m_initialized.load() && m_pipeline != nullptr && m_device == vkDevice) {
+        return true;
+    }
+
     // Destroy existing pipeline objects on swapchain recreation to prevent driver resource leakage
     if (m_pipeline || m_descriptorPool || m_pipelineLayout || m_descriptorSetLayout) {
         DestroyVulkanPipeline();
@@ -549,7 +554,8 @@ bool ReconstructionPass::UpdateVulkanDescriptors(void* quarterColorView, void* q
     imageInfos[3].imageView = historyDepthView;
     imageInfos[3].imageLayout = kVkImageLayoutShaderReadOnlyOptimal;
 
-    imageInfos[4].sampler = linearSampler;
+    // 4: u_Velocity (use point clamp sampler to prevent cross-edge velocity bleeding)
+    imageInfos[4].sampler = pointSampler;
     imageInfos[4].imageView = velocityView;
     imageInfos[4].imageLayout = kVkImageLayoutShaderReadOnlyOptimal;
 
@@ -662,7 +668,8 @@ void ReconstructionPass::DispatchVulkan(void* vkCommandBuffer, uint32_t frameInd
     pfnCmdBindPipeline(vkCommandBuffer, kVkPipelineBindPointCompute, m_pipeline);
 
     if (m_descriptorSet && pfnCmdBindDescriptorSets) {
-        pfnCmdBindDescriptorSets(vkCommandBuffer, kVkPipelineBindPointCompute, m_pipelineLayout, 0, 1, const_cast<const void**>(&m_descriptorSet), 0, nullptr);
+        const void* descriptorSets[] = { m_descriptorSet };
+        pfnCmdBindDescriptorSets(vkCommandBuffer, kVkPipelineBindPointCompute, m_pipelineLayout, 0, 1, descriptorSets, 0, nullptr);
     }
 
     pfnCmdPushConstants(vkCommandBuffer, m_pipelineLayout, kVkShaderStageComputeBit, 0, sizeof(pushConstants), &pushConstants);

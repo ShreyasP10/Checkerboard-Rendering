@@ -24,7 +24,7 @@ layout(set = 0, binding = 1) uniform sampler2DMS u_QuarterDepthMSAA;
 // History frame: full-resolution reconstructed color & depth buffers
 // SAMPLER REQUIREMENT (must match HLSL LinearClamp/PointClamp):
 //   u_HistoryColor -> LINEAR + CLAMP_TO_EDGE, u_HistoryDepth -> NEAREST + CLAMP_TO_EDGE,
-//   u_Velocity -> LINEAR + CLAMP_TO_EDGE. Depth history uses texelFetch (sampler-independent).
+//   u_Velocity -> POINT + CLAMP_TO_EDGE (texelFetch avoids cross-edge velocity interpolation).
 layout(set = 0, binding = 2) uniform sampler2D   u_HistoryColor;
 layout(set = 0, binding = 3) uniform sampler2D   u_HistoryDepth;
 
@@ -247,8 +247,8 @@ void main() {
         }
     }
 
-    vec2 dilatedUV = (vec2(motionCoord) + 0.5) * pc.u_InvTargetResolution;
-    vec2 velocity = textureLod(u_Velocity, dilatedUV, 0.0).xy;
+    // Point-sample velocity via texelFetch at integer motionCoord to prevent cross-edge velocity bleeding
+    vec2 velocity = texelFetch(u_Velocity, motionCoord, 0).xy;
     // NaN/Inf velocity or UV must disocclude: ivec2(NaN) is UB and NaN comparisons are false.
     bool velocityBad = isinf(velocity.x) || isnan(velocity.x) || isinf(velocity.y) || isnan(velocity.y)
         || isinf(uv.x) || isnan(uv.x) || isinf(uv.y) || isnan(uv.y);
@@ -428,5 +428,7 @@ void main() {
     if (isnan(outDepth) || isinf(outDepth)) {
         outDepth = (pc.u_DepthMode == 1u) ? 0.0 : 1.0;
     }
+    // GLSL 4.50 specification (section 8.14) mandates a 4-component vector for all floating-point
+    // imageStore invocations (including single-channel r32f). Hardware discards y, z, w.
     imageStore(u_OutputDepth, pixelCoord, vec4(outDepth, 0.0, 0.0, 0.0));
 }
