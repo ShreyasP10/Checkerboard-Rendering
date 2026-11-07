@@ -153,20 +153,24 @@ void CBREngine::OnBeginFrame() {
     uint32_t currentFrame = m_frameIndex.load();
     JitterManager::Get().Update(currentFrame);
 
+#if defined(_WIN32)
     const auto config = ConfigManager::Get().GetConfig();
     if (config.samplingStrategy == SamplingStrategy::StrategyA && config.jitterDirection != 0) {
         PatternScanner::UpdateCameraJitter(currentFrame, m_activeApi.load() == GraphicsApi::Vulkan);
     }
+#endif
 }
 
 void CBREngine::OnPreRender() {
     if (!m_enabled.load()) return;
     // Jitter is active for projection matrix during scene geometry pass
     const uint32_t currentFrame = m_frameIndex.load();
+#if defined(_WIN32)
     const auto config = ConfigManager::Get().GetConfig();
     if (config.samplingStrategy == SamplingStrategy::StrategyA && config.jitterDirection != 0) {
         PatternScanner::UpdateCameraJitter(currentFrame, m_activeApi.load() == GraphicsApi::Vulkan);
     }
+#endif
 }
 
 void CBREngine::OnPostRender() {

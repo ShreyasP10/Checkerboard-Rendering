@@ -35,6 +35,8 @@ public:
     static bool InitializeCameraScanner();
     static float* GetCameraProjectionMatrix();
     static bool UpdateCameraJitter(uint32_t frameIndex, bool isVulkan);
+#else
+    static bool UpdateCameraJitter(uint32_t /*frameIndex*/, bool /*isVulkan*/) { return false; }
 #endif
 };
 
