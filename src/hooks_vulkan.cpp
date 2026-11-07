@@ -34,11 +34,13 @@ typedef void  (*PFN_vkCmdSetScissor)(void* commandBuffer, uint32_t firstScissor,
 typedef void  (*PFN_vkCmdBeginRenderPass)(void* commandBuffer, const void* pRenderPassBegin, uint32_t contents);
 typedef void  (*PFN_vkCmdEndRenderPass)(void* commandBuffer);
 typedef void  (*PFN_vkCmdSetSampleLocationsEXT)(void* commandBuffer, const MinimalVkSampleLocationsInfoEXT* pSampleLocationsInfo);
+typedef int   (*PFN_vkGetSwapchainImagesKHR)(void* device, void* swapchain, uint32_t* pSwapchainImageCount, void** pSwapchainImages);
 
 PFN_vkGetDeviceProcAddr        g_Original_vkGetDeviceProcAddr = nullptr;
 PFN_vkGetInstanceProcAddr      g_Original_vkGetInstanceProcAddr = nullptr;
 PFN_vkQueuePresentKHR          g_Original_vkQueuePresentKHR = nullptr;
 PFN_vkCreateSwapchainKHR       g_Original_vkCreateSwapchainKHR = nullptr;
+PFN_vkGetSwapchainImagesKHR    g_Original_vkGetSwapchainImagesKHR = nullptr;
 PFN_vkCmdSetViewport           g_Original_vkCmdSetViewport = nullptr;
 PFN_vkCmdSetScissor            g_Original_vkCmdSetScissor = nullptr;
 PFN_vkCmdBeginRenderPass       g_Original_vkCmdBeginRenderPass = nullptr;
@@ -47,6 +49,7 @@ PFN_vkCmdSetSampleLocationsEXT g_Original_vkCmdSetSampleLocationsEXT = nullptr;
 
 void* Hooked_vkGetDeviceProcAddr(void* device, const char* pName);
 void* Hooked_vkGetInstanceProcAddr(void* instance, const char* pName);
+int   Hooked_vkGetSwapchainImagesKHR(void* device, void* swapchain, uint32_t* pSwapchainImageCount, void** pSwapchainImages);
 void  Hooked_vkCmdSetViewport(void* commandBuffer, uint32_t firstViewport, uint32_t viewportCount, const MinimalVkViewport* pViewports);
 void  Hooked_vkCmdSetScissor(void* commandBuffer, uint32_t firstScissor, uint32_t scissorCount, const MinimalVkRect2D* pScissors);
 void  Hooked_vkCmdBeginRenderPass(void* commandBuffer, const void* pRenderPassBegin, uint32_t contents);
@@ -233,6 +236,18 @@ int Hooked_vkCreateSwapchainKHR(void* device, const void* pCreateInfo, const voi
     return result;
 }
 
+int Hooked_vkGetSwapchainImagesKHR(void* device, void* swapchain, uint32_t* pSwapchainImageCount, void** pSwapchainImages) {
+    if (!g_Original_vkGetSwapchainImagesKHR) {
+        return kVkErrorInitializationFailed;
+    }
+    int result = g_Original_vkGetSwapchainImagesKHR(device, swapchain, pSwapchainImageCount, pSwapchainImages);
+    if (result == 0 && pSwapchainImages && pSwapchainImageCount && *pSwapchainImageCount > 0) {
+        CBR_LOG_INFO("vkGetSwapchainImagesKHR: %u swapchain image(s) captured for device %p.",
+                     *pSwapchainImageCount, device);
+    }
+    return result;
+}
+
 void Hooked_vkCmdSetViewport(void* commandBuffer, uint32_t firstViewport, uint32_t viewportCount, const MinimalVkViewport* pViewports) {
     if (!g_Original_vkCmdSetViewport) return;
 
@@ -246,6 +261,9 @@ void Hooked_vkCmdSetViewport(void* commandBuffer, uint32_t firstViewport, uint32
             static_cast<uint32_t>(pViewports[0].width),
             static_cast<uint32_t>(pViewports[0].height),
             0)) {
+
+        // Mark this command buffer as actively executing the intercepted scene geometry pass
+        CBREngine::Get().MarkCandidatePassActive(commandBuffer);
 
         MinimalVkViewport redirected = pViewports[0];
         redirected.width = static_cast<float>(dims.quarterWidth);
@@ -306,17 +324,6 @@ void Hooked_vkCmdSetScissor(void* commandBuffer, uint32_t firstScissor, uint32_t
 void Hooked_vkCmdBeginRenderPass(void* commandBuffer, const void* pRenderPassBegin, uint32_t contents) {
     if (!g_Original_vkCmdBeginRenderPass) return;
 
-    if (CBREngine::Get().IsEnabled()) {
-        const auto config = ConfigManager::Get().GetConfig();
-        if (config.samplingStrategy == SamplingStrategy::StrategyB && g_Original_vkCmdSetSampleLocationsEXT) {
-            const uint32_t currentFrame = CBREngine::Get().GetCurrentFrameIndex();
-            MinimalVkSampleLocationsInfoEXT sampleInfo{};
-            MinimalVkSampleLocationEXT sampleLocs[2]{};
-            ConfigureCheckerboardSampleLocations(currentFrame, sampleInfo, sampleLocs);
-            g_Original_vkCmdSetSampleLocationsEXT(commandBuffer, &sampleInfo);
-        }
-    }
-
     g_Original_vkCmdBeginRenderPass(commandBuffer, pRenderPassBegin, contents);
 }
 
@@ -327,7 +334,10 @@ void Hooked_vkCmdEndRenderPass(void* commandBuffer) {
 
     if (CBREngine::Get().IsEnabled()) {
         try {
-            CBREngine::Get().OnScenePassEnd(commandBuffer);
+            // Only trigger reconstruction if this command buffer executed the intercepted scene pass!
+            if (CBREngine::Get().ConsumeCandidatePassActive(commandBuffer)) {
+                CBREngine::Get().OnScenePassEnd(commandBuffer);
+            }
         } catch (...) {
         }
     }
@@ -338,7 +348,8 @@ void Hooked_vkCmdSetSampleLocationsEXT(void* commandBuffer, const MinimalVkSampl
 
     if (CBREngine::Get().IsEnabled()) {
         const auto config = ConfigManager::Get().GetConfig();
-        if (config.samplingStrategy == SamplingStrategy::StrategyB) {
+        if (config.samplingStrategy == SamplingStrategy::StrategyB &&
+            CBREngine::Get().IsCandidatePassActive(commandBuffer)) {
             const uint32_t currentFrame = CBREngine::Get().GetCurrentFrameIndex();
             MinimalVkSampleLocationsInfoEXT sampleInfo{};
             MinimalVkSampleLocationEXT sampleLocs[2]{};
@@ -372,6 +383,12 @@ void* Hooked_vkGetDeviceProcAddr(void* device, const char* pName) {
             g_Original_vkCreateSwapchainKHR = reinterpret_cast<PFN_vkCreateSwapchainKHR>(realProc);
         }
         return reinterpret_cast<void*>(&Hooked_vkCreateSwapchainKHR);
+    }
+    if (std::strcmp(pName, "vkGetSwapchainImagesKHR") == 0) {
+        if (!g_Original_vkGetSwapchainImagesKHR) {
+            g_Original_vkGetSwapchainImagesKHR = reinterpret_cast<PFN_vkGetSwapchainImagesKHR>(realProc);
+        }
+        return reinterpret_cast<void*>(&Hooked_vkGetSwapchainImagesKHR);
     }
     if (std::strcmp(pName, "vkCmdSetViewport") == 0) {
         if (!g_Original_vkCmdSetViewport) {
@@ -427,6 +444,12 @@ void* Hooked_vkGetInstanceProcAddr(void* instance, const char* pName) {
             g_Original_vkCreateSwapchainKHR = reinterpret_cast<PFN_vkCreateSwapchainKHR>(realProc);
         }
         return reinterpret_cast<void*>(&Hooked_vkCreateSwapchainKHR);
+    }
+    if (std::strcmp(pName, "vkGetSwapchainImagesKHR") == 0) {
+        if (!g_Original_vkGetSwapchainImagesKHR) {
+            g_Original_vkGetSwapchainImagesKHR = reinterpret_cast<PFN_vkGetSwapchainImagesKHR>(realProc);
+        }
+        return reinterpret_cast<void*>(&Hooked_vkGetSwapchainImagesKHR);
     }
     if (std::strcmp(pName, "vkCmdSetViewport") == 0) {
         if (!g_Original_vkCmdSetViewport) {
@@ -526,6 +549,21 @@ bool HookManager::InstallVulkanHooks() {
             hookedAny = true;
         } else {
             CBR_LOG_WARN("MinHook: Could not detour vkCreateSwapchainKHR (status: %d).", mhStatus);
+        }
+    }
+
+    // 2b. Detour vkGetSwapchainImagesKHR
+    auto pfnGetSwapchainImages = reinterpret_cast<void*>(GetProcAddress(vulkanModule, "vkGetSwapchainImagesKHR"));
+    if (pfnGetSwapchainImages) {
+        mhStatus = MH_CreateHook(
+            pfnGetSwapchainImages,
+            reinterpret_cast<LPVOID>(&Hooked_vkGetSwapchainImagesKHR),
+            reinterpret_cast<LPVOID*>(&g_Original_vkGetSwapchainImagesKHR)
+        );
+        if (mhStatus == MH_OK || mhStatus == MH_ERROR_ALREADY_CREATED) {
+            MH_EnableHook(pfnGetSwapchainImages);
+            CBR_LOG_INFO("MinHook: Successfully detoured vkGetSwapchainImagesKHR (export at 0x%p).", pfnGetSwapchainImages);
+            hookedAny = true;
         }
     }
 

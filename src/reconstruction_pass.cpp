@@ -23,7 +23,12 @@ constexpr uint32_t kVkStructureTypePipelineLayoutCreateInfo = 30;
 constexpr uint32_t kVkStructureTypeDescriptorSetLayoutCreateInfo = 32;
 constexpr uint32_t kVkStructureTypeDescriptorPoolCreateInfo = 33;
 constexpr uint32_t kVkStructureTypeDescriptorSetAllocateInfo = 34;
+constexpr uint32_t kVkStructureTypeWriteDescriptorSet = 35;
 constexpr uint32_t kVkStructureTypeMemoryBarrier = 46;
+constexpr uint32_t kVkStructureTypeImageMemoryBarrier = 47;
+
+constexpr uint32_t kVkImageLayoutGeneral = 3;
+constexpr uint32_t kVkImageLayoutShaderReadOnlyOptimal = 5;
 
 constexpr uint32_t kVkShaderStageComputeBit = 0x00000020;
 constexpr uint32_t kVkPipelineBindPointCompute = 1;
@@ -95,6 +100,46 @@ struct MinimalVkMemoryBarrier {
     uint32_t    dstAccessMask;
 };
 
+struct MinimalVkDescriptorImageInfo {
+    void*    sampler;
+    void*    imageView;
+    uint32_t imageLayout;
+};
+
+struct MinimalVkWriteDescriptorSet {
+    uint32_t                            sType;
+    const void*                         pNext;
+    void*                               dstSet;
+    uint32_t                            dstBinding;
+    uint32_t                            dstArrayElement;
+    uint32_t                            descriptorCount;
+    uint32_t                            descriptorType;
+    const MinimalVkDescriptorImageInfo* pImageInfo;
+    const void*                         pBufferInfo;
+    const void*                         pTexelBufferView;
+};
+
+struct MinimalVkImageSubresourceRange {
+    uint32_t aspectMask;
+    uint32_t baseMipLevel;
+    uint32_t levelCount;
+    uint32_t baseArrayLayer;
+    uint32_t layerCount;
+};
+
+struct MinimalVkImageMemoryBarrier {
+    uint32_t                       sType;
+    const void*                    pNext;
+    uint32_t                       srcAccessMask;
+    uint32_t                       dstAccessMask;
+    uint32_t                       oldLayout;
+    uint32_t                       newLayout;
+    uint32_t                       srcQueueFamilyIndex;
+    uint32_t                       dstQueueFamilyIndex;
+    void*                          image;
+    MinimalVkImageSubresourceRange subresourceRange;
+};
+
 struct MinimalVkPipelineLayoutCreateInfo {
     uint32_t                          sType;
     const void*                       pNext;
@@ -133,6 +178,7 @@ typedef void  (*PFN_vkDestroyDescriptorSetLayout)(void* device, void* setLayout,
 typedef int   (*PFN_vkCreateDescriptorPool)(void* device, const MinimalVkDescriptorPoolCreateInfo* pCreateInfo, const void* pAllocator, void** pDescriptorPool);
 typedef void  (*PFN_vkDestroyDescriptorPool)(void* device, void* descriptorPool, const void* pAllocator);
 typedef int   (*PFN_vkAllocateDescriptorSets)(void* device, const MinimalVkDescriptorSetAllocateInfo* pAllocateInfo, void** pDescriptorSets);
+typedef void  (*PFN_vkUpdateDescriptorSets)(void* device, uint32_t descriptorWriteCount, const MinimalVkWriteDescriptorSet* pDescriptorWrites, uint32_t descriptorCopyCount, const void* pDescriptorCopies);
 typedef int   (*PFN_vkCreatePipelineLayout)(void* device, const MinimalVkPipelineLayoutCreateInfo* pCreateInfo, const void* pAllocator, void** pPipelineLayout);
 typedef void  (*PFN_vkDestroyPipelineLayout)(void* device, void* pipelineLayout, const void* pAllocator);
 typedef int   (*PFN_vkCreateComputePipelines)(void* device, void* pipelineCache, uint32_t createInfoCount, const MinimalVkComputePipelineCreateInfo* pCreateInfos, const void* pAllocator, void** pPipelines);
@@ -418,6 +464,7 @@ void ReconstructionPass::DestroyVulkanPipeline() {
         pfnDestroyDescriptorSetLayout(m_device, m_descriptorSetLayout, nullptr);
         m_descriptorSetLayout = nullptr;
     }
+    m_descriptorsBound.store(false);
 #endif
 }
 
@@ -427,6 +474,11 @@ bool ReconstructionPass::InitializeVulkan(void* vkDevice, void* /*vkPhysicalDevi
         m_initialized.store(true);
         CBR_LOG_INFO("ReconstructionPass initialized for Vulkan API pipeline (device handle deferred).");
         return true;
+    }
+
+    // Destroy existing pipeline objects on swapchain recreation to prevent driver resource leakage
+    if (m_pipeline || m_descriptorPool || m_pipelineLayout || m_descriptorSetLayout) {
+        DestroyVulkanPipeline();
     }
 
     m_device = vkDevice;
@@ -452,8 +504,84 @@ void ReconstructionPass::Shutdown() {
     m_descriptorSetLayout = nullptr;
     m_descriptorPool = nullptr;
     m_descriptorSet = nullptr;
+    m_descriptorsBound.store(false);
     m_initialized.store(false);
     CBR_LOG_INFO("ReconstructionPass shut down cleanly.");
+}
+
+bool ReconstructionPass::UpdateVulkanDescriptors(void* quarterColorView, void* quarterDepthView,
+                                                void* historyColorView, void* historyDepthView,
+                                                void* velocityView,
+                                                void* outputImageView, void* outputDepthView,
+                                                void* linearSampler, void* pointSampler) {
+#if defined(_WIN32)
+    if (!m_device || !m_descriptorSet) return false;
+
+    HMODULE vulkanModule = GetModuleHandleA("vulkan-1.dll");
+    if (!vulkanModule) return false;
+
+    auto pfnGetDeviceProcAddr = reinterpret_cast<PFN_vkGetDeviceProcAddr>(GetProcAddress(vulkanModule, "vkGetDeviceProcAddr"));
+    auto resolveDeviceFunc = [&](const char* name) -> void* {
+        if (pfnGetDeviceProcAddr && m_device) {
+            void* p = pfnGetDeviceProcAddr(m_device, name);
+            if (p) return p;
+        }
+        return reinterpret_cast<void*>(GetProcAddress(vulkanModule, name));
+    };
+
+    auto pfnUpdateDescriptorSets = reinterpret_cast<PFN_vkUpdateDescriptorSets>(resolveDeviceFunc("vkUpdateDescriptorSets"));
+    if (!pfnUpdateDescriptorSets) return false;
+
+    MinimalVkDescriptorImageInfo imageInfos[7]{};
+    imageInfos[0].sampler = pointSampler;
+    imageInfos[0].imageView = quarterColorView;
+    imageInfos[0].imageLayout = kVkImageLayoutShaderReadOnlyOptimal;
+
+    imageInfos[1].sampler = pointSampler;
+    imageInfos[1].imageView = quarterDepthView;
+    imageInfos[1].imageLayout = kVkImageLayoutShaderReadOnlyOptimal;
+
+    imageInfos[2].sampler = linearSampler;
+    imageInfos[2].imageView = historyColorView;
+    imageInfos[2].imageLayout = kVkImageLayoutShaderReadOnlyOptimal;
+
+    imageInfos[3].sampler = pointSampler;
+    imageInfos[3].imageView = historyDepthView;
+    imageInfos[3].imageLayout = kVkImageLayoutShaderReadOnlyOptimal;
+
+    imageInfos[4].sampler = linearSampler;
+    imageInfos[4].imageView = velocityView;
+    imageInfos[4].imageLayout = kVkImageLayoutShaderReadOnlyOptimal;
+
+    imageInfos[5].sampler = nullptr;
+    imageInfos[5].imageView = outputImageView;
+    imageInfos[5].imageLayout = kVkImageLayoutGeneral;
+
+    imageInfos[6].sampler = nullptr;
+    imageInfos[6].imageView = outputDepthView;
+    imageInfos[6].imageLayout = kVkImageLayoutGeneral;
+
+    MinimalVkWriteDescriptorSet writes[7]{};
+    for (uint32_t i = 0; i < 7; ++i) {
+        writes[i].sType = kVkStructureTypeWriteDescriptorSet;
+        writes[i].dstSet = m_descriptorSet;
+        writes[i].dstBinding = i;
+        writes[i].dstArrayElement = 0;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = (i < 5) ? kVkDescriptorTypeCombinedImageSampler : kVkDescriptorTypeStorageImage;
+        writes[i].pImageInfo = &imageInfos[i];
+    }
+
+    pfnUpdateDescriptorSets(m_device, 7, writes, 0, nullptr);
+    m_descriptorsBound.store(true);
+    CBR_LOG_INFO("ReconstructionPass: Vulkan descriptors successfully updated with active image views.");
+    return true;
+#else
+    (void)quarterColorView; (void)quarterDepthView; (void)historyColorView;
+    (void)historyDepthView; (void)velocityView; (void)outputImageView;
+    (void)outputDepthView; (void)linearSampler; (void)pointSampler;
+    return true;
+#endif
 }
 
 ReconstructionPushConstants BuildReconstructionPushConstants(uint32_t frameIndex) {
@@ -497,6 +625,14 @@ void ReconstructionPass::DispatchVulkan(void* vkCommandBuffer, uint32_t frameInd
         static std::atomic<bool> s_warned{ false };
         if (!s_warned.exchange(true)) {
             CBR_LOG_WARN("DispatchVulkan: compute pipeline not loaded; skipping dispatch.");
+        }
+        return;
+    }
+
+    if (!m_descriptorsBound.load()) {
+        static std::atomic<bool> s_warnedDescriptors{ false };
+        if (!s_warnedDescriptors.exchange(true)) {
+            CBR_LOG_WARN("DispatchVulkan deferred: descriptor set not yet bound with active image views.");
         }
         return;
     }

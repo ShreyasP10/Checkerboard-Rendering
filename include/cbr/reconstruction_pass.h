@@ -48,6 +48,14 @@ public:
     void DispatchVulkan(void* vkCommandBuffer, uint32_t frameIndex);
     void DispatchDX12(void* d3d12GraphicsCommandList, uint32_t frameIndex);
 
+    // Updates descriptor set 0 with active Vulkan image views and samplers
+    bool UpdateVulkanDescriptors(void* quarterColorView, void* quarterDepthView,
+                                void* historyColorView, void* historyDepthView,
+                                void* velocityView,
+                                void* outputImageView, void* outputDepthView,
+                                void* linearSampler, void* pointSampler);
+    bool AreDescriptorsBound() const { return m_descriptorsBound.load(); }
+
     void SetShaderDirectory(const std::filesystem::path& dir) { m_shaderDir = dir; }
     const std::filesystem::path& GetShaderDirectory() const { return m_shaderDir; }
 
@@ -69,6 +77,7 @@ private:
     void DestroyVulkanPipeline();
 
     std::atomic<bool>     m_initialized{ false };
+    std::atomic<bool>     m_descriptorsBound{ false };
     std::atomic<bool>     m_isVulkan{ true };
     std::filesystem::path m_shaderDir;
 

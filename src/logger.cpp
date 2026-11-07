@@ -12,7 +12,7 @@ Logger& Logger::Get() {
 }
 
 void Logger::Initialize(const std::filesystem::path& logFilePath) {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
     if (m_initialized) {
         return;
     }
@@ -41,14 +41,14 @@ void Logger::Initialize(const std::filesystem::path& logFilePath) {
 }
 
 void Logger::Disable() {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
     m_disabled = true;
     m_pending.clear();
     m_droppedPending = 0;
 }
 
 void Logger::Shutdown() {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
     if (m_initialized && m_logFile.is_open()) {
         m_logFile << "[INFO] Logger shutting down.\n";
         m_logFile.flush();
@@ -61,19 +61,19 @@ void Logger::Shutdown() {
 }
 
 void Logger::SetMinLevel(LogLevel level) {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
     m_minLevel = level;
 }
 
 void Logger::Flush() {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
     if (m_initialized && m_logFile.is_open()) {
         m_logFile.flush();
     }
 }
 
 void Logger::Log(LogLevel level, const std::string& message) {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
 
     if (level < m_minLevel) {
         return;
@@ -107,7 +107,11 @@ void Logger::Log(LogLevel level, const std::string& message) {
 
     if (m_initialized && m_logFile.is_open()) {
         m_logFile << formatted;
-        m_logFile.flush(); // Immediate flush ensures zero loss on game crash
+        // Avoid synchronous disk flush on high-frequency render-thread frames;
+        // only flush immediately on warnings and errors to prevent I/O micro-stutters.
+        if (level >= LogLevel::Warning) {
+            m_logFile.flush();
+        }
     } else if (!m_initialized && !m_disabled) {
         if (m_pending.size() < kMaxPendingMessages) {
             m_pending.push_back(formatted);

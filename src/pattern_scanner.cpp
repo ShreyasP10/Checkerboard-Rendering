@@ -121,10 +121,25 @@ const uint8_t* PatternScanner::ScanModule(const char* moduleName, const char* si
             const auto* secBase = reinterpret_cast<const uint8_t*>(hMod) + sec.VirtualAddress;
             const size_t secSize = sec.Misc.VirtualSize > 0 ? sec.Misc.VirtualSize : sec.SizeOfRawData;
 
-            const uint8_t* found = FindPattern(secBase, secSize, signature, mask);
-            if (found) {
-                return found;
+#if defined(_MSC_VER)
+            __try {
+                const uint8_t* found = FindPattern(secBase, secSize, signature, mask);
+                if (found) {
+                    return found;
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                // Guard page or access violation encountered during pattern scan
             }
+#else
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (VirtualQuery(secBase, &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT &&
+                !(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) {
+                const uint8_t* found = FindPattern(secBase, secSize, signature, mask);
+                if (found) {
+                    return found;
+                }
+            }
+#endif
         }
     }
     return nullptr;

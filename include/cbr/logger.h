@@ -67,7 +67,7 @@ private:
     static constexpr size_t kMaxPendingMessages = 256;
 
     std::ofstream            m_logFile;
-    std::mutex               m_mutex;
+    std::recursive_mutex     m_mutex;
     bool                     m_initialized{ false };
     bool                     m_disabled{ false };
     LogLevel                 m_minLevel{ LogLevel::Info };

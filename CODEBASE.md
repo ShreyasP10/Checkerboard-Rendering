@@ -598,6 +598,13 @@ public:
     // Call when the game (re)creates its swapchain: resets frame parity, history, and updates dimensions if provided
     void OnSwapchainRecreated(uint32_t width = 0, uint32_t height = 0);
 
+    // Candidate scene pass tracking to prevent premature dispatch on shadow/SSAO passes
+    void MarkCandidatePassActive(void* cmdBuffer) { m_activeCandidateCmdBuffer.store(cmdBuffer); }
+    bool ConsumeCandidatePassActive(void* cmdBuffer);
+    bool IsCandidatePassActive(void* cmdBuffer) const {
+        return cmdBuffer != nullptr && m_activeCandidateCmdBuffer.load() == cmdBuffer;
+    }
+
     uint32_t    GetCurrentFrameIndex() const { return m_frameIndex.load(); }
     bool        IsEnabled() const { return m_enabled.load(); }
     void        SetEnabled(bool enabled) { m_enabled.store(enabled); }
@@ -624,6 +631,7 @@ private:
     std::atomic<uint32_t>      m_lastDispatchedFrame{ kNoFrame };
     // PreferredApi = Auto and no runtime was loaded yet: re-detect on each hook attempt
     std::atomic<bool>          m_apiPending{ false };
+    std::atomic<void*>         m_activeCandidateCmdBuffer{ nullptr };
     std::atomic<float>         m_lastReconDurationMs{ 0.0f };
     std::atomic<GraphicsApi>   m_activeApi{ GraphicsApi::Vulkan };
     std::filesystem::path      m_moduleDirectory;
@@ -1179,7 +1187,7 @@ private:
     static constexpr size_t kMaxPendingMessages = 256;
 
     std::ofstream            m_logFile;
-    std::mutex               m_mutex;
+    std::recursive_mutex     m_mutex;
     bool                     m_initialized{ false };
     bool                     m_disabled{ false };
     LogLevel                 m_minLevel{ LogLevel::Info };
@@ -1295,6 +1303,14 @@ public:
     void DispatchVulkan(void* vkCommandBuffer, uint32_t frameIndex);
     void DispatchDX12(void* d3d12GraphicsCommandList, uint32_t frameIndex);
 
+    // Updates descriptor set 0 with active Vulkan image views and samplers
+    bool UpdateVulkanDescriptors(void* quarterColorView, void* quarterDepthView,
+                                void* historyColorView, void* historyDepthView,
+                                void* velocityView,
+                                void* outputImageView, void* outputDepthView,
+                                void* linearSampler, void* pointSampler);
+    bool AreDescriptorsBound() const { return m_descriptorsBound.load(); }
+
     void SetShaderDirectory(const std::filesystem::path& dir) { m_shaderDir = dir; }
     const std::filesystem::path& GetShaderDirectory() const { return m_shaderDir; }
 
@@ -1316,6 +1332,7 @@ private:
     void DestroyVulkanPipeline();
 
     std::atomic<bool>     m_initialized{ false };
+    std::atomic<bool>     m_descriptorsBound{ false };
     std::atomic<bool>     m_isVulkan{ true };
     std::filesystem::path m_shaderDir;
 
@@ -1579,6 +1596,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID /*lpRese
 #include "cbr/ui_overlay.h"
 #include "cbr/hooks.h"
 #include "cbr/crash_handler.h"
+#include "cbr/pattern_scanner.h"
 #include <cctype>
 #include <string>
 
@@ -1709,16 +1727,35 @@ void CBREngine::Shutdown(bool isProcessExit) {
     m_initialized.store(false);
 }
 
+bool CBREngine::ConsumeCandidatePassActive(void* cmdBuffer) {
+    if (!cmdBuffer) return true; // allow manual/null calls (e.g. tests)
+    void* active = m_activeCandidateCmdBuffer.load();
+    if (active == cmdBuffer) {
+        return m_activeCandidateCmdBuffer.compare_exchange_strong(active, nullptr);
+    }
+    return false;
+}
+
 void CBREngine::OnBeginFrame() {
     if (!m_enabled.load()) return;
 
     uint32_t currentFrame = m_frameIndex.load();
     JitterManager::Get().Update(currentFrame);
+
+    const auto config = ConfigManager::Get().GetConfig();
+    if (config.samplingStrategy == SamplingStrategy::StrategyA && config.jitterDirection != 0) {
+        PatternScanner::UpdateCameraJitter(currentFrame, m_activeApi.load() == GraphicsApi::Vulkan);
+    }
 }
 
 void CBREngine::OnPreRender() {
     if (!m_enabled.load()) return;
     // Jitter is active for projection matrix during scene geometry pass
+    const uint32_t currentFrame = m_frameIndex.load();
+    const auto config = ConfigManager::Get().GetConfig();
+    if (config.samplingStrategy == SamplingStrategy::StrategyA && config.jitterDirection != 0) {
+        PatternScanner::UpdateCameraJitter(currentFrame, m_activeApi.load() == GraphicsApi::Vulkan);
+    }
 }
 
 void CBREngine::OnPostRender() {
@@ -1780,6 +1817,7 @@ void CBREngine::OnPostPresent(void* presentTarget) {
 
 void CBREngine::OnSwapchainRecreated(uint32_t width, uint32_t height) {
     m_mainPresentTarget.store(nullptr);
+    m_activeCandidateCmdBuffer.store(nullptr);
     m_frameIndex.store(0);
     m_lastDispatchedFrame.store(kNoFrame);
 
@@ -2343,23 +2381,31 @@ LONG WINAPI CBRUnhandledExceptionFilter(EXCEPTION_POINTERS* pEx) {
     ss << "=================================================================\n";
     const std::string report = ss.str();
 
-    // 1. Output to standard cbr.log and flush immediately
-    CBR_LOG_ERROR("%s", report.c_str());
-    Logger::Get().Flush();
-
-    // 2. Output to dedicated cbr_crash.log
+    // 1. Output to dedicated cbr_crash.log via raw Win32 API (async-signal-safe, deadlock-free)
     const std::filesystem::path crashLog = g_crashLogDirectory / "cbr_crash.log";
-    std::ofstream crashFile(crashLog, std::ios::out | std::ios::app);
-    if (crashFile.is_open()) {
-        crashFile << report;
-        crashFile.flush();
+    HANDLE hCrashFile = CreateFileW(crashLog.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                    nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hCrashFile != INVALID_HANDLE_VALUE) {
+        DWORD written = 0;
+        WriteFile(hCrashFile, report.c_str(), static_cast<DWORD>(report.size()), &written, nullptr);
+        FlushFileBuffers(hCrashFile);
+        CloseHandle(hCrashFile);
+    }
+
+    // 2. Also append directly to cbr.log via raw Win32 API without touching Logger mutex
+    const std::filesystem::path mainLog = g_crashLogDirectory / "cbr.log";
+    HANDLE hMainLog = CreateFileW(mainLog.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                  nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hMainLog != INVALID_HANDLE_VALUE) {
+        DWORD written = 0;
+        WriteFile(hMainLog, report.c_str(), static_cast<DWORD>(report.size()), &written, nullptr);
+        FlushFileBuffers(hMainLog);
+        CloseHandle(hMainLog);
     }
 
     // 3. Write minidump (.dmp) for Visual Studio / WinDbg debugging
     const std::filesystem::path dumpPath = g_crashLogDirectory / "cbr_crash.dmp";
     WriteMinidump(pEx, dumpPath);
-    CBR_LOG_INFO("Crash minidump written to: %s", dumpPath.string().c_str());
-    Logger::Get().Flush();
 
     if (g_previousFilter) {
         return g_previousFilter(pEx);
@@ -2550,11 +2596,13 @@ typedef void  (*PFN_vkCmdSetScissor)(void* commandBuffer, uint32_t firstScissor,
 typedef void  (*PFN_vkCmdBeginRenderPass)(void* commandBuffer, const void* pRenderPassBegin, uint32_t contents);
 typedef void  (*PFN_vkCmdEndRenderPass)(void* commandBuffer);
 typedef void  (*PFN_vkCmdSetSampleLocationsEXT)(void* commandBuffer, const MinimalVkSampleLocationsInfoEXT* pSampleLocationsInfo);
+typedef int   (*PFN_vkGetSwapchainImagesKHR)(void* device, void* swapchain, uint32_t* pSwapchainImageCount, void** pSwapchainImages);
 
 PFN_vkGetDeviceProcAddr        g_Original_vkGetDeviceProcAddr = nullptr;
 PFN_vkGetInstanceProcAddr      g_Original_vkGetInstanceProcAddr = nullptr;
 PFN_vkQueuePresentKHR          g_Original_vkQueuePresentKHR = nullptr;
 PFN_vkCreateSwapchainKHR       g_Original_vkCreateSwapchainKHR = nullptr;
+PFN_vkGetSwapchainImagesKHR    g_Original_vkGetSwapchainImagesKHR = nullptr;
 PFN_vkCmdSetViewport           g_Original_vkCmdSetViewport = nullptr;
 PFN_vkCmdSetScissor            g_Original_vkCmdSetScissor = nullptr;
 PFN_vkCmdBeginRenderPass       g_Original_vkCmdBeginRenderPass = nullptr;
@@ -2563,6 +2611,7 @@ PFN_vkCmdSetSampleLocationsEXT g_Original_vkCmdSetSampleLocationsEXT = nullptr;
 
 void* Hooked_vkGetDeviceProcAddr(void* device, const char* pName);
 void* Hooked_vkGetInstanceProcAddr(void* instance, const char* pName);
+int   Hooked_vkGetSwapchainImagesKHR(void* device, void* swapchain, uint32_t* pSwapchainImageCount, void** pSwapchainImages);
 void  Hooked_vkCmdSetViewport(void* commandBuffer, uint32_t firstViewport, uint32_t viewportCount, const MinimalVkViewport* pViewports);
 void  Hooked_vkCmdSetScissor(void* commandBuffer, uint32_t firstScissor, uint32_t scissorCount, const MinimalVkRect2D* pScissors);
 void  Hooked_vkCmdBeginRenderPass(void* commandBuffer, const void* pRenderPassBegin, uint32_t contents);
@@ -2749,6 +2798,18 @@ int Hooked_vkCreateSwapchainKHR(void* device, const void* pCreateInfo, const voi
     return result;
 }
 
+int Hooked_vkGetSwapchainImagesKHR(void* device, void* swapchain, uint32_t* pSwapchainImageCount, void** pSwapchainImages) {
+    if (!g_Original_vkGetSwapchainImagesKHR) {
+        return kVkErrorInitializationFailed;
+    }
+    int result = g_Original_vkGetSwapchainImagesKHR(device, swapchain, pSwapchainImageCount, pSwapchainImages);
+    if (result == 0 && pSwapchainImages && pSwapchainImageCount && *pSwapchainImageCount > 0) {
+        CBR_LOG_INFO("vkGetSwapchainImagesKHR: %u swapchain image(s) captured for device %p.",
+                     *pSwapchainImageCount, device);
+    }
+    return result;
+}
+
 void Hooked_vkCmdSetViewport(void* commandBuffer, uint32_t firstViewport, uint32_t viewportCount, const MinimalVkViewport* pViewports) {
     if (!g_Original_vkCmdSetViewport) return;
 
@@ -2762,6 +2823,9 @@ void Hooked_vkCmdSetViewport(void* commandBuffer, uint32_t firstViewport, uint32
             static_cast<uint32_t>(pViewports[0].width),
             static_cast<uint32_t>(pViewports[0].height),
             0)) {
+
+        // Mark this command buffer as actively executing the intercepted scene geometry pass
+        CBREngine::Get().MarkCandidatePassActive(commandBuffer);
 
         MinimalVkViewport redirected = pViewports[0];
         redirected.width = static_cast<float>(dims.quarterWidth);
@@ -2822,17 +2886,6 @@ void Hooked_vkCmdSetScissor(void* commandBuffer, uint32_t firstScissor, uint32_t
 void Hooked_vkCmdBeginRenderPass(void* commandBuffer, const void* pRenderPassBegin, uint32_t contents) {
     if (!g_Original_vkCmdBeginRenderPass) return;
 
-    if (CBREngine::Get().IsEnabled()) {
-        const auto config = ConfigManager::Get().GetConfig();
-        if (config.samplingStrategy == SamplingStrategy::StrategyB && g_Original_vkCmdSetSampleLocationsEXT) {
-            const uint32_t currentFrame = CBREngine::Get().GetCurrentFrameIndex();
-            MinimalVkSampleLocationsInfoEXT sampleInfo{};
-            MinimalVkSampleLocationEXT sampleLocs[2]{};
-            ConfigureCheckerboardSampleLocations(currentFrame, sampleInfo, sampleLocs);
-            g_Original_vkCmdSetSampleLocationsEXT(commandBuffer, &sampleInfo);
-        }
-    }
-
     g_Original_vkCmdBeginRenderPass(commandBuffer, pRenderPassBegin, contents);
 }
 
@@ -2843,7 +2896,10 @@ void Hooked_vkCmdEndRenderPass(void* commandBuffer) {
 
     if (CBREngine::Get().IsEnabled()) {
         try {
-            CBREngine::Get().OnScenePassEnd(commandBuffer);
+            // Only trigger reconstruction if this command buffer executed the intercepted scene pass!
+            if (CBREngine::Get().ConsumeCandidatePassActive(commandBuffer)) {
+                CBREngine::Get().OnScenePassEnd(commandBuffer);
+            }
         } catch (...) {
         }
     }
@@ -2854,7 +2910,8 @@ void Hooked_vkCmdSetSampleLocationsEXT(void* commandBuffer, const MinimalVkSampl
 
     if (CBREngine::Get().IsEnabled()) {
         const auto config = ConfigManager::Get().GetConfig();
-        if (config.samplingStrategy == SamplingStrategy::StrategyB) {
+        if (config.samplingStrategy == SamplingStrategy::StrategyB &&
+            CBREngine::Get().IsCandidatePassActive(commandBuffer)) {
             const uint32_t currentFrame = CBREngine::Get().GetCurrentFrameIndex();
             MinimalVkSampleLocationsInfoEXT sampleInfo{};
             MinimalVkSampleLocationEXT sampleLocs[2]{};
@@ -2888,6 +2945,12 @@ void* Hooked_vkGetDeviceProcAddr(void* device, const char* pName) {
             g_Original_vkCreateSwapchainKHR = reinterpret_cast<PFN_vkCreateSwapchainKHR>(realProc);
         }
         return reinterpret_cast<void*>(&Hooked_vkCreateSwapchainKHR);
+    }
+    if (std::strcmp(pName, "vkGetSwapchainImagesKHR") == 0) {
+        if (!g_Original_vkGetSwapchainImagesKHR) {
+            g_Original_vkGetSwapchainImagesKHR = reinterpret_cast<PFN_vkGetSwapchainImagesKHR>(realProc);
+        }
+        return reinterpret_cast<void*>(&Hooked_vkGetSwapchainImagesKHR);
     }
     if (std::strcmp(pName, "vkCmdSetViewport") == 0) {
         if (!g_Original_vkCmdSetViewport) {
@@ -2943,6 +3006,12 @@ void* Hooked_vkGetInstanceProcAddr(void* instance, const char* pName) {
             g_Original_vkCreateSwapchainKHR = reinterpret_cast<PFN_vkCreateSwapchainKHR>(realProc);
         }
         return reinterpret_cast<void*>(&Hooked_vkCreateSwapchainKHR);
+    }
+    if (std::strcmp(pName, "vkGetSwapchainImagesKHR") == 0) {
+        if (!g_Original_vkGetSwapchainImagesKHR) {
+            g_Original_vkGetSwapchainImagesKHR = reinterpret_cast<PFN_vkGetSwapchainImagesKHR>(realProc);
+        }
+        return reinterpret_cast<void*>(&Hooked_vkGetSwapchainImagesKHR);
     }
     if (std::strcmp(pName, "vkCmdSetViewport") == 0) {
         if (!g_Original_vkCmdSetViewport) {
@@ -3042,6 +3111,21 @@ bool HookManager::InstallVulkanHooks() {
             hookedAny = true;
         } else {
             CBR_LOG_WARN("MinHook: Could not detour vkCreateSwapchainKHR (status: %d).", mhStatus);
+        }
+    }
+
+    // 2b. Detour vkGetSwapchainImagesKHR
+    auto pfnGetSwapchainImages = reinterpret_cast<void*>(GetProcAddress(vulkanModule, "vkGetSwapchainImagesKHR"));
+    if (pfnGetSwapchainImages) {
+        mhStatus = MH_CreateHook(
+            pfnGetSwapchainImages,
+            reinterpret_cast<LPVOID>(&Hooked_vkGetSwapchainImagesKHR),
+            reinterpret_cast<LPVOID*>(&g_Original_vkGetSwapchainImagesKHR)
+        );
+        if (mhStatus == MH_OK || mhStatus == MH_ERROR_ALREADY_CREATED) {
+            MH_EnableHook(pfnGetSwapchainImages);
+            CBR_LOG_INFO("MinHook: Successfully detoured vkGetSwapchainImagesKHR (export at 0x%p).", pfnGetSwapchainImages);
+            hookedAny = true;
         }
     }
 
@@ -3375,7 +3459,7 @@ Logger& Logger::Get() {
 }
 
 void Logger::Initialize(const std::filesystem::path& logFilePath) {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
     if (m_initialized) {
         return;
     }
@@ -3404,14 +3488,14 @@ void Logger::Initialize(const std::filesystem::path& logFilePath) {
 }
 
 void Logger::Disable() {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
     m_disabled = true;
     m_pending.clear();
     m_droppedPending = 0;
 }
 
 void Logger::Shutdown() {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
     if (m_initialized && m_logFile.is_open()) {
         m_logFile << "[INFO] Logger shutting down.\n";
         m_logFile.flush();
@@ -3424,19 +3508,19 @@ void Logger::Shutdown() {
 }
 
 void Logger::SetMinLevel(LogLevel level) {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
     m_minLevel = level;
 }
 
 void Logger::Flush() {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
     if (m_initialized && m_logFile.is_open()) {
         m_logFile.flush();
     }
 }
 
 void Logger::Log(LogLevel level, const std::string& message) {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
 
     if (level < m_minLevel) {
         return;
@@ -3470,7 +3554,11 @@ void Logger::Log(LogLevel level, const std::string& message) {
 
     if (m_initialized && m_logFile.is_open()) {
         m_logFile << formatted;
-        m_logFile.flush(); // Immediate flush ensures zero loss on game crash
+        // Avoid synchronous disk flush on high-frequency render-thread frames;
+        // only flush immediately on warnings and errors to prevent I/O micro-stutters.
+        if (level >= LogLevel::Warning) {
+            m_logFile.flush();
+        }
     } else if (!m_initialized && !m_disabled) {
         if (m_pending.size() < kMaxPendingMessages) {
             m_pending.push_back(formatted);
@@ -3613,10 +3701,25 @@ const uint8_t* PatternScanner::ScanModule(const char* moduleName, const char* si
             const auto* secBase = reinterpret_cast<const uint8_t*>(hMod) + sec.VirtualAddress;
             const size_t secSize = sec.Misc.VirtualSize > 0 ? sec.Misc.VirtualSize : sec.SizeOfRawData;
 
-            const uint8_t* found = FindPattern(secBase, secSize, signature, mask);
-            if (found) {
-                return found;
+#if defined(_MSC_VER)
+            __try {
+                const uint8_t* found = FindPattern(secBase, secSize, signature, mask);
+                if (found) {
+                    return found;
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                // Guard page or access violation encountered during pattern scan
             }
+#else
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (VirtualQuery(secBase, &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT &&
+                !(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) {
+                const uint8_t* found = FindPattern(secBase, secSize, signature, mask);
+                if (found) {
+                    return found;
+                }
+            }
+#endif
         }
     }
     return nullptr;
@@ -3729,7 +3832,12 @@ constexpr uint32_t kVkStructureTypePipelineLayoutCreateInfo = 30;
 constexpr uint32_t kVkStructureTypeDescriptorSetLayoutCreateInfo = 32;
 constexpr uint32_t kVkStructureTypeDescriptorPoolCreateInfo = 33;
 constexpr uint32_t kVkStructureTypeDescriptorSetAllocateInfo = 34;
+constexpr uint32_t kVkStructureTypeWriteDescriptorSet = 35;
 constexpr uint32_t kVkStructureTypeMemoryBarrier = 46;
+constexpr uint32_t kVkStructureTypeImageMemoryBarrier = 47;
+
+constexpr uint32_t kVkImageLayoutGeneral = 3;
+constexpr uint32_t kVkImageLayoutShaderReadOnlyOptimal = 5;
 
 constexpr uint32_t kVkShaderStageComputeBit = 0x00000020;
 constexpr uint32_t kVkPipelineBindPointCompute = 1;
@@ -3801,6 +3909,46 @@ struct MinimalVkMemoryBarrier {
     uint32_t    dstAccessMask;
 };
 
+struct MinimalVkDescriptorImageInfo {
+    void*    sampler;
+    void*    imageView;
+    uint32_t imageLayout;
+};
+
+struct MinimalVkWriteDescriptorSet {
+    uint32_t                            sType;
+    const void*                         pNext;
+    void*                               dstSet;
+    uint32_t                            dstBinding;
+    uint32_t                            dstArrayElement;
+    uint32_t                            descriptorCount;
+    uint32_t                            descriptorType;
+    const MinimalVkDescriptorImageInfo* pImageInfo;
+    const void*                         pBufferInfo;
+    const void*                         pTexelBufferView;
+};
+
+struct MinimalVkImageSubresourceRange {
+    uint32_t aspectMask;
+    uint32_t baseMipLevel;
+    uint32_t levelCount;
+    uint32_t baseArrayLayer;
+    uint32_t layerCount;
+};
+
+struct MinimalVkImageMemoryBarrier {
+    uint32_t                       sType;
+    const void*                    pNext;
+    uint32_t                       srcAccessMask;
+    uint32_t                       dstAccessMask;
+    uint32_t                       oldLayout;
+    uint32_t                       newLayout;
+    uint32_t                       srcQueueFamilyIndex;
+    uint32_t                       dstQueueFamilyIndex;
+    void*                          image;
+    MinimalVkImageSubresourceRange subresourceRange;
+};
+
 struct MinimalVkPipelineLayoutCreateInfo {
     uint32_t                          sType;
     const void*                       pNext;
@@ -3839,6 +3987,7 @@ typedef void  (*PFN_vkDestroyDescriptorSetLayout)(void* device, void* setLayout,
 typedef int   (*PFN_vkCreateDescriptorPool)(void* device, const MinimalVkDescriptorPoolCreateInfo* pCreateInfo, const void* pAllocator, void** pDescriptorPool);
 typedef void  (*PFN_vkDestroyDescriptorPool)(void* device, void* descriptorPool, const void* pAllocator);
 typedef int   (*PFN_vkAllocateDescriptorSets)(void* device, const MinimalVkDescriptorSetAllocateInfo* pAllocateInfo, void** pDescriptorSets);
+typedef void  (*PFN_vkUpdateDescriptorSets)(void* device, uint32_t descriptorWriteCount, const MinimalVkWriteDescriptorSet* pDescriptorWrites, uint32_t descriptorCopyCount, const void* pDescriptorCopies);
 typedef int   (*PFN_vkCreatePipelineLayout)(void* device, const MinimalVkPipelineLayoutCreateInfo* pCreateInfo, const void* pAllocator, void** pPipelineLayout);
 typedef void  (*PFN_vkDestroyPipelineLayout)(void* device, void* pipelineLayout, const void* pAllocator);
 typedef int   (*PFN_vkCreateComputePipelines)(void* device, void* pipelineCache, uint32_t createInfoCount, const MinimalVkComputePipelineCreateInfo* pCreateInfos, const void* pAllocator, void** pPipelines);
@@ -4124,6 +4273,7 @@ void ReconstructionPass::DestroyVulkanPipeline() {
         pfnDestroyDescriptorSetLayout(m_device, m_descriptorSetLayout, nullptr);
         m_descriptorSetLayout = nullptr;
     }
+    m_descriptorsBound.store(false);
 #endif
 }
 
@@ -4133,6 +4283,11 @@ bool ReconstructionPass::InitializeVulkan(void* vkDevice, void* /*vkPhysicalDevi
         m_initialized.store(true);
         CBR_LOG_INFO("ReconstructionPass initialized for Vulkan API pipeline (device handle deferred).");
         return true;
+    }
+
+    // Destroy existing pipeline objects on swapchain recreation to prevent driver resource leakage
+    if (m_pipeline || m_descriptorPool || m_pipelineLayout || m_descriptorSetLayout) {
+        DestroyVulkanPipeline();
     }
 
     m_device = vkDevice;
@@ -4158,8 +4313,84 @@ void ReconstructionPass::Shutdown() {
     m_descriptorSetLayout = nullptr;
     m_descriptorPool = nullptr;
     m_descriptorSet = nullptr;
+    m_descriptorsBound.store(false);
     m_initialized.store(false);
     CBR_LOG_INFO("ReconstructionPass shut down cleanly.");
+}
+
+bool ReconstructionPass::UpdateVulkanDescriptors(void* quarterColorView, void* quarterDepthView,
+                                                void* historyColorView, void* historyDepthView,
+                                                void* velocityView,
+                                                void* outputImageView, void* outputDepthView,
+                                                void* linearSampler, void* pointSampler) {
+#if defined(_WIN32)
+    if (!m_device || !m_descriptorSet) return false;
+
+    HMODULE vulkanModule = GetModuleHandleA("vulkan-1.dll");
+    if (!vulkanModule) return false;
+
+    auto pfnGetDeviceProcAddr = reinterpret_cast<PFN_vkGetDeviceProcAddr>(GetProcAddress(vulkanModule, "vkGetDeviceProcAddr"));
+    auto resolveDeviceFunc = [&](const char* name) -> void* {
+        if (pfnGetDeviceProcAddr && m_device) {
+            void* p = pfnGetDeviceProcAddr(m_device, name);
+            if (p) return p;
+        }
+        return reinterpret_cast<void*>(GetProcAddress(vulkanModule, name));
+    };
+
+    auto pfnUpdateDescriptorSets = reinterpret_cast<PFN_vkUpdateDescriptorSets>(resolveDeviceFunc("vkUpdateDescriptorSets"));
+    if (!pfnUpdateDescriptorSets) return false;
+
+    MinimalVkDescriptorImageInfo imageInfos[7]{};
+    imageInfos[0].sampler = pointSampler;
+    imageInfos[0].imageView = quarterColorView;
+    imageInfos[0].imageLayout = kVkImageLayoutShaderReadOnlyOptimal;
+
+    imageInfos[1].sampler = pointSampler;
+    imageInfos[1].imageView = quarterDepthView;
+    imageInfos[1].imageLayout = kVkImageLayoutShaderReadOnlyOptimal;
+
+    imageInfos[2].sampler = linearSampler;
+    imageInfos[2].imageView = historyColorView;
+    imageInfos[2].imageLayout = kVkImageLayoutShaderReadOnlyOptimal;
+
+    imageInfos[3].sampler = pointSampler;
+    imageInfos[3].imageView = historyDepthView;
+    imageInfos[3].imageLayout = kVkImageLayoutShaderReadOnlyOptimal;
+
+    imageInfos[4].sampler = linearSampler;
+    imageInfos[4].imageView = velocityView;
+    imageInfos[4].imageLayout = kVkImageLayoutShaderReadOnlyOptimal;
+
+    imageInfos[5].sampler = nullptr;
+    imageInfos[5].imageView = outputImageView;
+    imageInfos[5].imageLayout = kVkImageLayoutGeneral;
+
+    imageInfos[6].sampler = nullptr;
+    imageInfos[6].imageView = outputDepthView;
+    imageInfos[6].imageLayout = kVkImageLayoutGeneral;
+
+    MinimalVkWriteDescriptorSet writes[7]{};
+    for (uint32_t i = 0; i < 7; ++i) {
+        writes[i].sType = kVkStructureTypeWriteDescriptorSet;
+        writes[i].dstSet = m_descriptorSet;
+        writes[i].dstBinding = i;
+        writes[i].dstArrayElement = 0;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = (i < 5) ? kVkDescriptorTypeCombinedImageSampler : kVkDescriptorTypeStorageImage;
+        writes[i].pImageInfo = &imageInfos[i];
+    }
+
+    pfnUpdateDescriptorSets(m_device, 7, writes, 0, nullptr);
+    m_descriptorsBound.store(true);
+    CBR_LOG_INFO("ReconstructionPass: Vulkan descriptors successfully updated with active image views.");
+    return true;
+#else
+    (void)quarterColorView; (void)quarterDepthView; (void)historyColorView;
+    (void)historyDepthView; (void)velocityView; (void)outputImageView;
+    (void)outputDepthView; (void)linearSampler; (void)pointSampler;
+    return true;
+#endif
 }
 
 ReconstructionPushConstants BuildReconstructionPushConstants(uint32_t frameIndex) {
@@ -4203,6 +4434,14 @@ void ReconstructionPass::DispatchVulkan(void* vkCommandBuffer, uint32_t frameInd
         static std::atomic<bool> s_warned{ false };
         if (!s_warned.exchange(true)) {
             CBR_LOG_WARN("DispatchVulkan: compute pipeline not loaded; skipping dispatch.");
+        }
+        return;
+    }
+
+    if (!m_descriptorsBound.load()) {
+        static std::atomic<bool> s_warnedDescriptors{ false };
+        if (!s_warnedDescriptors.exchange(true)) {
+            CBR_LOG_WARN("DispatchVulkan deferred: descriptor set not yet bound with active image views.");
         }
         return;
     }

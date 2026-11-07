@@ -218,23 +218,31 @@ LONG WINAPI CBRUnhandledExceptionFilter(EXCEPTION_POINTERS* pEx) {
     ss << "=================================================================\n";
     const std::string report = ss.str();
 
-    // 1. Output to standard cbr.log and flush immediately
-    CBR_LOG_ERROR("%s", report.c_str());
-    Logger::Get().Flush();
-
-    // 2. Output to dedicated cbr_crash.log
+    // 1. Output to dedicated cbr_crash.log via raw Win32 API (async-signal-safe, deadlock-free)
     const std::filesystem::path crashLog = g_crashLogDirectory / "cbr_crash.log";
-    std::ofstream crashFile(crashLog, std::ios::out | std::ios::app);
-    if (crashFile.is_open()) {
-        crashFile << report;
-        crashFile.flush();
+    HANDLE hCrashFile = CreateFileW(crashLog.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                    nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hCrashFile != INVALID_HANDLE_VALUE) {
+        DWORD written = 0;
+        WriteFile(hCrashFile, report.c_str(), static_cast<DWORD>(report.size()), &written, nullptr);
+        FlushFileBuffers(hCrashFile);
+        CloseHandle(hCrashFile);
+    }
+
+    // 2. Also append directly to cbr.log via raw Win32 API without touching Logger mutex
+    const std::filesystem::path mainLog = g_crashLogDirectory / "cbr.log";
+    HANDLE hMainLog = CreateFileW(mainLog.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                  nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hMainLog != INVALID_HANDLE_VALUE) {
+        DWORD written = 0;
+        WriteFile(hMainLog, report.c_str(), static_cast<DWORD>(report.size()), &written, nullptr);
+        FlushFileBuffers(hMainLog);
+        CloseHandle(hMainLog);
     }
 
     // 3. Write minidump (.dmp) for Visual Studio / WinDbg debugging
     const std::filesystem::path dumpPath = g_crashLogDirectory / "cbr_crash.dmp";
     WriteMinidump(pEx, dumpPath);
-    CBR_LOG_INFO("Crash minidump written to: %s", dumpPath.string().c_str());
-    Logger::Get().Flush();
 
     if (g_previousFilter) {
         return g_previousFilter(pEx);

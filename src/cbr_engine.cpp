@@ -7,6 +7,7 @@
 #include "cbr/ui_overlay.h"
 #include "cbr/hooks.h"
 #include "cbr/crash_handler.h"
+#include "cbr/pattern_scanner.h"
 #include <cctype>
 #include <string>
 
@@ -137,16 +138,35 @@ void CBREngine::Shutdown(bool isProcessExit) {
     m_initialized.store(false);
 }
 
+bool CBREngine::ConsumeCandidatePassActive(void* cmdBuffer) {
+    if (!cmdBuffer) return true; // allow manual/null calls (e.g. tests)
+    void* active = m_activeCandidateCmdBuffer.load();
+    if (active == cmdBuffer) {
+        return m_activeCandidateCmdBuffer.compare_exchange_strong(active, nullptr);
+    }
+    return false;
+}
+
 void CBREngine::OnBeginFrame() {
     if (!m_enabled.load()) return;
 
     uint32_t currentFrame = m_frameIndex.load();
     JitterManager::Get().Update(currentFrame);
+
+    const auto config = ConfigManager::Get().GetConfig();
+    if (config.samplingStrategy == SamplingStrategy::StrategyA && config.jitterDirection != 0) {
+        PatternScanner::UpdateCameraJitter(currentFrame, m_activeApi.load() == GraphicsApi::Vulkan);
+    }
 }
 
 void CBREngine::OnPreRender() {
     if (!m_enabled.load()) return;
     // Jitter is active for projection matrix during scene geometry pass
+    const uint32_t currentFrame = m_frameIndex.load();
+    const auto config = ConfigManager::Get().GetConfig();
+    if (config.samplingStrategy == SamplingStrategy::StrategyA && config.jitterDirection != 0) {
+        PatternScanner::UpdateCameraJitter(currentFrame, m_activeApi.load() == GraphicsApi::Vulkan);
+    }
 }
 
 void CBREngine::OnPostRender() {
@@ -208,6 +228,7 @@ void CBREngine::OnPostPresent(void* presentTarget) {
 
 void CBREngine::OnSwapchainRecreated(uint32_t width, uint32_t height) {
     m_mainPresentTarget.store(nullptr);
+    m_activeCandidateCmdBuffer.store(nullptr);
     m_frameIndex.store(0);
     m_lastDispatchedFrame.store(kNoFrame);
 
