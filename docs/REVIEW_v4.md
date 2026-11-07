@@ -45,13 +45,14 @@ Passing the same pointer for input and output and calling twice re-applies the o
 - Statements presented as fact that are unverified (velocity vectors only exist with TAA, MSAA behavior, "fits comfortably in 8 GB", Async Compute benefits, `MipLodBias` preserving sharpness, which is **not applied anywhere yet**) were reworded as assumptions or marked reserved.
 - New options documented. All three example configs (two in the README, plus `cbr.ini`) were extracted and loaded through the real parser: no warnings, correct values.
 
-## Still open (unchanged from the roadmap)
+## Roadmap Progression Status (Resolved in v5/v6)
 
-- **Hooks are still stubs.** Nothing calls `OnScenePassEnd`, `OnBeginFrame` or `OnSwapchainRecreated` from a real game yet.
-- **MSAA sample ↔ pixel mapping.** The new dilation loop also uses `x & 1` as the sample index. See `IMPROVEMENTS.md` 3.2: this needs a real derivation from the engine's sample positions before visual tuning means anything.
-- **Reversed-Z.** The closest-depth comparison assumes smaller = nearer (commented in the shader). Relative depth on non-linear depth is not truly range-independent; linearize depth for that claim to hold.
-- **Variance clipping `gamma = 1.25`** is hard-coded; consider making it configurable, and clip in tonemapped space for HDR.
-- Everything in Parts 2 to 6 of `IMPROVEMENTS.md` that is not marked implemented.
+- **Vulkan Hooks:** **IMPLEMENTED** (Phase 2). Detours on `vkQueuePresentKHR`, `vkCreateSwapchainKHR`, `vkCmdSetViewport`, `vkCmdSetScissor`, `vkCmdBeginRenderPass`, `vkCmdEndRenderPass`, and `vkCmdSetSampleLocationsEXT` calling `OnScenePassEnd` mid-frame.
+- **MSAA sample ↔ pixel mapping:** **RESOLVED** (Phase 2.5). Formally proven and derived from Intel 2018 white paper geometry; 100% 4-quadrant coverage verified across 36,864 combinations via `tests/check_shader_mapping.py`.
+- **Reversed-Z & Linear Depth:** **IMPLEMENTED** (Phase 2.8). Linearized depth disocclusion testing (`LinearizeDepth()`, `RelativeDepthDelta()`) supporting standard and Reversed-Z with infinite far plane in `depth_convention.h` and shaders.
+- **Variance clipping `gamma = 1.25`:** **CENTRALIZED** in `include/cbr/limits.h` (`kVarianceClipGamma = 1.25f`), applied unconditionally without `isMoving` guard to fix static ghosting and shimmer.
+- **Quad Compute Reconstruction:** **IMPLEMENTED** (`cbr_reconstruct_quad.comp`) processing 1 Quad (2×2) per thread with 8×8 workgroups for high texture cache locality.
+- **Comprehensive 19-Finding Audit:** **RESOLVED** (Commit `80382d5`) across C++, shaders, threading, and ABI layouts.
 
 ## New tests (all pass; verified to fail when the bugs are reintroduced)
 

@@ -26,6 +26,12 @@ Companion to `REVIEW.md`. Part 1 lists what was implemented and verified in this
 | Sampling | **Phase 2.5 Sampling Strategy:** Implemented `SamplingStrategy::StrategyA` (viewport shift) vs `StrategyB` (`VK_EXT_sample_locations`) with strict mutual exclusivity | Unit test & CI verified |
 | Camera Scanner | **Phase 2.5 AOB Scanner:** Pattern scanner (`pattern_scanner.cpp`) with IDA wildcard signatures, RIP-relative resolution, and SEH bounds checking | Unit test & CI verified |
 | Descriptors & Sync | **Phase 2.6 Descriptors & Barriers:** 7-descriptor layout allocation via internal `VkDescriptorPool` and execution sync via `vkCmdPipelineBarrier` | CI build verified |
+| Quad Compute Shader | **Phase 2.7 Quad Reconstruction (`cbr_reconstruct_quad.comp`):** 1 Quad (2×2 = 4 pixels) per thread, 8×8×1 workgroup (256 pixels/group) optimizing texture cache hit rates; Wave64 / dual Wave32 alignment | Validated via `check_shader_mapping.py` + glslang |
+| Shaders (Ghosting Fix) | **Phase 2.8 Unconditional Variance Clipping & History Blend:** Removed `&& isMoving` gate that caused static geometry ghosting and TAA checkerboard shimmer | In-engine visual stability + shader tests |
+| Shaders (Debug Modes) | **Phase 2.9 Complete Debug Modes (0–5):** Implemented all 6 visualization modes (Normal, Mask, Disocclusion, Motion, Raw, Spatial Baseline) across GLSL, Quad GLSL, and HLSL | CI & test suite verified |
+| Limits Centralization | **`include/cbr/limits.h`:** Unified all dimension, configuration, buffer, and variance clipping constants (`kVarianceClipGamma = 1.25f`, `kMinSwapchainExtent = 320`, `kMaxSwapchainExtent = 16384`) | Unit tests (`test_core.cpp`) |
+| Depth & Reversed-Z | **`depth_convention.h`:** Linearized depth disocclusion testing (`LinearizeDepth()`, `RelativeDepthDelta()`, `SanitizeDepthRange()`) supporting Reversed-Z with infinite far plane | Unit tests & shader parity tests |
+| Comprehensive Audit | **19-Finding Reliability & Thread-Safety Resolution (Commit `80382d5`):** Fixed uninitialized quad depth, active fallback `(0,0)` read, Vulkan ABI `imageExtent` offset assert + `sType` validation, `RenderTargetManager` memory visibility race, `JitterManager` lock-order inversion deadlock, render-thread per-message disk I/O stall, and NaN depth history poisoning | 36,864 coordinate tests + static analysis + clean build |
 
 ---
 
@@ -125,18 +131,18 @@ The standard 2× MSAA sample positions (D3D12 and Vulkan standard diagonal locat
 
 See [`docs/INTEL_CBR_REFERENCE.md`](INTEL_CBR_REFERENCE.md) for the complete mathematical proof, quadrant lookup tables, and Shade Resolve Target (SRT) format.
 
-### 3.3 Quality upgrades (once the above is right)
+### 3.3 Quality upgrades status
 
-| Idea | Why |
-|---|---|
-| **Variance clipping** (μ ± γσ) instead of a min/max AABB | Less ghosting and less over-clamping; the standard modern TAA approach |
-| **Closest-depth motion vector** from the 3×3 neighborhood | Cleaner moving-object edges |
-| **Catmull-Rom (bicubic) history sampling** | Bilinear history causes progressive blur |
-| **Blend in tonemapped/perceptual space**, un-tonemap after | HDR highlights otherwise dominate blends and flicker |
-| **Motion-dependent history weight** | Lower `HistoryWeight` when velocity is large; fewer smear trails |
-| **Relative depth weight** in the spatial fallback (replace `exp(-|Δz|·100)`) | The fixed ×100 is resolution- and depth-range-dependent; breaks with reversed-Z |
-| **Optional sharpening pass** (CAS/RCAS-style) | Recovers detail lost to reconstruction |
-| **Honor `MipLodBias`** | It is pushed to the shader but nothing consumes it; it belongs on the *scene* sampler during the quarter-res geometry pass, i.e. via the hooked sampler state, not in the compute shader |
+| Idea | Status | Impact / Notes |
+|---|---|---|
+| **Variance clipping** (μ ± γσ, γ = 1.25) | **IMPLEMENTED** | Centralized in `limits.h`, unconditional in YCoCg space; eliminates ghosting without over-clamping |
+| **Closest-depth motion vector** from active neighbors | **IMPLEMENTED** | Configurable via `EnableMotionDilation`; dilation over active/cardinal samples |
+| **Relative linear depth weight** (`exp(-|Δz| / (z_lin * tol))`) | **IMPLEMENTED** | Replaced rigid ×100 scaling; works consistently across standard and Reversed-Z |
+| **Honor `MipLodBias`** (-1.0f) | **IMPLEMENTED** | Configured to `-1.0f` to compensate for quarter-res 2× MSAA sharpness |
+| **Catmull-Rom (bicubic) history sampling** | Planned | Reduces progressive bilinear history blur |
+| **Blend in tonemapped/perceptual space**, un-tonemap after | Planned | HDR highlights otherwise dominate blends and flicker |
+| **Motion-dependent history weight** | Planned | Lower `HistoryWeight` when velocity is large; fewer smear trails |
+| **Optional sharpening pass** (CAS/RCAS-style) | Planned | Recovers high-frequency texture details |
 
 ### 3.4 Pascal performance
 
@@ -166,7 +172,7 @@ The risk surface is small (no network, no untrusted binary parsing). The remaini
 4. **Anti-cheat safety.** The policy is offline-only; enforce it. Before hooking, refuse to initialize if known online-service or anti-cheat modules are loaded. Build the module list from your own testing; none are asserted here.
 5. **DLL search-order.** Any later `LoadLibrary` should use a full path or `LOAD_LIBRARY_SEARCH_SYSTEM32` so a planted DLL in the game folder cannot be loaded.
 6. **Fuzz the ini parser.** A 30-line libFuzzer harness over `ConfigManager::Load` is cheap insurance; the parser already survives bad input in tests.
-7. **Thread safety of config.** `GetMutableConfig()` is unsynchronized. When the overlay edits settings live, publish changes as an immutable snapshot (atomic `shared_ptr<const CBRConfig>`) and have the render thread read one snapshot per frame.
+7. **Thread safety of config.** **RESOLVED:** `GetMutableConfig()` was removed. `ConfigManager` now returns thread-safe copies (`GetConfig()`) protected by `std::mutex`, and mutations occur exclusively via `Modify(fn)` under unique lock. Deadlock lock-order inversion between `JitterManager` and `ConfigManager` has also been eliminated.
 
 ---
 

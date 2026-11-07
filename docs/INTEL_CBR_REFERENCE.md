@@ -133,10 +133,10 @@ is mathematically scale-invariant from 0.1 meters to 10,000 meters.
 
 ## 3. Texture Sharpening via Mip LOD Bias
 
-The Intel white paper confirms:
+The Intel white paper notes:
 > *"In order to get increased texture resolution, a MIP LOD bias needs to be applied to textures... In Direct3D 12, use a D3D12_SAMPLER_DESC MipLODBias of -0.5f during the 3D scene pass."*
 
-Because the geometry is rasterized at half shading density, standard anisotropic texture filtering selects mip levels that are 1 level coarser. Setting `MipLODBias = -0.5` shifts sampler lookups 0.5 levels finer, preserving full 4K Nyquist texture detail on quarter-resolution checkerboard geometry.
+While Intel's prototype applied `-0.5f` for 1D half-width checkerboard passes, our RDR2 CBR mod renders at quarter-resolution ($W/2 \times H/2$) with 2× MSAA. A full resolution halving across both axes shifts the footprint by a factor of 2.0, requiring a `MipLODBias` of **`-1.0f`** (configured in `cbr.ini`, `include/cbr/config.h`, and `CHECKERBOARD.md`). This guarantees that anisotropic texture samplers pull from the native 4K mip levels rather than downsampled levels.
 
 ---
 
@@ -145,8 +145,9 @@ Because the geometry is rasterized at half shading density, standard anisotropic
 | Concept from Intel Paper | Status in RDR2 CBR Mod | Implementation Location |
 |---|---|---|
 | **2× MSAA 4-Quadrant Geometry** | Mathematically derived & applied | `include/cbr/jitter_manager.h`, `shaders/` |
-| **Horizontal 1-Pixel Jitter (+0.5 texel)** | Standard complementary 2-phase jitter | `src/jitter_manager.cpp` |
-| **Linear Depth Conversion** | Integrated into disocclusion & spatial fallback | `shaders/cbr_reconstruct.{comp,hlsl}` |
+| **Horizontal 1-Pixel Jitter (+0.5 texel)** | Standard complementary 2-phase jitter | `src/jitter_manager.cpp`, `checkerboard_mapping.h` |
+| **Linear Depth Conversion** | Integrated into disocclusion & spatial fallback | `include/cbr/depth_convention.h`, `shaders/` |
 | **ASO vs CSO Dual-Mode Occlusion** | Selectable via `EnableMotionDilation` & config | `include/cbr/config.h`, `shaders/` |
-| **Cardinal 4-Tap Spatial Fallback** | Cross-bilateral weighting with relative depth | `shaders/cbr_reconstruct.{comp,hlsl}` |
-| **Texture Mip LOD Bias (-0.5f)** | Configured in `cbr.ini` & sampler hook design | `cbr.ini`, `include/cbr/config.h` |
+| **Cardinal 4-Tap Spatial Fallback** | Cross-bilateral weighting with relative depth | `shaders/cbr_reconstruct.{comp,hlsl}`, `cbr_reconstruct_quad.comp` |
+| **Active Fallback Protection** | Preserves native sample for active pixels | Shaders (audit commit `80382d5`) |
+| **Texture Mip LOD Bias (-1.0f)** | Configured in `cbr.ini` & sampler hook design | `cbr.ini`, `include/cbr/config.h`, `limits.h` |

@@ -42,31 +42,52 @@ Because `vulkan-1.dll` is directly loaded by RDR2 (`0x00007FFE66510000`), placin
 
 ### Step 3.1: Intercepting Swapchain Creation (`vkCreateSwapchainKHR`)
 
-When RDR2 creates or resizes its window / swapchain, `vkCreateSwapchainKHR` is invoked.
+When RDR2 creates or resizes its window / swapchain, `vkCreateSwapchainKHR` is invoked. To avoid requiring external Vulkan SDK headers at compilation time, CBR employs headerless ABI extraction with compile-time layout assertions:
 
 ```cpp
+struct MinimalVkExtent2D {
+    uint32_t width;
+    uint32_t height;
+};
+
+struct MinimalVkSwapchainCreateInfoKHR {
+    uint32_t          sType;
+    const void*       pNext;
+    uint32_t          flags;
+    uint64_t          surface;
+    uint32_t          minImageCount;
+    int32_t           imageFormat;
+    int32_t           imageColorSpace;
+    MinimalVkExtent2D imageExtent;
+};
+static_assert(offsetof(MinimalVkSwapchainCreateInfoKHR, sType) == 0, "ABI drift");
+static_assert(offsetof(MinimalVkSwapchainCreateInfoKHR, imageExtent) == (sizeof(void*) == 8 ? 44 : 28), "ABI drift: imageExtent offset");
+
 int Hooked_vkCreateSwapchainKHR(
     void* device,
     const void* pCreateInfo,
     const void* pAllocator,
     void* pSwapchain)
 {
-    // 1. Call original function first to obtain valid VkSwapchainKHR
+    if (!g_Original_vkCreateSwapchainKHR) return -3; // VK_ERROR_INITIALIZATION_FAILED
+
     int result = g_Original_vkCreateSwapchainKHR(device, pCreateInfo, pAllocator, pSwapchain);
-    if (result != 0) { // VK_SUCCESS
-        return result;
+    if (result == 0) { // VK_SUCCESS
+        uint32_t w = 0, h = 0;
+        if (pCreateInfo) {
+            uint32_t sType = 0;
+            std::memcpy(&sType, pCreateInfo, sizeof(sType));
+            constexpr uint32_t kVkStructureTypeSwapchainCreateInfoKHR = 1000001000;
+            if (sType == kVkStructureTypeSwapchainCreateInfoKHR) {
+                MinimalVkSwapchainCreateInfoKHR info{};
+                std::memcpy(&info, pCreateInfo, sizeof(info));
+                w = info.imageExtent.width;
+                h = info.imageExtent.height;
+                if (w > 16384 || h > 16384) { w = 0; h = 0; } // Bounds protection
+            }
+        }
+        try { CBREngine::Get().OnSwapchainRecreated(w, h); } catch (...) {}
     }
-
-    // 2. Extract swapchain dimensions and format
-    const auto* createInfo = static_cast<const VkSwapchainCreateInfoKHR*>(pCreateInfo);
-    uint32_t width  = createInfo->imageExtent.width;
-    uint32_t height = createInfo->imageExtent.height;
-    VkFormat format = createInfo->imageFormat;
-
-    // 3. Initialize CBR Vulkan device resources
-    CBREngine::Get().OnSwapchainRecreated(width, height);
-    ReconstructionPass::Get().InitializeVulkan(device, *static_cast<VkSwapchainKHR*>(pSwapchain));
-
     return result;
 }
 ```
@@ -128,7 +149,7 @@ To achieve quarter-resolution rendering without altering RDR2's window or swapch
 Executing reconstruction compute passes during `vkQueuePresentKHR` can lead to artifacts if post-processing or UI compositing has already completed. CBR detours `vkCmdBeginRenderPass` and `vkCmdEndRenderPass`:
 
 1. **Scene Pass Tracking:** `Hooked_vkCmdBeginRenderPass` monitors the active render pass.
-2. **Reconstruction Trigger:** When the primary HDR geometry render pass finishes in `Hooked_vkCmdEndRenderPass`, CBR dispatches `cbr_reconstruct.comp` before the post-processing and UI passes begin.
+2. **Reconstruction Trigger:** When the primary HDR geometry render pass finishes in `Hooked_vkCmdEndRenderPass`, CBR dispatches the reconstruction compute shader (`cbr_reconstruct.comp` or quad-optimized `cbr_reconstruct_quad.comp`) before post-processing and UI passes begin. All 6 debug modes (0–5) are supported.
 3. **Pipeline Barriers:** Inserts `VkMemoryBarrier` and `VkImageMemoryBarrier` transitions from `VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT` to `VK_ACCESS_SHADER_READ_BIT`.
 
 ---
