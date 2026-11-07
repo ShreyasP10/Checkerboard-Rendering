@@ -110,6 +110,12 @@ static void TestConfigHardening(const fs::path& dir) {
     CHECK(ConfigManager::Get().GetConfig().projectionJitterSign == -1);
     CHECK(ConfigManager::Get().GetConfig().samplingStrategy == SamplingStrategy::StrategyB);
     CHECK(ConfigManager::Get().GetConfig().depthConvention == DepthConvention::Standard);
+
+    // Hardened integer parsing (large 64-bit clamp) and quoted comment stripping
+    WriteFile(dir / "hardened.ini", "[General]\nTargetWidth = 9999999999999999\nPreferredApi = \"Vulkan\" ; inline comment\n");
+    CHECK(ConfigManager::Get().Load(dir / "hardened.ini"));
+    CHECK(ConfigManager::Get().GetConfig().targetWidth == 7680); // clamped to kMaxTargetWidth
+    CHECK(ConfigManager::Get().GetConfig().preferredApi == GraphicsApi::Vulkan);
 }
 
 static void TestConfigMissingFileAndRoundTrip(const fs::path& dir) {

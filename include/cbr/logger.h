@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -8,6 +10,7 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <type_traits>
 #include <vector>
 
@@ -24,7 +27,7 @@ class Logger {
 public:
     static Logger& Get();
 
-    // Opens the log file and flushes any messages buffered before this call.
+    // Opens the log file, starts the asynchronous writer worker, and flushes pre-buffered messages.
     void Initialize(const std::filesystem::path& logFilePath);
     // Discards buffered messages and stops buffering (used when LogToFile = false).
     void Disable();
@@ -60,19 +63,29 @@ public:
 
 private:
     Logger() = default;
-    ~Logger() = default;
+    ~Logger();
     Logger(const Logger&) = delete;
     Logger& operator=(const Logger&) = delete;
 
+    void WorkerThread();
+
     static constexpr size_t kMaxPendingMessages = 256;
+    static constexpr size_t kMaxQueueMessages = 2048;
 
     std::ofstream            m_logFile;
-    std::recursive_mutex     m_mutex;
+    std::mutex               m_mutex;
+    std::condition_variable  m_cv;
+    std::condition_variable  m_flushCv;
+    std::thread              m_workerThread;
+    std::atomic<bool>        m_running{ false };
+    std::atomic<bool>        m_flushRequested{ false };
     bool                     m_initialized{ false };
     bool                     m_disabled{ false };
     LogLevel                 m_minLevel{ LogLevel::Info };
     std::vector<std::string> m_pending; // messages logged before Initialize()/Disable()
+    std::vector<std::string> m_queue;   // asynchronous background worker queue
     size_t                   m_droppedPending{ 0 }; // buffered messages dropped beyond cap
+    size_t                   m_droppedQueue{ 0 };   // queue messages dropped under extreme load
 };
 
 } // namespace cbr

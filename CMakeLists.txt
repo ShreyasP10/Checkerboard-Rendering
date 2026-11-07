@@ -111,11 +111,13 @@ if(MSVC)
         /sdl
         $<$<CONFIG:Release>:/O2 /GL /GS>
     )
+    # Note: /CETCOMPAT:NO is explicitly set because MinHook dynamically allocates trampolines
+    # in runtime-allocated memory pages which do not contain Intel/AMD CET shadow-stack landing pads.
     target_link_options(rdr2-cbr PRIVATE
         /guard:cf
         /DYNAMICBASE
         /NXCOMPAT
-        $<$<CONFIG:Release>:/LTCG /OPT:REF /OPT:ICF /CETCOMPAT>
+        $<$<CONFIG:Release>:/LTCG /OPT:REF /OPT:ICF /CETCOMPAT:NO>
     )
 endif()
 

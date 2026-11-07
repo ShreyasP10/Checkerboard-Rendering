@@ -195,11 +195,13 @@ if(MSVC)
         /sdl
         $<$<CONFIG:Release>:/O2 /GL /GS>
     )
+    # Note: /CETCOMPAT:NO is explicitly set because MinHook dynamically allocates trampolines
+    # in runtime-allocated memory pages which do not contain Intel/AMD CET shadow-stack landing pads.
     target_link_options(rdr2-cbr PRIVATE
         /guard:cf
         /DYNAMICBASE
         /NXCOMPAT
-        $<$<CONFIG:Release>:/LTCG /OPT:REF /OPT:ICF /CETCOMPAT>
+        $<$<CONFIG:Release>:/LTCG /OPT:REF /OPT:ICF /CETCOMPAT:NO>
     )
 endif()
 
@@ -604,6 +606,9 @@ public:
     bool IsCandidatePassActive(void* cmdBuffer) const {
         return cmdBuffer != nullptr && m_activeCandidateCmdBuffer.load() == cmdBuffer;
     }
+
+    // Scans loaded process modules for known anti-cheat or online multiplayer binaries
+    bool CheckAntiCheatModules() const;
 
     uint32_t    GetCurrentFrameIndex() const { return m_frameIndex.load(); }
     bool        IsEnabled() const { return m_enabled.load(); }
@@ -1123,6 +1128,8 @@ inline uint32_t MakeEvenUp(uint32_t v) { return (v & 1u) ? v + 1u : v; }
 ```cpp
 #pragma once
 
+#include <atomic>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -1131,6 +1138,7 @@ inline uint32_t MakeEvenUp(uint32_t v) { return (v & 1u) ? v + 1u : v; }
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <type_traits>
 #include <vector>
 
@@ -1147,7 +1155,7 @@ class Logger {
 public:
     static Logger& Get();
 
-    // Opens the log file and flushes any messages buffered before this call.
+    // Opens the log file, starts the asynchronous writer worker, and flushes pre-buffered messages.
     void Initialize(const std::filesystem::path& logFilePath);
     // Discards buffered messages and stops buffering (used when LogToFile = false).
     void Disable();
@@ -1183,19 +1191,29 @@ public:
 
 private:
     Logger() = default;
-    ~Logger() = default;
+    ~Logger();
     Logger(const Logger&) = delete;
     Logger& operator=(const Logger&) = delete;
 
+    void WorkerThread();
+
     static constexpr size_t kMaxPendingMessages = 256;
+    static constexpr size_t kMaxQueueMessages = 2048;
 
     std::ofstream            m_logFile;
-    std::recursive_mutex     m_mutex;
+    std::mutex               m_mutex;
+    std::condition_variable  m_cv;
+    std::condition_variable  m_flushCv;
+    std::thread              m_workerThread;
+    std::atomic<bool>        m_running{ false };
+    std::atomic<bool>        m_flushRequested{ false };
     bool                     m_initialized{ false };
     bool                     m_disabled{ false };
     LogLevel                 m_minLevel{ LogLevel::Info };
     std::vector<std::string> m_pending; // messages logged before Initialize()/Disable()
+    std::vector<std::string> m_queue;   // asynchronous background worker queue
     size_t                   m_droppedPending{ 0 }; // buffered messages dropped beyond cap
+    size_t                   m_droppedQueue{ 0 };   // queue messages dropped under extreme load
 };
 
 } // namespace cbr
@@ -1606,6 +1624,16 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID /*lpRese
 #include <cctype>
 #include <string>
 
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 namespace cbr {
 
 namespace {
@@ -1644,6 +1672,14 @@ bool CBREngine::Initialize() {
         }
 
         CBR_LOG_INFO("Initializing CBREngine for Red Dead Redemption 2...");
+
+        // 2a. Anti-Cheat & Online Safety Verification: refuse execution if anti-cheat or online DLLs are detected
+        if (CheckAntiCheatModules()) {
+            CBR_LOG_ERROR("CRITICAL: CBREngine initialization refused due to detected anti-cheat / online security modules.");
+            m_initialized.store(false);
+            return;
+        }
+
         CrashHandler::Get().Install(baseDir);
         CrashHandler::Get().LogSystemTelemetry();
         m_enabled.store(config.enabled);
@@ -1845,6 +1881,31 @@ void CBREngine::OnSwapchainRecreated(uint32_t width, uint32_t height) {
     }
 }
 
+bool CBREngine::CheckAntiCheatModules() const {
+#if defined(_WIN32)
+    static const char* const kKnownAntiCheatModules[] = {
+        "BEClient_x64.dll",
+        "BEClient.dll",
+        "BattlEye.dll",
+        "EasyAntiCheat_x64.dll",
+        "EasyAntiCheat.dll",
+        "eac_server64.dll",
+        "eac_server.dll",
+        "EOSOVH-Win64-Shipping.dll",
+        "vanguard.dll",
+        "Denuvo.dll"
+    };
+
+    for (const char* modName : kKnownAntiCheatModules) {
+        if (GetModuleHandleA(modName) != nullptr) {
+            CBR_LOG_ERROR("CRITICAL: Detected active anti-cheat / online security module '%s' in host process! Aborting CBREngine initialization to protect account standing.", modName);
+            return true;
+        }
+    }
+#endif
+    return false;
+}
+
 } // namespace cbr
 ```
 
@@ -1873,13 +1934,41 @@ std::string Trim(const std::string& str) {
     return str.substr(first, (last - first + 1));
 }
 
-// Strip inline comments starting with ';' or '#'
+// Strip inline comments starting with ';' or '#' unless escaped or inside quotes
 std::string StripComment(const std::string& str) {
-    auto pos = str.find_first_of(";#");
-    if (pos != std::string::npos) {
-        return str.substr(0, pos);
+    std::string result;
+    result.reserve(str.size());
+    bool inQuotes = false;
+    char quoteChar = '\0';
+    for (size_t i = 0; i < str.size(); ++i) {
+        char c = str[i];
+        if (c == '\\' && i + 1 < str.size() &&
+            (str[i + 1] == ';' || str[i + 1] == '#' || str[i + 1] == '"' || str[i + 1] == '\'')) {
+            result += str[++i];
+            continue;
+        }
+        if ((c == '"' || c == '\'') && !inQuotes) {
+            inQuotes = true;
+            quoteChar = c;
+            result += c;
+            continue;
+        } else if (inQuotes && c == quoteChar) {
+            inQuotes = false;
+            quoteChar = '\0';
+            result += c;
+            continue;
+        }
+        if (!inQuotes && (c == ';' || c == '#')) {
+            break;
+        }
+        result += c;
     }
-    return str;
+    std::string trimmed = Trim(result);
+    if (trimmed.size() >= 2 && ((trimmed.front() == '"' && trimmed.back() == '"') ||
+                                (trimmed.front() == '\'' && trimmed.back() == '\''))) {
+        return trimmed.substr(1, trimmed.size() - 2);
+    }
+    return result;
 }
 
 bool ParseBool(const std::string& val, bool defaultVal) {
@@ -1893,12 +1982,15 @@ bool ParseBool(const std::string& val, bool defaultVal) {
 uint32_t ParseUInt(const std::string& val, uint32_t defaultVal, uint32_t minVal, uint32_t maxVal) {
     if (val.empty()) return defaultVal;
     try {
-        // std::stoul accepts a leading '-' (wrapping around) and ignores trailing text ("4k" -> 4);
-        // reject both so typos fall back to the default instead of becoming a bogus value.
+        // Reject leading '-' (avoid unsigned wrap-around) and trailing text ("4k" -> rejected)
         if (val.front() == '-') return defaultVal;
         size_t idx = 0;
-        unsigned long result = std::stoul(val, &idx);
+        // Use unsigned long long (64-bit on both Windows LLP64 and Linux LP64) to prevent platform divergence
+        unsigned long long result = std::stoull(val, &idx);
         if (idx == 0 || idx != val.size()) return defaultVal;
+        if (result > static_cast<unsigned long long>(UINT32_MAX)) {
+            result = UINT32_MAX;
+        }
         if (result < minVal) result = minVal;
         if (result > maxVal) result = maxVal;
         return static_cast<uint32_t>(result);
@@ -2198,6 +2290,9 @@ namespace {
 
 LPTOP_LEVEL_EXCEPTION_FILTER g_previousFilter = nullptr;
 std::filesystem::path        g_crashLogDirectory;
+HANDLE                       g_hCrashLogFile = INVALID_HANDLE_VALUE;
+HANDLE                       g_hMainLogFile  = INVALID_HANDLE_VALUE;
+wchar_t                      g_dumpPathW[MAX_PATH] = { 0 };
 
 typedef BOOL(WINAPI* PFN_MiniDumpWriteDump)(
     HANDLE                            hProcess,
@@ -2235,8 +2330,13 @@ const char* GetExceptionCodeString(DWORD code) {
     }
 }
 
-std::string GetModuleAndOffset(void* address) {
-    if (!address) return "null";
+// Low-level, stack-only address resolver (async-signal-safe: no heap allocation)
+void FormatModuleAndOffset(void* address, char* outBuf, size_t outSize) {
+    if (!outBuf || outSize == 0) return;
+    if (!address) {
+        std::snprintf(outBuf, outSize, "null");
+        return;
+    }
 
     HMODULE hModule = nullptr;
     if (GetModuleHandleExA(
@@ -2247,33 +2347,35 @@ std::string GetModuleAndOffset(void* address) {
         char modPath[MAX_PATH] = { 0 };
         GetModuleFileNameA(hModule, modPath, MAX_PATH);
 
-        std::string fullPath(modPath);
-        std::string modName = fullPath.substr(fullPath.find_last_of("\\/") + 1);
+        const char* modName = modPath;
+        for (const char* p = modPath; *p; ++p) {
+            if (*p == '\\' || *p == '/') modName = p + 1;
+        }
 
-        uintptr_t baseAddr = reinterpret_cast<uintptr_t>(hModule);
-        uintptr_t targetAddr = reinterpret_cast<uintptr_t>(address);
-        uintptr_t offset = targetAddr - baseAddr;
+        const uintptr_t baseAddr = reinterpret_cast<uintptr_t>(hModule);
+        const uintptr_t targetAddr = reinterpret_cast<uintptr_t>(address);
+        const uintptr_t offset = targetAddr - baseAddr;
 
-        std::stringstream ss;
-        ss << modName << " + 0x" << std::hex << std::uppercase << offset
-           << " [Base: 0x" << baseAddr << "]";
-        return ss.str();
+        std::snprintf(outBuf, outSize, "%s + 0x%zX [Base: 0x%zX]", modName, offset, baseAddr);
+        return;
     }
 
-    std::stringstream ss;
-    ss << "0x" << std::hex << std::uppercase << reinterpret_cast<uintptr_t>(address) << " (unmapped)";
-    return ss.str();
+    std::snprintf(outBuf, outSize, "0x%zX (unmapped)", reinterpret_cast<uintptr_t>(address));
 }
 
-void WriteMinidump(EXCEPTION_POINTERS* pEx, const std::filesystem::path& dumpPath) {
-    HMODULE hDbgHelp = LoadLibraryA("dbghelp.dll");
+void WriteMinidump(EXCEPTION_POINTERS* pEx, const wchar_t* dumpPath) {
+    // Mitigate DLL preloading vulnerabilities by searching System32 only
+    HMODULE hDbgHelp = LoadLibraryExA("dbghelp.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!hDbgHelp) {
+        hDbgHelp = LoadLibraryA("dbghelp.dll");
+    }
     if (!hDbgHelp) return;
 
     auto pfnDump = reinterpret_cast<PFN_MiniDumpWriteDump>(
         GetProcAddress(hDbgHelp, "MiniDumpWriteDump"));
     if (pfnDump) {
         HANDLE hFile = CreateFileW(
-            dumpPath.c_str(),
+            dumpPath,
             GENERIC_WRITE,
             0,
             nullptr,
@@ -2312,6 +2414,18 @@ void WriteMinidump(EXCEPTION_POINTERS* pEx, const std::filesystem::path& dumpPat
     FreeLibrary(hDbgHelp);
 }
 
+// Stack report builder appending helper (no heap allocations)
+void AppendToReport(char* buf, size_t bufSize, size_t& offset, const char* format, ...) {
+    if (offset >= bufSize - 1) return;
+    va_list args;
+    va_start(args, format);
+    int written = std::vsnprintf(buf + offset, bufSize - offset, format, args);
+    va_end(args);
+    if (written > 0) {
+        offset = (offset + written < bufSize) ? offset + written : bufSize - 1;
+    }
+}
+
 LONG WINAPI CBRUnhandledExceptionFilter(EXCEPTION_POINTERS* pEx) {
     if (!pEx || !pEx->ExceptionRecord) {
         return (g_previousFilter) ? g_previousFilter(pEx) : EXCEPTION_CONTINUE_SEARCH;
@@ -2320,15 +2434,24 @@ LONG WINAPI CBRUnhandledExceptionFilter(EXCEPTION_POINTERS* pEx) {
     const DWORD code = pEx->ExceptionRecord->ExceptionCode;
     void* faultAddress = pEx->ExceptionRecord->ExceptionAddress;
 
-    std::stringstream ss;
-    ss << "\n=================================================================\n"
-       << " [FATAL] UNHANDLED EXCEPTION / GAME CRASH DETECTED\n"
-       << "=================================================================\n";
+    // Pre-allocated stack buffer: completely async-signal-safe, 0 heap allocations
+    char reportBuf[8192];
+    size_t offset = 0;
+    reportBuf[0] = '\0';
 
-    ss << "Exception Code:    0x" << std::hex << std::uppercase << code
-       << " (" << GetExceptionCodeString(code) << ")\n";
-    ss << "Fault Address:     0x" << std::hex << std::uppercase << reinterpret_cast<uintptr_t>(faultAddress)
-       << " in " << GetModuleAndOffset(faultAddress) << "\n";
+    AppendToReport(reportBuf, sizeof(reportBuf), offset,
+        "\n=================================================================\n"
+        " [FATAL] UNHANDLED EXCEPTION / GAME CRASH DETECTED\n"
+        "=================================================================\n");
+
+    char faultModBuf[256] = { 0 };
+    FormatModuleAndOffset(faultAddress, faultModBuf, sizeof(faultModBuf));
+
+    AppendToReport(reportBuf, sizeof(reportBuf), offset,
+        "Exception Code:    0x%08lX (%s)\n"
+        "Fault Address:     0x%zX in %s\n",
+        code, GetExceptionCodeString(code),
+        reinterpret_cast<uintptr_t>(faultAddress), faultModBuf);
 
     // Access violation details: Read, Write, or Execute
     if (code == EXCEPTION_ACCESS_VIOLATION && pEx->ExceptionRecord->NumberParameters >= 2) {
@@ -2339,83 +2462,77 @@ LONG WINAPI CBRUnhandledExceptionFilter(EXCEPTION_POINTERS* pEx) {
         else if (accessType == 1) typeStr = "write to";
         else if (accessType == 8) typeStr = "execute at";
 
-        ss << "Violation Details: The thread attempted to " << typeStr
-           << " invalid virtual address 0x" << std::hex << std::uppercase << targetAddr << "\n";
+        AppendToReport(reportBuf, sizeof(reportBuf), offset,
+            "Violation Details: The thread attempted to %s invalid virtual address 0x%zX\n",
+            typeStr, static_cast<uintptr_t>(targetAddr));
     }
 
 #if defined(_M_X64) || defined(__x86_64__)
     if (pEx->ContextRecord) {
         const auto& ctx = *pEx->ContextRecord;
-        ss << "\nCPU Register Dump (x64):\n";
-        ss << "  RAX: 0x" << std::hex << std::setw(16) << std::setfill('0') << ctx.Rax
-           << "  RBX: 0x" << std::setw(16) << ctx.Rbx
-           << "  RCX: 0x" << std::setw(16) << ctx.Rcx << "\n";
-        ss << "  RDX: 0x" << std::setw(16) << ctx.Rdx
-           << "  RSI: 0x" << std::setw(16) << ctx.Rsi
-           << "  RDI: 0x" << std::setw(16) << ctx.Rdi << "\n";
-        ss << "  RBP: 0x" << std::setw(16) << ctx.Rbp
-           << "  RSP: 0x" << std::setw(16) << ctx.Rsp
-           << "  RIP: 0x" << std::setw(16) << ctx.Rip << "\n";
-        ss << "  R8:  0x" << std::setw(16) << ctx.R8
-           << "  R9:  0x" << std::setw(16) << ctx.R9
-           << "  R10: 0x" << std::setw(16) << ctx.R10 << "\n";
-        ss << "  R11: 0x" << std::setw(16) << ctx.R11
-           << "  R12: 0x" << std::setw(16) << ctx.R12
-           << "  R13: 0x" << std::setw(16) << ctx.R13 << "\n";
-        ss << "  R14: 0x" << std::setw(16) << ctx.R14
-           << "  R15: 0x" << std::setw(16) << ctx.R15
-           << "  EFL: 0x" << std::hex << ctx.EFlags << "\n";
+        AppendToReport(reportBuf, sizeof(reportBuf), offset,
+            "\nCPU Register Dump (x64):\n"
+            "  RAX: 0x%016llX  RBX: 0x%016llX  RCX: 0x%016llX\n"
+            "  RDX: 0x%016llX  RSI: 0x%016llX  RDI: 0x%016llX\n"
+            "  RBP: 0x%016llX  RSP: 0x%016llX  RIP: 0x%016llX\n"
+            "  R8:  0x%016llX  R9:  0x%016llX  R10: 0x%016llX\n"
+            "  R11: 0x%016llX  R12: 0x%016llX  R13: 0x%016llX\n"
+            "  R14: 0x%016llX  R15: 0x%016llX  EFL: 0x%08lX\n",
+            ctx.Rax, ctx.Rbx, ctx.Rcx,
+            ctx.Rdx, ctx.Rsi, ctx.Rdi,
+            ctx.Rbp, ctx.Rsp, ctx.Rip,
+            ctx.R8, ctx.R9, ctx.R10,
+            ctx.R11, ctx.R12, ctx.R13,
+            ctx.R14, ctx.R15, ctx.EFlags);
     }
 #endif
 
-    // Call stack backtrace
-    ss << "\nCall Stack Backtrace (Return Addresses):\n";
+    // Call stack backtrace (return addresses)
+    AppendToReport(reportBuf, sizeof(reportBuf), offset, "\nCall Stack Backtrace (Return Addresses):\n");
     void* stackFrames[32] = { 0 };
     USHORT captured = CaptureStackBackTrace(0, 32, stackFrames, nullptr);
     for (USHORT i = 0; i < captured; ++i) {
-        ss << "  [" << std::setw(2) << std::setfill('0') << i << "] "
-           << GetModuleAndOffset(stackFrames[i]) << "\n";
+        char frameModBuf[256] = { 0 };
+        FormatModuleAndOffset(stackFrames[i], frameModBuf, sizeof(frameModBuf));
+        AppendToReport(reportBuf, sizeof(reportBuf), offset, "  [%02u] %s\n", i, frameModBuf);
     }
 
     // Memory status
     MEMORYSTATUSEX mem{};
     mem.dwLength = sizeof(mem);
     if (GlobalMemoryStatusEx(&mem)) {
-        ss << "\nSystem Memory at Crash:\n";
-        ss << "  Memory Load:     " << mem.dwMemoryLoad << "%\n";
-        ss << "  Available RAM:   " << (mem.ullAvailPhys / (1024 * 1024)) << " MB / "
-           << (mem.ullTotalPhys / (1024 * 1024)) << " MB\n";
-        ss << "  Available Page:  " << (mem.ullAvailPageFile / (1024 * 1024)) << " MB\n";
+        AppendToReport(reportBuf, sizeof(reportBuf), offset,
+            "\nSystem Memory at Crash:\n"
+            "  Memory Load:     %u%%\n"
+            "  Available RAM:   %llu MB / %llu MB\n"
+            "  Available Page:  %llu MB\n",
+            mem.dwMemoryLoad,
+            static_cast<unsigned long long>(mem.ullAvailPhys / (1024 * 1024)),
+            static_cast<unsigned long long>(mem.ullTotalPhys / (1024 * 1024)),
+            static_cast<unsigned long long>(mem.ullAvailPageFile / (1024 * 1024)));
     }
 
-    ss << "=================================================================\n";
-    const std::string report = ss.str();
+    AppendToReport(reportBuf, sizeof(reportBuf), offset,
+        "=================================================================\n");
 
-    // 1. Output to dedicated cbr_crash.log via raw Win32 API (async-signal-safe, deadlock-free)
-    const std::filesystem::path crashLog = g_crashLogDirectory / "cbr_crash.log";
-    HANDLE hCrashFile = CreateFileW(crashLog.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                                    nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (hCrashFile != INVALID_HANDLE_VALUE) {
+    // 1. Output to dedicated cbr_crash.log via pre-opened handle (or fallback direct handle)
+    if (g_hCrashLogFile != INVALID_HANDLE_VALUE) {
         DWORD written = 0;
-        WriteFile(hCrashFile, report.c_str(), static_cast<DWORD>(report.size()), &written, nullptr);
-        FlushFileBuffers(hCrashFile);
-        CloseHandle(hCrashFile);
+        WriteFile(g_hCrashLogFile, reportBuf, static_cast<DWORD>(offset), &written, nullptr);
+        FlushFileBuffers(g_hCrashLogFile);
     }
 
-    // 2. Also append directly to cbr.log via raw Win32 API without touching Logger mutex
-    const std::filesystem::path mainLog = g_crashLogDirectory / "cbr.log";
-    HANDLE hMainLog = CreateFileW(mainLog.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                                  nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (hMainLog != INVALID_HANDLE_VALUE) {
+    // 2. Output to cbr.log via pre-opened handle without touching Logger mutex or heap
+    if (g_hMainLogFile != INVALID_HANDLE_VALUE) {
         DWORD written = 0;
-        WriteFile(hMainLog, report.c_str(), static_cast<DWORD>(report.size()), &written, nullptr);
-        FlushFileBuffers(hMainLog);
-        CloseHandle(hMainLog);
+        WriteFile(g_hMainLogFile, reportBuf, static_cast<DWORD>(offset), &written, nullptr);
+        FlushFileBuffers(g_hMainLogFile);
     }
 
     // 3. Write minidump (.dmp) for Visual Studio / WinDbg debugging
-    const std::filesystem::path dumpPath = g_crashLogDirectory / "cbr_crash.dmp";
-    WriteMinidump(pEx, dumpPath);
+    if (g_dumpPathW[0] != L'\0') {
+        WriteMinidump(pEx, g_dumpPathW);
+    }
 
     if (g_previousFilter) {
         return g_previousFilter(pEx);
@@ -2435,6 +2552,19 @@ void CrashHandler::Install(const std::filesystem::path& logDirectory) {
     m_logDirectory = logDirectory;
     g_crashLogDirectory = logDirectory;
 
+    // Pre-open handles to cbr_crash.log and cbr.log for zero-allocation, deadlock-free crash writing
+    const std::filesystem::path crashLog = logDirectory / "cbr_crash.log";
+    g_hCrashLogFile = CreateFileW(crashLog.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                  nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+
+    const std::filesystem::path mainLog = logDirectory / "cbr.log";
+    g_hMainLogFile = CreateFileW(mainLog.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+
+    const std::filesystem::path dumpPath = logDirectory / "cbr_crash.dmp";
+    std::wcsncpy(g_dumpPathW, dumpPath.c_str(), MAX_PATH - 1);
+    g_dumpPathW[MAX_PATH - 1] = L'\0';
+
     g_previousFilter = SetUnhandledExceptionFilter(CBRUnhandledExceptionFilter);
     m_installed = true;
     CBR_LOG_INFO("CrashHandler installed. Unhandled exceptions & crash telemetry will be logged to cbr_crash.log.");
@@ -2444,6 +2574,17 @@ void CrashHandler::Uninstall() {
     if (!m_installed) return;
     SetUnhandledExceptionFilter(g_previousFilter);
     g_previousFilter = nullptr;
+
+    if (g_hCrashLogFile != INVALID_HANDLE_VALUE) {
+        CloseHandle(g_hCrashLogFile);
+        g_hCrashLogFile = INVALID_HANDLE_VALUE;
+    }
+    if (g_hMainLogFile != INVALID_HANDLE_VALUE) {
+        CloseHandle(g_hMainLogFile);
+        g_hMainLogFile = INVALID_HANDLE_VALUE;
+    }
+    g_dumpPathW[0] = L'\0';
+
     m_installed = false;
     CBR_LOG_INFO("CrashHandler uninstalled.");
 }
@@ -3470,8 +3611,12 @@ Logger& Logger::Get() {
     return instance;
 }
 
+Logger::~Logger() {
+    Shutdown();
+}
+
 void Logger::Initialize(const std::filesystem::path& logFilePath) {
-    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    std::lock_guard<std::mutex> lock(m_mutex);
     if (m_initialized) {
         return;
     }
@@ -3494,20 +3639,39 @@ void Logger::Initialize(const std::filesystem::path& logFilePath) {
                       << kMaxPendingMessages << ").\n";
         }
         m_logFile.flush();
+
+        // Start asynchronous background writer thread
+        m_running.store(true);
+        m_workerThread = std::thread(&Logger::WorkerThread, this);
     }
     m_pending.clear();
     m_droppedPending = 0;
 }
 
 void Logger::Disable() {
-    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    std::lock_guard<std::mutex> lock(m_mutex);
     m_disabled = true;
     m_pending.clear();
+    m_queue.clear();
     m_droppedPending = 0;
+    m_droppedQueue = 0;
 }
 
 void Logger::Shutdown() {
-    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (!m_initialized && !m_running.load()) {
+            return;
+        }
+        m_running.store(false);
+        m_cv.notify_all();
+    }
+
+    if (m_workerThread.joinable()) {
+        m_workerThread.join();
+    }
+
+    std::lock_guard<std::mutex> lock(m_mutex);
     if (m_initialized && m_logFile.is_open()) {
         m_logFile << "[INFO] Logger shutting down.\n";
         m_logFile.flush();
@@ -3516,26 +3680,73 @@ void Logger::Shutdown() {
     m_initialized = false;
     m_disabled = true;
     m_pending.clear();
+    m_queue.clear();
     m_droppedPending = 0;
+    m_droppedQueue = 0;
 }
 
 void Logger::SetMinLevel(LogLevel level) {
-    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    std::lock_guard<std::mutex> lock(m_mutex);
     m_minLevel = level;
 }
 
 void Logger::Flush() {
-    std::lock_guard<std::recursive_mutex> lock(m_mutex);
-    if (m_initialized && m_logFile.is_open()) {
-        m_logFile.flush();
+    if (m_running.load()) {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        m_flushRequested.store(true);
+        m_cv.notify_one();
+        m_flushCv.wait_for(lock, std::chrono::milliseconds(100), [this]() {
+            return m_queue.empty() && !m_flushRequested.load();
+        });
+    } else {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_initialized && m_logFile.is_open()) {
+            m_logFile.flush();
+        }
+    }
+}
+
+void Logger::WorkerThread() {
+    while (true) {
+        std::vector<std::string> batch;
+        bool doFlush = false;
+
+        {
+            std::unique_lock<std::mutex> lock(m_mutex);
+            m_cv.wait(lock, [this]() {
+                return !m_running.load() || !m_queue.empty() || m_flushRequested.load();
+            });
+
+            if (!m_running.load() && m_queue.empty()) {
+                break;
+            }
+
+            batch.swap(m_queue);
+            doFlush = m_flushRequested.exchange(false);
+        }
+
+        // Perform disk I/O on background thread outside mutex lock
+        if (m_logFile.is_open()) {
+            for (const auto& msg : batch) {
+                m_logFile << msg;
+            }
+            if (doFlush || !m_running.load()) {
+                m_logFile.flush();
+            }
+        }
+
+        if (doFlush) {
+            m_flushCv.notify_all();
+        }
     }
 }
 
 void Logger::Log(LogLevel level, const std::string& message) {
-    std::lock_guard<std::recursive_mutex> lock(m_mutex);
-
-    if (level < m_minLevel) {
-        return;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (level < m_minLevel) {
+            return;
+        }
     }
 
     const char* levelStr = "INFO";
@@ -3564,13 +3775,19 @@ void Logger::Log(LogLevel level, const std::string& message) {
 
     std::string formatted = ss.str();
 
-    if (m_initialized && m_logFile.is_open()) {
-        m_logFile << formatted;
-        // Avoid synchronous disk flush on high-frequency render-thread frames;
-        // only flush immediately on warnings and errors to prevent I/O micro-stutters.
-        if (level >= LogLevel::Warning) {
-            m_logFile.flush();
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (m_initialized && m_running.load()) {
+        // Enqueue to background writer (bounded ring/queue to avoid runaway memory)
+        if (m_queue.size() < kMaxQueueMessages) {
+            m_queue.push_back(std::move(formatted));
+        } else {
+            ++m_droppedQueue;
         }
+
+        if (level >= LogLevel::Warning) {
+            m_flushRequested.store(true);
+        }
+        m_cv.notify_one();
     } else if (!m_initialized && !m_disabled) {
         if (m_pending.size() < kMaxPendingMessages) {
             m_pending.push_back(formatted);
@@ -3682,9 +3899,34 @@ const uint8_t* PatternScanner::ResolveRipRelative(const uint8_t* instructionAddr
         return nullptr;
     }
 
+#if defined(_WIN32)
+    HMODULE hMod = nullptr;
+    if (!GetModuleHandleExA(
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        reinterpret_cast<LPCSTR>(instructionAddress),
+        &hMod) || !hMod) {
+        return nullptr;
+    }
+
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!VirtualQuery(instructionAddress, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT ||
+        (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) {
+        return nullptr;
+    }
+#endif
+
     int32_t displacement = 0;
     std::memcpy(&displacement, instructionAddress + displacementOffset, sizeof(int32_t));
-    return instructionAddress + instructionLength + displacement;
+    const uint8_t* target = instructionAddress + instructionLength + displacement;
+
+#if defined(_WIN32)
+    if (!VirtualQuery(target, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT ||
+        (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) {
+        return nullptr;
+    }
+#endif
+
+    return target;
 }
 
 #if defined(_WIN32)
@@ -3697,43 +3939,56 @@ const uint8_t* PatternScanner::ScanModule(const char* moduleName, const char* si
     HMODULE hMod = moduleName ? GetModuleHandleA(moduleName) : GetModuleHandleA(nullptr);
     if (!hMod) return nullptr;
 
-    auto dosHeader = reinterpret_cast<const IMAGE_DOS_HEADER*>(hMod);
-    if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) return nullptr;
-
-    auto ntHeaders = reinterpret_cast<const IMAGE_NT_HEADERS*>(reinterpret_cast<const uint8_t*>(hMod) + dosHeader->e_lfanew);
-    if (ntHeaders->Signature != IMAGE_NT_SIGNATURE) return nullptr;
-
-    const auto sectionHeader = IMAGE_FIRST_SECTION(ntHeaders);
-    const WORD numSections = ntHeaders->FileHeader.NumberOfSections;
-
-    for (WORD s = 0; s < numSections; ++s) {
-        const auto& sec = sectionHeader[s];
-        // Scan executable code sections (e.g. .text)
-        if (sec.Characteristics & (IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_CNT_CODE)) {
-            const auto* secBase = reinterpret_cast<const uint8_t*>(hMod) + sec.VirtualAddress;
-            const size_t secSize = sec.Misc.VirtualSize > 0 ? sec.Misc.VirtualSize : sec.SizeOfRawData;
+    MEMORY_BASIC_INFORMATION modMbi{};
+    if (!VirtualQuery(hMod, &modMbi, sizeof(modMbi)) || modMbi.State != MEM_COMMIT ||
+        (modMbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) {
+        return nullptr;
+    }
 
 #if defined(_MSC_VER)
-            __try {
-                const uint8_t* found = FindPattern(secBase, secSize, signature, mask);
-                if (found) {
-                    return found;
-                }
-            } __except (EXCEPTION_EXECUTE_HANDLER) {
-                // Guard page or access violation encountered during pattern scan
-            }
-#else
-            MEMORY_BASIC_INFORMATION mbi{};
-            if (VirtualQuery(secBase, &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT &&
-                !(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) {
-                const uint8_t* found = FindPattern(secBase, secSize, signature, mask);
-                if (found) {
-                    return found;
-                }
-            }
+    __try {
 #endif
+        auto dosHeader = reinterpret_cast<const IMAGE_DOS_HEADER*>(hMod);
+        if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) return nullptr;
+
+        const auto* ntHeaderAddr = reinterpret_cast<const uint8_t*>(hMod) + dosHeader->e_lfanew;
+        MEMORY_BASIC_INFORMATION ntMbi{};
+        if (!VirtualQuery(ntHeaderAddr, &ntMbi, sizeof(ntMbi)) || ntMbi.State != MEM_COMMIT ||
+            (ntMbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) {
+            return nullptr;
         }
+
+        auto ntHeaders = reinterpret_cast<const IMAGE_NT_HEADERS*>(ntHeaderAddr);
+        if (ntHeaders->Signature != IMAGE_NT_SIGNATURE) return nullptr;
+
+        const auto sectionHeader = IMAGE_FIRST_SECTION(ntHeaders);
+        const WORD numSections = ntHeaders->FileHeader.NumberOfSections;
+
+        for (WORD s = 0; s < numSections; ++s) {
+            const auto& sec = sectionHeader[s];
+            // Scan executable code sections (e.g. .text)
+            if (sec.Characteristics & (IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_CNT_CODE)) {
+                const auto* secBase = reinterpret_cast<const uint8_t*>(hMod) + sec.VirtualAddress;
+                const size_t secSize = sec.Misc.VirtualSize > 0 ? sec.Misc.VirtualSize : sec.SizeOfRawData;
+
+                MEMORY_BASIC_INFORMATION secMbi{};
+                if (!VirtualQuery(secBase, &secMbi, sizeof(secMbi)) || secMbi.State != MEM_COMMIT ||
+                    (secMbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) {
+                    continue;
+                }
+
+                const uint8_t* found = FindPattern(secBase, secSize, signature, mask);
+                if (found) {
+                    return found;
+                }
+            }
+        }
+#if defined(_MSC_VER)
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        // Guard page or access violation encountered during pattern scan
+        return nullptr;
     }
+#endif
     return nullptr;
 }
 
@@ -6144,6 +6399,12 @@ static void TestConfigHardening(const fs::path& dir) {
     CHECK(ConfigManager::Get().GetConfig().projectionJitterSign == -1);
     CHECK(ConfigManager::Get().GetConfig().samplingStrategy == SamplingStrategy::StrategyB);
     CHECK(ConfigManager::Get().GetConfig().depthConvention == DepthConvention::Standard);
+
+    // Hardened integer parsing (large 64-bit clamp) and quoted comment stripping
+    WriteFile(dir / "hardened.ini", "[General]\nTargetWidth = 9999999999999999\nPreferredApi = \"Vulkan\" ; inline comment\n");
+    CHECK(ConfigManager::Get().Load(dir / "hardened.ini"));
+    CHECK(ConfigManager::Get().GetConfig().targetWidth == 7680); // clamped to kMaxTargetWidth
+    CHECK(ConfigManager::Get().GetConfig().preferredApi == GraphicsApi::Vulkan);
 }
 
 static void TestConfigMissingFileAndRoundTrip(const fs::path& dir) {

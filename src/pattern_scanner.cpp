@@ -90,9 +90,34 @@ const uint8_t* PatternScanner::ResolveRipRelative(const uint8_t* instructionAddr
         return nullptr;
     }
 
+#if defined(_WIN32)
+    HMODULE hMod = nullptr;
+    if (!GetModuleHandleExA(
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        reinterpret_cast<LPCSTR>(instructionAddress),
+        &hMod) || !hMod) {
+        return nullptr;
+    }
+
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!VirtualQuery(instructionAddress, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT ||
+        (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) {
+        return nullptr;
+    }
+#endif
+
     int32_t displacement = 0;
     std::memcpy(&displacement, instructionAddress + displacementOffset, sizeof(int32_t));
-    return instructionAddress + instructionLength + displacement;
+    const uint8_t* target = instructionAddress + instructionLength + displacement;
+
+#if defined(_WIN32)
+    if (!VirtualQuery(target, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT ||
+        (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) {
+        return nullptr;
+    }
+#endif
+
+    return target;
 }
 
 #if defined(_WIN32)
@@ -105,43 +130,56 @@ const uint8_t* PatternScanner::ScanModule(const char* moduleName, const char* si
     HMODULE hMod = moduleName ? GetModuleHandleA(moduleName) : GetModuleHandleA(nullptr);
     if (!hMod) return nullptr;
 
-    auto dosHeader = reinterpret_cast<const IMAGE_DOS_HEADER*>(hMod);
-    if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) return nullptr;
-
-    auto ntHeaders = reinterpret_cast<const IMAGE_NT_HEADERS*>(reinterpret_cast<const uint8_t*>(hMod) + dosHeader->e_lfanew);
-    if (ntHeaders->Signature != IMAGE_NT_SIGNATURE) return nullptr;
-
-    const auto sectionHeader = IMAGE_FIRST_SECTION(ntHeaders);
-    const WORD numSections = ntHeaders->FileHeader.NumberOfSections;
-
-    for (WORD s = 0; s < numSections; ++s) {
-        const auto& sec = sectionHeader[s];
-        // Scan executable code sections (e.g. .text)
-        if (sec.Characteristics & (IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_CNT_CODE)) {
-            const auto* secBase = reinterpret_cast<const uint8_t*>(hMod) + sec.VirtualAddress;
-            const size_t secSize = sec.Misc.VirtualSize > 0 ? sec.Misc.VirtualSize : sec.SizeOfRawData;
+    MEMORY_BASIC_INFORMATION modMbi{};
+    if (!VirtualQuery(hMod, &modMbi, sizeof(modMbi)) || modMbi.State != MEM_COMMIT ||
+        (modMbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) {
+        return nullptr;
+    }
 
 #if defined(_MSC_VER)
-            __try {
-                const uint8_t* found = FindPattern(secBase, secSize, signature, mask);
-                if (found) {
-                    return found;
-                }
-            } __except (EXCEPTION_EXECUTE_HANDLER) {
-                // Guard page or access violation encountered during pattern scan
-            }
-#else
-            MEMORY_BASIC_INFORMATION mbi{};
-            if (VirtualQuery(secBase, &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT &&
-                !(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) {
-                const uint8_t* found = FindPattern(secBase, secSize, signature, mask);
-                if (found) {
-                    return found;
-                }
-            }
+    __try {
 #endif
+        auto dosHeader = reinterpret_cast<const IMAGE_DOS_HEADER*>(hMod);
+        if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) return nullptr;
+
+        const auto* ntHeaderAddr = reinterpret_cast<const uint8_t*>(hMod) + dosHeader->e_lfanew;
+        MEMORY_BASIC_INFORMATION ntMbi{};
+        if (!VirtualQuery(ntHeaderAddr, &ntMbi, sizeof(ntMbi)) || ntMbi.State != MEM_COMMIT ||
+            (ntMbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) {
+            return nullptr;
         }
+
+        auto ntHeaders = reinterpret_cast<const IMAGE_NT_HEADERS*>(ntHeaderAddr);
+        if (ntHeaders->Signature != IMAGE_NT_SIGNATURE) return nullptr;
+
+        const auto sectionHeader = IMAGE_FIRST_SECTION(ntHeaders);
+        const WORD numSections = ntHeaders->FileHeader.NumberOfSections;
+
+        for (WORD s = 0; s < numSections; ++s) {
+            const auto& sec = sectionHeader[s];
+            // Scan executable code sections (e.g. .text)
+            if (sec.Characteristics & (IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_CNT_CODE)) {
+                const auto* secBase = reinterpret_cast<const uint8_t*>(hMod) + sec.VirtualAddress;
+                const size_t secSize = sec.Misc.VirtualSize > 0 ? sec.Misc.VirtualSize : sec.SizeOfRawData;
+
+                MEMORY_BASIC_INFORMATION secMbi{};
+                if (!VirtualQuery(secBase, &secMbi, sizeof(secMbi)) || secMbi.State != MEM_COMMIT ||
+                    (secMbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) {
+                    continue;
+                }
+
+                const uint8_t* found = FindPattern(secBase, secSize, signature, mask);
+                if (found) {
+                    return found;
+                }
+            }
+        }
+#if defined(_MSC_VER)
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        // Guard page or access violation encountered during pattern scan
+        return nullptr;
     }
+#endif
     return nullptr;
 }
 

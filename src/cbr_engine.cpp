@@ -11,6 +11,16 @@
 #include <cctype>
 #include <string>
 
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 namespace cbr {
 
 namespace {
@@ -49,6 +59,14 @@ bool CBREngine::Initialize() {
         }
 
         CBR_LOG_INFO("Initializing CBREngine for Red Dead Redemption 2...");
+
+        // 2a. Anti-Cheat & Online Safety Verification: refuse execution if anti-cheat or online DLLs are detected
+        if (CheckAntiCheatModules()) {
+            CBR_LOG_ERROR("CRITICAL: CBREngine initialization refused due to detected anti-cheat / online security modules.");
+            m_initialized.store(false);
+            return;
+        }
+
         CrashHandler::Get().Install(baseDir);
         CrashHandler::Get().LogSystemTelemetry();
         m_enabled.store(config.enabled);
@@ -248,6 +266,31 @@ void CBREngine::OnSwapchainRecreated(uint32_t width, uint32_t height) {
         RenderTargetManager::Get().ResetHistory();
         CBR_LOG_INFO("Swapchain recreated: frame parity and history reset.");
     }
+}
+
+bool CBREngine::CheckAntiCheatModules() const {
+#if defined(_WIN32)
+    static const char* const kKnownAntiCheatModules[] = {
+        "BEClient_x64.dll",
+        "BEClient.dll",
+        "BattlEye.dll",
+        "EasyAntiCheat_x64.dll",
+        "EasyAntiCheat.dll",
+        "eac_server64.dll",
+        "eac_server.dll",
+        "EOSOVH-Win64-Shipping.dll",
+        "vanguard.dll",
+        "Denuvo.dll"
+    };
+
+    for (const char* modName : kKnownAntiCheatModules) {
+        if (GetModuleHandleA(modName) != nullptr) {
+            CBR_LOG_ERROR("CRITICAL: Detected active anti-cheat / online security module '%s' in host process! Aborting CBREngine initialization to protect account standing.", modName);
+            return true;
+        }
+    }
+#endif
+    return false;
 }
 
 } // namespace cbr

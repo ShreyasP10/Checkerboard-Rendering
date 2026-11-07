@@ -42,6 +42,9 @@ public:
         return cmdBuffer != nullptr && m_activeCandidateCmdBuffer.load() == cmdBuffer;
     }
 
+    // Scans loaded process modules for known anti-cheat or online multiplayer binaries
+    bool CheckAntiCheatModules() const;
+
     uint32_t    GetCurrentFrameIndex() const { return m_frameIndex.load(); }
     bool        IsEnabled() const { return m_enabled.load(); }
     void        SetEnabled(bool enabled) { m_enabled.store(enabled); }
