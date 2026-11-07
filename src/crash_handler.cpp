@@ -297,8 +297,12 @@ void CrashHandler::Install(const std::filesystem::path& logDirectory) {
                                 nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
 
     const std::filesystem::path dumpPath = logDirectory / "cbr_crash.dmp";
+#if defined(_MSC_VER)
+    wcsncpy_s(g_dumpPathW, dumpPath.c_str(), _TRUNCATE);
+#else
     std::wcsncpy(g_dumpPathW, dumpPath.c_str(), MAX_PATH - 1);
     g_dumpPathW[MAX_PATH - 1] = L'\0';
+#endif
 
     g_previousFilter = SetUnhandledExceptionFilter(CBRUnhandledExceptionFilter);
     m_installed = true;
