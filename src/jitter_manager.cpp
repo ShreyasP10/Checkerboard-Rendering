@@ -1,6 +1,8 @@
 #include "cbr/jitter_manager.h"
+#include <cmath>
 #include "cbr/config.h"
 #include "cbr/logger.h"
+#include "cbr/render_target_manager.h"
 
 // LOCK HIERARCHY:
 //   Level 1: ConfigManager::m_mutex
@@ -30,11 +32,11 @@ void JitterManager::Initialize(uint32_t targetWidth, uint32_t targetHeight) {
         w = m_targetWidth; h = m_targetHeight;
 
         const float pixelWidth = 1.0f / static_cast<float>(m_targetWidth);
-        const float ndcX = sign * (2.0f * dir * pixelWidth);
+        const JitterOffset phase1Jitter{ dir * pixelWidth, 0.0f };
         m_cachedProjectionOffsetVk[0] = { 0.0f, 0.0f };
         m_cachedProjectionOffsetDx[0] = { 0.0f, 0.0f };
-        m_cachedProjectionOffsetVk[1] = { ndcX, 0.0f };
-        m_cachedProjectionOffsetDx[1] = { ndcX, 0.0f };
+        m_cachedProjectionOffsetVk[1] = ComputeProjectionOffset(phase1Jitter, true);
+        m_cachedProjectionOffsetDx[1] = ComputeProjectionOffset(phase1Jitter, false);
     }
     CBR_LOG_INFO("JitterManager initialized with target resolution: %ux%u", w, h);
 }
@@ -54,12 +56,12 @@ void JitterManager::Update(uint32_t frameIndex) {
     // Odd frames are shifted horizontally by exactly one full-resolution pixel (shiftDirection * pixelWidth),
     // giving 100% 4-quadrant geometric coverage across two frames with standard 2x MSAA sample locations.
     const float pixelWidth = 1.0f / static_cast<float>(m_targetWidth);
-    const float ndcX = sign * (2.0f * dir * pixelWidth);
+    const JitterOffset phase1Jitter{ dir * pixelWidth, 0.0f };
 
     m_cachedProjectionOffsetVk[0] = { 0.0f, 0.0f };
     m_cachedProjectionOffsetDx[0] = { 0.0f, 0.0f };
-    m_cachedProjectionOffsetVk[1] = { ndcX, 0.0f };
-    m_cachedProjectionOffsetDx[1] = { ndcX, 0.0f };
+    m_cachedProjectionOffsetVk[1] = ComputeProjectionOffset(phase1Jitter, true);
+    m_cachedProjectionOffsetDx[1] = ComputeProjectionOffset(phase1Jitter, false);
 
     if (frameIndex & 1u) {
         m_currentJitter.x = dir * pixelWidth;
@@ -73,7 +75,9 @@ void JitterManager::Update(uint32_t frameIndex) {
 float JitterManager::GetQuarterViewportShiftX(uint32_t frameIndex) const {
     const auto& config = ConfigManager::Get().GetConfig();
     const float dir = (config.jitterDirection < 0) ? -1.0f : 1.0f;
-    return (frameIndex & 1u) ? (0.5f * dir) : 0.0f;
+    if (!(frameIndex & 1u)) return 0.0f;
+    const float shift = 0.5f * dir;
+    return std::round(shift * 16.0f) / 16.0f;
 }
 
 std::pair<float, float> JitterManager::ComputeProjectionOffset(const JitterOffset& jitter, bool isVulkan) const {
@@ -93,6 +97,18 @@ std::pair<float, float> JitterManager::ComputeProjectionOffset(const JitterOffse
 
 void JitterManager::ApplyJitterToProjection(float* projMatrix4x4, bool isVulkan) const {
     if (!projMatrix4x4) return;
+
+    // Detect rapid FOV changes (e.g. scoping / sniper zoom > 5 degrees per frame)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_lastProj0 > 0.0f && projMatrix4x4[0] > 0.0f) {
+            const float fovDeltaRatio = std::abs(projMatrix4x4[0] - m_lastProj0) / m_lastProj0;
+            if (fovDeltaRatio > 0.08f) {
+                RenderTargetManager::Get().ResetHistory();
+            }
+        }
+        m_lastProj0 = projMatrix4x4[0];
+    }
 
     std::pair<float, float> offset;
     {

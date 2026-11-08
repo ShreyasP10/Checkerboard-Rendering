@@ -64,7 +64,7 @@ vec3 YCoCgtoRGB(vec3 ycocg) {
 }
 
 vec3 ToClampSpace(vec3 rgb)  { return (pc.u_ColorSpace == 0u) ? RGBtoYCoCg(rgb) : rgb; }
-vec3 FromClampSpace(vec3 c)  { return (pc.u_ColorSpace == 0u) ? YCoCgtoRGB(c) : max(vec3(0.0), c); }
+vec3 FromClampSpace(vec3 c)  { return (pc.u_ColorSpace == 0u) ? YCoCgtoRGB(c) : c; }
 
 struct CbrSample {
     bool  isActive;
@@ -169,8 +169,8 @@ void ResolvePixel(ivec2 pixelCoord, ivec2 targetSize, uint frameParity) {
 
     ivec2 motionCoord = pixelCoord;
     if (pc.u_EnableMotionDilation != 0u) {
+        float best = currentDepth;
         if (isCurrentSampleActive) {
-            float best = currentDepth;
             const ivec2 kDiagonal[4] = ivec2[](ivec2(-1, -1), ivec2(1, -1), ivec2(-1, 1), ivec2(1, 1));
             for (int i = 0; i < 4; ++i) {
                 ivec2 n = pixelCoord + kDiagonal[i];
@@ -179,13 +179,11 @@ void ResolvePixel(ivec2 pixelCoord, ivec2 targetSize, uint frameParity) {
                 if (IsNearer(d, best)) { best = d; motionCoord = n; }
             }
         } else {
-            bool found = false;
-            float best = 0.0;
             for (int i = 0; i < 4; ++i) {
                 ivec2 n = pixelCoord + kCardinal[i];
                 if (!InBounds(n, targetSize)) continue;
                 float d = cardinalDepth[i];
-                if (!found || IsNearer(d, best)) { found = true; best = d; motionCoord = n; }
+                if (IsNearer(d, best)) { best = d; motionCoord = n; }
             }
         }
     }
@@ -195,7 +193,13 @@ void ResolvePixel(ivec2 pixelCoord, ivec2 targetSize, uint frameParity) {
     velocity = clamp(velocity, vec2(-0.5), vec2(0.5));
     bool velocityBad = isinf(velocity.x) || isnan(velocity.x) || isinf(velocity.y) || isnan(velocity.y)
         || isinf(uv.x) || isnan(uv.x) || isinf(uv.y) || isnan(uv.y);
-    vec2 historyUV = uv - velocity - pc.u_JitterDelta * pc.u_JitterCompensation;
+    // Jitter dampener: dampens jitter compensation on zero-velocity passes (transparent particles, fog, smoke)
+    // to prevent half-pixel oscillation when alpha-blended particles lack motion vectors.
+    float jitterDampener = (dot(velocity, velocity) < 1e-9) ? 0.0 : 1.0;
+    vec2 historyUV = uv - velocity - (pc.u_JitterDelta * (pc.u_JitterCompensation * jitterDampener));
+    vec2 minUV = 0.5 * pc.u_InvTargetResolution;
+    vec2 maxUV = vec2(1.0) - minUV;
+    historyUV = clamp(historyUV, minUV, maxUV);
     bool historyUVBad = velocityBad || isinf(historyUV.x) || isnan(historyUV.x)
         || isinf(historyUV.y) || isnan(historyUV.y);
 
@@ -212,11 +216,12 @@ void ResolvePixel(ivec2 pixelCoord, ivec2 targetSize, uint frameParity) {
         float prevLin = LinearizeDepth(previousDepth);
         bool depthBad = isinf(currentLinear) || isnan(currentLinear) || isinf(prevLin) || isnan(prevLin);
         depthDelta = depthBad ? 10.0 : abs(currentLinear - prevLin) / max(currentLinear, 1e-5);
-        if (depthDelta > pc.u_DepthTolerance) {
+        float dynamicTolerance = pc.u_DepthTolerance * max(1.0, 1.0 + 0.0005 * currentLinear);
+        if (depthDelta > dynamicTolerance) {
             isDisoccluded = true;
         } else {
             historyColor = textureLod(u_HistoryColor, historyUV, 0.0);
-            if (historyColor.a <= 0.0) isDisoccluded = true;
+            if (historyColor.a < 0.5) isDisoccluded = true;
         }
     }
 
@@ -249,7 +254,8 @@ void ResolvePixel(ivec2 pixelCoord, ivec2 targetSize, uint frameParity) {
 
         if (n >= 2.0) {
             vec3 mean = m1 / n;
-            vec3 stdDev = sqrt(max(vec3(0.0), (m2 / n) - (mean * mean)));
+            vec3 rawStdDev = sqrt(max(vec3(0.0), (m2 / n) - (mean * mean)));
+            vec3 stdDev = max(rawStdDev, vec3(0.005));
             const float gamma = 1.25;
             vec3 varianceMin = max(colorMin, mean - gamma * stdDev);
             vec3 varianceMax = min(colorMax, mean + gamma * stdDev);
@@ -291,8 +297,13 @@ void ResolvePixel(ivec2 pixelCoord, ivec2 targetSize, uint frameParity) {
                 finalColor = accumColor / accumWeight;
                 spatialDepth = accumDepth / accumWeight;
             } else {
-                finalColor = isCurrentSampleActive ? currentColor : FetchColor(MapPixelToSample(cardinalCoord[0], frameParity));
-                spatialDepth = isCurrentSampleActive ? currentDepth : cardinalDepth[0];
+                finalColor = isCurrentSampleActive ? currentColor : (
+                    FetchColor(MapPixelToSample(cardinalCoord[0], frameParity)) +
+                    FetchColor(MapPixelToSample(cardinalCoord[1], frameParity)) +
+                    FetchColor(MapPixelToSample(cardinalCoord[2], frameParity)) +
+                    FetchColor(MapPixelToSample(cardinalCoord[3], frameParity))
+                ) * 0.25;
+                spatialDepth = isCurrentSampleActive ? currentDepth : (cardinalDepth[0] + cardinalDepth[1] + cardinalDepth[2] + cardinalDepth[3]) * 0.25;
             }
         }
     }
@@ -307,11 +318,19 @@ void ResolvePixel(ivec2 pixelCoord, ivec2 targetSize, uint frameParity) {
     if (pc.u_DebugView == 1u) {
         finalColor = isCurrentSampleActive ? vec3(1.0, 1.0, 1.0) : vec3(0.05, 0.05, 0.05);
     } else if (pc.u_DebugView == 2u) {
-        finalColor = isDisoccluded ? vec3(1.0, 0.1, 0.1) : vec3(0.1, 0.9, 0.1);
+        float t = clamp(depthDelta / max(pc.u_DepthTolerance, 1e-4), 0.0, 1.0);
+        finalColor = isDisoccluded ? vec3(1.0, 0.1, 0.1) : mix(vec3(0.1, 0.9, 0.1), vec3(1.0, 0.9, 0.1), t);
     } else if (pc.u_DebugView == 3u) {
-        finalColor = vec3(abs(velocity) * 50.0, 0.0);
+        vec2 normVel = velocity * 20.0;
+        float speed = clamp(length(normVel), 0.0, 1.0);
+        finalColor = vec3(clamp(normVel * 0.5 + 0.5, 0.0, 1.0), speed);
     } else if (pc.u_DebugView == 4u) {
-        finalColor = isCurrentSampleActive ? currentColor : FetchColor(MapPixelToSample(cardinalCoord[0], frameParity));
+        finalColor = isCurrentSampleActive ? currentColor : (
+            FetchColor(MapPixelToSample(cardinalCoord[0], frameParity)) +
+            FetchColor(MapPixelToSample(cardinalCoord[1], frameParity)) +
+            FetchColor(MapPixelToSample(cardinalCoord[2], frameParity)) +
+            FetchColor(MapPixelToSample(cardinalCoord[3], frameParity))
+        ) * 0.25;
     } else if (pc.u_DebugView == 5u) {
         finalColor = isCurrentSampleActive ? currentColor : (
             FetchColor(MapPixelToSample(cardinalCoord[0], frameParity)) +

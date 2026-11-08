@@ -1101,6 +1101,7 @@ private:
     JitterOffset m_previousJitter;
     std::pair<float, float> m_cachedProjectionOffsetVk[2]{};
     std::pair<float, float> m_cachedProjectionOffsetDx[2]{};
+    mutable float           m_lastProj0{ 0.0f };
 };
 
 } // namespace cbr
@@ -1954,7 +1955,8 @@ void CBREngine::OnPostPresent(void* presentTarget) {
 void CBREngine::OnSwapchainRecreated(uint32_t width, uint32_t height) {
     m_mainPresentTarget.store(nullptr);
     m_activeCandidateCmdBuffer.store(nullptr);
-    m_frameIndex.store(0);
+    const uint32_t currentParity = m_frameIndex.load() & 1u;
+    m_frameIndex.store(currentParity);
     m_lastDispatchedFrame.store(kNoFrame);
 
     // Swapchain extents are untrusted: odd sizes round up to even, implausible ones are ignored.
@@ -2850,6 +2852,7 @@ namespace {
 struct MinimalVkViewport;
 struct MinimalVkRect2D;
 struct MinimalVkSampleLocationsInfoEXT;
+struct MinimalVkSamplerCreateInfo;
 
 // Function pointer typedefs matching Vulkan loader signatures
 typedef void* (*PFN_vkGetDeviceProcAddr)(void* device, const char* pName);
@@ -2867,6 +2870,7 @@ typedef void  (*PFN_vkCmdDraw)(void* commandBuffer, uint32_t vertexCount, uint32
 typedef void  (*PFN_vkCmdDrawIndexed)(void* commandBuffer, uint32_t indexCount, uint32_t instanceCount, uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance);
 typedef int   (*PFN_vkCreateDevice)(void* physicalDevice, const void* pCreateInfo, const void* pAllocator, void** pDevice);
 typedef void  (*PFN_vkDestroySwapchainKHR)(void* device, void* swapchain, const void* pAllocator);
+typedef int   (*PFN_vkCreateSampler)(void* device, const MinimalVkSamplerCreateInfo* pCreateInfo, const void* pAllocator, void* pSampler);
 
 PFN_vkGetDeviceProcAddr        g_Original_vkGetDeviceProcAddr = nullptr;
 PFN_vkGetInstanceProcAddr      g_Original_vkGetInstanceProcAddr = nullptr;
@@ -2883,6 +2887,7 @@ PFN_vkCmdEndRenderPass         g_Original_vkCmdEndRenderPass = nullptr;
 PFN_vkCmdDraw                  g_Original_vkCmdDraw = nullptr;
 PFN_vkCmdDrawIndexed           g_Original_vkCmdDrawIndexed = nullptr;
 PFN_vkCmdSetSampleLocationsEXT g_Original_vkCmdSetSampleLocationsEXT = nullptr;
+PFN_vkCreateSampler            g_Original_vkCreateSampler = nullptr;
 
 void* Hooked_vkGetDeviceProcAddr(void* device, const char* pName);
 void* Hooked_vkGetInstanceProcAddr(void* instance, const char* pName);
@@ -2897,6 +2902,7 @@ void  Hooked_vkCmdEndRenderPass(void* commandBuffer);
 void  Hooked_vkCmdDraw(void* commandBuffer, uint32_t vertexCount, uint32_t instanceCount, uint32_t firstVertex, uint32_t firstInstance);
 void  Hooked_vkCmdDrawIndexed(void* commandBuffer, uint32_t indexCount, uint32_t instanceCount, uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance);
 void  Hooked_vkCmdSetSampleLocationsEXT(void* commandBuffer, const MinimalVkSampleLocationsInfoEXT* pSampleLocationsInfo);
+int   Hooked_vkCreateSampler(void* device, const MinimalVkSamplerCreateInfo* pCreateInfo, const void* pAllocator, void* pSampler);
 
 // VK_ERROR_INITIALIZATION_FAILED: returned if a hook is ever invoked without a valid trampoline,
 // so the failure is visible to the caller instead of silently dropping frames / swapchains.
@@ -2972,6 +2978,28 @@ struct MinimalVkPipelineMultisampleStateCreateInfo {
     uint32_t     alphaToCoverageEnable;
     uint32_t     alphaToOneEnable;
 };
+
+struct MinimalVkSamplerCreateInfo {
+    uint32_t     sType;
+    const void*  pNext;
+    uint32_t     flags;
+    int32_t      magFilter;
+    int32_t      minFilter;
+    int32_t      mipmapMode;
+    int32_t      addressModeU;
+    int32_t      addressModeV;
+    int32_t      addressModeW;
+    float        mipLodBias;
+    uint32_t     anisotropyEnable;
+    float        maxAnisotropy;
+    uint32_t     compareEnable;
+    int32_t      compareOp;
+    float        minLod;
+    float        maxLod;
+    int32_t      borderColor;
+    uint32_t     unnormalizedCoordinates;
+};
+static_assert(offsetof(MinimalVkSamplerCreateInfo, mipLodBias) == 44, "MinimalVkSamplerCreateInfo mipLodBias offset mismatch");
 
 struct MinimalVkViewport {
     float x;
@@ -3426,6 +3454,19 @@ void Hooked_vkCmdSetSampleLocationsEXT(void* commandBuffer, const MinimalVkSampl
     g_Original_vkCmdSetSampleLocationsEXT(commandBuffer, pSampleLocationsInfo);
 }
 
+int Hooked_vkCreateSampler(void* device, const MinimalVkSamplerCreateInfo* pCreateInfo, const void* pAllocator, void* pSampler) {
+    if (!g_Original_vkCreateSampler) {
+        return -1; // VK_ERROR_INITIALIZATION_FAILED
+    }
+    const auto& config = ConfigManager::Get().GetConfig();
+    if (pCreateInfo && config.mipLodBias != 0.0f) {
+        MinimalVkSamplerCreateInfo modifiedInfo = *pCreateInfo;
+        modifiedInfo.mipLodBias += config.mipLodBias;
+        return g_Original_vkCreateSampler(device, &modifiedInfo, pAllocator, pSampler);
+    }
+    return g_Original_vkCreateSampler(device, pCreateInfo, pAllocator, pSampler);
+}
+
 void* Hooked_vkGetDeviceProcAddr(void* device, const char* pName) {
     if (!pName || !g_Original_vkGetDeviceProcAddr) {
         return nullptr;
@@ -3513,6 +3554,12 @@ void* Hooked_vkGetDeviceProcAddr(void* device, const char* pName) {
             g_Original_vkCmdDrawIndexed = reinterpret_cast<PFN_vkCmdDrawIndexed>(realProc);
         }
         return reinterpret_cast<void*>(&Hooked_vkCmdDrawIndexed);
+    }
+    if (std::strcmp(pName, "vkCreateSampler") == 0) {
+        if (!g_Original_vkCreateSampler) {
+            g_Original_vkCreateSampler = reinterpret_cast<PFN_vkCreateSampler>(realProc);
+        }
+        return reinterpret_cast<void*>(&Hooked_vkCreateSampler);
     }
     return realProc;
 }
@@ -3604,6 +3651,12 @@ void* Hooked_vkGetInstanceProcAddr(void* instance, const char* pName) {
             g_Original_vkCmdSetSampleLocationsEXT = reinterpret_cast<PFN_vkCmdSetSampleLocationsEXT>(realProc);
         }
         return reinterpret_cast<void*>(&Hooked_vkCmdSetSampleLocationsEXT);
+    }
+    if (std::strcmp(pName, "vkCreateSampler") == 0) {
+        if (!g_Original_vkCreateSampler) {
+            g_Original_vkCreateSampler = reinterpret_cast<PFN_vkCreateSampler>(realProc);
+        }
+        return reinterpret_cast<void*>(&Hooked_vkCreateSampler);
     }
     if (std::strcmp(pName, "vkGetDeviceProcAddr") == 0) {
         if (!g_Original_vkGetDeviceProcAddr) {
@@ -3860,6 +3913,23 @@ bool HookManager::InstallVulkanHooks() {
         } else {
             g_Original_vkCmdSetSampleLocationsEXT = reinterpret_cast<PFN_vkCmdSetSampleLocationsEXT>(pfnCmdSetSampleLocationsEXT);
             CBR_LOG_INFO("Directly resolved vkCmdSetSampleLocationsEXT: 0x%p", pfnCmdSetSampleLocationsEXT);
+        }
+    }
+
+    // 9. Intercept vkCreateSampler for negative LOD bias compensation
+    auto pfnCreateSampler = reinterpret_cast<void*>(GetProcAddress(vulkanModule, "vkCreateSampler"));
+    if (pfnCreateSampler) {
+        mhStatus = MH_CreateHook(
+            pfnCreateSampler,
+            reinterpret_cast<LPVOID>(&Hooked_vkCreateSampler),
+            reinterpret_cast<LPVOID*>(&g_Original_vkCreateSampler)
+        );
+        if (mhStatus == MH_OK || mhStatus == MH_ERROR_ALREADY_CREATED) {
+            MH_EnableHook(pfnCreateSampler);
+            CBR_LOG_INFO("MinHook: Successfully detoured vkCreateSampler (export at 0x%p).", pfnCreateSampler);
+            hookedAny = true;
+        } else {
+            CBR_LOG_WARN("MinHook: Could not detour vkCreateSampler (status: %d).", mhStatus);
         }
     }
 
@@ -4204,8 +4274,10 @@ void HookManager::UninstallDX12Hooks() {
 ### `src/jitter_manager.cpp`
 ```cpp
 #include "cbr/jitter_manager.h"
+#include <cmath>
 #include "cbr/config.h"
 #include "cbr/logger.h"
+#include "cbr/render_target_manager.h"
 
 // LOCK HIERARCHY:
 //   Level 1: ConfigManager::m_mutex
@@ -4235,11 +4307,11 @@ void JitterManager::Initialize(uint32_t targetWidth, uint32_t targetHeight) {
         w = m_targetWidth; h = m_targetHeight;
 
         const float pixelWidth = 1.0f / static_cast<float>(m_targetWidth);
-        const float ndcX = sign * (2.0f * dir * pixelWidth);
+        const JitterOffset phase1Jitter{ dir * pixelWidth, 0.0f };
         m_cachedProjectionOffsetVk[0] = { 0.0f, 0.0f };
         m_cachedProjectionOffsetDx[0] = { 0.0f, 0.0f };
-        m_cachedProjectionOffsetVk[1] = { ndcX, 0.0f };
-        m_cachedProjectionOffsetDx[1] = { ndcX, 0.0f };
+        m_cachedProjectionOffsetVk[1] = ComputeProjectionOffset(phase1Jitter, true);
+        m_cachedProjectionOffsetDx[1] = ComputeProjectionOffset(phase1Jitter, false);
     }
     CBR_LOG_INFO("JitterManager initialized with target resolution: %ux%u", w, h);
 }
@@ -4259,12 +4331,12 @@ void JitterManager::Update(uint32_t frameIndex) {
     // Odd frames are shifted horizontally by exactly one full-resolution pixel (shiftDirection * pixelWidth),
     // giving 100% 4-quadrant geometric coverage across two frames with standard 2x MSAA sample locations.
     const float pixelWidth = 1.0f / static_cast<float>(m_targetWidth);
-    const float ndcX = sign * (2.0f * dir * pixelWidth);
+    const JitterOffset phase1Jitter{ dir * pixelWidth, 0.0f };
 
     m_cachedProjectionOffsetVk[0] = { 0.0f, 0.0f };
     m_cachedProjectionOffsetDx[0] = { 0.0f, 0.0f };
-    m_cachedProjectionOffsetVk[1] = { ndcX, 0.0f };
-    m_cachedProjectionOffsetDx[1] = { ndcX, 0.0f };
+    m_cachedProjectionOffsetVk[1] = ComputeProjectionOffset(phase1Jitter, true);
+    m_cachedProjectionOffsetDx[1] = ComputeProjectionOffset(phase1Jitter, false);
 
     if (frameIndex & 1u) {
         m_currentJitter.x = dir * pixelWidth;
@@ -4278,7 +4350,9 @@ void JitterManager::Update(uint32_t frameIndex) {
 float JitterManager::GetQuarterViewportShiftX(uint32_t frameIndex) const {
     const auto& config = ConfigManager::Get().GetConfig();
     const float dir = (config.jitterDirection < 0) ? -1.0f : 1.0f;
-    return (frameIndex & 1u) ? (0.5f * dir) : 0.0f;
+    if (!(frameIndex & 1u)) return 0.0f;
+    const float shift = 0.5f * dir;
+    return std::round(shift * 16.0f) / 16.0f;
 }
 
 std::pair<float, float> JitterManager::ComputeProjectionOffset(const JitterOffset& jitter, bool isVulkan) const {
@@ -4298,6 +4372,18 @@ std::pair<float, float> JitterManager::ComputeProjectionOffset(const JitterOffse
 
 void JitterManager::ApplyJitterToProjection(float* projMatrix4x4, bool isVulkan) const {
     if (!projMatrix4x4) return;
+
+    // Detect rapid FOV changes (e.g. scoping / sniper zoom > 5 degrees per frame)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_lastProj0 > 0.0f && projMatrix4x4[0] > 0.0f) {
+            const float fovDeltaRatio = std::abs(projMatrix4x4[0] - m_lastProj0) / m_lastProj0;
+            if (fovDeltaRatio > 0.08f) {
+                RenderTargetManager::Get().ResetHistory();
+            }
+        }
+        m_lastProj0 = projMatrix4x4[0];
+    }
 
     std::pair<float, float> offset;
     {
@@ -6641,7 +6727,7 @@ vec3 YCoCgtoRGB(vec3 ycocg) {
 }
 
 vec3 ToClampSpace(vec3 rgb)  { return (pc.u_ColorSpace == 0u) ? RGBtoYCoCg(rgb) : rgb; }
-vec3 FromClampSpace(vec3 c)  { return (pc.u_ColorSpace == 0u) ? YCoCgtoRGB(c) : max(vec3(0.0), c); }
+vec3 FromClampSpace(vec3 c)  { return (pc.u_ColorSpace == 0u) ? YCoCgtoRGB(c) : c; }
 
 // =============================================================================
 // Checkerboard sample mapping. MIRRORS include/cbr/checkerboard_mapping.h: keep the two in sync
@@ -6783,8 +6869,8 @@ void main() {
     // For inactive pixels, the 4 cardinal neighbours are already fetched in step 1, avoiding redundant texture fetches.
     ivec2 motionCoord = pixelCoord;
     if (pc.u_EnableMotionDilation != 0u) {
+        float best = currentDepth;
         if (isCurrentSampleActive) {
-            float best = currentDepth;
             const ivec2 kDiagonal[4] = ivec2[](ivec2(-1, -1), ivec2(1, -1), ivec2(-1, 1), ivec2(1, 1));
             for (int i = 0; i < 4; ++i) {
                 ivec2 n = pixelCoord + kDiagonal[i];
@@ -6796,14 +6882,11 @@ void main() {
                 }
             }
         } else {
-            bool found = false;
-            float best = 0.0;
             for (int i = 0; i < 4; ++i) {
                 ivec2 n = pixelCoord + kCardinal[i];
                 if (!InBounds(n, targetSize)) continue;
                 float d = cardinalDepth[i];
-                if (!found || IsNearer(d, best)) {
-                    found = true;
+                if (IsNearer(d, best)) {
                     best = d;
                     motionCoord = n;
                 }
@@ -6817,7 +6900,14 @@ void main() {
     // NaN/Inf velocity or UV must disocclude: ivec2(NaN) is UB and NaN comparisons are false.
     bool velocityBad = isinf(velocity.x) || isnan(velocity.x) || isinf(velocity.y) || isnan(velocity.y)
         || isinf(uv.x) || isnan(uv.x) || isinf(uv.y) || isnan(uv.y);
-    vec2 historyUV = uv - velocity - pc.u_JitterDelta * pc.u_JitterCompensation;
+    // Jitter dampener: dampens jitter compensation on zero-velocity passes (transparent particles, fog, smoke)
+    // to prevent half-pixel oscillation when alpha-blended particles lack motion vectors.
+    float jitterDampener = (dot(velocity, velocity) < 1e-9) ? 0.0 : 1.0;
+    vec2 historyUV = uv - velocity - (pc.u_JitterDelta * (pc.u_JitterCompensation * jitterDampener));
+    // Clamp historyUV to valid subpixel inner border to prevent edge sample bleeding
+    vec2 minUV = 0.5 * pc.u_InvTargetResolution;
+    vec2 maxUV = vec2(1.0) - minUV;
+    historyUV = clamp(historyUV, minUV, maxUV);
     bool historyUVBad = velocityBad || isinf(historyUV.x) || isnan(historyUV.x)
         || isinf(historyUV.y) || isnan(historyUV.y);
 
@@ -6838,11 +6928,12 @@ void main() {
         float prevLin = LinearizeDepth(previousDepth);
         bool depthBad = isinf(currentLinear) || isnan(currentLinear) || isinf(prevLin) || isnan(prevLin);
         depthDelta = depthBad ? 10.0 : abs(currentLinear - prevLin) / max(currentLinear, 1e-5);
-        if (depthDelta > pc.u_DepthTolerance) {
+        float dynamicTolerance = pc.u_DepthTolerance * max(1.0, 1.0 + 0.0005 * currentLinear);
+        if (depthDelta > dynamicTolerance) {
             isDisoccluded = true;
         } else {
             historyColor = textureLod(u_HistoryColor, historyUV, 0.0);
-            if (historyColor.a <= 0.0) {
+            if (historyColor.a < 0.5) {
                 isDisoccluded = true; // Cleared history buffer
             }
         }
@@ -6896,7 +6987,8 @@ void main() {
         if (n >= 2.0) {
             // Variance clipping: clamp history inside [mean - gamma * stdDev, mean + gamma * stdDev]
             vec3 mean = m1 / n;
-            vec3 stdDev = sqrt(max(vec3(0.0), (m2 / n) - (mean * mean)));
+            vec3 rawStdDev = sqrt(max(vec3(0.0), (m2 / n) - (mean * mean)));
+            vec3 stdDev = max(rawStdDev, vec3(0.005)); // Enforce floor to avoid shadow collapse and retain specular headroom
             const float gamma = 1.25; // kVarianceClipGamma (include/cbr/limits.h)
             vec3 varianceMin = max(colorMin, mean - gamma * stdDev);
             vec3 varianceMax = min(colorMax, mean + gamma * stdDev);
@@ -6948,8 +7040,10 @@ void main() {
                 finalColor = accumColor / accumWeight;
                 spatialDepth = accumDepth / accumWeight;
             } else {
-                finalColor = isCurrentSampleActive ? currentColor : cardinalColor[0];
-                spatialDepth = isCurrentSampleActive ? currentDepth : cardinalDepth[0];
+                // When depth divergence across all 4 samples is high, average cardinal samples
+                // to prevent single-pixel directional bias (Item 58)
+                finalColor = isCurrentSampleActive ? currentColor : (cardinalColor[0] + cardinalColor[1] + cardinalColor[2] + cardinalColor[3]) * 0.25;
+                spatialDepth = isCurrentSampleActive ? currentDepth : (cardinalDepth[0] + cardinalDepth[1] + cardinalDepth[2] + cardinalDepth[3]) * 0.25;
             }
         }
     }
@@ -6968,14 +7062,17 @@ void main() {
         // Checkerboard mask: White = natively shaded this frame, Black = reconstructed
         finalColor = isCurrentSampleActive ? vec3(1.0, 1.0, 1.0) : vec3(0.05, 0.05, 0.05);
     } else if (pc.u_DebugView == 2u) {
-        // Disocclusion heatmap: Green = temporal history, Red = spatial disocclusion
-        finalColor = isDisoccluded ? vec3(1.0, 0.1, 0.1) : vec3(0.1, 0.9, 0.1);
+        // Continuous gradient heatmap: Green = 0 delta, Yellow = mid delta, Red = disoccluded (Item 66)
+        float t = clamp(depthDelta / max(pc.u_DepthTolerance, 1e-4), 0.0, 1.0);
+        finalColor = isDisoccluded ? vec3(1.0, 0.1, 0.1) : mix(vec3(0.1, 0.9, 0.1), vec3(1.0, 0.9, 0.1), t);
     } else if (pc.u_DebugView == 3u) {
-        // Motion vector field
-        finalColor = vec3(abs(velocity) * 50.0, 0.0);
+        // Directional color wheel: RG = direction, B = normalized speed (Item 69)
+        vec2 normVel = velocity * 20.0;
+        float speed = clamp(length(normVel), 0.0, 1.0);
+        finalColor = vec3(clamp(normVel * 0.5 + 0.5, 0.0, 1.0), speed);
     } else if (pc.u_DebugView == 4u) {
-        // Quarter-resolution raw colour (nearest native sample for reconstructed pixels)
-        finalColor = isCurrentSampleActive ? currentColor : cardinalColor[0];
+        // Quarter-resolution raw colour without directional bias (Item 61)
+        finalColor = isCurrentSampleActive ? currentColor : (cardinalColor[0] + cardinalColor[1] + cardinalColor[2] + cardinalColor[3]) * 0.25;
     } else if (pc.u_DebugView == 5u) {
         // Spatial baseline resolve: average of 4 cardinal samples for reconstructed pixels
         // (direct visual A/B baseline comparison against temporal CBR, matching reference Space toggle)
@@ -7070,7 +7167,7 @@ vec3 YCoCgtoRGB(vec3 ycocg) {
 }
 
 vec3 ToClampSpace(vec3 rgb)  { return (pc.u_ColorSpace == 0u) ? RGBtoYCoCg(rgb) : rgb; }
-vec3 FromClampSpace(vec3 c)  { return (pc.u_ColorSpace == 0u) ? YCoCgtoRGB(c) : max(vec3(0.0), c); }
+vec3 FromClampSpace(vec3 c)  { return (pc.u_ColorSpace == 0u) ? YCoCgtoRGB(c) : c; }
 
 struct CbrSample {
     bool  isActive;
@@ -7175,8 +7272,8 @@ void ResolvePixel(ivec2 pixelCoord, ivec2 targetSize, uint frameParity) {
 
     ivec2 motionCoord = pixelCoord;
     if (pc.u_EnableMotionDilation != 0u) {
+        float best = currentDepth;
         if (isCurrentSampleActive) {
-            float best = currentDepth;
             const ivec2 kDiagonal[4] = ivec2[](ivec2(-1, -1), ivec2(1, -1), ivec2(-1, 1), ivec2(1, 1));
             for (int i = 0; i < 4; ++i) {
                 ivec2 n = pixelCoord + kDiagonal[i];
@@ -7185,13 +7282,11 @@ void ResolvePixel(ivec2 pixelCoord, ivec2 targetSize, uint frameParity) {
                 if (IsNearer(d, best)) { best = d; motionCoord = n; }
             }
         } else {
-            bool found = false;
-            float best = 0.0;
             for (int i = 0; i < 4; ++i) {
                 ivec2 n = pixelCoord + kCardinal[i];
                 if (!InBounds(n, targetSize)) continue;
                 float d = cardinalDepth[i];
-                if (!found || IsNearer(d, best)) { found = true; best = d; motionCoord = n; }
+                if (IsNearer(d, best)) { best = d; motionCoord = n; }
             }
         }
     }
@@ -7201,7 +7296,13 @@ void ResolvePixel(ivec2 pixelCoord, ivec2 targetSize, uint frameParity) {
     velocity = clamp(velocity, vec2(-0.5), vec2(0.5));
     bool velocityBad = isinf(velocity.x) || isnan(velocity.x) || isinf(velocity.y) || isnan(velocity.y)
         || isinf(uv.x) || isnan(uv.x) || isinf(uv.y) || isnan(uv.y);
-    vec2 historyUV = uv - velocity - pc.u_JitterDelta * pc.u_JitterCompensation;
+    // Jitter dampener: dampens jitter compensation on zero-velocity passes (transparent particles, fog, smoke)
+    // to prevent half-pixel oscillation when alpha-blended particles lack motion vectors.
+    float jitterDampener = (dot(velocity, velocity) < 1e-9) ? 0.0 : 1.0;
+    vec2 historyUV = uv - velocity - (pc.u_JitterDelta * (pc.u_JitterCompensation * jitterDampener));
+    vec2 minUV = 0.5 * pc.u_InvTargetResolution;
+    vec2 maxUV = vec2(1.0) - minUV;
+    historyUV = clamp(historyUV, minUV, maxUV);
     bool historyUVBad = velocityBad || isinf(historyUV.x) || isnan(historyUV.x)
         || isinf(historyUV.y) || isnan(historyUV.y);
 
@@ -7218,11 +7319,12 @@ void ResolvePixel(ivec2 pixelCoord, ivec2 targetSize, uint frameParity) {
         float prevLin = LinearizeDepth(previousDepth);
         bool depthBad = isinf(currentLinear) || isnan(currentLinear) || isinf(prevLin) || isnan(prevLin);
         depthDelta = depthBad ? 10.0 : abs(currentLinear - prevLin) / max(currentLinear, 1e-5);
-        if (depthDelta > pc.u_DepthTolerance) {
+        float dynamicTolerance = pc.u_DepthTolerance * max(1.0, 1.0 + 0.0005 * currentLinear);
+        if (depthDelta > dynamicTolerance) {
             isDisoccluded = true;
         } else {
             historyColor = textureLod(u_HistoryColor, historyUV, 0.0);
-            if (historyColor.a <= 0.0) isDisoccluded = true;
+            if (historyColor.a < 0.5) isDisoccluded = true;
         }
     }
 
@@ -7255,7 +7357,8 @@ void ResolvePixel(ivec2 pixelCoord, ivec2 targetSize, uint frameParity) {
 
         if (n >= 2.0) {
             vec3 mean = m1 / n;
-            vec3 stdDev = sqrt(max(vec3(0.0), (m2 / n) - (mean * mean)));
+            vec3 rawStdDev = sqrt(max(vec3(0.0), (m2 / n) - (mean * mean)));
+            vec3 stdDev = max(rawStdDev, vec3(0.005));
             const float gamma = 1.25;
             vec3 varianceMin = max(colorMin, mean - gamma * stdDev);
             vec3 varianceMax = min(colorMax, mean + gamma * stdDev);
@@ -7297,8 +7400,13 @@ void ResolvePixel(ivec2 pixelCoord, ivec2 targetSize, uint frameParity) {
                 finalColor = accumColor / accumWeight;
                 spatialDepth = accumDepth / accumWeight;
             } else {
-                finalColor = isCurrentSampleActive ? currentColor : FetchColor(MapPixelToSample(cardinalCoord[0], frameParity));
-                spatialDepth = isCurrentSampleActive ? currentDepth : cardinalDepth[0];
+                finalColor = isCurrentSampleActive ? currentColor : (
+                    FetchColor(MapPixelToSample(cardinalCoord[0], frameParity)) +
+                    FetchColor(MapPixelToSample(cardinalCoord[1], frameParity)) +
+                    FetchColor(MapPixelToSample(cardinalCoord[2], frameParity)) +
+                    FetchColor(MapPixelToSample(cardinalCoord[3], frameParity))
+                ) * 0.25;
+                spatialDepth = isCurrentSampleActive ? currentDepth : (cardinalDepth[0] + cardinalDepth[1] + cardinalDepth[2] + cardinalDepth[3]) * 0.25;
             }
         }
     }
@@ -7313,11 +7421,19 @@ void ResolvePixel(ivec2 pixelCoord, ivec2 targetSize, uint frameParity) {
     if (pc.u_DebugView == 1u) {
         finalColor = isCurrentSampleActive ? vec3(1.0, 1.0, 1.0) : vec3(0.05, 0.05, 0.05);
     } else if (pc.u_DebugView == 2u) {
-        finalColor = isDisoccluded ? vec3(1.0, 0.1, 0.1) : vec3(0.1, 0.9, 0.1);
+        float t = clamp(depthDelta / max(pc.u_DepthTolerance, 1e-4), 0.0, 1.0);
+        finalColor = isDisoccluded ? vec3(1.0, 0.1, 0.1) : mix(vec3(0.1, 0.9, 0.1), vec3(1.0, 0.9, 0.1), t);
     } else if (pc.u_DebugView == 3u) {
-        finalColor = vec3(abs(velocity) * 50.0, 0.0);
+        vec2 normVel = velocity * 20.0;
+        float speed = clamp(length(normVel), 0.0, 1.0);
+        finalColor = vec3(clamp(normVel * 0.5 + 0.5, 0.0, 1.0), speed);
     } else if (pc.u_DebugView == 4u) {
-        finalColor = isCurrentSampleActive ? currentColor : FetchColor(MapPixelToSample(cardinalCoord[0], frameParity));
+        finalColor = isCurrentSampleActive ? currentColor : (
+            FetchColor(MapPixelToSample(cardinalCoord[0], frameParity)) +
+            FetchColor(MapPixelToSample(cardinalCoord[1], frameParity)) +
+            FetchColor(MapPixelToSample(cardinalCoord[2], frameParity)) +
+            FetchColor(MapPixelToSample(cardinalCoord[3], frameParity))
+        ) * 0.25;
     } else if (pc.u_DebugView == 5u) {
         finalColor = isCurrentSampleActive ? currentColor : (
             FetchColor(MapPixelToSample(cardinalCoord[0], frameParity)) +
@@ -7434,7 +7550,7 @@ float3 YCoCgtoRGB(float3 ycocg)
 }
 
 float3 ToClampSpace(float3 rgb)   { return (g_ColorSpace == 0u) ? RGBtoYCoCg(rgb) : rgb; }
-float3 FromClampSpace(float3 c)   { return (g_ColorSpace == 0u) ? YCoCgtoRGB(c) : max(float3(0.0f, 0.0f, 0.0f), c); }
+float3 FromClampSpace(float3 c)   { return (g_ColorSpace == 0u) ? YCoCgtoRGB(c) : c; }
 
 // =============================================================================
 // Checkerboard sample mapping. MIRRORS include/cbr/checkerboard_mapping.h: keep the two in sync
@@ -7589,14 +7705,11 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
                 }
             }
         } else {
-            bool found = false;
-            float best = 0.0f;
             for (int i = 0; i < 4; ++i) {
                 int2 n = pixelCoord + kCardinal[i];
                 if (!InBounds(n, targetSize)) continue;
                 float d = cardinalDepth[i];
-                if (!found || IsNearer(d, best)) {
-                    found = true;
+                if (IsNearer(d, best)) {
                     best = d;
                     motionCoord = n;
                 }
@@ -7609,7 +7722,13 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     velocity = clamp(velocity, float2(-0.5f, -0.5f), float2(0.5f, 0.5f));
     bool velocityBad = isinf(velocity.x) || isnan(velocity.x) || isinf(velocity.y) || isnan(velocity.y)
         || isinf(uv.x) || isnan(uv.x) || isinf(uv.y) || isnan(uv.y);
-    float2 historyUV = uv - velocity - g_JitterDelta * g_JitterCompensation;
+    // Jitter dampener: dampens jitter compensation on zero-velocity passes (transparent particles, fog, smoke)
+    // to prevent half-pixel oscillation when alpha-blended particles lack motion vectors.
+    float jitterDampener = (dot(velocity, velocity) < 1e-9f) ? 0.0f : 1.0f;
+    float2 historyUV = uv - velocity - (g_JitterDelta * (g_JitterCompensation * jitterDampener));
+    float2 minUV = 0.5f * g_InvTargetResolution;
+    float2 maxUV = float2(1.0f, 1.0f) - minUV;
+    historyUV = clamp(historyUV, minUV, maxUV);
     bool historyUVBad = velocityBad || isinf(historyUV.x) || isnan(historyUV.x)
         || isinf(historyUV.y) || isnan(historyUV.y);
 
@@ -7628,11 +7747,12 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
         float prevLin = LinearizeDepth(previousDepth);
         bool depthBad = isinf(currentLinear) || isnan(currentLinear) || isinf(prevLin) || isnan(prevLin);
         depthDelta = depthBad ? 10.0f : abs(currentLinear - prevLin) / max(currentLinear, 1e-5f);
-        if (depthDelta > g_DepthTolerance) {
+        float dynamicTolerance = g_DepthTolerance * max(1.0f, 1.0f + 0.0005f * currentLinear);
+        if (depthDelta > dynamicTolerance) {
             isDisoccluded = true;
         } else {
             historyColor = g_HistoryColor.SampleLevel(g_LinearClampSampler, historyUV, 0.0f);
-            if (historyColor.a <= 0.0f) {
+            if (historyColor.a < 0.5f) {
                 isDisoccluded = true; // Cleared history buffer
             }
         }
@@ -7684,7 +7804,8 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
         if (n >= 2.0f) {
             // Variance clipping: clamp history inside [mean - gamma * stdDev, mean + gamma * stdDev]
             float3 mean = m1 / n;
-            float3 stdDev = sqrt(max(float3(0.0f, 0.0f, 0.0f), (m2 / n) - (mean * mean)));
+            float3 rawStdDev = sqrt(max(float3(0.0f, 0.0f, 0.0f), (m2 / n) - (mean * mean)));
+            float3 stdDev = max(rawStdDev, float3(0.005f, 0.005f, 0.005f));
             const float gamma = 1.25f; // kVarianceClipGamma (include/cbr/limits.h)
             float3 varianceMin = max(colorMin, mean - gamma * stdDev);
             float3 varianceMax = min(colorMax, mean + gamma * stdDev);
@@ -7736,8 +7857,13 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
                 finalColor = accumColor / accumWeight;
                 spatialDepth = accumDepth / accumWeight;
             } else {
-                finalColor = isCurrentSampleActive ? currentColor : FetchColor(MapPixelToSample(cardinalCoord[0], frameParity));
-                spatialDepth = isCurrentSampleActive ? currentDepth : cardinalDepth[0];
+                finalColor = isCurrentSampleActive ? currentColor : (
+                    FetchColor(MapPixelToSample(cardinalCoord[0], frameParity)) +
+                    FetchColor(MapPixelToSample(cardinalCoord[1], frameParity)) +
+                    FetchColor(MapPixelToSample(cardinalCoord[2], frameParity)) +
+                    FetchColor(MapPixelToSample(cardinalCoord[3], frameParity))
+                ) * 0.25f;
+                spatialDepth = isCurrentSampleActive ? currentDepth : (cardinalDepth[0] + cardinalDepth[1] + cardinalDepth[2] + cardinalDepth[3]) * 0.25f;
             }
         }
     }
@@ -7755,13 +7881,21 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
         finalColor = isCurrentSampleActive ? float3(1.0f, 1.0f, 1.0f) : float3(0.05f, 0.05f, 0.05f);
     } else if (g_DebugView == 2u) {
         // Disocclusion heatmap: Green = temporal history, Red = spatial disocclusion
-        finalColor = isDisoccluded ? float3(1.0f, 0.1f, 0.1f) : float3(0.1f, 0.9f, 0.1f);
+        float t = clamp(depthDelta / max(g_DepthTolerance, 1e-4f), 0.0f, 1.0f);
+        finalColor = isDisoccluded ? float3(1.0f, 0.1f, 0.1f) : lerp(float3(0.1f, 0.9f, 0.1f), float3(1.0f, 0.9f, 0.1f), t);
     } else if (g_DebugView == 3u) {
-        // Motion vector field
-        finalColor = float3(abs(velocity) * 50.0f, 0.0f);
+        // Motion vector field: directional color wheel
+        float2 normVel = velocity * 20.0f;
+        float speed = clamp(length(normVel), 0.0f, 1.0f);
+        finalColor = float3(clamp(normVel * 0.5f + 0.5f, 0.0f, 1.0f), speed);
     } else if (g_DebugView == 4u) {
-        // Quarter-resolution raw colour (nearest native sample for reconstructed pixels)
-        finalColor = isCurrentSampleActive ? currentColor : FetchColor(MapPixelToSample(cardinalCoord[0], frameParity));
+        // Quarter-resolution raw colour without directional bias
+        finalColor = isCurrentSampleActive ? currentColor : (
+            FetchColor(MapPixelToSample(cardinalCoord[0], frameParity)) +
+            FetchColor(MapPixelToSample(cardinalCoord[1], frameParity)) +
+            FetchColor(MapPixelToSample(cardinalCoord[2], frameParity)) +
+            FetchColor(MapPixelToSample(cardinalCoord[3], frameParity))
+        ) * 0.25f;
     } else if (g_DebugView == 5u) {
         // Spatial baseline resolve: average of 4 cardinal samples for reconstructed pixels
         // (direct visual A/B baseline comparison against temporal CBR, matching reference Space toggle)

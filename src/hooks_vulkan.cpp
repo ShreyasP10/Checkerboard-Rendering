@@ -26,6 +26,7 @@ namespace {
 struct MinimalVkViewport;
 struct MinimalVkRect2D;
 struct MinimalVkSampleLocationsInfoEXT;
+struct MinimalVkSamplerCreateInfo;
 
 // Function pointer typedefs matching Vulkan loader signatures
 typedef void* (*PFN_vkGetDeviceProcAddr)(void* device, const char* pName);
@@ -43,6 +44,7 @@ typedef void  (*PFN_vkCmdDraw)(void* commandBuffer, uint32_t vertexCount, uint32
 typedef void  (*PFN_vkCmdDrawIndexed)(void* commandBuffer, uint32_t indexCount, uint32_t instanceCount, uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance);
 typedef int   (*PFN_vkCreateDevice)(void* physicalDevice, const void* pCreateInfo, const void* pAllocator, void** pDevice);
 typedef void  (*PFN_vkDestroySwapchainKHR)(void* device, void* swapchain, const void* pAllocator);
+typedef int   (*PFN_vkCreateSampler)(void* device, const MinimalVkSamplerCreateInfo* pCreateInfo, const void* pAllocator, void* pSampler);
 
 PFN_vkGetDeviceProcAddr        g_Original_vkGetDeviceProcAddr = nullptr;
 PFN_vkGetInstanceProcAddr      g_Original_vkGetInstanceProcAddr = nullptr;
@@ -59,6 +61,7 @@ PFN_vkCmdEndRenderPass         g_Original_vkCmdEndRenderPass = nullptr;
 PFN_vkCmdDraw                  g_Original_vkCmdDraw = nullptr;
 PFN_vkCmdDrawIndexed           g_Original_vkCmdDrawIndexed = nullptr;
 PFN_vkCmdSetSampleLocationsEXT g_Original_vkCmdSetSampleLocationsEXT = nullptr;
+PFN_vkCreateSampler            g_Original_vkCreateSampler = nullptr;
 
 void* Hooked_vkGetDeviceProcAddr(void* device, const char* pName);
 void* Hooked_vkGetInstanceProcAddr(void* instance, const char* pName);
@@ -73,6 +76,7 @@ void  Hooked_vkCmdEndRenderPass(void* commandBuffer);
 void  Hooked_vkCmdDraw(void* commandBuffer, uint32_t vertexCount, uint32_t instanceCount, uint32_t firstVertex, uint32_t firstInstance);
 void  Hooked_vkCmdDrawIndexed(void* commandBuffer, uint32_t indexCount, uint32_t instanceCount, uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance);
 void  Hooked_vkCmdSetSampleLocationsEXT(void* commandBuffer, const MinimalVkSampleLocationsInfoEXT* pSampleLocationsInfo);
+int   Hooked_vkCreateSampler(void* device, const MinimalVkSamplerCreateInfo* pCreateInfo, const void* pAllocator, void* pSampler);
 
 // VK_ERROR_INITIALIZATION_FAILED: returned if a hook is ever invoked without a valid trampoline,
 // so the failure is visible to the caller instead of silently dropping frames / swapchains.
@@ -148,6 +152,28 @@ struct MinimalVkPipelineMultisampleStateCreateInfo {
     uint32_t     alphaToCoverageEnable;
     uint32_t     alphaToOneEnable;
 };
+
+struct MinimalVkSamplerCreateInfo {
+    uint32_t     sType;
+    const void*  pNext;
+    uint32_t     flags;
+    int32_t      magFilter;
+    int32_t      minFilter;
+    int32_t      mipmapMode;
+    int32_t      addressModeU;
+    int32_t      addressModeV;
+    int32_t      addressModeW;
+    float        mipLodBias;
+    uint32_t     anisotropyEnable;
+    float        maxAnisotropy;
+    uint32_t     compareEnable;
+    int32_t      compareOp;
+    float        minLod;
+    float        maxLod;
+    int32_t      borderColor;
+    uint32_t     unnormalizedCoordinates;
+};
+static_assert(offsetof(MinimalVkSamplerCreateInfo, mipLodBias) == 44, "MinimalVkSamplerCreateInfo mipLodBias offset mismatch");
 
 struct MinimalVkViewport {
     float x;
@@ -602,6 +628,19 @@ void Hooked_vkCmdSetSampleLocationsEXT(void* commandBuffer, const MinimalVkSampl
     g_Original_vkCmdSetSampleLocationsEXT(commandBuffer, pSampleLocationsInfo);
 }
 
+int Hooked_vkCreateSampler(void* device, const MinimalVkSamplerCreateInfo* pCreateInfo, const void* pAllocator, void* pSampler) {
+    if (!g_Original_vkCreateSampler) {
+        return -1; // VK_ERROR_INITIALIZATION_FAILED
+    }
+    const auto& config = ConfigManager::Get().GetConfig();
+    if (pCreateInfo && config.mipLodBias != 0.0f) {
+        MinimalVkSamplerCreateInfo modifiedInfo = *pCreateInfo;
+        modifiedInfo.mipLodBias += config.mipLodBias;
+        return g_Original_vkCreateSampler(device, &modifiedInfo, pAllocator, pSampler);
+    }
+    return g_Original_vkCreateSampler(device, pCreateInfo, pAllocator, pSampler);
+}
+
 void* Hooked_vkGetDeviceProcAddr(void* device, const char* pName) {
     if (!pName || !g_Original_vkGetDeviceProcAddr) {
         return nullptr;
@@ -689,6 +728,12 @@ void* Hooked_vkGetDeviceProcAddr(void* device, const char* pName) {
             g_Original_vkCmdDrawIndexed = reinterpret_cast<PFN_vkCmdDrawIndexed>(realProc);
         }
         return reinterpret_cast<void*>(&Hooked_vkCmdDrawIndexed);
+    }
+    if (std::strcmp(pName, "vkCreateSampler") == 0) {
+        if (!g_Original_vkCreateSampler) {
+            g_Original_vkCreateSampler = reinterpret_cast<PFN_vkCreateSampler>(realProc);
+        }
+        return reinterpret_cast<void*>(&Hooked_vkCreateSampler);
     }
     return realProc;
 }
@@ -780,6 +825,12 @@ void* Hooked_vkGetInstanceProcAddr(void* instance, const char* pName) {
             g_Original_vkCmdSetSampleLocationsEXT = reinterpret_cast<PFN_vkCmdSetSampleLocationsEXT>(realProc);
         }
         return reinterpret_cast<void*>(&Hooked_vkCmdSetSampleLocationsEXT);
+    }
+    if (std::strcmp(pName, "vkCreateSampler") == 0) {
+        if (!g_Original_vkCreateSampler) {
+            g_Original_vkCreateSampler = reinterpret_cast<PFN_vkCreateSampler>(realProc);
+        }
+        return reinterpret_cast<void*>(&Hooked_vkCreateSampler);
     }
     if (std::strcmp(pName, "vkGetDeviceProcAddr") == 0) {
         if (!g_Original_vkGetDeviceProcAddr) {
@@ -1036,6 +1087,23 @@ bool HookManager::InstallVulkanHooks() {
         } else {
             g_Original_vkCmdSetSampleLocationsEXT = reinterpret_cast<PFN_vkCmdSetSampleLocationsEXT>(pfnCmdSetSampleLocationsEXT);
             CBR_LOG_INFO("Directly resolved vkCmdSetSampleLocationsEXT: 0x%p", pfnCmdSetSampleLocationsEXT);
+        }
+    }
+
+    // 9. Intercept vkCreateSampler for negative LOD bias compensation
+    auto pfnCreateSampler = reinterpret_cast<void*>(GetProcAddress(vulkanModule, "vkCreateSampler"));
+    if (pfnCreateSampler) {
+        mhStatus = MH_CreateHook(
+            pfnCreateSampler,
+            reinterpret_cast<LPVOID>(&Hooked_vkCreateSampler),
+            reinterpret_cast<LPVOID*>(&g_Original_vkCreateSampler)
+        );
+        if (mhStatus == MH_OK || mhStatus == MH_ERROR_ALREADY_CREATED) {
+            MH_EnableHook(pfnCreateSampler);
+            CBR_LOG_INFO("MinHook: Successfully detoured vkCreateSampler (export at 0x%p).", pfnCreateSampler);
+            hookedAny = true;
+        } else {
+            CBR_LOG_WARN("MinHook: Could not detour vkCreateSampler (status: %d).", mhStatus);
         }
     }
 
