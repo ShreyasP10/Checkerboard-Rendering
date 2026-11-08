@@ -263,6 +263,14 @@ bool PatternScanner::UpdateCameraJitter(uint32_t /*frameIndex*/, bool isVulkan) 
     }
 
     if (cameraMatrix) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(cameraMatrix, &mbi, sizeof(mbi)) != sizeof(mbi) ||
+            mbi.State != MEM_COMMIT ||
+            (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) == 0) {
+            g_cachedCameraMatrix.store(nullptr, std::memory_order_release);
+            CBR_LOG_WARN("Camera projection matrix memory unreadable or not committed; falling back to Viewport Redirection.");
+            return false;
+        }
 #if defined(_MSC_VER)
         __try {
             JitterManager::Get().ApplyJitterToProjection(cameraMatrix, isVulkan);
@@ -273,14 +281,6 @@ bool PatternScanner::UpdateCameraJitter(uint32_t /*frameIndex*/, bool isVulkan) 
             return false;
         }
 #else
-        MEMORY_BASIC_INFORMATION mbi{};
-        if (VirtualQuery(cameraMatrix, &mbi, sizeof(mbi)) != sizeof(mbi) ||
-            mbi.State != MEM_COMMIT ||
-            (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) == 0) {
-            g_cachedCameraMatrix.store(nullptr, std::memory_order_release);
-            CBR_LOG_WARN("Camera projection matrix memory unreadable or not committed; falling back to Viewport Redirection.");
-            return false;
-        }
         try {
             JitterManager::Get().ApplyJitterToProjection(cameraMatrix, isVulkan);
             return true;

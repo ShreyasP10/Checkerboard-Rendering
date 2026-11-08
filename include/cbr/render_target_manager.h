@@ -13,6 +13,8 @@ struct TargetDimensions {
     uint32_t quarterWidth{ 1920 };
     uint32_t quarterHeight{ 1080 };
     uint32_t msaaSamples{ 2 };
+    float    invFullWidth{ 1.0f / 3840.0f };
+    float    invFullHeight{ 1.0f / 2160.0f };
 };
 
 struct VulkanTextureResource {
@@ -46,10 +48,10 @@ public:
     // Vulkan GPU resource management (VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
     bool CreateVulkanResources(void* vkDevice, void* vkPhysicalDevice);
     void DestroyVulkanResources();
-    const VulkanRenderTargetSet& GetVulkanResources() const { return m_vkResources; }
-    bool AreVulkanResourcesCreated() const { return m_vkResourcesCreated.load(); }
+    [[nodiscard]] const VulkanRenderTargetSet& GetVulkanResources() const { return m_vkResources; }
+    [[nodiscard]] bool AreVulkanResourcesCreated() const { return m_vkResourcesCreated.load(); }
 
-    TargetDimensions GetDimensions() const {
+    [[nodiscard]] TargetDimensions GetDimensions() const {
         std::shared_lock<std::shared_mutex> lock(m_mutex);
         return m_dims;
     }
@@ -58,13 +60,13 @@ public:
     bool IsQuarterPassCandidate(uint32_t width, uint32_t height) const;
 
     // Ping-pong history buffer index management
-    uint32_t GetCurrentHistoryIndex() const { return m_historyPingPong.load(); }
-    uint32_t GetPreviousHistoryIndex() const { return 1u - m_historyPingPong.load(); }
+    [[nodiscard]] uint32_t GetCurrentHistoryIndex() const { return m_historyPingPong.load(); }
+    [[nodiscard]] uint32_t GetPreviousHistoryIndex() const { return 1u - m_historyPingPong.load(); }
     void     SwapHistoryBuffers() { m_historyPingPong.fetch_xor(1u); }
     void     ResetHistory() { m_historyPingPong.store(0u); }
 
     // Memory footprint tracking
-    size_t GetTotalAllocatedVramBytes() const { return m_totalAllocatedVramBytes.load(); }
+    [[nodiscard]] size_t GetTotalAllocatedVramBytes() const { return m_totalAllocatedVramBytes.load(); }
 
 private:
     RenderTargetManager() = default;

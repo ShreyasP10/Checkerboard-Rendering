@@ -123,11 +123,14 @@ struct MinimalD3D12CommandQueueDesc {
     unsigned int NodeMask;
 };
 
-// Forward declaration of COM call helper
+// Type-safe and null-checked COM VMT invocation helper
 template <typename T, typename... Args>
 inline HRESULT CallVmt(void* obj, size_t index, Args... args) {
+    if (!obj) return E_POINTER;
     void** vmt = *reinterpret_cast<void***>(obj);
+    if (!vmt) return E_POINTER;
     auto func = reinterpret_cast<T>(vmt[index]);
+    if (!func) return E_UNEXPECTED;
     return func(obj, args...);
 }
 
@@ -135,6 +138,7 @@ inline ULONG ReleaseCom(void* obj) {
     if (!obj) return 0;
     typedef ULONG (__stdcall *PFN_Release)(void*);
     void** vmt = *reinterpret_cast<void***>(obj);
+    if (!vmt || !vmt[2]) return 0;
     return reinterpret_cast<PFN_Release>(vmt[2])(obj);
 }
 #endif

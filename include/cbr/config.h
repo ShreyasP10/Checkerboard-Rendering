@@ -36,6 +36,15 @@ enum class SamplingStrategy {
     StrategyB  // ProgrammableSampleLocations (VK_EXT_sample_locations 2x MSAA alternation per frame, stationary viewport)
 };
 
+enum class DebugViewMode : uint32_t {
+    Normal = 0,
+    CheckerboardMask = 1,
+    DisocclusionHeatmap = 2,
+    MotionVectors = 3,
+    QuarterResRaw = 4,
+    SpatialUpscaleBaseline = 5
+};
+
 struct CBRConfig {
     // General
     bool             enabled{ true };
@@ -59,6 +68,8 @@ struct CBRConfig {
     DepthConvention depthConvention{ DepthConvention::Reversed };
     float           depthNear{ 0.1f };
     float           depthFar{ 0.0f }; // 0.0 = infinite far plane (Reversed only)
+    float           sanitizedNear{ 0.1f };
+    float           sanitizedFar{ 0.0f };
 
     // Jitter
     JitterPattern jitterPattern{ JitterPattern::Checkerboard };
@@ -86,7 +97,7 @@ public:
     bool Load(const std::filesystem::path& configPath);
     bool Save(const std::filesystem::path& configPath);
 
-    CBRConfig GetConfig() const {
+    [[nodiscard]] CBRConfig GetConfig() const {
         std::lock_guard<std::mutex> lock(m_mutex);
         return m_config;
     }

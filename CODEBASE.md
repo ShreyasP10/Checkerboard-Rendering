@@ -807,6 +807,15 @@ enum class SamplingStrategy {
     StrategyB  // ProgrammableSampleLocations (VK_EXT_sample_locations 2x MSAA alternation per frame, stationary viewport)
 };
 
+enum class DebugViewMode : uint32_t {
+    Normal = 0,
+    CheckerboardMask = 1,
+    DisocclusionHeatmap = 2,
+    MotionVectors = 3,
+    QuarterResRaw = 4,
+    SpatialUpscaleBaseline = 5
+};
+
 struct CBRConfig {
     // General
     bool             enabled{ true };
@@ -830,6 +839,8 @@ struct CBRConfig {
     DepthConvention depthConvention{ DepthConvention::Reversed };
     float           depthNear{ 0.1f };
     float           depthFar{ 0.0f }; // 0.0 = infinite far plane (Reversed only)
+    float           sanitizedNear{ 0.1f };
+    float           sanitizedFar{ 0.0f };
 
     // Jitter
     JitterPattern jitterPattern{ JitterPattern::Checkerboard };
@@ -857,7 +868,7 @@ public:
     bool Load(const std::filesystem::path& configPath);
     bool Save(const std::filesystem::path& configPath);
 
-    CBRConfig GetConfig() const {
+    [[nodiscard]] CBRConfig GetConfig() const {
         std::lock_guard<std::mutex> lock(m_mutex);
         return m_config;
     }
@@ -1057,26 +1068,26 @@ public:
     void Initialize(uint32_t targetWidth, uint32_t targetHeight);
     void Update(uint32_t frameIndex);
 
-    JitterOffset GetCurrentJitter() const {
+    [[nodiscard]] JitterOffset GetCurrentJitter() const {
         std::lock_guard<std::mutex> lock(m_mutex);
         return m_currentJitter;
     }
-    JitterOffset GetPreviousJitter() const {
+    [[nodiscard]] JitterOffset GetPreviousJitter() const {
         std::lock_guard<std::mutex> lock(m_mutex);
         return m_previousJitter;
     }
-    JitterOffset GetJitterDelta() const {
+    [[nodiscard]] JitterOffset GetJitterDelta() const {
         std::lock_guard<std::mutex> lock(m_mutex);
         return { m_currentJitter.x - m_previousJitter.x, m_currentJitter.y - m_previousJitter.y };
     }
 
     // Returns viewport horizontal offset in quarter-resolution pixels (0.5 px shift on odd frames)
     // per CHECKERBOARD.md (Viewport Half-Pixel Offset).
-    float GetQuarterViewportShiftX(uint32_t frameIndex) const;
+    [[nodiscard]] float GetQuarterViewportShiftX(uint32_t frameIndex) const;
 
     // Computes the NDC projection offset (delta_x, delta_y) applied to proj[8] and proj[9].
     // Incorporates ConfigManager::Get().GetConfig().projectionJitterSign and Vulkan Y-flip.
-    std::pair<float, float> ComputeProjectionOffset(const JitterOffset& jitter, bool isVulkan) const;
+    [[nodiscard]] std::pair<float, float> ComputeProjectionOffset(const JitterOffset& jitter, bool isVulkan) const;
 
     // Computes subpixel jitter offset for a 4x4 projection matrix
     void ApplyJitterToProjection(float* projMatrix4x4, bool isVulkan) const;
@@ -1445,6 +1456,8 @@ struct TargetDimensions {
     uint32_t quarterWidth{ 1920 };
     uint32_t quarterHeight{ 1080 };
     uint32_t msaaSamples{ 2 };
+    float    invFullWidth{ 1.0f / 3840.0f };
+    float    invFullHeight{ 1.0f / 2160.0f };
 };
 
 struct VulkanTextureResource {
@@ -1478,10 +1491,10 @@ public:
     // Vulkan GPU resource management (VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
     bool CreateVulkanResources(void* vkDevice, void* vkPhysicalDevice);
     void DestroyVulkanResources();
-    const VulkanRenderTargetSet& GetVulkanResources() const { return m_vkResources; }
-    bool AreVulkanResourcesCreated() const { return m_vkResourcesCreated.load(); }
+    [[nodiscard]] const VulkanRenderTargetSet& GetVulkanResources() const { return m_vkResources; }
+    [[nodiscard]] bool AreVulkanResourcesCreated() const { return m_vkResourcesCreated.load(); }
 
-    TargetDimensions GetDimensions() const {
+    [[nodiscard]] TargetDimensions GetDimensions() const {
         std::shared_lock<std::shared_mutex> lock(m_mutex);
         return m_dims;
     }
@@ -1490,13 +1503,13 @@ public:
     bool IsQuarterPassCandidate(uint32_t width, uint32_t height) const;
 
     // Ping-pong history buffer index management
-    uint32_t GetCurrentHistoryIndex() const { return m_historyPingPong.load(); }
-    uint32_t GetPreviousHistoryIndex() const { return 1u - m_historyPingPong.load(); }
+    [[nodiscard]] uint32_t GetCurrentHistoryIndex() const { return m_historyPingPong.load(); }
+    [[nodiscard]] uint32_t GetPreviousHistoryIndex() const { return 1u - m_historyPingPong.load(); }
     void     SwapHistoryBuffers() { m_historyPingPong.fetch_xor(1u); }
     void     ResetHistory() { m_historyPingPong.store(0u); }
 
     // Memory footprint tracking
-    size_t GetTotalAllocatedVramBytes() const { return m_totalAllocatedVramBytes.load(); }
+    [[nodiscard]] size_t GetTotalAllocatedVramBytes() const { return m_totalAllocatedVramBytes.load(); }
 
 private:
     RenderTargetManager() = default;
@@ -2005,6 +2018,7 @@ bool CBREngine::CheckAntiCheatModules() const {
 ### `src/config.cpp`
 ```cpp
 #include "cbr/config.h"
+#include "cbr/depth_convention.h"
 #include "cbr/logger.h"
 #include <fstream>
 #include <sstream>
@@ -2093,9 +2107,18 @@ uint32_t ParseUInt(const std::string& val, uint32_t defaultVal, uint32_t minVal,
 
 float ParseFloat(const std::string& val, float defaultVal, float minVal, float maxVal) {
     if (val.empty()) return defaultVal;
+    float result = defaultVal;
+    // Locale-independent float parsing (Item 71)
+    auto [ptr, ec] = std::from_chars(val.data(), val.data() + val.size(), result);
+    if (ec == std::errc() && ptr == val.data() + val.size()) {
+        if (std::isnan(result) || std::isinf(result)) return defaultVal;
+        if (result < minVal) result = minVal;
+        if (result > maxVal) result = maxVal;
+        return result;
+    }
     try {
         size_t idx = 0;
-        float result = std::stof(val, &idx);
+        result = std::stof(val, &idx);
         if (idx == 0 || idx != val.size() || std::isnan(result) || std::isinf(result)) return defaultVal;
         if (result < minVal) result = minVal;
         if (result > maxVal) result = maxVal;
@@ -2279,6 +2302,9 @@ bool ConfigManager::Load(const std::filesystem::path& configPath) {
         }
     }
 
+    const DepthRange depthRange = SanitizeDepthRange(parsed.depthConvention, parsed.depthNear, parsed.depthFar);
+    parsed.sanitizedNear = depthRange.zNear;
+    parsed.sanitizedFar = depthRange.zFar;
     UpdateConfig(parsed);
     for (const auto& w : warnings) CBR_LOG_WARN("%s", w.c_str());
 
@@ -2384,7 +2410,8 @@ LPTOP_LEVEL_EXCEPTION_FILTER g_previousFilter = nullptr;
 std::filesystem::path        g_crashLogDirectory;
 HANDLE                       g_hCrashLogFile = INVALID_HANDLE_VALUE;
 HANDLE                       g_hMainLogFile  = INVALID_HANDLE_VALUE;
-wchar_t                      g_dumpPathW[MAX_PATH] = { 0 };
+constexpr size_t             kMaxCrashDumpPathLength = 1024;
+wchar_t                      g_dumpPathW[kMaxCrashDumpPathLength] = { 0 };
 
 typedef BOOL(WINAPI* PFN_MiniDumpWriteDump)(
     HANDLE                            hProcess,
@@ -2659,12 +2686,10 @@ void CrashHandler::Install(const std::filesystem::path& logDirectory) {
                                 nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
 
     const std::filesystem::path dumpPath = logDirectory / "cbr_crash.dmp";
-#if defined(_MSC_VER)
-    wcsncpy_s(g_dumpPathW, dumpPath.c_str(), _TRUNCATE);
-#else
-    std::wcsncpy(g_dumpPathW, dumpPath.c_str(), MAX_PATH - 1);
-    g_dumpPathW[MAX_PATH - 1] = L'\0';
-#endif
+    const auto& nativeDump = dumpPath.native();
+    const size_t copyLen = (std::min)(nativeDump.size(), kMaxCrashDumpPathLength - 1);
+    std::copy_n(nativeDump.c_str(), copyLen, g_dumpPathW);
+    g_dumpPathW[copyLen] = L'\0';
 
     g_previousFilter = SetUnhandledExceptionFilter(CBRUnhandledExceptionFilter);
     m_installed = true;
@@ -4081,11 +4106,14 @@ struct MinimalD3D12CommandQueueDesc {
     unsigned int NodeMask;
 };
 
-// Forward declaration of COM call helper
+// Type-safe and null-checked COM VMT invocation helper
 template <typename T, typename... Args>
 inline HRESULT CallVmt(void* obj, size_t index, Args... args) {
+    if (!obj) return E_POINTER;
     void** vmt = *reinterpret_cast<void***>(obj);
+    if (!vmt) return E_POINTER;
     auto func = reinterpret_cast<T>(vmt[index]);
+    if (!func) return E_UNEXPECTED;
     return func(obj, args...);
 }
 
@@ -4093,6 +4121,7 @@ inline ULONG ReleaseCom(void* obj) {
     if (!obj) return 0;
     typedef ULONG (__stdcall *PFN_Release)(void*);
     void** vmt = *reinterpret_cast<void***>(obj);
+    if (!vmt || !vmt[2]) return 0;
     return reinterpret_cast<PFN_Release>(vmt[2])(obj);
 }
 #endif
@@ -4919,6 +4948,14 @@ bool PatternScanner::UpdateCameraJitter(uint32_t /*frameIndex*/, bool isVulkan) 
     }
 
     if (cameraMatrix) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(cameraMatrix, &mbi, sizeof(mbi)) != sizeof(mbi) ||
+            mbi.State != MEM_COMMIT ||
+            (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) == 0) {
+            g_cachedCameraMatrix.store(nullptr, std::memory_order_release);
+            CBR_LOG_WARN("Camera projection matrix memory unreadable or not committed; falling back to Viewport Redirection.");
+            return false;
+        }
 #if defined(_MSC_VER)
         __try {
             JitterManager::Get().ApplyJitterToProjection(cameraMatrix, isVulkan);
@@ -4929,14 +4966,6 @@ bool PatternScanner::UpdateCameraJitter(uint32_t /*frameIndex*/, bool isVulkan) 
             return false;
         }
 #else
-        MEMORY_BASIC_INFORMATION mbi{};
-        if (VirtualQuery(cameraMatrix, &mbi, sizeof(mbi)) != sizeof(mbi) ||
-            mbi.State != MEM_COMMIT ||
-            (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) == 0) {
-            g_cachedCameraMatrix.store(nullptr, std::memory_order_release);
-            CBR_LOG_WARN("Camera projection matrix memory unreadable or not committed; falling back to Viewport Redirection.");
-            return false;
-        }
         try {
             JitterManager::Get().ApplyJitterToProjection(cameraMatrix, isVulkan);
             return true;
@@ -5818,8 +5847,8 @@ ReconstructionPushConstants BuildReconstructionPushConstants(uint32_t frameIndex
     const float fh = dims.fullHeight > 0 ? static_cast<float>(dims.fullHeight) : 2160.0f;
     pc.targetResolution[0] = fw;
     pc.targetResolution[1] = fh;
-    pc.invTargetResolution[0] = 1.0f / fw;
-    pc.invTargetResolution[1] = 1.0f / fh;
+    pc.invTargetResolution[0] = (dims.invFullWidth > 0.0f) ? dims.invFullWidth : (1.0f / fw);
+    pc.invTargetResolution[1] = (dims.invFullHeight > 0.0f) ? dims.invFullHeight : (1.0f / fh);
     pc.frameIndex = frameIndex;
     pc.depthTolerance = config.depthTolerance;
     pc.historyWeight = config.historyWeight;
@@ -5833,10 +5862,9 @@ ReconstructionPushConstants BuildReconstructionPushConstants(uint32_t frameIndex
     pc.enableMotionDilation = config.enableMotionDilation ? 1u : 0u;
     pc.jitterCompensation = config.jitterCompensation;
     pc.shiftDirection = (config.jitterDirection < 0) ? -1 : 1;
-    const DepthRange range = SanitizeDepthRange(config.depthConvention, config.depthNear, config.depthFar);
     pc.depthMode = (config.depthConvention == DepthConvention::Reversed) ? 1u : 0u;
-    pc.depthNear = range.zNear;
-    pc.depthFar = range.zFar;
+    pc.depthNear = (config.sanitizedNear > 0.0f) ? config.sanitizedNear : config.depthNear;
+    pc.depthFar = config.sanitizedFar;
     return pc;
 }
 
@@ -5888,12 +5916,14 @@ void ReconstructionPass::DispatchVulkan(void* vkCommandBuffer, uint32_t frameInd
 
     const uint32_t targetW = dims.fullWidth > 0 ? dims.fullWidth : 3840u;
     const uint32_t targetH = dims.fullHeight > 0 ? dims.fullHeight : 2160u;
-    const uint32_t groupCountX = (targetW + 15u) / 16u;
-    const uint32_t groupCountY = (targetH + 15u) / 16u;
+    constexpr uint32_t kWorkgroupSizeX = 16u;
+    constexpr uint32_t kWorkgroupSizeY = 16u;
+    const uint32_t groupCountX = (targetW + kWorkgroupSizeX - 1u) / kWorkgroupSizeX;
+    const uint32_t groupCountY = (targetH + kWorkgroupSizeY - 1u) / kWorkgroupSizeY;
 
     pfnCmdBindPipeline(vkCommandBuffer, kVkPipelineBindPointCompute, m_pipeline);
 
-    const uint32_t activeSetIdx = RenderTargetManager::Get().GetCurrentHistoryIndex() % 2;
+    const uint32_t activeSetIdx = RenderTargetManager::Get().GetCurrentHistoryIndex() & 1u;
     void* activeSet = m_descriptorSets[activeSetIdx] ? m_descriptorSets[activeSetIdx] : m_descriptorSets[0];
 
     if (activeSet && pfnCmdBindDescriptorSets) {
@@ -5991,15 +6021,24 @@ void ReconstructionPass::DispatchDX12(void* /*d3d12GraphicsCommandList*/, uint32
 
 namespace {
 
+// Official Vulkan Specification equivalents for minimal ABI definitions:
+// VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO = 5
 constexpr uint32_t kVkStructureTypeMemoryAllocateInfo   = 5;
+// VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO = 14
 constexpr uint32_t kVkStructureTypeImageCreateInfo        = 14;
+// VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO = 15
 constexpr uint32_t kVkStructureTypeImageViewCreateInfo    = 15;
+// VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO = 31
 constexpr uint32_t kVkStructureTypeSamplerCreateInfo      = 31;
 
+// VK_IMAGE_TYPE_2D = 1
 constexpr uint32_t kVkImageType2D                         = 1;
+// VK_IMAGE_VIEW_TYPE_2D = 1
 constexpr uint32_t kVkImageViewType2D                     = 1;
 
+// VK_FORMAT_R16G16B16A16_SFLOAT = 97
 constexpr uint32_t kVkFormatR16G16B16A16Sfloat            = 97;
+// VK_FORMAT_R32_SFLOAT = 100
 constexpr uint32_t kVkFormatR32Sfloat                     = 100;
 
 constexpr uint32_t kVkImageTilingOptimal                  = 0;
@@ -6159,6 +6198,8 @@ void RenderTargetManager::Initialize(uint32_t width, uint32_t height) {
     dims.quarterWidth = width / 2;
     dims.quarterHeight = height / 2;
     dims.msaaSamples = 2;
+    dims.invFullWidth = (width > 0) ? (1.0f / static_cast<float>(width)) : 0.0f;
+    dims.invFullHeight = (height > 0) ? (1.0f / static_cast<float>(height)) : 0.0f;
     m_historyPingPong.store(0);
 
     // Calculate VRAM footprint:

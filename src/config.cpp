@@ -1,4 +1,5 @@
 #include "cbr/config.h"
+#include "cbr/depth_convention.h"
 #include "cbr/logger.h"
 #include <fstream>
 #include <sstream>
@@ -87,9 +88,18 @@ uint32_t ParseUInt(const std::string& val, uint32_t defaultVal, uint32_t minVal,
 
 float ParseFloat(const std::string& val, float defaultVal, float minVal, float maxVal) {
     if (val.empty()) return defaultVal;
+    float result = defaultVal;
+    // Locale-independent float parsing (Item 71)
+    auto [ptr, ec] = std::from_chars(val.data(), val.data() + val.size(), result);
+    if (ec == std::errc() && ptr == val.data() + val.size()) {
+        if (std::isnan(result) || std::isinf(result)) return defaultVal;
+        if (result < minVal) result = minVal;
+        if (result > maxVal) result = maxVal;
+        return result;
+    }
     try {
         size_t idx = 0;
-        float result = std::stof(val, &idx);
+        result = std::stof(val, &idx);
         if (idx == 0 || idx != val.size() || std::isnan(result) || std::isinf(result)) return defaultVal;
         if (result < minVal) result = minVal;
         if (result > maxVal) result = maxVal;
@@ -273,6 +283,9 @@ bool ConfigManager::Load(const std::filesystem::path& configPath) {
         }
     }
 
+    const DepthRange depthRange = SanitizeDepthRange(parsed.depthConvention, parsed.depthNear, parsed.depthFar);
+    parsed.sanitizedNear = depthRange.zNear;
+    parsed.sanitizedFar = depthRange.zFar;
     UpdateConfig(parsed);
     for (const auto& w : warnings) CBR_LOG_WARN("%s", w.c_str());
 

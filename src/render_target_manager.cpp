@@ -8,15 +8,24 @@
 
 namespace {
 
+// Official Vulkan Specification equivalents for minimal ABI definitions:
+// VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO = 5
 constexpr uint32_t kVkStructureTypeMemoryAllocateInfo   = 5;
+// VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO = 14
 constexpr uint32_t kVkStructureTypeImageCreateInfo        = 14;
+// VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO = 15
 constexpr uint32_t kVkStructureTypeImageViewCreateInfo    = 15;
+// VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO = 31
 constexpr uint32_t kVkStructureTypeSamplerCreateInfo      = 31;
 
+// VK_IMAGE_TYPE_2D = 1
 constexpr uint32_t kVkImageType2D                         = 1;
+// VK_IMAGE_VIEW_TYPE_2D = 1
 constexpr uint32_t kVkImageViewType2D                     = 1;
 
+// VK_FORMAT_R16G16B16A16_SFLOAT = 97
 constexpr uint32_t kVkFormatR16G16B16A16Sfloat            = 97;
+// VK_FORMAT_R32_SFLOAT = 100
 constexpr uint32_t kVkFormatR32Sfloat                     = 100;
 
 constexpr uint32_t kVkImageTilingOptimal                  = 0;
@@ -176,6 +185,8 @@ void RenderTargetManager::Initialize(uint32_t width, uint32_t height) {
     dims.quarterWidth = width / 2;
     dims.quarterHeight = height / 2;
     dims.msaaSamples = 2;
+    dims.invFullWidth = (width > 0) ? (1.0f / static_cast<float>(width)) : 0.0f;
+    dims.invFullHeight = (height > 0) ? (1.0f / static_cast<float>(height)) : 0.0f;
     m_historyPingPong.store(0);
 
     // Calculate VRAM footprint:

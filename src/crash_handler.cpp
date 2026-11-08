@@ -27,7 +27,8 @@ LPTOP_LEVEL_EXCEPTION_FILTER g_previousFilter = nullptr;
 std::filesystem::path        g_crashLogDirectory;
 HANDLE                       g_hCrashLogFile = INVALID_HANDLE_VALUE;
 HANDLE                       g_hMainLogFile  = INVALID_HANDLE_VALUE;
-wchar_t                      g_dumpPathW[MAX_PATH] = { 0 };
+constexpr size_t             kMaxCrashDumpPathLength = 1024;
+wchar_t                      g_dumpPathW[kMaxCrashDumpPathLength] = { 0 };
 
 typedef BOOL(WINAPI* PFN_MiniDumpWriteDump)(
     HANDLE                            hProcess,
@@ -302,12 +303,10 @@ void CrashHandler::Install(const std::filesystem::path& logDirectory) {
                                 nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
 
     const std::filesystem::path dumpPath = logDirectory / "cbr_crash.dmp";
-#if defined(_MSC_VER)
-    wcsncpy_s(g_dumpPathW, dumpPath.c_str(), _TRUNCATE);
-#else
-    std::wcsncpy(g_dumpPathW, dumpPath.c_str(), MAX_PATH - 1);
-    g_dumpPathW[MAX_PATH - 1] = L'\0';
-#endif
+    const auto& nativeDump = dumpPath.native();
+    const size_t copyLen = (std::min)(nativeDump.size(), kMaxCrashDumpPathLength - 1);
+    std::copy_n(nativeDump.c_str(), copyLen, g_dumpPathW);
+    g_dumpPathW[copyLen] = L'\0';
 
     g_previousFilter = SetUnhandledExceptionFilter(CBRUnhandledExceptionFilter);
     m_installed = true;

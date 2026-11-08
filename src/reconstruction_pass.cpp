@@ -859,8 +859,8 @@ ReconstructionPushConstants BuildReconstructionPushConstants(uint32_t frameIndex
     const float fh = dims.fullHeight > 0 ? static_cast<float>(dims.fullHeight) : 2160.0f;
     pc.targetResolution[0] = fw;
     pc.targetResolution[1] = fh;
-    pc.invTargetResolution[0] = 1.0f / fw;
-    pc.invTargetResolution[1] = 1.0f / fh;
+    pc.invTargetResolution[0] = (dims.invFullWidth > 0.0f) ? dims.invFullWidth : (1.0f / fw);
+    pc.invTargetResolution[1] = (dims.invFullHeight > 0.0f) ? dims.invFullHeight : (1.0f / fh);
     pc.frameIndex = frameIndex;
     pc.depthTolerance = config.depthTolerance;
     pc.historyWeight = config.historyWeight;
@@ -874,10 +874,9 @@ ReconstructionPushConstants BuildReconstructionPushConstants(uint32_t frameIndex
     pc.enableMotionDilation = config.enableMotionDilation ? 1u : 0u;
     pc.jitterCompensation = config.jitterCompensation;
     pc.shiftDirection = (config.jitterDirection < 0) ? -1 : 1;
-    const DepthRange range = SanitizeDepthRange(config.depthConvention, config.depthNear, config.depthFar);
     pc.depthMode = (config.depthConvention == DepthConvention::Reversed) ? 1u : 0u;
-    pc.depthNear = range.zNear;
-    pc.depthFar = range.zFar;
+    pc.depthNear = (config.sanitizedNear > 0.0f) ? config.sanitizedNear : config.depthNear;
+    pc.depthFar = config.sanitizedFar;
     return pc;
 }
 
@@ -929,12 +928,14 @@ void ReconstructionPass::DispatchVulkan(void* vkCommandBuffer, uint32_t frameInd
 
     const uint32_t targetW = dims.fullWidth > 0 ? dims.fullWidth : 3840u;
     const uint32_t targetH = dims.fullHeight > 0 ? dims.fullHeight : 2160u;
-    const uint32_t groupCountX = (targetW + 15u) / 16u;
-    const uint32_t groupCountY = (targetH + 15u) / 16u;
+    constexpr uint32_t kWorkgroupSizeX = 16u;
+    constexpr uint32_t kWorkgroupSizeY = 16u;
+    const uint32_t groupCountX = (targetW + kWorkgroupSizeX - 1u) / kWorkgroupSizeX;
+    const uint32_t groupCountY = (targetH + kWorkgroupSizeY - 1u) / kWorkgroupSizeY;
 
     pfnCmdBindPipeline(vkCommandBuffer, kVkPipelineBindPointCompute, m_pipeline);
 
-    const uint32_t activeSetIdx = RenderTargetManager::Get().GetCurrentHistoryIndex() % 2;
+    const uint32_t activeSetIdx = RenderTargetManager::Get().GetCurrentHistoryIndex() & 1u;
     void* activeSet = m_descriptorSets[activeSetIdx] ? m_descriptorSets[activeSetIdx] : m_descriptorSets[0];
 
     if (activeSet && pfnCmdBindDescriptorSets) {

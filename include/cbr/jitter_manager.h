@@ -19,26 +19,26 @@ public:
     void Initialize(uint32_t targetWidth, uint32_t targetHeight);
     void Update(uint32_t frameIndex);
 
-    JitterOffset GetCurrentJitter() const {
+    [[nodiscard]] JitterOffset GetCurrentJitter() const {
         std::lock_guard<std::mutex> lock(m_mutex);
         return m_currentJitter;
     }
-    JitterOffset GetPreviousJitter() const {
+    [[nodiscard]] JitterOffset GetPreviousJitter() const {
         std::lock_guard<std::mutex> lock(m_mutex);
         return m_previousJitter;
     }
-    JitterOffset GetJitterDelta() const {
+    [[nodiscard]] JitterOffset GetJitterDelta() const {
         std::lock_guard<std::mutex> lock(m_mutex);
         return { m_currentJitter.x - m_previousJitter.x, m_currentJitter.y - m_previousJitter.y };
     }
 
     // Returns viewport horizontal offset in quarter-resolution pixels (0.5 px shift on odd frames)
     // per CHECKERBOARD.md (Viewport Half-Pixel Offset).
-    float GetQuarterViewportShiftX(uint32_t frameIndex) const;
+    [[nodiscard]] float GetQuarterViewportShiftX(uint32_t frameIndex) const;
 
     // Computes the NDC projection offset (delta_x, delta_y) applied to proj[8] and proj[9].
     // Incorporates ConfigManager::Get().GetConfig().projectionJitterSign and Vulkan Y-flip.
-    std::pair<float, float> ComputeProjectionOffset(const JitterOffset& jitter, bool isVulkan) const;
+    [[nodiscard]] std::pair<float, float> ComputeProjectionOffset(const JitterOffset& jitter, bool isVulkan) const;
 
     // Computes subpixel jitter offset for a 4x4 projection matrix
     void ApplyJitterToProjection(float* projMatrix4x4, bool isVulkan) const;
