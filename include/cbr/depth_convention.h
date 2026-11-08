@@ -19,7 +19,7 @@ constexpr float kMinLinearDepth = 1e-5f;
 // Reversed (1 = near, 0 = far): z = n*f / (n + d*(f - n)), or n / d when f is infinite (f <= 0)
 // Returns NaN for NaN/Inf device depth so callers must treat it as disoccluded.
 inline float LinearizeDepth(float d, DepthConvention convention, float zNear, float zFar) {
-    if (!std::isfinite(d)) return std::numeric_limits<float>::quiet_NaN();
+    if (!std::isfinite(d) || zNear <= 0.0f) return std::numeric_limits<float>::quiet_NaN();
     if (convention == DepthConvention::Reversed) {
         if (zFar <= 0.0f) return zNear / std::max(d, kMinDeviceDepth);
         const float denom = (zNear + d * (zFar - zNear));

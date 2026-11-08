@@ -122,7 +122,7 @@ float FetchDepth(CbrSample s) {
 // MIRRORS include/cbr/depth_convention.h
 // NaN/Inf device depth yields NaN so the disocclusion test must reject it.
 float LinearizeDepth(float d) {
-    if (!isnan(d) && !isinf(d)) {
+    if (!isnan(d) && !isinf(d) && g_DepthNear > 0.0f) {
         float n = g_DepthNear;
         float f = g_DepthFar;
         if (g_DepthMode == 1u) {

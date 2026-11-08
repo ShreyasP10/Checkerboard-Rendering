@@ -938,7 +938,7 @@ constexpr float kMinLinearDepth = 1e-5f;
 // Reversed (1 = near, 0 = far): z = n*f / (n + d*(f - n)), or n / d when f is infinite (f <= 0)
 // Returns NaN for NaN/Inf device depth so callers must treat it as disoccluded.
 inline float LinearizeDepth(float d, DepthConvention convention, float zNear, float zFar) {
-    if (!std::isfinite(d)) return std::numeric_limits<float>::quiet_NaN();
+    if (!std::isfinite(d) || zNear <= 0.0f) return std::numeric_limits<float>::quiet_NaN();
     if (convention == DepthConvention::Reversed) {
         if (zFar <= 0.0f) return zNear / std::max(d, kMinDeviceDepth);
         const float denom = (zNear + d * (zFar - zNear));
@@ -6500,7 +6500,7 @@ float FetchDepth(CbrSample s) {
 // MIRRORS include/cbr/depth_convention.h
 // NaN/Inf device depth yields NaN so the disocclusion test must reject it.
 float LinearizeDepth(float d) {
-    if (isnan(d) || isinf(d)) return uintBitsToFloat(0x7fc00000u); // quiet NaN
+    if (isnan(d) || isinf(d) || pc.u_DepthNear <= 0.0) return uintBitsToFloat(0x7fc00000u); // quiet NaN
     float n = pc.u_DepthNear;
     float f = pc.u_DepthFar;
     if (pc.u_DepthMode == 1u) {
@@ -6913,7 +6913,7 @@ float FetchDepth(CbrSample s) {
 }
 
 float LinearizeDepth(float d) {
-    if (isnan(d) || isinf(d)) return uintBitsToFloat(0x7fc00000u);
+    if (isnan(d) || isinf(d) || pc.u_DepthNear <= 0.0) return uintBitsToFloat(0x7fc00000u);
     float n = pc.u_DepthNear;
     float f = pc.u_DepthFar;
     if (pc.u_DepthMode == 1u) {
@@ -7284,7 +7284,7 @@ float FetchDepth(CbrSample s) {
 // MIRRORS include/cbr/depth_convention.h
 // NaN/Inf device depth yields NaN so the disocclusion test must reject it.
 float LinearizeDepth(float d) {
-    if (!isnan(d) && !isinf(d)) {
+    if (!isnan(d) && !isinf(d) && g_DepthNear > 0.0f) {
         float n = g_DepthNear;
         float f = g_DepthFar;
         if (g_DepthMode == 1u) {
