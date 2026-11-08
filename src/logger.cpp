@@ -2,6 +2,7 @@
 #include <chrono>
 #include <ctime>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 
 namespace cbr {
@@ -191,7 +192,10 @@ void Logger::Log(LogLevel level, const std::string& message) {
         if (m_queue.size() < kMaxQueueMessages) {
             m_queue.push_back(std::move(formatted));
         } else {
-            ++m_droppedQueue;
+            // Saturating increment to prevent drop counter overflow (Item 88)
+            if (m_droppedQueue < std::numeric_limits<size_t>::max()) {
+                ++m_droppedQueue;
+            }
         }
 
         if (level >= LogLevel::Warning) {
@@ -202,7 +206,10 @@ void Logger::Log(LogLevel level, const std::string& message) {
         if (m_pending.size() < kMaxPendingMessages) {
             m_pending.push_back(formatted);
         } else {
-            ++m_droppedPending;
+            // Saturating increment to prevent drop counter overflow (Item 88)
+            if (m_droppedPending < std::numeric_limits<size_t>::max()) {
+                ++m_droppedPending;
+            }
         }
     }
 

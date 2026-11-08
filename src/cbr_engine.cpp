@@ -259,11 +259,17 @@ void CBREngine::OnSwapchainRecreated(uint32_t width, uint32_t height) {
     m_frameIndex.store(0);
     m_lastDispatchedFrame.store(kNoFrame);
 
-    // Swapchain extents are untrusted: odd sizes round up to even, implausible ones are ignored.
+    // Swapchain extents are untrusted: odd sizes round up to even for 2x MSAA symmetry (Item 91)
     if (width >= kMinSwapchainExtent && width <= kMaxSwapchainExtent &&
         height >= kMinSwapchainExtent && height <= kMaxSwapchainExtent) {
-        width = MakeEvenUp(width);
-        height = MakeEvenUp(height);
+        const uint32_t evenW = MakeEvenUp(width);
+        const uint32_t evenH = MakeEvenUp(height);
+        if (evenW != width || evenH != height) {
+            CBR_LOG_INFO("Swapchain odd extent (%ux%u) rounded up to even (%ux%u) for 2x MSAA symmetry (Item 91).",
+                         width, height, evenW, evenH);
+        }
+        width = evenW;
+        height = evenH;
         RenderTargetManager::Get().Initialize(width, height);
         JitterManager::Get().Initialize(width, height);
         CBR_LOG_INFO("Swapchain recreated with new resolution %ux%u: frame parity and history reset.", width, height);

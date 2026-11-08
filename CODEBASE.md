@@ -1969,11 +1969,17 @@ void CBREngine::OnSwapchainRecreated(uint32_t width, uint32_t height) {
     m_frameIndex.store(0);
     m_lastDispatchedFrame.store(kNoFrame);
 
-    // Swapchain extents are untrusted: odd sizes round up to even, implausible ones are ignored.
+    // Swapchain extents are untrusted: odd sizes round up to even for 2x MSAA symmetry (Item 91)
     if (width >= kMinSwapchainExtent && width <= kMaxSwapchainExtent &&
         height >= kMinSwapchainExtent && height <= kMaxSwapchainExtent) {
-        width = MakeEvenUp(width);
-        height = MakeEvenUp(height);
+        const uint32_t evenW = MakeEvenUp(width);
+        const uint32_t evenH = MakeEvenUp(height);
+        if (evenW != width || evenH != height) {
+            CBR_LOG_INFO("Swapchain odd extent (%ux%u) rounded up to even (%ux%u) for 2x MSAA symmetry (Item 91).",
+                         width, height, evenW, evenH);
+        }
+        width = evenW;
+        height = evenH;
         RenderTargetManager::Get().Initialize(width, height);
         JitterManager::Get().Initialize(width, height);
         CBR_LOG_INFO("Swapchain recreated with new resolution %ux%u: frame parity and history reset.", width, height);
@@ -2499,7 +2505,11 @@ void WriteMinidump(EXCEPTION_POINTERS* pEx, const wchar_t* dumpPath) {
 
         if (hFile != INVALID_HANDLE_VALUE) {
             // Struct for MiniDumpWriteDump MINIDUMP_EXCEPTION_INFORMATION
-            // Packed with 4-byte alignment according to Microsoft dbghelp ABI (pshpack4.h)
+            // Packed with 4-byte alignment according to Microsoft dbghelp ABI (pshpack4.h / Item 89)
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wattributes"
+#endif
 #pragma pack(push, 4)
             struct MinimalMiniDumpExceptionInformation {
                 DWORD ThreadId;
@@ -2507,6 +2517,9 @@ void WriteMinidump(EXCEPTION_POINTERS* pEx, const wchar_t* dumpPath) {
                 BOOL ClientPointers;
             } expInfo{};
 #pragma pack(pop)
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
             static_assert(sizeof(expInfo) == (sizeof(void*) == 8 ? 16 : 12),
                           "MINIDUMP_EXCEPTION_INFORMATION packing ABI drift");
 
@@ -2823,6 +2836,9 @@ bool HookManager::Initialize() {
         CBR_LOG_ERROR("HookManager: MH_Initialize failed with code: %d", status);
         return false;
     }
+    if (status == MH_ERROR_ALREADY_INITIALIZED) {
+        CBR_LOG_INFO("HookManager: MinHook was previously initialized by host or companion module (Item 87).");
+    }
 #endif
     CBR_LOG_INFO("HookManager initialized.");
     return true;
@@ -2860,7 +2876,12 @@ void HookManager::Shutdown() {
 #include "cbr/render_target_manager.h"
 
 #if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #endif
 
@@ -4252,8 +4273,15 @@ bool HookManager::InstallDX12Hooks() {
     if (dxgiFactory) ReleaseCom(dxgiFactory);
     if (cmdQueue)    ReleaseCom(cmdQueue);
     if (d3d12Device) ReleaseCom(d3d12Device);
-    DestroyWindow(dummyHwnd);
-    UnregisterClassA(wc.lpszClassName, wc.hInstance);
+    if (dummyHwnd) {
+        if (!DestroyWindow(dummyHwnd)) {
+            CBR_LOG_WARN("HooksDX12: DestroyWindow on dummy window returned error: %lu (Item 92)", GetLastError());
+        }
+        dummyHwnd = nullptr;
+    }
+    if (!UnregisterClassA(wc.lpszClassName, wc.hInstance)) {
+        CBR_LOG_WARN("HooksDX12: UnregisterClassA returned error: %lu", GetLastError());
+    }
 
     if (hooked) {
         m_dx12Hooked.store(true);
@@ -4463,6 +4491,7 @@ void JitterManager::SetProjectionJitter(float* outMatrix4x4, const float* inUnji
 #include <chrono>
 #include <ctime>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 
 namespace cbr {
@@ -4652,7 +4681,10 @@ void Logger::Log(LogLevel level, const std::string& message) {
         if (m_queue.size() < kMaxQueueMessages) {
             m_queue.push_back(std::move(formatted));
         } else {
-            ++m_droppedQueue;
+            // Saturating increment to prevent drop counter overflow (Item 88)
+            if (m_droppedQueue < std::numeric_limits<size_t>::max()) {
+                ++m_droppedQueue;
+            }
         }
 
         if (level >= LogLevel::Warning) {
@@ -4663,7 +4695,10 @@ void Logger::Log(LogLevel level, const std::string& message) {
         if (m_pending.size() < kMaxPendingMessages) {
             m_pending.push_back(formatted);
         } else {
-            ++m_droppedPending;
+            // Saturating increment to prevent drop counter overflow (Item 88)
+            if (m_droppedPending < std::numeric_limits<size_t>::max()) {
+                ++m_droppedPending;
+            }
         }
     }
 
@@ -6012,8 +6047,14 @@ void ReconstructionPass::DispatchDX12(void* /*d3d12GraphicsCommandList*/, uint32
 #include <cstring>
 
 #if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
+#endif
 
 namespace {
 
@@ -7129,8 +7170,9 @@ void main() {
     if (isnan(outDepth) || isinf(outDepth)) {
         outDepth = (pc.u_DepthMode == 1u) ? 0.0 : 1.0;
     }
-    // Hardware ignores discarded components when writing to single-channel r32f
-    imageStore(u_OutputDepth, pixelCoord, vec4(outDepth));
+    // GLSL 4.50 section 8.14 mandates 4-component vector parameter for imageStore;
+    // GPU hardware routes the red channel to r32f and discards yzw (Item 86).
+    imageStore(u_OutputDepth, pixelCoord, vec4(outDepth, 0.0, 0.0, 0.0));
 }
 ```
 
@@ -7488,7 +7530,9 @@ void ResolvePixel(ivec2 pixelCoord, ivec2 targetSize, uint frameParity) {
     if (isnan(outDepth) || isinf(outDepth)) {
         outDepth = (pc.u_DepthMode == 1u) ? 0.0 : 1.0;
     }
-    imageStore(u_OutputDepth, pixelCoord, vec4(outDepth));
+    // GLSL 4.50 section 8.14 mandates 4-component vector parameter for imageStore;
+    // GPU hardware routes the red channel to r32f and discards yzw (Item 86).
+    imageStore(u_OutputDepth, pixelCoord, vec4(outDepth, 0.0, 0.0, 0.0));
 }
 
 void main() {

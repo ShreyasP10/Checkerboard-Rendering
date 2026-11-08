@@ -121,7 +121,11 @@ void WriteMinidump(EXCEPTION_POINTERS* pEx, const wchar_t* dumpPath) {
 
         if (hFile != INVALID_HANDLE_VALUE) {
             // Struct for MiniDumpWriteDump MINIDUMP_EXCEPTION_INFORMATION
-            // Packed with 4-byte alignment according to Microsoft dbghelp ABI (pshpack4.h)
+            // Packed with 4-byte alignment according to Microsoft dbghelp ABI (pshpack4.h / Item 89)
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wattributes"
+#endif
 #pragma pack(push, 4)
             struct MinimalMiniDumpExceptionInformation {
                 DWORD ThreadId;
@@ -129,6 +133,9 @@ void WriteMinidump(EXCEPTION_POINTERS* pEx, const wchar_t* dumpPath) {
                 BOOL ClientPointers;
             } expInfo{};
 #pragma pack(pop)
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
             static_assert(sizeof(expInfo) == (sizeof(void*) == 8 ? 16 : 12),
                           "MINIDUMP_EXCEPTION_INFORMATION packing ABI drift");
 

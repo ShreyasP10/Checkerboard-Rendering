@@ -34,6 +34,9 @@ bool HookManager::Initialize() {
         CBR_LOG_ERROR("HookManager: MH_Initialize failed with code: %d", status);
         return false;
     }
+    if (status == MH_ERROR_ALREADY_INITIALIZED) {
+        CBR_LOG_INFO("HookManager: MinHook was previously initialized by host or companion module (Item 87).");
+    }
 #endif
     CBR_LOG_INFO("HookManager initialized.");
     return true;

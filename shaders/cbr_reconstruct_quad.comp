@@ -349,7 +349,9 @@ void ResolvePixel(ivec2 pixelCoord, ivec2 targetSize, uint frameParity) {
     if (isnan(outDepth) || isinf(outDepth)) {
         outDepth = (pc.u_DepthMode == 1u) ? 0.0 : 1.0;
     }
-    imageStore(u_OutputDepth, pixelCoord, vec4(outDepth));
+    // GLSL 4.50 section 8.14 mandates 4-component vector parameter for imageStore;
+    // GPU hardware routes the red channel to r32f and discards yzw (Item 86).
+    imageStore(u_OutputDepth, pixelCoord, vec4(outDepth, 0.0, 0.0, 0.0));
 }
 
 void main() {

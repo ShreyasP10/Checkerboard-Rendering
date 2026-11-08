@@ -274,8 +274,15 @@ bool HookManager::InstallDX12Hooks() {
     if (dxgiFactory) ReleaseCom(dxgiFactory);
     if (cmdQueue)    ReleaseCom(cmdQueue);
     if (d3d12Device) ReleaseCom(d3d12Device);
-    DestroyWindow(dummyHwnd);
-    UnregisterClassA(wc.lpszClassName, wc.hInstance);
+    if (dummyHwnd) {
+        if (!DestroyWindow(dummyHwnd)) {
+            CBR_LOG_WARN("HooksDX12: DestroyWindow on dummy window returned error: %lu (Item 92)", GetLastError());
+        }
+        dummyHwnd = nullptr;
+    }
+    if (!UnregisterClassA(wc.lpszClassName, wc.hInstance)) {
+        CBR_LOG_WARN("HooksDX12: UnregisterClassA returned error: %lu", GetLastError());
+    }
 
     if (hooked) {
         m_dx12Hooked.store(true);
