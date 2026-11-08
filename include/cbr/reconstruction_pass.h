@@ -73,7 +73,8 @@ public:
     // Helper function to blit reconstructed color image to a destination image (e.g. swapchain backbuffer)
     static void BlitToImage(void* vkCommandBuffer, void* srcImage, void* dstImage,
                             uint32_t srcWidth, uint32_t srcHeight,
-                            uint32_t dstWidth, uint32_t dstHeight);
+                            uint32_t dstWidth, uint32_t dstHeight,
+                            uint32_t targetDstLayout = 1000001002 /* VK_IMAGE_LAYOUT_PRESENT_SRC_KHR */);
 
     bool AreDescriptorsBound() const { return m_descriptorsBound.load(); }
 
@@ -108,6 +109,21 @@ private:
     void* m_descriptorSetLayout{ nullptr };
     void* m_descriptorPool{ nullptr };
     void* m_descriptorSets[2]{ nullptr, nullptr };
+
+    // Cached Vulkan device function pointers to avoid GetProcAddress overhead in render hot loop
+    using PFN_CmdPipelineBarrier = void (*)(void*, uint32_t, uint32_t, uint32_t, uint32_t, const void*, uint32_t, const void*, uint32_t, const void*);
+    using PFN_CmdBlitImage = void (*)(void*, void*, uint32_t, void*, uint32_t, uint32_t, const void*, uint32_t);
+    using PFN_CmdBindPipeline = void (*)(void*, uint32_t, void*);
+    using PFN_CmdBindDescriptorSets = void (*)(void*, uint32_t, void*, uint32_t, uint32_t, const void* const*, uint32_t, const uint32_t*);
+    using PFN_CmdPushConstants = void (*)(void*, void*, uint32_t, uint32_t, uint32_t, const void*);
+    using PFN_CmdDispatch = void (*)(void*, uint32_t, uint32_t, uint32_t);
+
+    PFN_CmdPipelineBarrier    m_pfnCmdPipelineBarrier{ nullptr };
+    PFN_CmdBlitImage          m_pfnCmdBlitImage{ nullptr };
+    PFN_CmdBindPipeline       m_pfnCmdBindPipeline{ nullptr };
+    PFN_CmdBindDescriptorSets m_pfnCmdBindDescriptorSets{ nullptr };
+    PFN_CmdPushConstants      m_pfnCmdPushConstants{ nullptr };
+    PFN_CmdDispatch           m_pfnCmdDispatch{ nullptr };
 };
 
 } // namespace cbr

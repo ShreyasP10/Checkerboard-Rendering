@@ -457,6 +457,15 @@ bool ReconstructionPass::CreateVulkanPipeline() {
     m_descriptorPool = descriptorPool;
     m_descriptorSets[0] = descriptorSets[0];
     m_descriptorSets[1] = descriptorSets[1];
+
+    // Cache Vulkan device function pointers to avoid GetProcAddress overhead in render hot loop
+    m_pfnCmdPipelineBarrier = reinterpret_cast<PFN_CmdPipelineBarrier>(resolveDeviceFunc("vkCmdPipelineBarrier"));
+    m_pfnCmdBlitImage = reinterpret_cast<PFN_CmdBlitImage>(resolveDeviceFunc("vkCmdBlitImage"));
+    m_pfnCmdBindPipeline = reinterpret_cast<PFN_CmdBindPipeline>(resolveDeviceFunc("vkCmdBindPipeline"));
+    m_pfnCmdBindDescriptorSets = reinterpret_cast<PFN_CmdBindDescriptorSets>(resolveDeviceFunc("vkCmdBindDescriptorSets"));
+    m_pfnCmdPushConstants = reinterpret_cast<PFN_CmdPushConstants>(resolveDeviceFunc("vkCmdPushConstants"));
+    m_pfnCmdDispatch = reinterpret_cast<PFN_CmdDispatch>(resolveDeviceFunc("vkCmdDispatch"));
+
     CBR_LOG_INFO("Vulkan CBR reconstruction compute pipeline created successfully! (Pipeline: %p, Layout: %p, Descriptors: %p, Pool: %p, Sets: %p / %p)",
         m_pipeline, m_pipelineLayout, m_descriptorSetLayout, m_descriptorPool, m_descriptorSets[0], m_descriptorSets[1]);
     return true;
@@ -508,6 +517,12 @@ void ReconstructionPass::DestroyVulkanPipeline() {
         pfnDestroyDescriptorSetLayout(m_device, m_descriptorSetLayout, nullptr);
         m_descriptorSetLayout = nullptr;
     }
+    m_pfnCmdPipelineBarrier = nullptr;
+    m_pfnCmdBlitImage = nullptr;
+    m_pfnCmdBindPipeline = nullptr;
+    m_pfnCmdBindDescriptorSets = nullptr;
+    m_pfnCmdPushConstants = nullptr;
+    m_pfnCmdDispatch = nullptr;
     m_descriptorsBound.store(false);
 #endif
 }
@@ -718,9 +733,14 @@ void ReconstructionPass::TransitionImageLayout(void* vkCommandBuffer, void* vkIm
                                               uint32_t aspectMask) {
 #if defined(_WIN32)
     if (!vkCommandBuffer || !vkImage) return;
-    HMODULE vulkanModule = GetModuleHandleA("vulkan-1.dll");
-    if (!vulkanModule) return;
-    auto pfnCmdPipelineBarrier = reinterpret_cast<PFN_vkCmdPipelineBarrier>(GetProcAddress(vulkanModule, "vkCmdPipelineBarrier"));
+
+    auto pfnCmdPipelineBarrier = ReconstructionPass::Get().m_pfnCmdPipelineBarrier;
+    if (!pfnCmdPipelineBarrier) {
+        HMODULE vulkanModule = GetModuleHandleA("vulkan-1.dll");
+        if (vulkanModule) {
+            pfnCmdPipelineBarrier = reinterpret_cast<PFN_CmdPipelineBarrier>(GetProcAddress(vulkanModule, "vkCmdPipelineBarrier"));
+        }
+    }
     if (!pfnCmdPipelineBarrier) return;
 
     constexpr uint32_t kVkStructureTypeImageMemoryBarrier = 45;
@@ -749,12 +769,18 @@ void ReconstructionPass::TransitionImageLayout(void* vkCommandBuffer, void* vkIm
 
 void ReconstructionPass::BlitToImage(void* vkCommandBuffer, void* srcImage, void* dstImage,
                                     uint32_t srcWidth, uint32_t srcHeight,
-                                    uint32_t dstWidth, uint32_t dstHeight) {
+                                    uint32_t dstWidth, uint32_t dstHeight,
+                                    uint32_t targetDstLayout) {
 #if defined(_WIN32)
     if (!vkCommandBuffer || !srcImage || !dstImage) return;
-    HMODULE vulkanModule = GetModuleHandleA("vulkan-1.dll");
-    if (!vulkanModule) return;
-    auto pfnCmdBlitImage = reinterpret_cast<PFN_vkCmdBlitImage>(GetProcAddress(vulkanModule, "vkCmdBlitImage"));
+
+    auto pfnCmdBlitImage = ReconstructionPass::Get().m_pfnCmdBlitImage;
+    if (!pfnCmdBlitImage) {
+        HMODULE vulkanModule = GetModuleHandleA("vulkan-1.dll");
+        if (vulkanModule) {
+            pfnCmdBlitImage = reinterpret_cast<PFN_CmdBlitImage>(GetProcAddress(vulkanModule, "vkCmdBlitImage"));
+        }
+    }
     if (!pfnCmdBlitImage) return;
 
     // Transition srcImage to TRANSFER_SRC_OPTIMAL
@@ -791,12 +817,25 @@ void ReconstructionPass::BlitToImage(void* vkCommandBuffer, void* srcImage, void
                     dstImage, kVkImageLayoutTransferDstOptimal,
                     1, &blitRegion, kVkFilterLinear);
 
-    // Transition dstImage to PRESENT_SRC_KHR
-    TransitionImageLayout(vkCommandBuffer, dstImage,
-                          kVkImageLayoutTransferDstOptimal, kVkImageLayoutPresentSrcKHR,
-                          kVkPipelineStageTransferBit, kVkPipelineStageBottomOfPipeBit,
-                          kVkAccessTransferWriteBit, 0,
-                          kVkImageAspectColorBit);
+    // Transition dstImage to targetDstLayout (e.g. PRESENT_SRC_KHR or COLOR_ATTACHMENT_OPTIMAL)
+    constexpr uint32_t kVkImageLayoutColorAttachmentOptimal = 2;
+    constexpr uint32_t kVkPipelineStageColorAttachmentOutputBit = 0x00000400;
+    constexpr uint32_t kVkAccessColorAttachmentWriteBit = 0x00000100;
+    constexpr uint32_t kVkAccessColorAttachmentReadBit = 0x00000080;
+
+    if (targetDstLayout == kVkImageLayoutColorAttachmentOptimal) {
+        TransitionImageLayout(vkCommandBuffer, dstImage,
+                              kVkImageLayoutTransferDstOptimal, kVkImageLayoutColorAttachmentOptimal,
+                              kVkPipelineStageTransferBit, kVkPipelineStageColorAttachmentOutputBit,
+                              kVkAccessTransferWriteBit, kVkAccessColorAttachmentWriteBit | kVkAccessColorAttachmentReadBit,
+                              kVkImageAspectColorBit);
+    } else {
+        TransitionImageLayout(vkCommandBuffer, dstImage,
+                              kVkImageLayoutTransferDstOptimal, targetDstLayout,
+                              kVkPipelineStageTransferBit, kVkPipelineStageBottomOfPipeBit,
+                              kVkAccessTransferWriteBit, 0,
+                              kVkImageAspectColorBit);
+    }
 
     // Transition srcImage back to GENERAL
     TransitionImageLayout(vkCommandBuffer, srcImage,
@@ -807,6 +846,7 @@ void ReconstructionPass::BlitToImage(void* vkCommandBuffer, void* srcImage, void
 #else
     (void)vkCommandBuffer; (void)srcImage; (void)dstImage;
     (void)srcWidth; (void)srcHeight; (void)dstWidth; (void)dstHeight;
+    (void)targetDstLayout;
 #endif
 }
 
@@ -864,14 +904,22 @@ void ReconstructionPass::DispatchVulkan(void* vkCommandBuffer, uint32_t frameInd
     }
 
 #if defined(_WIN32)
-    HMODULE vulkanModule = GetModuleHandleA("vulkan-1.dll");
-    if (!vulkanModule) return;
+    auto pfnCmdBindPipeline = m_pfnCmdBindPipeline;
+    auto pfnCmdBindDescriptorSets = m_pfnCmdBindDescriptorSets;
+    auto pfnCmdPushConstants = m_pfnCmdPushConstants;
+    auto pfnCmdDispatch = m_pfnCmdDispatch;
+    auto pfnCmdPipelineBarrier = m_pfnCmdPipelineBarrier;
 
-    auto pfnCmdBindPipeline = reinterpret_cast<PFN_vkCmdBindPipeline>(GetProcAddress(vulkanModule, "vkCmdBindPipeline"));
-    auto pfnCmdBindDescriptorSets = reinterpret_cast<PFN_vkCmdBindDescriptorSets>(GetProcAddress(vulkanModule, "vkCmdBindDescriptorSets"));
-    auto pfnCmdPushConstants = reinterpret_cast<PFN_vkCmdPushConstants>(GetProcAddress(vulkanModule, "vkCmdPushConstants"));
-    auto pfnCmdDispatch = reinterpret_cast<PFN_vkCmdDispatch>(GetProcAddress(vulkanModule, "vkCmdDispatch"));
-    auto pfnCmdPipelineBarrier = reinterpret_cast<PFN_vkCmdPipelineBarrier>(GetProcAddress(vulkanModule, "vkCmdPipelineBarrier"));
+    if (!pfnCmdBindPipeline || !pfnCmdPushConstants || !pfnCmdDispatch) {
+        HMODULE vulkanModule = GetModuleHandleA("vulkan-1.dll");
+        if (vulkanModule) {
+            if (!pfnCmdBindPipeline) pfnCmdBindPipeline = reinterpret_cast<PFN_CmdBindPipeline>(GetProcAddress(vulkanModule, "vkCmdBindPipeline"));
+            if (!pfnCmdBindDescriptorSets) pfnCmdBindDescriptorSets = reinterpret_cast<PFN_CmdBindDescriptorSets>(GetProcAddress(vulkanModule, "vkCmdBindDescriptorSets"));
+            if (!pfnCmdPushConstants) pfnCmdPushConstants = reinterpret_cast<PFN_CmdPushConstants>(GetProcAddress(vulkanModule, "vkCmdPushConstants"));
+            if (!pfnCmdDispatch) pfnCmdDispatch = reinterpret_cast<PFN_CmdDispatch>(GetProcAddress(vulkanModule, "vkCmdDispatch"));
+            if (!pfnCmdPipelineBarrier) pfnCmdPipelineBarrier = reinterpret_cast<PFN_CmdPipelineBarrier>(GetProcAddress(vulkanModule, "vkCmdPipelineBarrier"));
+        }
+    }
 
     if (!pfnCmdBindPipeline || !pfnCmdPushConstants || !pfnCmdDispatch) {
         return;
@@ -891,7 +939,7 @@ void ReconstructionPass::DispatchVulkan(void* vkCommandBuffer, uint32_t frameInd
     void* activeSet = m_descriptorSets[activeSetIdx] ? m_descriptorSets[activeSetIdx] : m_descriptorSets[0];
 
     if (activeSet && pfnCmdBindDescriptorSets) {
-        const void* descriptorSets[] = { activeSet };
+        const void* const descriptorSets[] = { activeSet };
         pfnCmdBindDescriptorSets(vkCommandBuffer, kVkPipelineBindPointCompute, m_pipelineLayout, 0, 1, descriptorSets, 0, nullptr);
     }
 

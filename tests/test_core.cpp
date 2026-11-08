@@ -137,6 +137,12 @@ static void TestConfigMissingFileAndRoundTrip(const fs::path& dir) {
     CHECK(after.samplingStrategy == before.samplingStrategy);
     CHECK(after.depthConvention == before.depthConvention);
     CHECK(after.depthNear == before.depthNear && after.depthFar == before.depthFar);
+
+    // Verify thread-safe Modify callback executes and commits successfully
+    ConfigManager::Get().Modify([](CBRConfig& cfg) {
+        cfg.targetWidth = 1920;
+    });
+    CHECK(ConfigManager::Get().GetConfig().targetWidth == 1920);
 }
 
 static void TestLoggerBufferingAndLevel(const fs::path& dir) {

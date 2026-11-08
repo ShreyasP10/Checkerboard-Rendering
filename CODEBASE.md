@@ -863,8 +863,16 @@ public:
     }
     template<typename Fn>
     void Modify(Fn&& fn) {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        fn(m_config);
+        CBRConfig cfg;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            cfg = m_config;
+        }
+        fn(cfg);
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_config = cfg;
+        }
     }
 
 private:
@@ -1353,7 +1361,8 @@ public:
     // Helper function to blit reconstructed color image to a destination image (e.g. swapchain backbuffer)
     static void BlitToImage(void* vkCommandBuffer, void* srcImage, void* dstImage,
                             uint32_t srcWidth, uint32_t srcHeight,
-                            uint32_t dstWidth, uint32_t dstHeight);
+                            uint32_t dstWidth, uint32_t dstHeight,
+                            uint32_t targetDstLayout = 1000001002 /* VK_IMAGE_LAYOUT_PRESENT_SRC_KHR */);
 
     bool AreDescriptorsBound() const { return m_descriptorsBound.load(); }
 
@@ -1388,6 +1397,21 @@ private:
     void* m_descriptorSetLayout{ nullptr };
     void* m_descriptorPool{ nullptr };
     void* m_descriptorSets[2]{ nullptr, nullptr };
+
+    // Cached Vulkan device function pointers to avoid GetProcAddress overhead in render hot loop
+    using PFN_CmdPipelineBarrier = void (*)(void*, uint32_t, uint32_t, uint32_t, uint32_t, const void*, uint32_t, const void*, uint32_t, const void*);
+    using PFN_CmdBlitImage = void (*)(void*, void*, uint32_t, void*, uint32_t, uint32_t, const void*, uint32_t);
+    using PFN_CmdBindPipeline = void (*)(void*, uint32_t, void*);
+    using PFN_CmdBindDescriptorSets = void (*)(void*, uint32_t, void*, uint32_t, uint32_t, const void* const*, uint32_t, const uint32_t*);
+    using PFN_CmdPushConstants = void (*)(void*, void*, uint32_t, uint32_t, uint32_t, const void*);
+    using PFN_CmdDispatch = void (*)(void*, uint32_t, uint32_t, uint32_t);
+
+    PFN_CmdPipelineBarrier    m_pfnCmdPipelineBarrier{ nullptr };
+    PFN_CmdBlitImage          m_pfnCmdBlitImage{ nullptr };
+    PFN_CmdBindPipeline       m_pfnCmdBindPipeline{ nullptr };
+    PFN_CmdBindDescriptorSets m_pfnCmdBindDescriptorSets{ nullptr };
+    PFN_CmdPushConstants      m_pfnCmdPushConstants{ nullptr };
+    PFN_CmdDispatch           m_pfnCmdDispatch{ nullptr };
 };
 
 } // namespace cbr
@@ -1847,13 +1871,7 @@ void CBREngine::OnBeginFrame() {
 void CBREngine::OnPreRender() {
     if (!m_enabled.load()) return;
     // Jitter is active for projection matrix during scene geometry pass
-    const uint32_t currentFrame = m_frameIndex.load();
-#if defined(_WIN32)
-    const auto config = ConfigManager::Get().GetConfig();
-    if (config.samplingStrategy == SamplingStrategy::StrategyA && config.jitterDirection != 0) {
-        PatternScanner::UpdateCameraJitter(currentFrame, m_activeApi.load() == GraphicsApi::Vulkan);
-    }
-#endif
+    // (Camera projection jitter is applied in OnBeginFrame; avoid duplicate application here)
 }
 
 void CBREngine::OnPostRender() {
@@ -2740,6 +2758,7 @@ void CrashHandler::LogSystemTelemetry() {
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <MinHook.h>
 #endif
 
 namespace cbr {
@@ -2758,6 +2777,13 @@ GraphicsApi HookManager::DetectLoadedApi() const {
 }
 
 bool HookManager::Initialize() {
+#if defined(_WIN32)
+    MH_STATUS status = MH_Initialize();
+    if (status != MH_OK && status != MH_ERROR_ALREADY_INITIALIZED) {
+        CBR_LOG_ERROR("HookManager: MH_Initialize failed with code: %d", status);
+        return false;
+    }
+#endif
     CBR_LOG_INFO("HookManager initialized.");
     return true;
 }
@@ -2765,6 +2791,9 @@ bool HookManager::Initialize() {
 void HookManager::Shutdown() {
     UninstallVulkanHooks();
     UninstallDX12Hooks();
+#if defined(_WIN32)
+    MH_Uninitialize();
+#endif
     CBR_LOG_INFO("HookManager shut down.");
 }
 
@@ -2999,15 +3028,54 @@ inline void* GetActiveSwapchainImage() {
     return nullptr;
 }
 
-// Scene pass identification and draw tracking
-struct PassTrackingState {
-    bool     hasMatchingExtent{ false };
-    bool     viewportDownscaled{ false };
-    uint32_t drawCount{ 0 };
+// Scene pass identification and draw tracking using lock-free slot pool
+struct PassSlot {
+    std::atomic<void*>    cmdBuffer{ nullptr };
+    std::atomic<bool>     hasMatchingExtent{ false };
+    std::atomic<bool>     viewportDownscaled{ false };
+    std::atomic<uint32_t> drawCount{ 0 };
 };
 
-std::mutex g_passTrackingMutex;
-std::unordered_map<void*, PassTrackingState> g_passTracking;
+constexpr size_t kMaxTrackedPassSlots = 64;
+static PassSlot g_passSlots[kMaxTrackedPassSlots];
+
+inline PassSlot* GetOrCreatePassSlot(void* cmdBuffer) {
+    if (!cmdBuffer) return nullptr;
+    const size_t startIdx = (reinterpret_cast<uintptr_t>(cmdBuffer) >> 4) % kMaxTrackedPassSlots;
+    for (size_t i = 0; i < 8; ++i) {
+        size_t idx = (startIdx + i) % kMaxTrackedPassSlots;
+        if (g_passSlots[idx].cmdBuffer.load(std::memory_order_relaxed) == cmdBuffer) {
+            return &g_passSlots[idx];
+        }
+    }
+    for (size_t i = 0; i < 8; ++i) {
+        size_t idx = (startIdx + i) % kMaxTrackedPassSlots;
+        void* expected = nullptr;
+        if (g_passSlots[idx].cmdBuffer.compare_exchange_strong(expected, cmdBuffer, std::memory_order_acq_rel)) {
+            return &g_passSlots[idx];
+        }
+    }
+    return nullptr;
+}
+
+inline PassSlot* FindPassSlot(void* cmdBuffer) {
+    if (!cmdBuffer) return nullptr;
+    const size_t startIdx = (reinterpret_cast<uintptr_t>(cmdBuffer) >> 4) % kMaxTrackedPassSlots;
+    for (size_t i = 0; i < 8; ++i) {
+        size_t idx = (startIdx + i) % kMaxTrackedPassSlots;
+        if (g_passSlots[idx].cmdBuffer.load(std::memory_order_relaxed) == cmdBuffer) {
+            return &g_passSlots[idx];
+        }
+    }
+    return nullptr;
+}
+
+inline void IncrementDrawCount(void* cmdBuffer) {
+    PassSlot* slot = FindPassSlot(cmdBuffer);
+    if (slot) {
+        slot->drawCount.fetch_add(1, std::memory_order_relaxed);
+    }
+}
 
 int Hooked_vkQueuePresentKHR(void* queue, const void* pPresentInfo) {
     if (!g_Original_vkQueuePresentKHR) {
@@ -3067,7 +3135,7 @@ int Hooked_vkCreateSwapchainKHR(void* device, const void* pCreateInfo, const voi
                 std::memcpy(&info, pCreateInfo, sizeof(info));
                 w = info.imageExtent.width;
                 h = info.imageExtent.height;
-                if (w > 16384 || h > 16384) { w = 0; h = 0; } // untrusted: let engine ignore
+                if (w < 2 || h < 2 || w > 16384 || h > 16384) { w = 0; h = 0; } // untrusted: let engine ignore
             } else {
                 CBR_LOG_WARN("vkCreateSwapchainKHR: unexpected sType (%u), skipping extent extraction.", sType);
             }
@@ -3167,9 +3235,9 @@ void Hooked_vkCmdSetViewport(void* commandBuffer, uint32_t firstViewport, uint32
         // Mark this command buffer as actively executing the intercepted scene geometry pass
         CBREngine::Get().MarkCandidatePassActive(commandBuffer);
 
-        {
-            std::lock_guard<std::mutex> lock(g_passTrackingMutex);
-            g_passTracking[commandBuffer].viewportDownscaled = true;
+        PassSlot* slot = GetOrCreatePassSlot(commandBuffer);
+        if (slot) {
+            slot->viewportDownscaled.store(true, std::memory_order_release);
         }
 
         MinimalVkViewport redirected = pViewports[0];
@@ -3234,8 +3302,6 @@ void Hooked_vkCmdBeginRenderPass(void* commandBuffer, const void* pRenderPassBeg
     if (!g_Original_vkCmdBeginRenderPass) return;
 
     if (pRenderPassBegin && CBREngine::Get().IsEnabled()) {
-        CBREngine::Get().ConsumeCandidatePassActive(commandBuffer);
-
         uint32_t sType = 0;
         std::memcpy(&sType, pRenderPassBegin, sizeof(sType));
         constexpr uint32_t kVkStructureTypeRenderPassBeginInfo = 43;
@@ -3246,12 +3312,14 @@ void Hooked_vkCmdBeginRenderPass(void* commandBuffer, const void* pRenderPassBeg
             const uint32_t w = info.renderArea.extent.width;
             const uint32_t h = info.renderArea.extent.height;
 
-            std::lock_guard<std::mutex> lock(g_passTrackingMutex);
-            auto& state = g_passTracking[commandBuffer];
-            state.hasMatchingExtent = ((w == dims.fullWidth && h == dims.fullHeight) ||
+            PassSlot* slot = GetOrCreatePassSlot(commandBuffer);
+            if (slot) {
+                const bool matching = ((w == dims.fullWidth && h == dims.fullHeight) ||
                                        (w == dims.quarterWidth && h == dims.quarterHeight));
-            state.viewportDownscaled = false;
-            state.drawCount = 0;
+                slot->hasMatchingExtent.store(matching, std::memory_order_release);
+                slot->viewportDownscaled.store(false, std::memory_order_release);
+                slot->drawCount.store(0, std::memory_order_release);
+            }
         }
     }
 
@@ -3261,11 +3329,7 @@ void Hooked_vkCmdBeginRenderPass(void* commandBuffer, const void* pRenderPassBeg
 void Hooked_vkCmdDraw(void* commandBuffer, uint32_t vertexCount, uint32_t instanceCount, uint32_t firstVertex, uint32_t firstInstance) {
     if (!g_Original_vkCmdDraw) return;
     if (CBREngine::Get().IsEnabled()) {
-        std::lock_guard<std::mutex> lock(g_passTrackingMutex);
-        auto it = g_passTracking.find(commandBuffer);
-        if (it != g_passTracking.end()) {
-            it->second.drawCount++;
-        }
+        IncrementDrawCount(commandBuffer);
     }
     g_Original_vkCmdDraw(commandBuffer, vertexCount, instanceCount, firstVertex, firstInstance);
 }
@@ -3273,11 +3337,7 @@ void Hooked_vkCmdDraw(void* commandBuffer, uint32_t vertexCount, uint32_t instan
 void Hooked_vkCmdDrawIndexed(void* commandBuffer, uint32_t indexCount, uint32_t instanceCount, uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance) {
     if (!g_Original_vkCmdDrawIndexed) return;
     if (CBREngine::Get().IsEnabled()) {
-        std::lock_guard<std::mutex> lock(g_passTrackingMutex);
-        auto it = g_passTracking.find(commandBuffer);
-        if (it != g_passTracking.end()) {
-            it->second.drawCount++;
-        }
+        IncrementDrawCount(commandBuffer);
     }
     g_Original_vkCmdDrawIndexed(commandBuffer, indexCount, instanceCount, firstIndex, vertexOffset, firstInstance);
 }
@@ -3290,14 +3350,18 @@ void Hooked_vkCmdEndRenderPass(void* commandBuffer) {
     if (CBREngine::Get().IsEnabled()) {
         try {
             bool isScenePass = false;
-            {
-                std::lock_guard<std::mutex> lock(g_passTrackingMutex);
-                auto it = g_passTracking.find(commandBuffer);
-                if (it != g_passTracking.end()) {
-                    isScenePass = it->second.viewportDownscaled ||
-                                  (it->second.hasMatchingExtent && it->second.drawCount >= 20);
-                    g_passTracking.erase(it);
-                }
+            PassSlot* slot = FindPassSlot(commandBuffer);
+            if (slot) {
+                const bool downscaled = slot->viewportDownscaled.load(std::memory_order_acquire);
+                const bool matching = slot->hasMatchingExtent.load(std::memory_order_acquire);
+                const uint32_t draws = slot->drawCount.load(std::memory_order_acquire);
+                isScenePass = downscaled || (matching && draws >= 20);
+
+                // Release slot back to pool
+                slot->hasMatchingExtent.store(false, std::memory_order_relaxed);
+                slot->viewportDownscaled.store(false, std::memory_order_relaxed);
+                slot->drawCount.store(0, std::memory_order_relaxed);
+                slot->cmdBuffer.store(nullptr, std::memory_order_release);
             }
 
             // Trigger reconstruction if identified as scene pass or engine marked active
@@ -3548,11 +3612,6 @@ bool HookManager::InstallVulkanHooks() {
         CBR_LOG_INFO("Vulkan module located at 0x%p. Initializing Vulkan function interception via MinHook...", vulkanModule);
     }
 
-    MH_STATUS mhStatus = MH_Initialize();
-    if (mhStatus != MH_OK && mhStatus != MH_ERROR_ALREADY_INITIALIZED) {
-        CBR_LOG_ERROR("Failed to initialize MinHook core (MH_STATUS: %d).", mhStatus);
-        return false;
-    }
 
     // Resolve exported function addresses from vulkan-1.dll
     auto pfnQueuePresent = reinterpret_cast<void*>(GetProcAddress(vulkanModule, "vkQueuePresentKHR"));
@@ -3798,7 +3857,6 @@ void HookManager::UninstallVulkanHooks() {
     if (m_vulkanHooked.load()) {
         CBR_LOG_INFO("Restoring original Vulkan function dispatch table.");
         MH_DisableHook(MH_ALL_HOOKS);
-        MH_Uninitialize();
         m_vulkanHooked.store(false);
     }
 }
@@ -3965,11 +4023,6 @@ bool HookManager::InstallDX12Hooks() {
         return false;
     }
 
-    MH_STATUS mhStatus = MH_Initialize();
-    if (mhStatus != MH_OK && mhStatus != MH_ERROR_ALREADY_INITIALIZED) {
-        CBR_LOG_ERROR("Failed to initialize MinHook core for DX12 (MH_STATUS: %d).", mhStatus);
-        return false;
-    }
 
     typedef HRESULT (WINAPI *PFN_D3D12CreateDevice)(IUnknown*, int, REFIID, void**);
     typedef HRESULT (WINAPI *PFN_CreateDXGIFactory1)(REFIID, void**);
@@ -4358,13 +4411,14 @@ void Logger::Flush() {
 }
 
 void Logger::WorkerThread() {
+    auto lastFlushTime = std::chrono::steady_clock::now();
     while (true) {
         std::vector<std::string> batch;
         bool doFlush = false;
 
         {
             std::unique_lock<std::mutex> lock(m_mutex);
-            m_cv.wait(lock, [this]() {
+            m_cv.wait_for(lock, std::chrono::seconds(1), [this]() {
                 return !m_running.load() || !m_queue.empty() || m_flushRequested.load();
             });
 
@@ -4376,13 +4430,17 @@ void Logger::WorkerThread() {
             doFlush = m_flushRequested.exchange(false);
         }
 
+        const auto now = std::chrono::steady_clock::now();
+        const bool periodicFlush = (now - lastFlushTime >= std::chrono::seconds(1));
+
         // Perform disk I/O on background thread outside mutex lock
         if (m_logFile.is_open()) {
             for (const auto& msg : batch) {
                 m_logFile << msg;
             }
-            if (doFlush || !m_running.load()) {
+            if (doFlush || periodicFlush || !m_running.load()) {
                 m_logFile.flush();
+                lastFlushTime = now;
             }
         }
 
@@ -5204,6 +5262,15 @@ bool ReconstructionPass::CreateVulkanPipeline() {
     m_descriptorPool = descriptorPool;
     m_descriptorSets[0] = descriptorSets[0];
     m_descriptorSets[1] = descriptorSets[1];
+
+    // Cache Vulkan device function pointers to avoid GetProcAddress overhead in render hot loop
+    m_pfnCmdPipelineBarrier = reinterpret_cast<PFN_CmdPipelineBarrier>(resolveDeviceFunc("vkCmdPipelineBarrier"));
+    m_pfnCmdBlitImage = reinterpret_cast<PFN_CmdBlitImage>(resolveDeviceFunc("vkCmdBlitImage"));
+    m_pfnCmdBindPipeline = reinterpret_cast<PFN_CmdBindPipeline>(resolveDeviceFunc("vkCmdBindPipeline"));
+    m_pfnCmdBindDescriptorSets = reinterpret_cast<PFN_CmdBindDescriptorSets>(resolveDeviceFunc("vkCmdBindDescriptorSets"));
+    m_pfnCmdPushConstants = reinterpret_cast<PFN_CmdPushConstants>(resolveDeviceFunc("vkCmdPushConstants"));
+    m_pfnCmdDispatch = reinterpret_cast<PFN_CmdDispatch>(resolveDeviceFunc("vkCmdDispatch"));
+
     CBR_LOG_INFO("Vulkan CBR reconstruction compute pipeline created successfully! (Pipeline: %p, Layout: %p, Descriptors: %p, Pool: %p, Sets: %p / %p)",
         m_pipeline, m_pipelineLayout, m_descriptorSetLayout, m_descriptorPool, m_descriptorSets[0], m_descriptorSets[1]);
     return true;
@@ -5255,6 +5322,12 @@ void ReconstructionPass::DestroyVulkanPipeline() {
         pfnDestroyDescriptorSetLayout(m_device, m_descriptorSetLayout, nullptr);
         m_descriptorSetLayout = nullptr;
     }
+    m_pfnCmdPipelineBarrier = nullptr;
+    m_pfnCmdBlitImage = nullptr;
+    m_pfnCmdBindPipeline = nullptr;
+    m_pfnCmdBindDescriptorSets = nullptr;
+    m_pfnCmdPushConstants = nullptr;
+    m_pfnCmdDispatch = nullptr;
     m_descriptorsBound.store(false);
 #endif
 }
@@ -5465,9 +5538,14 @@ void ReconstructionPass::TransitionImageLayout(void* vkCommandBuffer, void* vkIm
                                               uint32_t aspectMask) {
 #if defined(_WIN32)
     if (!vkCommandBuffer || !vkImage) return;
-    HMODULE vulkanModule = GetModuleHandleA("vulkan-1.dll");
-    if (!vulkanModule) return;
-    auto pfnCmdPipelineBarrier = reinterpret_cast<PFN_vkCmdPipelineBarrier>(GetProcAddress(vulkanModule, "vkCmdPipelineBarrier"));
+
+    auto pfnCmdPipelineBarrier = ReconstructionPass::Get().m_pfnCmdPipelineBarrier;
+    if (!pfnCmdPipelineBarrier) {
+        HMODULE vulkanModule = GetModuleHandleA("vulkan-1.dll");
+        if (vulkanModule) {
+            pfnCmdPipelineBarrier = reinterpret_cast<PFN_CmdPipelineBarrier>(GetProcAddress(vulkanModule, "vkCmdPipelineBarrier"));
+        }
+    }
     if (!pfnCmdPipelineBarrier) return;
 
     constexpr uint32_t kVkStructureTypeImageMemoryBarrier = 45;
@@ -5496,12 +5574,18 @@ void ReconstructionPass::TransitionImageLayout(void* vkCommandBuffer, void* vkIm
 
 void ReconstructionPass::BlitToImage(void* vkCommandBuffer, void* srcImage, void* dstImage,
                                     uint32_t srcWidth, uint32_t srcHeight,
-                                    uint32_t dstWidth, uint32_t dstHeight) {
+                                    uint32_t dstWidth, uint32_t dstHeight,
+                                    uint32_t targetDstLayout) {
 #if defined(_WIN32)
     if (!vkCommandBuffer || !srcImage || !dstImage) return;
-    HMODULE vulkanModule = GetModuleHandleA("vulkan-1.dll");
-    if (!vulkanModule) return;
-    auto pfnCmdBlitImage = reinterpret_cast<PFN_vkCmdBlitImage>(GetProcAddress(vulkanModule, "vkCmdBlitImage"));
+
+    auto pfnCmdBlitImage = ReconstructionPass::Get().m_pfnCmdBlitImage;
+    if (!pfnCmdBlitImage) {
+        HMODULE vulkanModule = GetModuleHandleA("vulkan-1.dll");
+        if (vulkanModule) {
+            pfnCmdBlitImage = reinterpret_cast<PFN_CmdBlitImage>(GetProcAddress(vulkanModule, "vkCmdBlitImage"));
+        }
+    }
     if (!pfnCmdBlitImage) return;
 
     // Transition srcImage to TRANSFER_SRC_OPTIMAL
@@ -5538,12 +5622,25 @@ void ReconstructionPass::BlitToImage(void* vkCommandBuffer, void* srcImage, void
                     dstImage, kVkImageLayoutTransferDstOptimal,
                     1, &blitRegion, kVkFilterLinear);
 
-    // Transition dstImage to PRESENT_SRC_KHR
-    TransitionImageLayout(vkCommandBuffer, dstImage,
-                          kVkImageLayoutTransferDstOptimal, kVkImageLayoutPresentSrcKHR,
-                          kVkPipelineStageTransferBit, kVkPipelineStageBottomOfPipeBit,
-                          kVkAccessTransferWriteBit, 0,
-                          kVkImageAspectColorBit);
+    // Transition dstImage to targetDstLayout (e.g. PRESENT_SRC_KHR or COLOR_ATTACHMENT_OPTIMAL)
+    constexpr uint32_t kVkImageLayoutColorAttachmentOptimal = 2;
+    constexpr uint32_t kVkPipelineStageColorAttachmentOutputBit = 0x00000400;
+    constexpr uint32_t kVkAccessColorAttachmentWriteBit = 0x00000100;
+    constexpr uint32_t kVkAccessColorAttachmentReadBit = 0x00000080;
+
+    if (targetDstLayout == kVkImageLayoutColorAttachmentOptimal) {
+        TransitionImageLayout(vkCommandBuffer, dstImage,
+                              kVkImageLayoutTransferDstOptimal, kVkImageLayoutColorAttachmentOptimal,
+                              kVkPipelineStageTransferBit, kVkPipelineStageColorAttachmentOutputBit,
+                              kVkAccessTransferWriteBit, kVkAccessColorAttachmentWriteBit | kVkAccessColorAttachmentReadBit,
+                              kVkImageAspectColorBit);
+    } else {
+        TransitionImageLayout(vkCommandBuffer, dstImage,
+                              kVkImageLayoutTransferDstOptimal, targetDstLayout,
+                              kVkPipelineStageTransferBit, kVkPipelineStageBottomOfPipeBit,
+                              kVkAccessTransferWriteBit, 0,
+                              kVkImageAspectColorBit);
+    }
 
     // Transition srcImage back to GENERAL
     TransitionImageLayout(vkCommandBuffer, srcImage,
@@ -5554,6 +5651,7 @@ void ReconstructionPass::BlitToImage(void* vkCommandBuffer, void* srcImage, void
 #else
     (void)vkCommandBuffer; (void)srcImage; (void)dstImage;
     (void)srcWidth; (void)srcHeight; (void)dstWidth; (void)dstHeight;
+    (void)targetDstLayout;
 #endif
 }
 
@@ -5611,14 +5709,22 @@ void ReconstructionPass::DispatchVulkan(void* vkCommandBuffer, uint32_t frameInd
     }
 
 #if defined(_WIN32)
-    HMODULE vulkanModule = GetModuleHandleA("vulkan-1.dll");
-    if (!vulkanModule) return;
+    auto pfnCmdBindPipeline = m_pfnCmdBindPipeline;
+    auto pfnCmdBindDescriptorSets = m_pfnCmdBindDescriptorSets;
+    auto pfnCmdPushConstants = m_pfnCmdPushConstants;
+    auto pfnCmdDispatch = m_pfnCmdDispatch;
+    auto pfnCmdPipelineBarrier = m_pfnCmdPipelineBarrier;
 
-    auto pfnCmdBindPipeline = reinterpret_cast<PFN_vkCmdBindPipeline>(GetProcAddress(vulkanModule, "vkCmdBindPipeline"));
-    auto pfnCmdBindDescriptorSets = reinterpret_cast<PFN_vkCmdBindDescriptorSets>(GetProcAddress(vulkanModule, "vkCmdBindDescriptorSets"));
-    auto pfnCmdPushConstants = reinterpret_cast<PFN_vkCmdPushConstants>(GetProcAddress(vulkanModule, "vkCmdPushConstants"));
-    auto pfnCmdDispatch = reinterpret_cast<PFN_vkCmdDispatch>(GetProcAddress(vulkanModule, "vkCmdDispatch"));
-    auto pfnCmdPipelineBarrier = reinterpret_cast<PFN_vkCmdPipelineBarrier>(GetProcAddress(vulkanModule, "vkCmdPipelineBarrier"));
+    if (!pfnCmdBindPipeline || !pfnCmdPushConstants || !pfnCmdDispatch) {
+        HMODULE vulkanModule = GetModuleHandleA("vulkan-1.dll");
+        if (vulkanModule) {
+            if (!pfnCmdBindPipeline) pfnCmdBindPipeline = reinterpret_cast<PFN_CmdBindPipeline>(GetProcAddress(vulkanModule, "vkCmdBindPipeline"));
+            if (!pfnCmdBindDescriptorSets) pfnCmdBindDescriptorSets = reinterpret_cast<PFN_CmdBindDescriptorSets>(GetProcAddress(vulkanModule, "vkCmdBindDescriptorSets"));
+            if (!pfnCmdPushConstants) pfnCmdPushConstants = reinterpret_cast<PFN_CmdPushConstants>(GetProcAddress(vulkanModule, "vkCmdPushConstants"));
+            if (!pfnCmdDispatch) pfnCmdDispatch = reinterpret_cast<PFN_CmdDispatch>(GetProcAddress(vulkanModule, "vkCmdDispatch"));
+            if (!pfnCmdPipelineBarrier) pfnCmdPipelineBarrier = reinterpret_cast<PFN_CmdPipelineBarrier>(GetProcAddress(vulkanModule, "vkCmdPipelineBarrier"));
+        }
+    }
 
     if (!pfnCmdBindPipeline || !pfnCmdPushConstants || !pfnCmdDispatch) {
         return;
@@ -5638,7 +5744,7 @@ void ReconstructionPass::DispatchVulkan(void* vkCommandBuffer, uint32_t frameInd
     void* activeSet = m_descriptorSets[activeSetIdx] ? m_descriptorSets[activeSetIdx] : m_descriptorSets[0];
 
     if (activeSet && pfnCmdBindDescriptorSets) {
-        const void* descriptorSets[] = { activeSet };
+        const void* const descriptorSets[] = { activeSet };
         pfnCmdBindDescriptorSets(vkCommandBuffer, kVkPipelineBindPointCompute, m_pipelineLayout, 0, 1, descriptorSets, 0, nullptr);
     }
 
@@ -6005,6 +6111,7 @@ bool RenderTargetManager::CreateVulkanResources(void* vkDevice, void* vkPhysical
     };
 
     const TargetDimensions dims = GetDimensions();
+    size_t totalDriverVram = 0;
 
     auto createTexture = [&](uint32_t width, uint32_t height, uint32_t format,
                              uint32_t usage, uint32_t aspectMask, VulkanTextureResource& out,
@@ -6043,6 +6150,15 @@ bool RenderTargetManager::CreateVulkanResources(void* vkDevice, void* vkPhysical
 
         pfnBindImageMemory(vkDevice, image, memory, 0);
 
+        // Support true depth aspect mask if a native depth format is requested
+        constexpr uint32_t kVkFormatD16Unorm = 124;
+        constexpr uint32_t kVkFormatD32Sfloat = 126;
+        constexpr uint32_t kVkFormatD24UnormS8Uint = 129;
+        constexpr uint32_t kVkImageAspectDepthBit = 0x00000002;
+        if (format == kVkFormatD16Unorm || format == kVkFormatD32Sfloat || format == kVkFormatD24UnormS8Uint) {
+            aspectMask = kVkImageAspectDepthBit;
+        }
+
         MinimalVkImageViewCreateInfo viewInfo{};
         viewInfo.sType = kVkStructureTypeImageViewCreateInfo;
         viewInfo.image = image;
@@ -6060,6 +6176,8 @@ bool RenderTargetManager::CreateVulkanResources(void* vkDevice, void* vkPhysical
             pfnDestroyImage(vkDevice, image, nullptr);
             return false;
         }
+
+        totalDriverVram += memReqs.size;
 
         out.image = image;
         out.memory = memory;
@@ -6145,9 +6263,12 @@ bool RenderTargetManager::CreateVulkanResources(void* vkDevice, void* vkPhysical
     pfnCreateSampler(vkDevice, &samplerInfo, nullptr, &pointSampler);
     m_vkResources.pointSampler = pointSampler;
 
+    m_totalAllocatedVramBytes.store(totalDriverVram);
     m_vkResourcesCreated.store(true);
-    CBR_LOG_INFO("Vulkan device-local render targets & samplers successfully instantiated (%ux%u).",
-                 dims.fullWidth, dims.fullHeight);
+    CBR_LOG_INFO("Vulkan device-local render targets & samplers instantiated (%ux%u). Driver VRAM: %.2f MiB (%.2f MB)",
+                 dims.fullWidth, dims.fullHeight,
+                 static_cast<double>(totalDriverVram) / (1024.0 * 1024.0),
+                 static_cast<double>(totalDriverVram) / 1000000.0);
     return true;
 #else
     m_vkResourcesCreated.store(true);
@@ -7804,6 +7925,12 @@ static void TestConfigMissingFileAndRoundTrip(const fs::path& dir) {
     CHECK(after.samplingStrategy == before.samplingStrategy);
     CHECK(after.depthConvention == before.depthConvention);
     CHECK(after.depthNear == before.depthNear && after.depthFar == before.depthFar);
+
+    // Verify thread-safe Modify callback executes and commits successfully
+    ConfigManager::Get().Modify([](CBRConfig& cfg) {
+        cfg.targetWidth = 1920;
+    });
+    CHECK(ConfigManager::Get().GetConfig().targetWidth == 1920);
 }
 
 static void TestLoggerBufferingAndLevel(const fs::path& dir) {

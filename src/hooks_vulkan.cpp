@@ -223,15 +223,54 @@ inline void* GetActiveSwapchainImage() {
     return nullptr;
 }
 
-// Scene pass identification and draw tracking
-struct PassTrackingState {
-    bool     hasMatchingExtent{ false };
-    bool     viewportDownscaled{ false };
-    uint32_t drawCount{ 0 };
+// Scene pass identification and draw tracking using lock-free slot pool
+struct PassSlot {
+    std::atomic<void*>    cmdBuffer{ nullptr };
+    std::atomic<bool>     hasMatchingExtent{ false };
+    std::atomic<bool>     viewportDownscaled{ false };
+    std::atomic<uint32_t> drawCount{ 0 };
 };
 
-std::mutex g_passTrackingMutex;
-std::unordered_map<void*, PassTrackingState> g_passTracking;
+constexpr size_t kMaxTrackedPassSlots = 64;
+static PassSlot g_passSlots[kMaxTrackedPassSlots];
+
+inline PassSlot* GetOrCreatePassSlot(void* cmdBuffer) {
+    if (!cmdBuffer) return nullptr;
+    const size_t startIdx = (reinterpret_cast<uintptr_t>(cmdBuffer) >> 4) % kMaxTrackedPassSlots;
+    for (size_t i = 0; i < 8; ++i) {
+        size_t idx = (startIdx + i) % kMaxTrackedPassSlots;
+        if (g_passSlots[idx].cmdBuffer.load(std::memory_order_relaxed) == cmdBuffer) {
+            return &g_passSlots[idx];
+        }
+    }
+    for (size_t i = 0; i < 8; ++i) {
+        size_t idx = (startIdx + i) % kMaxTrackedPassSlots;
+        void* expected = nullptr;
+        if (g_passSlots[idx].cmdBuffer.compare_exchange_strong(expected, cmdBuffer, std::memory_order_acq_rel)) {
+            return &g_passSlots[idx];
+        }
+    }
+    return nullptr;
+}
+
+inline PassSlot* FindPassSlot(void* cmdBuffer) {
+    if (!cmdBuffer) return nullptr;
+    const size_t startIdx = (reinterpret_cast<uintptr_t>(cmdBuffer) >> 4) % kMaxTrackedPassSlots;
+    for (size_t i = 0; i < 8; ++i) {
+        size_t idx = (startIdx + i) % kMaxTrackedPassSlots;
+        if (g_passSlots[idx].cmdBuffer.load(std::memory_order_relaxed) == cmdBuffer) {
+            return &g_passSlots[idx];
+        }
+    }
+    return nullptr;
+}
+
+inline void IncrementDrawCount(void* cmdBuffer) {
+    PassSlot* slot = FindPassSlot(cmdBuffer);
+    if (slot) {
+        slot->drawCount.fetch_add(1, std::memory_order_relaxed);
+    }
+}
 
 int Hooked_vkQueuePresentKHR(void* queue, const void* pPresentInfo) {
     if (!g_Original_vkQueuePresentKHR) {
@@ -291,7 +330,7 @@ int Hooked_vkCreateSwapchainKHR(void* device, const void* pCreateInfo, const voi
                 std::memcpy(&info, pCreateInfo, sizeof(info));
                 w = info.imageExtent.width;
                 h = info.imageExtent.height;
-                if (w > 16384 || h > 16384) { w = 0; h = 0; } // untrusted: let engine ignore
+                if (w < 2 || h < 2 || w > 16384 || h > 16384) { w = 0; h = 0; } // untrusted: let engine ignore
             } else {
                 CBR_LOG_WARN("vkCreateSwapchainKHR: unexpected sType (%u), skipping extent extraction.", sType);
             }
@@ -391,9 +430,9 @@ void Hooked_vkCmdSetViewport(void* commandBuffer, uint32_t firstViewport, uint32
         // Mark this command buffer as actively executing the intercepted scene geometry pass
         CBREngine::Get().MarkCandidatePassActive(commandBuffer);
 
-        {
-            std::lock_guard<std::mutex> lock(g_passTrackingMutex);
-            g_passTracking[commandBuffer].viewportDownscaled = true;
+        PassSlot* slot = GetOrCreatePassSlot(commandBuffer);
+        if (slot) {
+            slot->viewportDownscaled.store(true, std::memory_order_release);
         }
 
         MinimalVkViewport redirected = pViewports[0];
@@ -458,8 +497,6 @@ void Hooked_vkCmdBeginRenderPass(void* commandBuffer, const void* pRenderPassBeg
     if (!g_Original_vkCmdBeginRenderPass) return;
 
     if (pRenderPassBegin && CBREngine::Get().IsEnabled()) {
-        CBREngine::Get().ConsumeCandidatePassActive(commandBuffer);
-
         uint32_t sType = 0;
         std::memcpy(&sType, pRenderPassBegin, sizeof(sType));
         constexpr uint32_t kVkStructureTypeRenderPassBeginInfo = 43;
@@ -470,12 +507,14 @@ void Hooked_vkCmdBeginRenderPass(void* commandBuffer, const void* pRenderPassBeg
             const uint32_t w = info.renderArea.extent.width;
             const uint32_t h = info.renderArea.extent.height;
 
-            std::lock_guard<std::mutex> lock(g_passTrackingMutex);
-            auto& state = g_passTracking[commandBuffer];
-            state.hasMatchingExtent = ((w == dims.fullWidth && h == dims.fullHeight) ||
+            PassSlot* slot = GetOrCreatePassSlot(commandBuffer);
+            if (slot) {
+                const bool matching = ((w == dims.fullWidth && h == dims.fullHeight) ||
                                        (w == dims.quarterWidth && h == dims.quarterHeight));
-            state.viewportDownscaled = false;
-            state.drawCount = 0;
+                slot->hasMatchingExtent.store(matching, std::memory_order_release);
+                slot->viewportDownscaled.store(false, std::memory_order_release);
+                slot->drawCount.store(0, std::memory_order_release);
+            }
         }
     }
 
@@ -485,11 +524,7 @@ void Hooked_vkCmdBeginRenderPass(void* commandBuffer, const void* pRenderPassBeg
 void Hooked_vkCmdDraw(void* commandBuffer, uint32_t vertexCount, uint32_t instanceCount, uint32_t firstVertex, uint32_t firstInstance) {
     if (!g_Original_vkCmdDraw) return;
     if (CBREngine::Get().IsEnabled()) {
-        std::lock_guard<std::mutex> lock(g_passTrackingMutex);
-        auto it = g_passTracking.find(commandBuffer);
-        if (it != g_passTracking.end()) {
-            it->second.drawCount++;
-        }
+        IncrementDrawCount(commandBuffer);
     }
     g_Original_vkCmdDraw(commandBuffer, vertexCount, instanceCount, firstVertex, firstInstance);
 }
@@ -497,11 +532,7 @@ void Hooked_vkCmdDraw(void* commandBuffer, uint32_t vertexCount, uint32_t instan
 void Hooked_vkCmdDrawIndexed(void* commandBuffer, uint32_t indexCount, uint32_t instanceCount, uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance) {
     if (!g_Original_vkCmdDrawIndexed) return;
     if (CBREngine::Get().IsEnabled()) {
-        std::lock_guard<std::mutex> lock(g_passTrackingMutex);
-        auto it = g_passTracking.find(commandBuffer);
-        if (it != g_passTracking.end()) {
-            it->second.drawCount++;
-        }
+        IncrementDrawCount(commandBuffer);
     }
     g_Original_vkCmdDrawIndexed(commandBuffer, indexCount, instanceCount, firstIndex, vertexOffset, firstInstance);
 }
@@ -514,14 +545,18 @@ void Hooked_vkCmdEndRenderPass(void* commandBuffer) {
     if (CBREngine::Get().IsEnabled()) {
         try {
             bool isScenePass = false;
-            {
-                std::lock_guard<std::mutex> lock(g_passTrackingMutex);
-                auto it = g_passTracking.find(commandBuffer);
-                if (it != g_passTracking.end()) {
-                    isScenePass = it->second.viewportDownscaled ||
-                                  (it->second.hasMatchingExtent && it->second.drawCount >= 20);
-                    g_passTracking.erase(it);
-                }
+            PassSlot* slot = FindPassSlot(commandBuffer);
+            if (slot) {
+                const bool downscaled = slot->viewportDownscaled.load(std::memory_order_acquire);
+                const bool matching = slot->hasMatchingExtent.load(std::memory_order_acquire);
+                const uint32_t draws = slot->drawCount.load(std::memory_order_acquire);
+                isScenePass = downscaled || (matching && draws >= 20);
+
+                // Release slot back to pool
+                slot->hasMatchingExtent.store(false, std::memory_order_relaxed);
+                slot->viewportDownscaled.store(false, std::memory_order_relaxed);
+                slot->drawCount.store(0, std::memory_order_relaxed);
+                slot->cmdBuffer.store(nullptr, std::memory_order_release);
             }
 
             // Trigger reconstruction if identified as scene pass or engine marked active
@@ -772,11 +807,6 @@ bool HookManager::InstallVulkanHooks() {
         CBR_LOG_INFO("Vulkan module located at 0x%p. Initializing Vulkan function interception via MinHook...", vulkanModule);
     }
 
-    MH_STATUS mhStatus = MH_Initialize();
-    if (mhStatus != MH_OK && mhStatus != MH_ERROR_ALREADY_INITIALIZED) {
-        CBR_LOG_ERROR("Failed to initialize MinHook core (MH_STATUS: %d).", mhStatus);
-        return false;
-    }
 
     // Resolve exported function addresses from vulkan-1.dll
     auto pfnQueuePresent = reinterpret_cast<void*>(GetProcAddress(vulkanModule, "vkQueuePresentKHR"));
@@ -1022,7 +1052,6 @@ void HookManager::UninstallVulkanHooks() {
     if (m_vulkanHooked.load()) {
         CBR_LOG_INFO("Restoring original Vulkan function dispatch table.");
         MH_DisableHook(MH_ALL_HOOKS);
-        MH_Uninitialize();
         m_vulkanHooked.store(false);
     }
 }

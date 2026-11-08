@@ -107,13 +107,14 @@ void Logger::Flush() {
 }
 
 void Logger::WorkerThread() {
+    auto lastFlushTime = std::chrono::steady_clock::now();
     while (true) {
         std::vector<std::string> batch;
         bool doFlush = false;
 
         {
             std::unique_lock<std::mutex> lock(m_mutex);
-            m_cv.wait(lock, [this]() {
+            m_cv.wait_for(lock, std::chrono::seconds(1), [this]() {
                 return !m_running.load() || !m_queue.empty() || m_flushRequested.load();
             });
 
@@ -125,13 +126,17 @@ void Logger::WorkerThread() {
             doFlush = m_flushRequested.exchange(false);
         }
 
+        const auto now = std::chrono::steady_clock::now();
+        const bool periodicFlush = (now - lastFlushTime >= std::chrono::seconds(1));
+
         // Perform disk I/O on background thread outside mutex lock
         if (m_logFile.is_open()) {
             for (const auto& msg : batch) {
                 m_logFile << msg;
             }
-            if (doFlush || !m_running.load()) {
+            if (doFlush || periodicFlush || !m_running.load()) {
                 m_logFile.flush();
+                lastFlushTime = now;
             }
         }
 

@@ -99,8 +99,16 @@ public:
     }
     template<typename Fn>
     void Modify(Fn&& fn) {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        fn(m_config);
+        CBRConfig cfg;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            cfg = m_config;
+        }
+        fn(cfg);
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_config = cfg;
+        }
     }
 
 private:

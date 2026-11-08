@@ -281,6 +281,7 @@ bool RenderTargetManager::CreateVulkanResources(void* vkDevice, void* vkPhysical
     };
 
     const TargetDimensions dims = GetDimensions();
+    size_t totalDriverVram = 0;
 
     auto createTexture = [&](uint32_t width, uint32_t height, uint32_t format,
                              uint32_t usage, uint32_t aspectMask, VulkanTextureResource& out,
@@ -319,6 +320,15 @@ bool RenderTargetManager::CreateVulkanResources(void* vkDevice, void* vkPhysical
 
         pfnBindImageMemory(vkDevice, image, memory, 0);
 
+        // Support true depth aspect mask if a native depth format is requested
+        constexpr uint32_t kVkFormatD16Unorm = 124;
+        constexpr uint32_t kVkFormatD32Sfloat = 126;
+        constexpr uint32_t kVkFormatD24UnormS8Uint = 129;
+        constexpr uint32_t kVkImageAspectDepthBit = 0x00000002;
+        if (format == kVkFormatD16Unorm || format == kVkFormatD32Sfloat || format == kVkFormatD24UnormS8Uint) {
+            aspectMask = kVkImageAspectDepthBit;
+        }
+
         MinimalVkImageViewCreateInfo viewInfo{};
         viewInfo.sType = kVkStructureTypeImageViewCreateInfo;
         viewInfo.image = image;
@@ -336,6 +346,8 @@ bool RenderTargetManager::CreateVulkanResources(void* vkDevice, void* vkPhysical
             pfnDestroyImage(vkDevice, image, nullptr);
             return false;
         }
+
+        totalDriverVram += memReqs.size;
 
         out.image = image;
         out.memory = memory;
@@ -421,9 +433,12 @@ bool RenderTargetManager::CreateVulkanResources(void* vkDevice, void* vkPhysical
     pfnCreateSampler(vkDevice, &samplerInfo, nullptr, &pointSampler);
     m_vkResources.pointSampler = pointSampler;
 
+    m_totalAllocatedVramBytes.store(totalDriverVram);
     m_vkResourcesCreated.store(true);
-    CBR_LOG_INFO("Vulkan device-local render targets & samplers successfully instantiated (%ux%u).",
-                 dims.fullWidth, dims.fullHeight);
+    CBR_LOG_INFO("Vulkan device-local render targets & samplers instantiated (%ux%u). Driver VRAM: %.2f MiB (%.2f MB)",
+                 dims.fullWidth, dims.fullHeight,
+                 static_cast<double>(totalDriverVram) / (1024.0 * 1024.0),
+                 static_cast<double>(totalDriverVram) / 1000000.0);
     return true;
 #else
     m_vkResourcesCreated.store(true);

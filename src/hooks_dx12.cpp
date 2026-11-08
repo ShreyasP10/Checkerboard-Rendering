@@ -154,11 +154,6 @@ bool HookManager::InstallDX12Hooks() {
         return false;
     }
 
-    MH_STATUS mhStatus = MH_Initialize();
-    if (mhStatus != MH_OK && mhStatus != MH_ERROR_ALREADY_INITIALIZED) {
-        CBR_LOG_ERROR("Failed to initialize MinHook core for DX12 (MH_STATUS: %d).", mhStatus);
-        return false;
-    }
 
     typedef HRESULT (WINAPI *PFN_D3D12CreateDevice)(IUnknown*, int, REFIID, void**);
     typedef HRESULT (WINAPI *PFN_CreateDXGIFactory1)(REFIID, void**);
