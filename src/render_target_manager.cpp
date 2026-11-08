@@ -171,7 +171,6 @@ typedef void  (*PFN_vkDestroySampler)(void* device, void* sampler, const void* p
 typedef void  (*PFN_vkGetPhysicalDeviceMemoryProperties)(void* physicalDevice, MinimalVkPhysicalDeviceMemoryProperties* pMemoryProperties);
 
 } // namespace
-#endif
 
 namespace cbr {
 

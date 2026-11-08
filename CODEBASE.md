@@ -4346,7 +4346,6 @@ JitterManager& JitterManager::Get() {
 
 void JitterManager::Initialize(uint32_t targetWidth, uint32_t targetHeight) {
     const auto config = ConfigManager::Get().GetConfig();
-    const float sign = (config.projectionJitterSign < 0) ? -1.0f : 1.0f;
     const float dir = (config.jitterDirection < 0) ? -1.0f : 1.0f;
     uint32_t w, h;
     {
@@ -4372,7 +4371,6 @@ void JitterManager::Update(uint32_t frameIndex) {
     // requires exactly one full-resolution pixel shift. See config warning.
     const auto config = ConfigManager::Get().GetConfig();
     const float dir = (config.jitterDirection < 0) ? -1.0f : 1.0f;
-    const float sign = (config.projectionJitterSign < 0) ? -1.0f : 1.0f;
 
     std::lock_guard<std::mutex> lock(m_mutex);
     m_previousJitter = m_currentJitter;
@@ -6215,7 +6213,6 @@ typedef void  (*PFN_vkDestroySampler)(void* device, void* sampler, const void* p
 typedef void  (*PFN_vkGetPhysicalDeviceMemoryProperties)(void* physicalDevice, MinimalVkPhysicalDeviceMemoryProperties* pMemoryProperties);
 
 } // namespace
-#endif
 
 namespace cbr {
 
