@@ -874,9 +874,10 @@ ReconstructionPushConstants BuildReconstructionPushConstants(uint32_t frameIndex
     pc.enableMotionDilation = config.enableMotionDilation ? 1u : 0u;
     pc.jitterCompensation = config.jitterCompensation;
     pc.shiftDirection = (config.jitterDirection < 0) ? -1 : 1;
+    const DepthRange range = SanitizeDepthRange(config.depthConvention, config.depthNear, config.depthFar);
     pc.depthMode = (config.depthConvention == DepthConvention::Reversed) ? 1u : 0u;
-    pc.depthNear = (config.sanitizedNear > 0.0f) ? config.sanitizedNear : config.depthNear;
-    pc.depthFar = config.sanitizedFar;
+    pc.depthNear = range.zNear;
+    pc.depthFar = range.zFar;
     return pc;
 }
 

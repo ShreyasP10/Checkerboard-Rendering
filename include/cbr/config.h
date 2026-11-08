@@ -68,8 +68,6 @@ struct CBRConfig {
     DepthConvention depthConvention{ DepthConvention::Reversed };
     float           depthNear{ 0.1f };
     float           depthFar{ 0.0f }; // 0.0 = infinite far plane (Reversed only)
-    float           sanitizedNear{ 0.1f };
-    float           sanitizedFar{ 0.0f };
 
     // Jitter
     JitterPattern jitterPattern{ JitterPattern::Checkerboard };

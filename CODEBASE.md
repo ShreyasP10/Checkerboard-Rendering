@@ -839,8 +839,6 @@ struct CBRConfig {
     DepthConvention depthConvention{ DepthConvention::Reversed };
     float           depthNear{ 0.1f };
     float           depthFar{ 0.0f }; // 0.0 = infinite far plane (Reversed only)
-    float           sanitizedNear{ 0.1f };
-    float           sanitizedFar{ 0.0f };
 
     // Jitter
     JitterPattern jitterPattern{ JitterPattern::Checkerboard };
@@ -2302,9 +2300,6 @@ bool ConfigManager::Load(const std::filesystem::path& configPath) {
         }
     }
 
-    const DepthRange depthRange = SanitizeDepthRange(parsed.depthConvention, parsed.depthNear, parsed.depthFar);
-    parsed.sanitizedNear = depthRange.zNear;
-    parsed.sanitizedFar = depthRange.zFar;
     UpdateConfig(parsed);
     for (const auto& w : warnings) CBR_LOG_WARN("%s", w.c_str());
 
@@ -5862,9 +5857,10 @@ ReconstructionPushConstants BuildReconstructionPushConstants(uint32_t frameIndex
     pc.enableMotionDilation = config.enableMotionDilation ? 1u : 0u;
     pc.jitterCompensation = config.jitterCompensation;
     pc.shiftDirection = (config.jitterDirection < 0) ? -1 : 1;
+    const DepthRange range = SanitizeDepthRange(config.depthConvention, config.depthNear, config.depthFar);
     pc.depthMode = (config.depthConvention == DepthConvention::Reversed) ? 1u : 0u;
-    pc.depthNear = (config.sanitizedNear > 0.0f) ? config.sanitizedNear : config.depthNear;
-    pc.depthFar = config.sanitizedFar;
+    pc.depthNear = range.zNear;
+    pc.depthFar = range.zFar;
     return pc;
 }
 

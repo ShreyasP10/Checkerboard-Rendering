@@ -283,9 +283,6 @@ bool ConfigManager::Load(const std::filesystem::path& configPath) {
         }
     }
 
-    const DepthRange depthRange = SanitizeDepthRange(parsed.depthConvention, parsed.depthNear, parsed.depthFar);
-    parsed.sanitizedNear = depthRange.zNear;
-    parsed.sanitizedFar = depthRange.zFar;
     UpdateConfig(parsed);
     for (const auto& w : warnings) CBR_LOG_WARN("%s", w.c_str());
 
