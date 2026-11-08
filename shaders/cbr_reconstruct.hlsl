@@ -219,8 +219,8 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     // For inactive pixels, the 4 cardinal neighbours are already fetched in step 1, avoiding redundant texture fetches.
     int2 motionCoord = pixelCoord;
     if (g_EnableMotionDilation != 0u) {
+        float best = currentDepth;
         if (isCurrentSampleActive) {
-            float best = currentDepth;
             static const int2 kDiagonal[4] = { int2(-1, -1), int2(1, -1), int2(-1, 1), int2(1, 1) };
             for (int i = 0; i < 4; ++i) {
                 int2 n = pixelCoord + kDiagonal[i];
