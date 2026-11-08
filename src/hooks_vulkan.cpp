@@ -421,6 +421,8 @@ void Hooked_vkCmdBeginRenderPass(void* commandBuffer, const void* pRenderPassBeg
     if (!g_Original_vkCmdBeginRenderPass) return;
 
     if (pRenderPassBegin && CBREngine::Get().IsEnabled()) {
+        CBREngine::Get().ConsumeCandidatePassActive(commandBuffer);
+
         uint32_t sType = 0;
         std::memcpy(&sType, pRenderPassBegin, sizeof(sType));
         constexpr uint32_t kVkStructureTypeRenderPassBeginInfo = 43;
@@ -486,7 +488,8 @@ void Hooked_vkCmdEndRenderPass(void* commandBuffer) {
             }
 
             // Trigger reconstruction if identified as scene pass or engine marked active
-            if (isScenePass || CBREngine::Get().ConsumeCandidatePassActive(commandBuffer)) {
+            const bool wasCandidateActive = CBREngine::Get().ConsumeCandidatePassActive(commandBuffer);
+            if (isScenePass || wasCandidateActive) {
                 CBREngine::Get().OnScenePassEnd(commandBuffer);
 
                 // Presentation path: blit reconstructed output to swapchain backbuffer image

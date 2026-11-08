@@ -245,6 +245,17 @@ bool PatternScanner::UpdateCameraJitter(uint32_t frameIndex, bool isVulkan) {
     }
 
     if (g_cachedCameraMatrix) {
+#if defined(_MSC_VER)
+        __try {
+            JitterManager::Get().Update(frameIndex);
+            JitterManager::Get().ApplyJitterToProjection(g_cachedCameraMatrix, isVulkan);
+            return true;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            g_cachedCameraMatrix = nullptr;
+            CBR_LOG_WARN("Camera projection matrix access faulted; falling back to Viewport Redirection.");
+            return false;
+        }
+#else
         try {
             JitterManager::Get().Update(frameIndex);
             JitterManager::Get().ApplyJitterToProjection(g_cachedCameraMatrix, isVulkan);
@@ -254,6 +265,7 @@ bool PatternScanner::UpdateCameraJitter(uint32_t frameIndex, bool isVulkan) {
             CBR_LOG_WARN("Camera projection matrix access faulted; falling back to Viewport Redirection.");
             return false;
         }
+#endif
     }
     return false;
 }

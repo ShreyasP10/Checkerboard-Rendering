@@ -2,6 +2,13 @@
 #include "cbr/config.h"
 #include "cbr/logger.h"
 
+// LOCK HIERARCHY:
+//   Level 1: ConfigManager::m_mutex
+//   Level 2: JitterManager::m_mutex
+//   Level 3: Logger::m_mutex
+// ConfigManager mutex must NEVER be acquired while holding JitterManager::m_mutex.
+// All configuration lookups occur strictly outside of JitterManager::m_mutex lock scopes.
+
 namespace cbr {
 
 JitterManager& JitterManager::Get() {

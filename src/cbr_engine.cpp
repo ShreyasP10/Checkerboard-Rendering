@@ -245,6 +245,7 @@ void CBREngine::OnPostPresent(void* presentTarget) {
 
     if (m_mainPresentTarget.load() == presentTarget) {
         m_frameIndex.fetch_add(1);
+        OnBeginFrame();
     }
 }
 
@@ -262,6 +263,7 @@ void CBREngine::OnSwapchainRecreated(uint32_t width, uint32_t height) {
         RenderTargetManager::Get().Initialize(width, height);
         JitterManager::Get().Initialize(width, height);
         CBR_LOG_INFO("Swapchain recreated with new resolution %ux%u: frame parity and history reset.", width, height);
+        OnBeginFrame();
     } else {
         RenderTargetManager::Get().ResetHistory();
         CBR_LOG_INFO("Swapchain recreated: frame parity and history reset.");

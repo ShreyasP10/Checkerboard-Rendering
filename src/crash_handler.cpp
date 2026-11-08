@@ -120,11 +120,16 @@ void WriteMinidump(EXCEPTION_POINTERS* pEx, const wchar_t* dumpPath) {
 
         if (hFile != INVALID_HANDLE_VALUE) {
             // Struct for MiniDumpWriteDump MINIDUMP_EXCEPTION_INFORMATION
-            struct {
+            // Packed with 4-byte alignment according to Microsoft dbghelp ABI (pshpack4.h)
+#pragma pack(push, 4)
+            struct MinimalMiniDumpExceptionInformation {
                 DWORD ThreadId;
                 PEXCEPTION_POINTERS ExceptionPointers;
                 BOOL ClientPointers;
             } expInfo{};
+#pragma pack(pop)
+            static_assert(sizeof(expInfo) == (sizeof(void*) == 8 ? 16 : 12),
+                          "MINIDUMP_EXCEPTION_INFORMATION packing ABI drift");
 
             expInfo.ThreadId = GetCurrentThreadId();
             expInfo.ExceptionPointers = pEx;

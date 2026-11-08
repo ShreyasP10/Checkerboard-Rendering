@@ -1909,6 +1909,7 @@ void CBREngine::OnPostPresent(void* presentTarget) {
 
     if (m_mainPresentTarget.load() == presentTarget) {
         m_frameIndex.fetch_add(1);
+        OnBeginFrame();
     }
 }
 
@@ -1926,6 +1927,7 @@ void CBREngine::OnSwapchainRecreated(uint32_t width, uint32_t height) {
         RenderTargetManager::Get().Initialize(width, height);
         JitterManager::Get().Initialize(width, height);
         CBR_LOG_INFO("Swapchain recreated with new resolution %ux%u: frame parity and history reset.", width, height);
+        OnBeginFrame();
     } else {
         RenderTargetManager::Get().ResetHistory();
         CBR_LOG_INFO("Swapchain recreated: frame parity and history reset.");
@@ -2436,11 +2438,16 @@ void WriteMinidump(EXCEPTION_POINTERS* pEx, const wchar_t* dumpPath) {
 
         if (hFile != INVALID_HANDLE_VALUE) {
             // Struct for MiniDumpWriteDump MINIDUMP_EXCEPTION_INFORMATION
-            struct {
+            // Packed with 4-byte alignment according to Microsoft dbghelp ABI (pshpack4.h)
+#pragma pack(push, 4)
+            struct MinimalMiniDumpExceptionInformation {
                 DWORD ThreadId;
                 PEXCEPTION_POINTERS ExceptionPointers;
                 BOOL ClientPointers;
             } expInfo{};
+#pragma pack(pop)
+            static_assert(sizeof(expInfo) == (sizeof(void*) == 8 ? 16 : 12),
+                          "MINIDUMP_EXCEPTION_INFORMATION packing ABI drift");
 
             expInfo.ThreadId = GetCurrentThreadId();
             expInfo.ExceptionPointers = pEx;
@@ -3189,6 +3196,8 @@ void Hooked_vkCmdBeginRenderPass(void* commandBuffer, const void* pRenderPassBeg
     if (!g_Original_vkCmdBeginRenderPass) return;
 
     if (pRenderPassBegin && CBREngine::Get().IsEnabled()) {
+        CBREngine::Get().ConsumeCandidatePassActive(commandBuffer);
+
         uint32_t sType = 0;
         std::memcpy(&sType, pRenderPassBegin, sizeof(sType));
         constexpr uint32_t kVkStructureTypeRenderPassBeginInfo = 43;
@@ -3254,7 +3263,8 @@ void Hooked_vkCmdEndRenderPass(void* commandBuffer) {
             }
 
             // Trigger reconstruction if identified as scene pass or engine marked active
-            if (isScenePass || CBREngine::Get().ConsumeCandidatePassActive(commandBuffer)) {
+            const bool wasCandidateActive = CBREngine::Get().ConsumeCandidatePassActive(commandBuffer);
+            if (isScenePass || wasCandidateActive) {
                 CBREngine::Get().OnScenePassEnd(commandBuffer);
 
                 // Presentation path: blit reconstructed output to swapchain backbuffer image
@@ -3786,6 +3796,13 @@ void HookManager::UninstallDX12Hooks() {
 #include "cbr/jitter_manager.h"
 #include "cbr/config.h"
 #include "cbr/logger.h"
+
+// LOCK HIERARCHY:
+//   Level 1: ConfigManager::m_mutex
+//   Level 2: JitterManager::m_mutex
+//   Level 3: Logger::m_mutex
+// ConfigManager mutex must NEVER be acquired while holding JitterManager::m_mutex.
+// All configuration lookups occur strictly outside of JitterManager::m_mutex lock scopes.
 
 namespace cbr {
 
@@ -4353,6 +4370,17 @@ bool PatternScanner::UpdateCameraJitter(uint32_t frameIndex, bool isVulkan) {
     }
 
     if (g_cachedCameraMatrix) {
+#if defined(_MSC_VER)
+        __try {
+            JitterManager::Get().Update(frameIndex);
+            JitterManager::Get().ApplyJitterToProjection(g_cachedCameraMatrix, isVulkan);
+            return true;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            g_cachedCameraMatrix = nullptr;
+            CBR_LOG_WARN("Camera projection matrix access faulted; falling back to Viewport Redirection.");
+            return false;
+        }
+#else
         try {
             JitterManager::Get().Update(frameIndex);
             JitterManager::Get().ApplyJitterToProjection(g_cachedCameraMatrix, isVulkan);
@@ -4362,6 +4390,7 @@ bool PatternScanner::UpdateCameraJitter(uint32_t frameIndex, bool isVulkan) {
             CBR_LOG_WARN("Camera projection matrix access faulted; falling back to Viewport Redirection.");
             return false;
         }
+#endif
     }
     return false;
 }
@@ -6572,8 +6601,8 @@ void ResolvePixel(ivec2 pixelCoord, ivec2 targetSize, uint frameParity) {
         }
     }
 
-    vec2 dilatedUV = (vec2(motionCoord) + 0.5) * pc.u_InvTargetResolution;
-    vec2 velocity = textureLod(u_Velocity, dilatedUV, 0.0).xy;
+    // Sample velocity using texelFetch to avoid cross-edge interpolation/ghosting
+    vec2 velocity = texelFetch(u_Velocity, motionCoord, 0).xy;
     bool velocityBad = isinf(velocity.x) || isnan(velocity.x) || isinf(velocity.y) || isnan(velocity.y)
         || isinf(uv.x) || isnan(uv.x) || isinf(uv.y) || isnan(uv.y);
     vec2 historyUV = uv - velocity - pc.u_JitterDelta * pc.u_JitterCompensation;

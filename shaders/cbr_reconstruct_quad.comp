@@ -188,8 +188,8 @@ void ResolvePixel(ivec2 pixelCoord, ivec2 targetSize, uint frameParity) {
         }
     }
 
-    vec2 dilatedUV = (vec2(motionCoord) + 0.5) * pc.u_InvTargetResolution;
-    vec2 velocity = textureLod(u_Velocity, dilatedUV, 0.0).xy;
+    // Sample velocity using texelFetch to avoid cross-edge interpolation/ghosting
+    vec2 velocity = texelFetch(u_Velocity, motionCoord, 0).xy;
     bool velocityBad = isinf(velocity.x) || isnan(velocity.x) || isinf(velocity.y) || isnan(velocity.y)
         || isinf(uv.x) || isnan(uv.x) || isinf(uv.y) || isnan(uv.y);
     vec2 historyUV = uv - velocity - pc.u_JitterDelta * pc.u_JitterCompensation;
