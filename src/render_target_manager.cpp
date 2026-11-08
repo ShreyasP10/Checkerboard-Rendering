@@ -246,9 +246,7 @@ bool RenderTargetManager::CreateVulkanResources(void* vkDevice, void* vkPhysical
     auto pfnFreeMemory = reinterpret_cast<PFN_vkFreeMemory>(resolveDeviceFunc("vkFreeMemory"));
     auto pfnBindImageMemory = reinterpret_cast<PFN_vkBindImageMemory>(resolveDeviceFunc("vkBindImageMemory"));
     auto pfnCreateImageView = reinterpret_cast<PFN_vkCreateImageView>(resolveDeviceFunc("vkCreateImageView"));
-    auto pfnDestroyImageView = reinterpret_cast<PFN_vkDestroyImageView>(resolveDeviceFunc("vkDestroyImageView"));
     auto pfnCreateSampler = reinterpret_cast<PFN_vkCreateSampler>(resolveDeviceFunc("vkCreateSampler"));
-    auto pfnDestroySampler = reinterpret_cast<PFN_vkDestroySampler>(resolveDeviceFunc("vkDestroySampler"));
     auto pfnGetPhysMemProps = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties>(
         GetProcAddress(vulkanModule, "vkGetPhysicalDeviceMemoryProperties"));
 
@@ -324,7 +322,6 @@ bool RenderTargetManager::CreateVulkanResources(void* vkDevice, void* vkPhysical
         constexpr uint32_t kVkFormatD16Unorm = 124;
         constexpr uint32_t kVkFormatD32Sfloat = 126;
         constexpr uint32_t kVkFormatD24UnormS8Uint = 129;
-        constexpr uint32_t kVkImageAspectDepthBit = 0x00000002;
         if (format == kVkFormatD16Unorm || format == kVkFormatD32Sfloat || format == kVkFormatD24UnormS8Uint) {
             aspectMask = kVkImageAspectDepthBit;
         }

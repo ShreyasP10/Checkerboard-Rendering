@@ -807,6 +807,7 @@ bool HookManager::InstallVulkanHooks() {
         CBR_LOG_INFO("Vulkan module located at 0x%p. Initializing Vulkan function interception via MinHook...", vulkanModule);
     }
 
+    MH_STATUS mhStatus = MH_OK;
 
     // Resolve exported function addresses from vulkan-1.dll
     auto pfnQueuePresent = reinterpret_cast<void*>(GetProcAddress(vulkanModule, "vkQueuePresentKHR"));

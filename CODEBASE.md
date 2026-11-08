@@ -3612,6 +3612,7 @@ bool HookManager::InstallVulkanHooks() {
         CBR_LOG_INFO("Vulkan module located at 0x%p. Initializing Vulkan function interception via MinHook...", vulkanModule);
     }
 
+    MH_STATUS mhStatus = MH_OK;
 
     // Resolve exported function addresses from vulkan-1.dll
     auto pfnQueuePresent = reinterpret_cast<void*>(GetProcAddress(vulkanModule, "vkQueuePresentKHR"));
@@ -5548,7 +5549,6 @@ void ReconstructionPass::TransitionImageLayout(void* vkCommandBuffer, void* vkIm
     }
     if (!pfnCmdPipelineBarrier) return;
 
-    constexpr uint32_t kVkStructureTypeImageMemoryBarrier = 45;
     MinimalVkImageMemoryBarrier barrier{};
     barrier.sType = kVkStructureTypeImageMemoryBarrier;
     barrier.pNext = nullptr;
@@ -6076,9 +6076,7 @@ bool RenderTargetManager::CreateVulkanResources(void* vkDevice, void* vkPhysical
     auto pfnFreeMemory = reinterpret_cast<PFN_vkFreeMemory>(resolveDeviceFunc("vkFreeMemory"));
     auto pfnBindImageMemory = reinterpret_cast<PFN_vkBindImageMemory>(resolveDeviceFunc("vkBindImageMemory"));
     auto pfnCreateImageView = reinterpret_cast<PFN_vkCreateImageView>(resolveDeviceFunc("vkCreateImageView"));
-    auto pfnDestroyImageView = reinterpret_cast<PFN_vkDestroyImageView>(resolveDeviceFunc("vkDestroyImageView"));
     auto pfnCreateSampler = reinterpret_cast<PFN_vkCreateSampler>(resolveDeviceFunc("vkCreateSampler"));
-    auto pfnDestroySampler = reinterpret_cast<PFN_vkDestroySampler>(resolveDeviceFunc("vkDestroySampler"));
     auto pfnGetPhysMemProps = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties>(
         GetProcAddress(vulkanModule, "vkGetPhysicalDeviceMemoryProperties"));
 
@@ -6154,7 +6152,6 @@ bool RenderTargetManager::CreateVulkanResources(void* vkDevice, void* vkPhysical
         constexpr uint32_t kVkFormatD16Unorm = 124;
         constexpr uint32_t kVkFormatD32Sfloat = 126;
         constexpr uint32_t kVkFormatD24UnormS8Uint = 129;
-        constexpr uint32_t kVkImageAspectDepthBit = 0x00000002;
         if (format == kVkFormatD16Unorm || format == kVkFormatD32Sfloat || format == kVkFormatD24UnormS8Uint) {
             aspectMask = kVkImageAspectDepthBit;
         }

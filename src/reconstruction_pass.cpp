@@ -743,7 +743,6 @@ void ReconstructionPass::TransitionImageLayout(void* vkCommandBuffer, void* vkIm
     }
     if (!pfnCmdPipelineBarrier) return;
 
-    constexpr uint32_t kVkStructureTypeImageMemoryBarrier = 45;
     MinimalVkImageMemoryBarrier barrier{};
     barrier.sType = kVkStructureTypeImageMemoryBarrier;
     barrier.pNext = nullptr;
