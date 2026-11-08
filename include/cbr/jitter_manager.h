@@ -61,6 +61,8 @@ private:
     uint32_t     m_targetHeight{ 2160 };
     JitterOffset m_currentJitter;
     JitterOffset m_previousJitter;
+    std::pair<float, float> m_cachedProjectionOffsetVk[2]{};
+    std::pair<float, float> m_cachedProjectionOffsetDx[2]{};
 };
 
 } // namespace cbr

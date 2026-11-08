@@ -85,6 +85,11 @@ bool CBREngine::Initialize() {
         }
         m_activeApi.store(api);
 
+        {
+            std::lock_guard<std::mutex> lock(m_frameConfigMutex);
+            m_cachedFrameConfig = config;
+        }
+
         // 3. Initialize Render Target & Jitter Managers
         RenderTargetManager::Get().Initialize(config.targetWidth, config.targetHeight);
         JitterManager::Get().Initialize(config.targetWidth, config.targetHeight);
@@ -168,11 +173,16 @@ bool CBREngine::ConsumeCandidatePassActive(void* cmdBuffer) {
 void CBREngine::OnBeginFrame() {
     if (!m_enabled.load()) return;
 
+    {
+        std::lock_guard<std::mutex> lock(m_frameConfigMutex);
+        m_cachedFrameConfig = ConfigManager::Get().GetConfig();
+    }
+
     uint32_t currentFrame = m_frameIndex.load();
     JitterManager::Get().Update(currentFrame);
 
 #if defined(_WIN32)
-    const auto config = ConfigManager::Get().GetConfig();
+    const auto config = GetCachedFrameConfig();
     if (config.samplingStrategy == SamplingStrategy::StrategyA && config.jitterDirection != 0) {
         PatternScanner::UpdateCameraJitter(currentFrame, m_activeApi.load() == GraphicsApi::Vulkan);
     }

@@ -176,6 +176,7 @@ void main() {
     // The 4 cardinal neighbours of a reconstructed pixel are always natively shaded (mirrored at borders).
     ivec2 cardinalCoord[4] = ivec2[](ivec2(0), ivec2(0), ivec2(0), ivec2(0));
     float cardinalDepth[4] = float[](0.0, 0.0, 0.0, 0.0);
+    vec3  cardinalColor[4] = vec3[](vec3(0.0), vec3(0.0), vec3(0.0), vec3(0.0));
 
     if (isCurrentSampleActive) {
         currentColor = FetchColor(self);
@@ -195,7 +196,9 @@ void main() {
                 c = pixelCoord;
             }
             cardinalCoord[i] = c;
-            cardinalDepth[i] = FetchDepth(MapPixelToSample(c, frameParity));
+            CbrSample s = MapPixelToSample(c, frameParity);
+            cardinalDepth[i] = FetchDepth(s);
+            cardinalColor[i] = FetchColor(s);
             float raw = cardinalDepth[i];
             float lin = LinearizeDepth(raw);
             if (!isnan(raw) && !isinf(raw) && !isnan(lin) && !isinf(lin)) {
@@ -251,6 +254,7 @@ void main() {
 
     // Point-sample velocity via texelFetch at integer motionCoord to prevent cross-edge velocity bleeding
     vec2 velocity = texelFetch(u_Velocity, motionCoord, 0).xy;
+    velocity = clamp(velocity, vec2(-0.5), vec2(0.5));
     // NaN/Inf velocity or UV must disocclude: ivec2(NaN) is UB and NaN comparisons are false.
     bool velocityBad = isinf(velocity.x) || isnan(velocity.x) || isinf(velocity.y) || isnan(velocity.y)
         || isinf(uv.x) || isnan(uv.x) || isinf(uv.y) || isnan(uv.y);
@@ -289,8 +293,10 @@ void main() {
     // Uses ONLY natively shaded neighbours: samples that do not exist this frame must not enter the statistics.
     // Clamping is active on both static and moving geometry: static geometry subject to dynamic lighting,
     // shadows, or moving occluders still requires history bounding to prevent temporal ghosting.
+    // Variance clipping is bypassed on strictly static geometry with sub-tolerance depth variance.
     // -------------------------------------------------------------------------
-    if (!isDisoccluded && pc.u_EnableColorClamping != 0u) {
+    const bool isStatic = dot(velocity, velocity) < 1e-9 && depthDelta < (0.05 * pc.u_DepthTolerance);
+    if (!isDisoccluded && pc.u_EnableColorClamping != 0u && !isStatic) {
         vec3 colorMin = vec3(1e6);
         vec3 colorMax = vec3(-1e6);
         vec3 m1 = vec3(0.0);
@@ -314,6 +320,8 @@ void main() {
             vec3 c;
             if (isCurrentSampleActive && i == 0) {
                 c = ToClampSpace(currentColor);
+            } else if (!isCurrentSampleActive) {
+                c = ToClampSpace(cardinalColor[i]);
             } else {
                 c = ToClampSpace(FetchColor(MapPixelToSample(nc, frameParity)));
             }
@@ -364,11 +372,12 @@ void main() {
             float accumWeight = 0.0;
 
             for (int i = 0; i < 4 && pc.u_EnableSpatialFallback != 0u; ++i) {
-                vec3 sCol = FetchColor(MapPixelToSample(cardinalCoord[i], frameParity));
+                vec3 sCol = cardinalColor[i];
                 float sLin = LinearizeDepth(cardinalDepth[i]);
 
                 // Relative linear-depth weighting: scale-invariant, independent of the depth convention
-                float depthWeight = exp(-abs(currentLinear - sLin) / (max(currentLinear, 1e-5) * max(pc.u_DepthTolerance, 1e-4)));
+                // Fast base-2 exponentiation: exp(-x) == exp2(-x * log2(e))
+                float depthWeight = exp2((-abs(currentLinear - sLin) / (max(currentLinear, 1e-5) * max(pc.u_DepthTolerance, 1e-4))) * 1.4426950408889634);
 
                 accumColor += sCol * depthWeight;
                 accumDepth += cardinalDepth[i] * depthWeight;
@@ -379,7 +388,7 @@ void main() {
                 finalColor = accumColor / accumWeight;
                 spatialDepth = accumDepth / accumWeight;
             } else {
-                finalColor = isCurrentSampleActive ? currentColor : FetchColor(MapPixelToSample(cardinalCoord[0], frameParity));
+                finalColor = isCurrentSampleActive ? currentColor : cardinalColor[0];
                 spatialDepth = isCurrentSampleActive ? currentDepth : cardinalDepth[0];
             }
         }
@@ -389,7 +398,7 @@ void main() {
     if (isnan(finalColor.r) || isinf(finalColor.r) ||
         isnan(finalColor.g) || isinf(finalColor.g) ||
         isnan(finalColor.b) || isinf(finalColor.b)) {
-        finalColor = isCurrentSampleActive ? currentColor : FetchColor(MapPixelToSample(cardinalCoord[0], frameParity));
+        finalColor = isCurrentSampleActive ? currentColor : cardinalColor[0];
     }
 
     // -------------------------------------------------------------------------
@@ -406,15 +415,12 @@ void main() {
         finalColor = vec3(abs(velocity) * 50.0, 0.0);
     } else if (pc.u_DebugView == 4u) {
         // Quarter-resolution raw colour (nearest native sample for reconstructed pixels)
-        finalColor = isCurrentSampleActive ? currentColor : FetchColor(MapPixelToSample(cardinalCoord[0], frameParity));
+        finalColor = isCurrentSampleActive ? currentColor : cardinalColor[0];
     } else if (pc.u_DebugView == 5u) {
         // Spatial baseline resolve: average of 4 cardinal samples for reconstructed pixels
         // (direct visual A/B baseline comparison against temporal CBR, matching reference Space toggle)
         finalColor = isCurrentSampleActive ? currentColor : (
-            FetchColor(MapPixelToSample(cardinalCoord[0], frameParity)) +
-            FetchColor(MapPixelToSample(cardinalCoord[1], frameParity)) +
-            FetchColor(MapPixelToSample(cardinalCoord[2], frameParity)) +
-            FetchColor(MapPixelToSample(cardinalCoord[3], frameParity))
+            cardinalColor[0] + cardinalColor[1] + cardinalColor[2] + cardinalColor[3]
         ) * 0.25;
     }
 
@@ -430,7 +436,6 @@ void main() {
     if (isnan(outDepth) || isinf(outDepth)) {
         outDepth = (pc.u_DepthMode == 1u) ? 0.0 : 1.0;
     }
-    // GLSL 4.50 specification (section 8.14) mandates a 4-component vector for all floating-point
-    // imageStore invocations (including single-channel r32f). Hardware discards y, z, w.
-    imageStore(u_OutputDepth, pixelCoord, vec4(outDepth, 0.0, 0.0, 0.0));
+    // Hardware ignores discarded components when writing to single-channel r32f
+    imageStore(u_OutputDepth, pixelCoord, vec4(outDepth));
 }

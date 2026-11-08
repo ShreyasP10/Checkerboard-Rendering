@@ -192,6 +192,7 @@ void ResolvePixel(ivec2 pixelCoord, ivec2 targetSize, uint frameParity) {
 
     // Sample velocity using texelFetch to avoid cross-edge interpolation/ghosting
     vec2 velocity = texelFetch(u_Velocity, motionCoord, 0).xy;
+    velocity = clamp(velocity, vec2(-0.5), vec2(0.5));
     bool velocityBad = isinf(velocity.x) || isnan(velocity.x) || isinf(velocity.y) || isnan(velocity.y)
         || isinf(uv.x) || isnan(uv.x) || isinf(uv.y) || isnan(uv.y);
     vec2 historyUV = uv - velocity - pc.u_JitterDelta * pc.u_JitterCompensation;
@@ -218,7 +219,8 @@ void ResolvePixel(ivec2 pixelCoord, ivec2 targetSize, uint frameParity) {
         }
     }
 
-    if (!isDisoccluded && pc.u_EnableColorClamping != 0u) {
+    const bool isStatic = dot(velocity, velocity) < 1e-9 && depthDelta < (0.05 * pc.u_DepthTolerance);
+    if (!isDisoccluded && pc.u_EnableColorClamping != 0u && !isStatic) {
         vec3 colorMin = vec3(1e6);
         vec3 colorMax = vec3(-1e6);
         vec3 m1 = vec3(0.0);
@@ -278,7 +280,7 @@ void ResolvePixel(ivec2 pixelCoord, ivec2 targetSize, uint frameParity) {
             for (int i = 0; i < 4 && pc.u_EnableSpatialFallback != 0u; ++i) {
                 vec3 sCol = FetchColor(MapPixelToSample(cardinalCoord[i], frameParity));
                 float sLin = LinearizeDepth(cardinalDepth[i]);
-                float depthWeight = exp(-abs(currentLinear - sLin) / (max(currentLinear, 1e-5) * max(pc.u_DepthTolerance, 1e-4)));
+                float depthWeight = exp2((-abs(currentLinear - sLin) / (max(currentLinear, 1e-5) * max(pc.u_DepthTolerance, 1e-4))) * 1.4426950408889634);
                 accumColor += sCol * depthWeight;
                 accumDepth += cardinalDepth[i] * depthWeight;
                 accumWeight += depthWeight;
@@ -327,7 +329,7 @@ void ResolvePixel(ivec2 pixelCoord, ivec2 targetSize, uint frameParity) {
     if (isnan(outDepth) || isinf(outDepth)) {
         outDepth = (pc.u_DepthMode == 1u) ? 0.0 : 1.0;
     }
-    imageStore(u_OutputDepth, pixelCoord, vec4(outDepth, 0.0, 0.0, 0.0));
+    imageStore(u_OutputDepth, pixelCoord, vec4(outDepth));
 }
 
 void main() {

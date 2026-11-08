@@ -249,6 +249,7 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
 
     // Exact texel fetch of velocity using integer motionCoord prevents cross-edge interpolation
     float2 velocity = g_Velocity.Load(int3(motionCoord, 0)).xy;
+    velocity = clamp(velocity, float2(-0.5f, -0.5f), float2(0.5f, 0.5f));
     bool velocityBad = isinf(velocity.x) || isnan(velocity.x) || isinf(velocity.y) || isnan(velocity.y)
         || isinf(uv.x) || isnan(uv.x) || isinf(uv.y) || isnan(uv.y);
     float2 historyUV = uv - velocity - g_JitterDelta * g_JitterCompensation;
@@ -284,8 +285,10 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     // Uses ONLY natively shaded neighbours: samples that do not exist this frame must not enter the statistics.
     // Clamping is active on both static and moving geometry: static geometry subject to dynamic lighting,
     // shadows, or moving occluders still requires history bounding to prevent temporal ghosting.
+    // Variance clipping is bypassed on strictly static geometry with sub-tolerance depth variance.
     // -------------------------------------------------------------------------
-    if (!isDisoccluded && g_EnableColorClamping != 0u) {
+    bool isStatic = dot(velocity, velocity) < 1e-9f && depthDelta < (0.05f * g_DepthTolerance);
+    if (!isDisoccluded && g_EnableColorClamping != 0u && !isStatic) {
         float3 colorMin = float3(1e6f, 1e6f, 1e6f);
         float3 colorMax = float3(-1e6f, -1e6f, -1e6f);
         float3 m1 = float3(0.0f, 0.0f, 0.0f);
@@ -363,7 +366,8 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
                 float sLin = LinearizeDepth(cardinalDepth[i]);
 
                 // Relative linear-depth weighting: scale-invariant, independent of the depth convention
-                float depthWeight = exp(-abs(currentLinear - sLin) / (max(currentLinear, 1e-5f) * max(g_DepthTolerance, 1e-4f)));
+                // Fast base-2 exponentiation: exp(-x) == exp2(-x * log2(e))
+                float depthWeight = exp2((-abs(currentLinear - sLin) / (max(currentLinear, 1e-5f) * max(g_DepthTolerance, 1e-4f))) * 1.44269504f);
 
                 accumColor += sCol * depthWeight;
                 accumDepth += cardinalDepth[i] * depthWeight;

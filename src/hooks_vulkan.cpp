@@ -439,7 +439,7 @@ void Hooked_vkCmdSetViewport(void* commandBuffer, uint32_t firstViewport, uint32
         redirected.width = static_cast<float>(dims.quarterWidth);
         redirected.height = static_cast<float>(dims.quarterHeight);
 
-        const auto config = ConfigManager::Get().GetConfig();
+        const auto config = CBREngine::Get().GetCachedFrameConfig();
         const uint32_t currentFrame = CBREngine::Get().GetCurrentFrameIndex();
 
         if (config.samplingStrategy == SamplingStrategy::StrategyA) {
@@ -587,7 +587,7 @@ void Hooked_vkCmdSetSampleLocationsEXT(void* commandBuffer, const MinimalVkSampl
     if (!g_Original_vkCmdSetSampleLocationsEXT) return;
 
     if (CBREngine::Get().IsEnabled()) {
-        const auto config = ConfigManager::Get().GetConfig();
+        const auto config = CBREngine::Get().GetCachedFrameConfig();
         if (config.samplingStrategy == SamplingStrategy::StrategyB &&
             CBREngine::Get().IsCandidatePassActive(commandBuffer)) {
             const uint32_t currentFrame = CBREngine::Get().GetCurrentFrameIndex();

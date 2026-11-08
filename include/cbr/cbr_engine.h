@@ -54,6 +54,11 @@ public:
     // Performance metrics
     float GetLastReconstructionDurationMs() const { return m_lastReconDurationMs.load(); }
 
+    CBRConfig GetCachedFrameConfig() const {
+        std::lock_guard<std::mutex> lock(m_frameConfigMutex);
+        return m_cachedFrameConfig;
+    }
+
 private:
     CBREngine() = default;
     ~CBREngine() = default;
@@ -75,6 +80,8 @@ private:
     std::atomic<float>         m_lastReconDurationMs{ 0.0f };
     std::atomic<GraphicsApi>   m_activeApi{ GraphicsApi::Vulkan };
     std::filesystem::path      m_moduleDirectory;
+    mutable std::mutex         m_frameConfigMutex;
+    CBRConfig                  m_cachedFrameConfig;
 };
 
 } // namespace cbr

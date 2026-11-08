@@ -1,4 +1,5 @@
 #include "cbr/pattern_scanner.h"
+#include <atomic>
 #include <cctype>
 #include <cstring>
 #include "cbr/jitter_manager.h"
@@ -22,9 +23,20 @@ const uint8_t* PatternScanner::FindPattern(const uint8_t* base, size_t size, con
     }
 
     const size_t scanLimit = size - maskLen;
-    for (size_t i = 0; i <= scanLimit; ++i) {
+    const bool firstByteFixed = (mask[0] == 'x');
+    const uint8_t firstByte = static_cast<uint8_t>(signature[0]);
+
+    for (size_t i = 0; i <= scanLimit; ) {
+        if (firstByteFixed) {
+            const void* hit = std::memchr(base + i, firstByte, scanLimit - i + 1);
+            if (!hit) {
+                return nullptr;
+            }
+            i = static_cast<const uint8_t*>(hit) - base;
+        }
+
         bool match = true;
-        for (size_t j = 0; j < maskLen; ++j) {
+        for (size_t j = (firstByteFixed ? 1 : 0); j < maskLen; ++j) {
             if (mask[j] == 'x' && base[i + j] != static_cast<uint8_t>(signature[j])) {
                 match = false;
                 break;
@@ -33,6 +45,7 @@ const uint8_t* PatternScanner::FindPattern(const uint8_t* base, size_t size, con
         if (match) {
             return base + i;
         }
+        ++i;
     }
     return nullptr;
 }
@@ -40,6 +53,8 @@ const uint8_t* PatternScanner::FindPattern(const uint8_t* base, size_t size, con
 bool PatternScanner::ParseIdaPattern(std::string_view idaPattern, std::vector<uint8_t>& outBytes, std::string& outMask) {
     outBytes.clear();
     outMask.clear();
+    outBytes.reserve(64);
+    outMask.reserve(64);
 
     size_t i = 0;
     const size_t n = idaPattern.size();
@@ -122,8 +137,8 @@ const uint8_t* PatternScanner::ResolveRipRelative(const uint8_t* instructionAddr
 
 #if defined(_WIN32)
 namespace {
-    float* g_cachedCameraMatrix = nullptr;
-    bool   g_cameraScannerAttempted = false;
+    std::atomic<float*> g_cachedCameraMatrix{ nullptr };
+    std::atomic<bool>   g_cameraScannerAttempted{ false };
 }
 
 const uint8_t* PatternScanner::ScanModule(const char* moduleName, const char* signature, const char* mask) {
@@ -193,10 +208,10 @@ const uint8_t* PatternScanner::ScanModuleIda(const char* moduleName, std::string
 }
 
 bool PatternScanner::InitializeCameraScanner() {
-    if (g_cameraScannerAttempted) {
-        return g_cachedCameraMatrix != nullptr;
+    bool expected = false;
+    if (!g_cameraScannerAttempted.compare_exchange_strong(expected, true)) {
+        return g_cachedCameraMatrix.load(std::memory_order_acquire) != nullptr;
     }
-    g_cameraScannerAttempted = true;
 
     // Known candidate camera signatures for RDR2 PC (1.0.1491.50+):
     // 1. mov rax, cs:g_cameraManager (48 8B 05 ? ? ? ?)
@@ -220,8 +235,9 @@ bool PatternScanner::InitializeCameraScanner() {
                     void* targetManager = nullptr;
                     std::memcpy(&targetManager, managerPtr, sizeof(void*));
                     if (targetManager && VirtualQuery(targetManager, &mbi, sizeof(mbi)) && (mbi.State == MEM_COMMIT)) {
-                        g_cachedCameraMatrix = reinterpret_cast<float*>(static_cast<uint8_t*>(targetManager) + 0x40);
-                        CBR_LOG_INFO("RDR2 camera projection matrix acquired at 0x%p", g_cachedCameraMatrix);
+                        float* matrixPtr = reinterpret_cast<float*>(static_cast<uint8_t*>(targetManager) + 0x40);
+                        g_cachedCameraMatrix.store(matrixPtr, std::memory_order_release);
+                        CBR_LOG_INFO("RDR2 camera projection matrix acquired at 0x%p", matrixPtr);
                         return true;
                     }
                 }
@@ -234,42 +250,42 @@ bool PatternScanner::InitializeCameraScanner() {
 }
 
 float* PatternScanner::GetCameraProjectionMatrix() {
-    return g_cachedCameraMatrix;
+    return g_cachedCameraMatrix.load(std::memory_order_acquire);
 }
 
-bool PatternScanner::UpdateCameraJitter(uint32_t frameIndex, bool isVulkan) {
-    if (!g_cachedCameraMatrix) {
+bool PatternScanner::UpdateCameraJitter(uint32_t /*frameIndex*/, bool isVulkan) {
+    float* cameraMatrix = g_cachedCameraMatrix.load(std::memory_order_acquire);
+    if (!cameraMatrix) {
         if (!InitializeCameraScanner()) {
             return false;
         }
+        cameraMatrix = g_cachedCameraMatrix.load(std::memory_order_acquire);
     }
 
-    if (g_cachedCameraMatrix) {
+    if (cameraMatrix) {
 #if defined(_MSC_VER)
         __try {
-            JitterManager::Get().Update(frameIndex);
-            JitterManager::Get().ApplyJitterToProjection(g_cachedCameraMatrix, isVulkan);
+            JitterManager::Get().ApplyJitterToProjection(cameraMatrix, isVulkan);
             return true;
         } __except (EXCEPTION_EXECUTE_HANDLER) {
-            g_cachedCameraMatrix = nullptr;
+            g_cachedCameraMatrix.store(nullptr, std::memory_order_release);
             CBR_LOG_WARN("Camera projection matrix access faulted; falling back to Viewport Redirection.");
             return false;
         }
 #else
         MEMORY_BASIC_INFORMATION mbi{};
-        if (VirtualQuery(g_cachedCameraMatrix, &mbi, sizeof(mbi)) != sizeof(mbi) ||
+        if (VirtualQuery(cameraMatrix, &mbi, sizeof(mbi)) != sizeof(mbi) ||
             mbi.State != MEM_COMMIT ||
             (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) == 0) {
-            g_cachedCameraMatrix = nullptr;
+            g_cachedCameraMatrix.store(nullptr, std::memory_order_release);
             CBR_LOG_WARN("Camera projection matrix memory unreadable or not committed; falling back to Viewport Redirection.");
             return false;
         }
         try {
-            JitterManager::Get().Update(frameIndex);
-            JitterManager::Get().ApplyJitterToProjection(g_cachedCameraMatrix, isVulkan);
+            JitterManager::Get().ApplyJitterToProjection(cameraMatrix, isVulkan);
             return true;
         } catch (...) {
-            g_cachedCameraMatrix = nullptr;
+            g_cachedCameraMatrix.store(nullptr, std::memory_order_release);
             CBR_LOG_WARN("Camera projection matrix access faulted; falling back to Viewport Redirection.");
             return false;
         }

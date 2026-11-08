@@ -173,12 +173,17 @@ void Logger::Log(LogLevel level, const std::string& message) {
     localtime_r(&in_time_t, &timeInfo);
 #endif
 
-    std::stringstream ss;
-    ss << std::put_time(&timeInfo, "%Y-%m-%d %H:%M:%S")
-       << '.' << std::setfill('0') << std::setw(3) << ms.count()
-       << " [" << levelStr << "] " << message << "\n";
+    char timeBuffer[64];
+    std::snprintf(timeBuffer, sizeof(timeBuffer), "%04d-%02d-%02d %02d:%02d:%02d.%03d [%s] ",
+                  timeInfo.tm_year + 1900, timeInfo.tm_mon + 1, timeInfo.tm_mday,
+                  timeInfo.tm_hour, timeInfo.tm_min, timeInfo.tm_sec,
+                  static_cast<int>(ms.count()), levelStr);
 
-    std::string formatted = ss.str();
+    std::string formatted;
+    formatted.reserve(std::strlen(timeBuffer) + message.size() + 2);
+    formatted.append(timeBuffer);
+    formatted.append(message);
+    formatted.push_back('\n');
 
     std::lock_guard<std::mutex> lock(m_mutex);
     if (m_initialized && m_running.load()) {

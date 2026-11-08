@@ -17,6 +17,9 @@ JitterManager& JitterManager::Get() {
 }
 
 void JitterManager::Initialize(uint32_t targetWidth, uint32_t targetHeight) {
+    const auto config = ConfigManager::Get().GetConfig();
+    const float sign = (config.projectionJitterSign < 0) ? -1.0f : 1.0f;
+    const float dir = (config.jitterDirection < 0) ? -1.0f : 1.0f;
     uint32_t w, h;
     {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -25,6 +28,13 @@ void JitterManager::Initialize(uint32_t targetWidth, uint32_t targetHeight) {
         m_currentJitter = { 0.0f, 0.0f };
         m_previousJitter = { 0.0f, 0.0f };
         w = m_targetWidth; h = m_targetHeight;
+
+        const float pixelWidth = 1.0f / static_cast<float>(m_targetWidth);
+        const float ndcX = sign * (2.0f * dir * pixelWidth);
+        m_cachedProjectionOffsetVk[0] = { 0.0f, 0.0f };
+        m_cachedProjectionOffsetDx[0] = { 0.0f, 0.0f };
+        m_cachedProjectionOffsetVk[1] = { ndcX, 0.0f };
+        m_cachedProjectionOffsetDx[1] = { ndcX, 0.0f };
     }
     CBR_LOG_INFO("JitterManager initialized with target resolution: %ux%u", w, h);
 }
@@ -34,6 +44,7 @@ void JitterManager::Update(uint32_t frameIndex) {
     // requires exactly one full-resolution pixel shift. See config warning.
     const auto config = ConfigManager::Get().GetConfig();
     const float dir = (config.jitterDirection < 0) ? -1.0f : 1.0f;
+    const float sign = (config.projectionJitterSign < 0) ? -1.0f : 1.0f;
 
     std::lock_guard<std::mutex> lock(m_mutex);
     m_previousJitter = m_currentJitter;
@@ -43,6 +54,12 @@ void JitterManager::Update(uint32_t frameIndex) {
     // Odd frames are shifted horizontally by exactly one full-resolution pixel (shiftDirection * pixelWidth),
     // giving 100% 4-quadrant geometric coverage across two frames with standard 2x MSAA sample locations.
     const float pixelWidth = 1.0f / static_cast<float>(m_targetWidth);
+    const float ndcX = sign * (2.0f * dir * pixelWidth);
+
+    m_cachedProjectionOffsetVk[0] = { 0.0f, 0.0f };
+    m_cachedProjectionOffsetDx[0] = { 0.0f, 0.0f };
+    m_cachedProjectionOffsetVk[1] = { ndcX, 0.0f };
+    m_cachedProjectionOffsetDx[1] = { ndcX, 0.0f };
 
     if (frameIndex & 1u) {
         m_currentJitter.x = dir * pixelWidth;
@@ -77,23 +94,29 @@ std::pair<float, float> JitterManager::ComputeProjectionOffset(const JitterOffse
 void JitterManager::ApplyJitterToProjection(float* projMatrix4x4, bool isVulkan) const {
     if (!projMatrix4x4) return;
 
-    JitterOffset cur;
-    { std::lock_guard<std::mutex> lock(m_mutex); cur = m_currentJitter; }
-    auto [jitterNdcX, jitterNdcY] = ComputeProjectionOffset(cur, isVulkan);
+    std::pair<float, float> offset;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        const uint32_t phase = (m_currentJitter.x != 0.0f) ? 1u : 0u;
+        offset = isVulkan ? m_cachedProjectionOffsetVk[phase] : m_cachedProjectionOffsetDx[phase];
+    }
 
-    projMatrix4x4[8] += jitterNdcX;
-    projMatrix4x4[9] += jitterNdcY;
+    projMatrix4x4[8] += offset.first;
+    projMatrix4x4[9] += offset.second;
 }
 
 void JitterManager::RemoveJitterFromProjection(float* projMatrix4x4, bool isVulkan) const {
     if (!projMatrix4x4) return;
 
-    JitterOffset cur;
-    { std::lock_guard<std::mutex> lock(m_mutex); cur = m_currentJitter; }
-    auto [jitterNdcX, jitterNdcY] = ComputeProjectionOffset(cur, isVulkan);
+    std::pair<float, float> offset;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        const uint32_t phase = (m_currentJitter.x != 0.0f) ? 1u : 0u;
+        offset = isVulkan ? m_cachedProjectionOffsetVk[phase] : m_cachedProjectionOffsetDx[phase];
+    }
 
-    projMatrix4x4[8] -= jitterNdcX;
-    projMatrix4x4[9] -= jitterNdcY;
+    projMatrix4x4[8] -= offset.first;
+    projMatrix4x4[9] -= offset.second;
 }
 
 void JitterManager::SetProjectionJitter(float* outMatrix4x4, const float* inUnjitteredMatrix4x4, bool isVulkan) const {
@@ -105,12 +128,15 @@ void JitterManager::SetProjectionJitter(float* outMatrix4x4, const float* inUnji
         }
     }
 
-    JitterOffset cur;
-    { std::lock_guard<std::mutex> lock(m_mutex); cur = m_currentJitter; }
-    auto [jitterNdcX, jitterNdcY] = ComputeProjectionOffset(cur, isVulkan);
+    std::pair<float, float> offset;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        const uint32_t phase = (m_currentJitter.x != 0.0f) ? 1u : 0u;
+        offset = isVulkan ? m_cachedProjectionOffsetVk[phase] : m_cachedProjectionOffsetDx[phase];
+    }
 
-    outMatrix4x4[8] = inUnjitteredMatrix4x4[8] + jitterNdcX;
-    outMatrix4x4[9] = inUnjitteredMatrix4x4[9] + jitterNdcY;
+    outMatrix4x4[8] = inUnjitteredMatrix4x4[8] + offset.first;
+    outMatrix4x4[9] = inUnjitteredMatrix4x4[9] + offset.second;
 }
 
 } // namespace cbr

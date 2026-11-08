@@ -620,6 +620,11 @@ public:
     // Performance metrics
     float GetLastReconstructionDurationMs() const { return m_lastReconDurationMs.load(); }
 
+    CBRConfig GetCachedFrameConfig() const {
+        std::lock_guard<std::mutex> lock(m_frameConfigMutex);
+        return m_cachedFrameConfig;
+    }
+
 private:
     CBREngine() = default;
     ~CBREngine() = default;
@@ -641,6 +646,8 @@ private:
     std::atomic<float>         m_lastReconDurationMs{ 0.0f };
     std::atomic<GraphicsApi>   m_activeApi{ GraphicsApi::Vulkan };
     std::filesystem::path      m_moduleDirectory;
+    mutable std::mutex         m_frameConfigMutex;
+    CBRConfig                  m_cachedFrameConfig;
 };
 
 } // namespace cbr
@@ -1092,6 +1099,8 @@ private:
     uint32_t     m_targetHeight{ 2160 };
     JitterOffset m_currentJitter;
     JitterOffset m_previousJitter;
+    std::pair<float, float> m_cachedProjectionOffsetVk[2]{};
+    std::pair<float, float> m_cachedProjectionOffsetDx[2]{};
 };
 
 } // namespace cbr
@@ -1774,6 +1783,11 @@ bool CBREngine::Initialize() {
         }
         m_activeApi.store(api);
 
+        {
+            std::lock_guard<std::mutex> lock(m_frameConfigMutex);
+            m_cachedFrameConfig = config;
+        }
+
         // 3. Initialize Render Target & Jitter Managers
         RenderTargetManager::Get().Initialize(config.targetWidth, config.targetHeight);
         JitterManager::Get().Initialize(config.targetWidth, config.targetHeight);
@@ -1857,11 +1871,16 @@ bool CBREngine::ConsumeCandidatePassActive(void* cmdBuffer) {
 void CBREngine::OnBeginFrame() {
     if (!m_enabled.load()) return;
 
+    {
+        std::lock_guard<std::mutex> lock(m_frameConfigMutex);
+        m_cachedFrameConfig = ConfigManager::Get().GetConfig();
+    }
+
     uint32_t currentFrame = m_frameIndex.load();
     JitterManager::Get().Update(currentFrame);
 
 #if defined(_WIN32)
-    const auto config = ConfigManager::Get().GetConfig();
+    const auto config = GetCachedFrameConfig();
     if (config.samplingStrategy == SamplingStrategy::StrategyA && config.jitterDirection != 0) {
         PatternScanner::UpdateCameraJitter(currentFrame, m_activeApi.load() == GraphicsApi::Vulkan);
     }
@@ -3244,7 +3263,7 @@ void Hooked_vkCmdSetViewport(void* commandBuffer, uint32_t firstViewport, uint32
         redirected.width = static_cast<float>(dims.quarterWidth);
         redirected.height = static_cast<float>(dims.quarterHeight);
 
-        const auto config = ConfigManager::Get().GetConfig();
+        const auto config = CBREngine::Get().GetCachedFrameConfig();
         const uint32_t currentFrame = CBREngine::Get().GetCurrentFrameIndex();
 
         if (config.samplingStrategy == SamplingStrategy::StrategyA) {
@@ -3392,7 +3411,7 @@ void Hooked_vkCmdSetSampleLocationsEXT(void* commandBuffer, const MinimalVkSampl
     if (!g_Original_vkCmdSetSampleLocationsEXT) return;
 
     if (CBREngine::Get().IsEnabled()) {
-        const auto config = ConfigManager::Get().GetConfig();
+        const auto config = CBREngine::Get().GetCachedFrameConfig();
         if (config.samplingStrategy == SamplingStrategy::StrategyB &&
             CBREngine::Get().IsCandidatePassActive(commandBuffer)) {
             const uint32_t currentFrame = CBREngine::Get().GetCurrentFrameIndex();
@@ -4203,6 +4222,9 @@ JitterManager& JitterManager::Get() {
 }
 
 void JitterManager::Initialize(uint32_t targetWidth, uint32_t targetHeight) {
+    const auto config = ConfigManager::Get().GetConfig();
+    const float sign = (config.projectionJitterSign < 0) ? -1.0f : 1.0f;
+    const float dir = (config.jitterDirection < 0) ? -1.0f : 1.0f;
     uint32_t w, h;
     {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -4211,6 +4233,13 @@ void JitterManager::Initialize(uint32_t targetWidth, uint32_t targetHeight) {
         m_currentJitter = { 0.0f, 0.0f };
         m_previousJitter = { 0.0f, 0.0f };
         w = m_targetWidth; h = m_targetHeight;
+
+        const float pixelWidth = 1.0f / static_cast<float>(m_targetWidth);
+        const float ndcX = sign * (2.0f * dir * pixelWidth);
+        m_cachedProjectionOffsetVk[0] = { 0.0f, 0.0f };
+        m_cachedProjectionOffsetDx[0] = { 0.0f, 0.0f };
+        m_cachedProjectionOffsetVk[1] = { ndcX, 0.0f };
+        m_cachedProjectionOffsetDx[1] = { ndcX, 0.0f };
     }
     CBR_LOG_INFO("JitterManager initialized with target resolution: %ux%u", w, h);
 }
@@ -4220,6 +4249,7 @@ void JitterManager::Update(uint32_t frameIndex) {
     // requires exactly one full-resolution pixel shift. See config warning.
     const auto config = ConfigManager::Get().GetConfig();
     const float dir = (config.jitterDirection < 0) ? -1.0f : 1.0f;
+    const float sign = (config.projectionJitterSign < 0) ? -1.0f : 1.0f;
 
     std::lock_guard<std::mutex> lock(m_mutex);
     m_previousJitter = m_currentJitter;
@@ -4229,6 +4259,12 @@ void JitterManager::Update(uint32_t frameIndex) {
     // Odd frames are shifted horizontally by exactly one full-resolution pixel (shiftDirection * pixelWidth),
     // giving 100% 4-quadrant geometric coverage across two frames with standard 2x MSAA sample locations.
     const float pixelWidth = 1.0f / static_cast<float>(m_targetWidth);
+    const float ndcX = sign * (2.0f * dir * pixelWidth);
+
+    m_cachedProjectionOffsetVk[0] = { 0.0f, 0.0f };
+    m_cachedProjectionOffsetDx[0] = { 0.0f, 0.0f };
+    m_cachedProjectionOffsetVk[1] = { ndcX, 0.0f };
+    m_cachedProjectionOffsetDx[1] = { ndcX, 0.0f };
 
     if (frameIndex & 1u) {
         m_currentJitter.x = dir * pixelWidth;
@@ -4263,23 +4299,29 @@ std::pair<float, float> JitterManager::ComputeProjectionOffset(const JitterOffse
 void JitterManager::ApplyJitterToProjection(float* projMatrix4x4, bool isVulkan) const {
     if (!projMatrix4x4) return;
 
-    JitterOffset cur;
-    { std::lock_guard<std::mutex> lock(m_mutex); cur = m_currentJitter; }
-    auto [jitterNdcX, jitterNdcY] = ComputeProjectionOffset(cur, isVulkan);
+    std::pair<float, float> offset;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        const uint32_t phase = (m_currentJitter.x != 0.0f) ? 1u : 0u;
+        offset = isVulkan ? m_cachedProjectionOffsetVk[phase] : m_cachedProjectionOffsetDx[phase];
+    }
 
-    projMatrix4x4[8] += jitterNdcX;
-    projMatrix4x4[9] += jitterNdcY;
+    projMatrix4x4[8] += offset.first;
+    projMatrix4x4[9] += offset.second;
 }
 
 void JitterManager::RemoveJitterFromProjection(float* projMatrix4x4, bool isVulkan) const {
     if (!projMatrix4x4) return;
 
-    JitterOffset cur;
-    { std::lock_guard<std::mutex> lock(m_mutex); cur = m_currentJitter; }
-    auto [jitterNdcX, jitterNdcY] = ComputeProjectionOffset(cur, isVulkan);
+    std::pair<float, float> offset;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        const uint32_t phase = (m_currentJitter.x != 0.0f) ? 1u : 0u;
+        offset = isVulkan ? m_cachedProjectionOffsetVk[phase] : m_cachedProjectionOffsetDx[phase];
+    }
 
-    projMatrix4x4[8] -= jitterNdcX;
-    projMatrix4x4[9] -= jitterNdcY;
+    projMatrix4x4[8] -= offset.first;
+    projMatrix4x4[9] -= offset.second;
 }
 
 void JitterManager::SetProjectionJitter(float* outMatrix4x4, const float* inUnjitteredMatrix4x4, bool isVulkan) const {
@@ -4291,12 +4333,15 @@ void JitterManager::SetProjectionJitter(float* outMatrix4x4, const float* inUnji
         }
     }
 
-    JitterOffset cur;
-    { std::lock_guard<std::mutex> lock(m_mutex); cur = m_currentJitter; }
-    auto [jitterNdcX, jitterNdcY] = ComputeProjectionOffset(cur, isVulkan);
+    std::pair<float, float> offset;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        const uint32_t phase = (m_currentJitter.x != 0.0f) ? 1u : 0u;
+        offset = isVulkan ? m_cachedProjectionOffsetVk[phase] : m_cachedProjectionOffsetDx[phase];
+    }
 
-    outMatrix4x4[8] = inUnjitteredMatrix4x4[8] + jitterNdcX;
-    outMatrix4x4[9] = inUnjitteredMatrix4x4[9] + jitterNdcY;
+    outMatrix4x4[8] = inUnjitteredMatrix4x4[8] + offset.first;
+    outMatrix4x4[9] = inUnjitteredMatrix4x4[9] + offset.second;
 }
 
 } // namespace cbr
@@ -4480,12 +4525,17 @@ void Logger::Log(LogLevel level, const std::string& message) {
     localtime_r(&in_time_t, &timeInfo);
 #endif
 
-    std::stringstream ss;
-    ss << std::put_time(&timeInfo, "%Y-%m-%d %H:%M:%S")
-       << '.' << std::setfill('0') << std::setw(3) << ms.count()
-       << " [" << levelStr << "] " << message << "\n";
+    char timeBuffer[64];
+    std::snprintf(timeBuffer, sizeof(timeBuffer), "%04d-%02d-%02d %02d:%02d:%02d.%03d [%s] ",
+                  timeInfo.tm_year + 1900, timeInfo.tm_mon + 1, timeInfo.tm_mday,
+                  timeInfo.tm_hour, timeInfo.tm_min, timeInfo.tm_sec,
+                  static_cast<int>(ms.count()), levelStr);
 
-    std::string formatted = ss.str();
+    std::string formatted;
+    formatted.reserve(std::strlen(timeBuffer) + message.size() + 2);
+    formatted.append(timeBuffer);
+    formatted.append(message);
+    formatted.push_back('\n');
 
     std::lock_guard<std::mutex> lock(m_mutex);
     if (m_initialized && m_running.load()) {
@@ -4520,6 +4570,7 @@ void Logger::Log(LogLevel level, const std::string& message) {
 ### `src/pattern_scanner.cpp`
 ```cpp
 #include "cbr/pattern_scanner.h"
+#include <atomic>
 #include <cctype>
 #include <cstring>
 #include "cbr/jitter_manager.h"
@@ -4543,9 +4594,20 @@ const uint8_t* PatternScanner::FindPattern(const uint8_t* base, size_t size, con
     }
 
     const size_t scanLimit = size - maskLen;
-    for (size_t i = 0; i <= scanLimit; ++i) {
+    const bool firstByteFixed = (mask[0] == 'x');
+    const uint8_t firstByte = static_cast<uint8_t>(signature[0]);
+
+    for (size_t i = 0; i <= scanLimit; ) {
+        if (firstByteFixed) {
+            const void* hit = std::memchr(base + i, firstByte, scanLimit - i + 1);
+            if (!hit) {
+                return nullptr;
+            }
+            i = static_cast<const uint8_t*>(hit) - base;
+        }
+
         bool match = true;
-        for (size_t j = 0; j < maskLen; ++j) {
+        for (size_t j = (firstByteFixed ? 1 : 0); j < maskLen; ++j) {
             if (mask[j] == 'x' && base[i + j] != static_cast<uint8_t>(signature[j])) {
                 match = false;
                 break;
@@ -4554,6 +4616,7 @@ const uint8_t* PatternScanner::FindPattern(const uint8_t* base, size_t size, con
         if (match) {
             return base + i;
         }
+        ++i;
     }
     return nullptr;
 }
@@ -4561,6 +4624,8 @@ const uint8_t* PatternScanner::FindPattern(const uint8_t* base, size_t size, con
 bool PatternScanner::ParseIdaPattern(std::string_view idaPattern, std::vector<uint8_t>& outBytes, std::string& outMask) {
     outBytes.clear();
     outMask.clear();
+    outBytes.reserve(64);
+    outMask.reserve(64);
 
     size_t i = 0;
     const size_t n = idaPattern.size();
@@ -4643,8 +4708,8 @@ const uint8_t* PatternScanner::ResolveRipRelative(const uint8_t* instructionAddr
 
 #if defined(_WIN32)
 namespace {
-    float* g_cachedCameraMatrix = nullptr;
-    bool   g_cameraScannerAttempted = false;
+    std::atomic<float*> g_cachedCameraMatrix{ nullptr };
+    std::atomic<bool>   g_cameraScannerAttempted{ false };
 }
 
 const uint8_t* PatternScanner::ScanModule(const char* moduleName, const char* signature, const char* mask) {
@@ -4714,10 +4779,10 @@ const uint8_t* PatternScanner::ScanModuleIda(const char* moduleName, std::string
 }
 
 bool PatternScanner::InitializeCameraScanner() {
-    if (g_cameraScannerAttempted) {
-        return g_cachedCameraMatrix != nullptr;
+    bool expected = false;
+    if (!g_cameraScannerAttempted.compare_exchange_strong(expected, true)) {
+        return g_cachedCameraMatrix.load(std::memory_order_acquire) != nullptr;
     }
-    g_cameraScannerAttempted = true;
 
     // Known candidate camera signatures for RDR2 PC (1.0.1491.50+):
     // 1. mov rax, cs:g_cameraManager (48 8B 05 ? ? ? ?)
@@ -4741,8 +4806,9 @@ bool PatternScanner::InitializeCameraScanner() {
                     void* targetManager = nullptr;
                     std::memcpy(&targetManager, managerPtr, sizeof(void*));
                     if (targetManager && VirtualQuery(targetManager, &mbi, sizeof(mbi)) && (mbi.State == MEM_COMMIT)) {
-                        g_cachedCameraMatrix = reinterpret_cast<float*>(static_cast<uint8_t*>(targetManager) + 0x40);
-                        CBR_LOG_INFO("RDR2 camera projection matrix acquired at 0x%p", g_cachedCameraMatrix);
+                        float* matrixPtr = reinterpret_cast<float*>(static_cast<uint8_t*>(targetManager) + 0x40);
+                        g_cachedCameraMatrix.store(matrixPtr, std::memory_order_release);
+                        CBR_LOG_INFO("RDR2 camera projection matrix acquired at 0x%p", matrixPtr);
                         return true;
                     }
                 }
@@ -4755,42 +4821,42 @@ bool PatternScanner::InitializeCameraScanner() {
 }
 
 float* PatternScanner::GetCameraProjectionMatrix() {
-    return g_cachedCameraMatrix;
+    return g_cachedCameraMatrix.load(std::memory_order_acquire);
 }
 
-bool PatternScanner::UpdateCameraJitter(uint32_t frameIndex, bool isVulkan) {
-    if (!g_cachedCameraMatrix) {
+bool PatternScanner::UpdateCameraJitter(uint32_t /*frameIndex*/, bool isVulkan) {
+    float* cameraMatrix = g_cachedCameraMatrix.load(std::memory_order_acquire);
+    if (!cameraMatrix) {
         if (!InitializeCameraScanner()) {
             return false;
         }
+        cameraMatrix = g_cachedCameraMatrix.load(std::memory_order_acquire);
     }
 
-    if (g_cachedCameraMatrix) {
+    if (cameraMatrix) {
 #if defined(_MSC_VER)
         __try {
-            JitterManager::Get().Update(frameIndex);
-            JitterManager::Get().ApplyJitterToProjection(g_cachedCameraMatrix, isVulkan);
+            JitterManager::Get().ApplyJitterToProjection(cameraMatrix, isVulkan);
             return true;
         } __except (EXCEPTION_EXECUTE_HANDLER) {
-            g_cachedCameraMatrix = nullptr;
+            g_cachedCameraMatrix.store(nullptr, std::memory_order_release);
             CBR_LOG_WARN("Camera projection matrix access faulted; falling back to Viewport Redirection.");
             return false;
         }
 #else
         MEMORY_BASIC_INFORMATION mbi{};
-        if (VirtualQuery(g_cachedCameraMatrix, &mbi, sizeof(mbi)) != sizeof(mbi) ||
+        if (VirtualQuery(cameraMatrix, &mbi, sizeof(mbi)) != sizeof(mbi) ||
             mbi.State != MEM_COMMIT ||
             (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) == 0) {
-            g_cachedCameraMatrix = nullptr;
+            g_cachedCameraMatrix.store(nullptr, std::memory_order_release);
             CBR_LOG_WARN("Camera projection matrix memory unreadable or not committed; falling back to Viewport Redirection.");
             return false;
         }
         try {
-            JitterManager::Get().Update(frameIndex);
-            JitterManager::Get().ApplyJitterToProjection(g_cachedCameraMatrix, isVulkan);
+            JitterManager::Get().ApplyJitterToProjection(cameraMatrix, isVulkan);
             return true;
         } catch (...) {
-            g_cachedCameraMatrix = nullptr;
+            g_cachedCameraMatrix.store(nullptr, std::memory_order_release);
             CBR_LOG_WARN("Camera projection matrix access faulted; falling back to Viewport Redirection.");
             return false;
         }
@@ -6669,6 +6735,7 @@ void main() {
     // The 4 cardinal neighbours of a reconstructed pixel are always natively shaded (mirrored at borders).
     ivec2 cardinalCoord[4] = ivec2[](ivec2(0), ivec2(0), ivec2(0), ivec2(0));
     float cardinalDepth[4] = float[](0.0, 0.0, 0.0, 0.0);
+    vec3  cardinalColor[4] = vec3[](vec3(0.0), vec3(0.0), vec3(0.0), vec3(0.0));
 
     if (isCurrentSampleActive) {
         currentColor = FetchColor(self);
@@ -6688,7 +6755,9 @@ void main() {
                 c = pixelCoord;
             }
             cardinalCoord[i] = c;
-            cardinalDepth[i] = FetchDepth(MapPixelToSample(c, frameParity));
+            CbrSample s = MapPixelToSample(c, frameParity);
+            cardinalDepth[i] = FetchDepth(s);
+            cardinalColor[i] = FetchColor(s);
             float raw = cardinalDepth[i];
             float lin = LinearizeDepth(raw);
             if (!isnan(raw) && !isinf(raw) && !isnan(lin) && !isinf(lin)) {
@@ -6744,6 +6813,7 @@ void main() {
 
     // Point-sample velocity via texelFetch at integer motionCoord to prevent cross-edge velocity bleeding
     vec2 velocity = texelFetch(u_Velocity, motionCoord, 0).xy;
+    velocity = clamp(velocity, vec2(-0.5), vec2(0.5));
     // NaN/Inf velocity or UV must disocclude: ivec2(NaN) is UB and NaN comparisons are false.
     bool velocityBad = isinf(velocity.x) || isnan(velocity.x) || isinf(velocity.y) || isnan(velocity.y)
         || isinf(uv.x) || isnan(uv.x) || isinf(uv.y) || isnan(uv.y);
@@ -6782,8 +6852,10 @@ void main() {
     // Uses ONLY natively shaded neighbours: samples that do not exist this frame must not enter the statistics.
     // Clamping is active on both static and moving geometry: static geometry subject to dynamic lighting,
     // shadows, or moving occluders still requires history bounding to prevent temporal ghosting.
+    // Variance clipping is bypassed on strictly static geometry with sub-tolerance depth variance.
     // -------------------------------------------------------------------------
-    if (!isDisoccluded && pc.u_EnableColorClamping != 0u) {
+    const bool isStatic = dot(velocity, velocity) < 1e-9 && depthDelta < (0.05 * pc.u_DepthTolerance);
+    if (!isDisoccluded && pc.u_EnableColorClamping != 0u && !isStatic) {
         vec3 colorMin = vec3(1e6);
         vec3 colorMax = vec3(-1e6);
         vec3 m1 = vec3(0.0);
@@ -6807,6 +6879,8 @@ void main() {
             vec3 c;
             if (isCurrentSampleActive && i == 0) {
                 c = ToClampSpace(currentColor);
+            } else if (!isCurrentSampleActive) {
+                c = ToClampSpace(cardinalColor[i]);
             } else {
                 c = ToClampSpace(FetchColor(MapPixelToSample(nc, frameParity)));
             }
@@ -6857,11 +6931,12 @@ void main() {
             float accumWeight = 0.0;
 
             for (int i = 0; i < 4 && pc.u_EnableSpatialFallback != 0u; ++i) {
-                vec3 sCol = FetchColor(MapPixelToSample(cardinalCoord[i], frameParity));
+                vec3 sCol = cardinalColor[i];
                 float sLin = LinearizeDepth(cardinalDepth[i]);
 
                 // Relative linear-depth weighting: scale-invariant, independent of the depth convention
-                float depthWeight = exp(-abs(currentLinear - sLin) / (max(currentLinear, 1e-5) * max(pc.u_DepthTolerance, 1e-4)));
+                // Fast base-2 exponentiation: exp(-x) == exp2(-x * log2(e))
+                float depthWeight = exp2((-abs(currentLinear - sLin) / (max(currentLinear, 1e-5) * max(pc.u_DepthTolerance, 1e-4))) * 1.4426950408889634);
 
                 accumColor += sCol * depthWeight;
                 accumDepth += cardinalDepth[i] * depthWeight;
@@ -6872,7 +6947,7 @@ void main() {
                 finalColor = accumColor / accumWeight;
                 spatialDepth = accumDepth / accumWeight;
             } else {
-                finalColor = isCurrentSampleActive ? currentColor : FetchColor(MapPixelToSample(cardinalCoord[0], frameParity));
+                finalColor = isCurrentSampleActive ? currentColor : cardinalColor[0];
                 spatialDepth = isCurrentSampleActive ? currentDepth : cardinalDepth[0];
             }
         }
@@ -6882,7 +6957,7 @@ void main() {
     if (isnan(finalColor.r) || isinf(finalColor.r) ||
         isnan(finalColor.g) || isinf(finalColor.g) ||
         isnan(finalColor.b) || isinf(finalColor.b)) {
-        finalColor = isCurrentSampleActive ? currentColor : FetchColor(MapPixelToSample(cardinalCoord[0], frameParity));
+        finalColor = isCurrentSampleActive ? currentColor : cardinalColor[0];
     }
 
     // -------------------------------------------------------------------------
@@ -6899,15 +6974,12 @@ void main() {
         finalColor = vec3(abs(velocity) * 50.0, 0.0);
     } else if (pc.u_DebugView == 4u) {
         // Quarter-resolution raw colour (nearest native sample for reconstructed pixels)
-        finalColor = isCurrentSampleActive ? currentColor : FetchColor(MapPixelToSample(cardinalCoord[0], frameParity));
+        finalColor = isCurrentSampleActive ? currentColor : cardinalColor[0];
     } else if (pc.u_DebugView == 5u) {
         // Spatial baseline resolve: average of 4 cardinal samples for reconstructed pixels
         // (direct visual A/B baseline comparison against temporal CBR, matching reference Space toggle)
         finalColor = isCurrentSampleActive ? currentColor : (
-            FetchColor(MapPixelToSample(cardinalCoord[0], frameParity)) +
-            FetchColor(MapPixelToSample(cardinalCoord[1], frameParity)) +
-            FetchColor(MapPixelToSample(cardinalCoord[2], frameParity)) +
-            FetchColor(MapPixelToSample(cardinalCoord[3], frameParity))
+            cardinalColor[0] + cardinalColor[1] + cardinalColor[2] + cardinalColor[3]
         ) * 0.25;
     }
 
@@ -6923,9 +6995,8 @@ void main() {
     if (isnan(outDepth) || isinf(outDepth)) {
         outDepth = (pc.u_DepthMode == 1u) ? 0.0 : 1.0;
     }
-    // GLSL 4.50 specification (section 8.14) mandates a 4-component vector for all floating-point
-    // imageStore invocations (including single-channel r32f). Hardware discards y, z, w.
-    imageStore(u_OutputDepth, pixelCoord, vec4(outDepth, 0.0, 0.0, 0.0));
+    // Hardware ignores discarded components when writing to single-channel r32f
+    imageStore(u_OutputDepth, pixelCoord, vec4(outDepth));
 }
 ```
 
@@ -7126,6 +7197,7 @@ void ResolvePixel(ivec2 pixelCoord, ivec2 targetSize, uint frameParity) {
 
     // Sample velocity using texelFetch to avoid cross-edge interpolation/ghosting
     vec2 velocity = texelFetch(u_Velocity, motionCoord, 0).xy;
+    velocity = clamp(velocity, vec2(-0.5), vec2(0.5));
     bool velocityBad = isinf(velocity.x) || isnan(velocity.x) || isinf(velocity.y) || isnan(velocity.y)
         || isinf(uv.x) || isnan(uv.x) || isinf(uv.y) || isnan(uv.y);
     vec2 historyUV = uv - velocity - pc.u_JitterDelta * pc.u_JitterCompensation;
@@ -7152,7 +7224,8 @@ void ResolvePixel(ivec2 pixelCoord, ivec2 targetSize, uint frameParity) {
         }
     }
 
-    if (!isDisoccluded && pc.u_EnableColorClamping != 0u) {
+    const bool isStatic = dot(velocity, velocity) < 1e-9 && depthDelta < (0.05 * pc.u_DepthTolerance);
+    if (!isDisoccluded && pc.u_EnableColorClamping != 0u && !isStatic) {
         vec3 colorMin = vec3(1e6);
         vec3 colorMax = vec3(-1e6);
         vec3 m1 = vec3(0.0);
@@ -7212,7 +7285,7 @@ void ResolvePixel(ivec2 pixelCoord, ivec2 targetSize, uint frameParity) {
             for (int i = 0; i < 4 && pc.u_EnableSpatialFallback != 0u; ++i) {
                 vec3 sCol = FetchColor(MapPixelToSample(cardinalCoord[i], frameParity));
                 float sLin = LinearizeDepth(cardinalDepth[i]);
-                float depthWeight = exp(-abs(currentLinear - sLin) / (max(currentLinear, 1e-5) * max(pc.u_DepthTolerance, 1e-4)));
+                float depthWeight = exp2((-abs(currentLinear - sLin) / (max(currentLinear, 1e-5) * max(pc.u_DepthTolerance, 1e-4))) * 1.4426950408889634);
                 accumColor += sCol * depthWeight;
                 accumDepth += cardinalDepth[i] * depthWeight;
                 accumWeight += depthWeight;
@@ -7261,7 +7334,7 @@ void ResolvePixel(ivec2 pixelCoord, ivec2 targetSize, uint frameParity) {
     if (isnan(outDepth) || isinf(outDepth)) {
         outDepth = (pc.u_DepthMode == 1u) ? 0.0 : 1.0;
     }
-    imageStore(u_OutputDepth, pixelCoord, vec4(outDepth, 0.0, 0.0, 0.0));
+    imageStore(u_OutputDepth, pixelCoord, vec4(outDepth));
 }
 
 void main() {
@@ -7531,6 +7604,7 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
 
     // Exact texel fetch of velocity using integer motionCoord prevents cross-edge interpolation
     float2 velocity = g_Velocity.Load(int3(motionCoord, 0)).xy;
+    velocity = clamp(velocity, float2(-0.5f, -0.5f), float2(0.5f, 0.5f));
     bool velocityBad = isinf(velocity.x) || isnan(velocity.x) || isinf(velocity.y) || isnan(velocity.y)
         || isinf(uv.x) || isnan(uv.x) || isinf(uv.y) || isnan(uv.y);
     float2 historyUV = uv - velocity - g_JitterDelta * g_JitterCompensation;
@@ -7566,8 +7640,10 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     // Uses ONLY natively shaded neighbours: samples that do not exist this frame must not enter the statistics.
     // Clamping is active on both static and moving geometry: static geometry subject to dynamic lighting,
     // shadows, or moving occluders still requires history bounding to prevent temporal ghosting.
+    // Variance clipping is bypassed on strictly static geometry with sub-tolerance depth variance.
     // -------------------------------------------------------------------------
-    if (!isDisoccluded && g_EnableColorClamping != 0u) {
+    bool isStatic = dot(velocity, velocity) < 1e-9f && depthDelta < (0.05f * g_DepthTolerance);
+    if (!isDisoccluded && g_EnableColorClamping != 0u && !isStatic) {
         float3 colorMin = float3(1e6f, 1e6f, 1e6f);
         float3 colorMax = float3(-1e6f, -1e6f, -1e6f);
         float3 m1 = float3(0.0f, 0.0f, 0.0f);
@@ -7645,7 +7721,8 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
                 float sLin = LinearizeDepth(cardinalDepth[i]);
 
                 // Relative linear-depth weighting: scale-invariant, independent of the depth convention
-                float depthWeight = exp(-abs(currentLinear - sLin) / (max(currentLinear, 1e-5f) * max(g_DepthTolerance, 1e-4f)));
+                // Fast base-2 exponentiation: exp(-x) == exp2(-x * log2(e))
+                float depthWeight = exp2((-abs(currentLinear - sLin) / (max(currentLinear, 1e-5f) * max(g_DepthTolerance, 1e-4f))) * 1.44269504f);
 
                 accumColor += sCol * depthWeight;
                 accumDepth += cardinalDepth[i] * depthWeight;
