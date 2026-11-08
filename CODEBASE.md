@@ -1955,8 +1955,7 @@ void CBREngine::OnPostPresent(void* presentTarget) {
 void CBREngine::OnSwapchainRecreated(uint32_t width, uint32_t height) {
     m_mainPresentTarget.store(nullptr);
     m_activeCandidateCmdBuffer.store(nullptr);
-    const uint32_t currentParity = m_frameIndex.load() & 1u;
-    m_frameIndex.store(currentParity);
+    m_frameIndex.store(0);
     m_lastDispatchedFrame.store(kNoFrame);
 
     // Swapchain extents are untrusted: odd sizes round up to even, implausible ones are ignored.
