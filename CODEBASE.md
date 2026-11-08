@@ -6827,6 +6827,7 @@ void main() {
     bool isDisoccluded = false;
     vec4 historyColor = vec4(0.0);
     float previousDepth = currentDepth;
+    float depthDelta = 0.0;
 
     if (historyUVBad || pc.u_FrameIndex == 0u || historyUV.x < 0.0 || historyUV.x > 1.0 || historyUV.y < 0.0 || historyUV.y > 1.0) {
         isDisoccluded = true; // First frame, bad velocity/UV, or sample moved outside screen space
@@ -6836,7 +6837,7 @@ void main() {
         previousDepth = texelFetch(u_HistoryDepth, historyCoord, 0).r;
         float prevLin = LinearizeDepth(previousDepth);
         bool depthBad = isinf(currentLinear) || isnan(currentLinear) || isinf(prevLin) || isnan(prevLin);
-        float depthDelta = depthBad ? 10.0 : abs(currentLinear - prevLin) / max(currentLinear, 1e-5);
+        depthDelta = depthBad ? 10.0 : abs(currentLinear - prevLin) / max(currentLinear, 1e-5);
         if (depthDelta > pc.u_DepthTolerance) {
             isDisoccluded = true;
         } else {
@@ -7207,6 +7208,7 @@ void ResolvePixel(ivec2 pixelCoord, ivec2 targetSize, uint frameParity) {
     bool isDisoccluded = false;
     vec4 historyColor = vec4(0.0);
     float previousDepth = currentDepth;
+    float depthDelta = 0.0;
 
     if (historyUVBad || pc.u_FrameIndex == 0u || historyUV.x < 0.0 || historyUV.x > 1.0 || historyUV.y < 0.0 || historyUV.y > 1.0) {
         isDisoccluded = true;
@@ -7215,7 +7217,7 @@ void ResolvePixel(ivec2 pixelCoord, ivec2 targetSize, uint frameParity) {
         previousDepth = texelFetch(u_HistoryDepth, historyCoord, 0).r;
         float prevLin = LinearizeDepth(previousDepth);
         bool depthBad = isinf(currentLinear) || isnan(currentLinear) || isinf(prevLin) || isnan(prevLin);
-        float depthDelta = depthBad ? 10.0 : abs(currentLinear - prevLin) / max(currentLinear, 1e-5);
+        depthDelta = depthBad ? 10.0 : abs(currentLinear - prevLin) / max(currentLinear, 1e-5);
         if (depthDelta > pc.u_DepthTolerance) {
             isDisoccluded = true;
         } else {
@@ -7617,6 +7619,7 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     bool isDisoccluded = false;
     float4 historyColor = float4(0.0f, 0.0f, 0.0f, 0.0f);
     float previousDepth = currentDepth;
+    float depthDelta = 0.0f;
 
     if (historyUVBad || g_FrameIndex == 0u || historyUV.x < 0.0f || historyUV.x > 1.0f || historyUV.y < 0.0f || historyUV.y > 1.0f) {
         isDisoccluded = true; // First frame, bad velocity/UV, or sample moved outside screen space
@@ -7624,7 +7627,7 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
         previousDepth = g_HistoryDepth.SampleLevel(g_PointClampSampler, historyUV, 0.0f).r;
         float prevLin = LinearizeDepth(previousDepth);
         bool depthBad = isinf(currentLinear) || isnan(currentLinear) || isinf(prevLin) || isnan(prevLin);
-        float depthDelta = depthBad ? 10.0f : abs(currentLinear - prevLin) / max(currentLinear, 1e-5f);
+        depthDelta = depthBad ? 10.0f : abs(currentLinear - prevLin) / max(currentLinear, 1e-5f);
         if (depthDelta > g_DepthTolerance) {
             isDisoccluded = true;
         } else {
