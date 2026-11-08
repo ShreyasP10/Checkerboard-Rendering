@@ -867,7 +867,7 @@ ReconstructionPushConstants BuildReconstructionPushConstants(uint32_t frameIndex
     pc.debugView = config.debugView;
     pc.enableColorClamping = config.enableColorClamping ? 1u : 0u;
     pc.mipLodBias = config.mipLodBias;
-    pc.colorSpace = (config.colorSpace == ColorSpace::RGB) ? 1u : 0u;
+    pc.colorSpace = (config.colorSpace == ColorSpace::RGB) ? 1u : ((config.colorSpace == ColorSpace::ICtCp) ? 2u : 0u);
     pc.enableSpatialFallback = config.enableSpatialFallback ? 1u : 0u;
     pc.jitterDelta[0] = jitterDelta.x;
     pc.jitterDelta[1] = jitterDelta.y;

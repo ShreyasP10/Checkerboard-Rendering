@@ -400,6 +400,12 @@ static void TestPushConstantBuilder() {
     const ReconstructionPushConstants pc2 = BuildReconstructionPushConstants(0);
     CHECK(pc2.enableSpatialFallback == 1u && pc2.enableMotionDilation == 1u && pc2.colorSpace == 0u);
     CHECK(pc2.shiftDirection == 1 && pc2.depthMode == 1u && pc2.depthFar == 0.0f);
+
+    ConfigManager::Get().Modify([](CBRConfig& c) {
+        c.colorSpace = ColorSpace::ICtCp;
+    });
+    const ReconstructionPushConstants pc3 = BuildReconstructionPushConstants(0);
+    CHECK(pc3.colorSpace == 2u);
 }
 
 static void TestRenderTargets() {
@@ -547,6 +553,24 @@ static void TestPatternScanner() {
     // 3. Negative search (pattern not present)
     const uint8_t* notFound = PatternScanner::FindIdaPattern(mockMemory, sizeof(mockMemory), "FF 15 ? ? ? ?");
     CHECK(notFound == nullptr);
+
+    // 3b. SIMD (SSE2/AVX2) buffer testing with large buffers and non-trivial offsets
+    uint8_t largeMemory[256];
+    std::memset(largeMemory, 0x90, sizeof(largeMemory));
+    // Embed pattern at offset 73 (crosses 32-byte and 16-byte SIMD chunk boundaries)
+    const uint8_t targetSignature[] = { 0x48, 0x8B, 0x05, 0xAA, 0xBB, 0xCC, 0xDD, 0x48, 0x8B, 0x48, 0x08 };
+    std::memcpy(largeMemory + 73, targetSignature, sizeof(targetSignature));
+    const uint8_t* foundSimd = PatternScanner::FindIdaPattern(largeMemory, sizeof(largeMemory), "48 8B 05 ? ? ? ? 48 8B 48 08");
+    CHECK(foundSimd == largeMemory + 73);
+
+    // 3c. SIMD false-positive prefix rejection (first byte matches multiple times, rest differs)
+    largeMemory[10] = 0x48;
+    largeMemory[11] = 0x00;
+    largeMemory[32] = 0x48;
+    largeMemory[33] = 0x8B;
+    largeMemory[34] = 0x00; // mismatch
+    const uint8_t* foundPrefixReject = PatternScanner::FindIdaPattern(largeMemory, sizeof(largeMemory), "48 8B 05 ? ? ? ? 48 8B 48 08");
+    CHECK(foundPrefixReject == largeMemory + 73);
 
     // 4. RIP-relative resolution: instruction address + instruction length + displacement
     // Instruction starts at mockMemory + 3, length is 7 bytes (48 8B 05 12 34 00 00), displacement is 0x00003412

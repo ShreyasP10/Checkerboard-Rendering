@@ -42,7 +42,7 @@ cbuffer CBRConstants : register(b0)
     uint   g_DebugView;              // 0=Normal, 1=Mask, 2=Disocclusion, 3=Motion, 4=Raw
     uint   g_EnableColorClamping;    // 1 = True, 0 = False
     float  g_MipLodBias;             // Texture LOD bias (-0.5f)
-    uint   g_ColorSpace;             // 0 = YCoCg clamp, 1 = RGB clamp
+    uint   g_ColorSpace;             // 0 = YCoCg clamp, 1 = RGB clamp, 2 = ICtCp clamp (HDR10/BT.2100)
     uint   g_EnableSpatialFallback;  // 1 = cross-bilateral fallback, 0 = raw current sample
     float2 g_JitterDelta;            // subpixel projection jitter delta (jc - jp)
         uint   g_EnableMotionDilation;  // 1 = closest-depth motion dilation over the active 3x3 neighbours
@@ -76,8 +76,52 @@ float3 YCoCgtoRGB(float3 ycocg)
     return max(float3(0.0f, 0.0f, 0.0f), float3(R, G, B));
 }
 
-float3 ToClampSpace(float3 rgb)   { return (g_ColorSpace == 0u) ? RGBtoYCoCg(rgb) : rgb; }
-float3 FromClampSpace(float3 c)   { return (g_ColorSpace == 0u) ? YCoCgtoRGB(c) : c; }
+// ITU-R BT.2100 ICtCp color space transform for HDR10 and Wide Color Gamut (Rec.2020)
+float3 RGBtoICtCp(float3 rgb)
+{
+    float3 lms;
+    lms.x = dot(rgb, float3(0.3593094f, 0.6976081f, -0.0358878f));
+    lms.y = dot(rgb, float3(0.0828188f, 0.7938356f,  0.1233592f));
+    lms.z = dot(rgb, float3(0.0125411f, 0.0767544f,  0.9107026f));
+
+    float3 lmsPrime = sign(lms) * pow(abs(lms), float3(0.25f, 0.25f, 0.25f));
+
+    float3 ictcp;
+    ictcp.x = dot(lmsPrime, float3(0.5f, 0.5f, 0.0f));
+    ictcp.y = dot(lmsPrime, float3(1.613769f, -3.323439f, 1.709670f));
+    ictcp.z = dot(lmsPrime, float3(4.378183f, -4.245536f, -0.132647f));
+    return ictcp;
+}
+
+float3 ICtCptoRGB(float3 ictcp)
+{
+    float3 lmsPrime;
+    lmsPrime.x = ictcp.x + 0.00861421f * ictcp.y + 0.11102749f * ictcp.z;
+    lmsPrime.y = ictcp.x - 0.00861421f * ictcp.y - 0.11102749f * ictcp.z;
+    lmsPrime.z = ictcp.x + 0.56003196f * ictcp.y - 0.32062666f * ictcp.z;
+
+    float3 lms = sign(lmsPrime) * (lmsPrime * lmsPrime * lmsPrime * lmsPrime);
+
+    float3 rgb;
+    rgb.x = dot(lms, float3( 3.4811960f, -3.1132484f,  0.5588873f));
+    rgb.y = dot(lms, float3(-0.3604555f,  1.5987806f, -0.2307671f));
+    rgb.z = dot(lms, float3(-0.0175594f, -0.0918741f,  1.1098062f));
+    return max(float3(0.0f, 0.0f, 0.0f), rgb);
+}
+
+float3 ToClampSpace(float3 rgb)
+{
+    if (g_ColorSpace == 0u) return RGBtoYCoCg(rgb);
+    if (g_ColorSpace == 2u) return RGBtoICtCp(rgb);
+    return rgb;
+}
+
+float3 FromClampSpace(float3 c)
+{
+    if (g_ColorSpace == 0u) return YCoCgtoRGB(c);
+    if (g_ColorSpace == 2u) return ICtCptoRGB(c);
+    return c;
+}
 
 // =============================================================================
 // Checkerboard sample mapping. MIRRORS include/cbr/checkerboard_mapping.h: keep the two in sync

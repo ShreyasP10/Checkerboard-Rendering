@@ -49,7 +49,7 @@ layout(push_constant) uniform CBRConstants {
     uint  u_DebugView;              // 0=Normal, 1=Mask, 2=Disocclusion, 3=Motion, 4=Raw
     uint  u_EnableColorClamping;    // 1 = True, 0 = False
     float u_MipLodBias;             // Texture LOD bias (-1.0f: compensates for quarter-res 2x MSAA, see CHECKERBOARD.md)
-    uint  u_ColorSpace;             // 0 = YCoCg clamp, 1 = RGB clamp
+    uint  u_ColorSpace;             // 0 = YCoCg clamp, 1 = RGB clamp, 2 = ICtCp clamp (HDR10/BT.2100)
     uint  u_EnableSpatialFallback;  // 1 = cross-bilateral fallback, 0 = use raw current sample
     vec2  u_JitterDelta;            // Subpixel projection jitter delta (jc - jp)
     uint  u_EnableMotionDilation;   // 1 = closest-depth motion dilation over the active 3x3 neighbours
@@ -81,8 +81,47 @@ vec3 YCoCgtoRGB(vec3 ycocg) {
     return max(vec3(0.0), vec3(R, G, B));
 }
 
-vec3 ToClampSpace(vec3 rgb)  { return (pc.u_ColorSpace == 0u) ? RGBtoYCoCg(rgb) : rgb; }
-vec3 FromClampSpace(vec3 c)  { return (pc.u_ColorSpace == 0u) ? YCoCgtoRGB(c) : c; }
+// ITU-R BT.2100 ICtCp color space transform for HDR10 and Wide Color Gamut (Rec.2020)
+vec3 RGBtoICtCp(vec3 rgb) {
+    vec3 lms;
+    lms.x = dot(rgb, vec3(0.3593094, 0.6976081, -0.0358878));
+    lms.y = dot(rgb, vec3(0.0828188, 0.7938356,  0.1233592));
+    lms.z = dot(rgb, vec3(0.0125411, 0.0767544,  0.9107026));
+
+    vec3 lmsPrime = sign(lms) * pow(abs(lms), vec3(0.25));
+
+    vec3 ictcp;
+    ictcp.x = dot(lmsPrime, vec3(0.5, 0.5, 0.0));
+    ictcp.y = dot(lmsPrime, vec3(1.613769, -3.323439, 1.709670));
+    ictcp.z = dot(lmsPrime, vec3(4.378183, -4.245536, -0.132647));
+    return ictcp;
+}
+
+vec3 ICtCptoRGB(vec3 ictcp) {
+    vec3 lmsPrime;
+    lmsPrime.x = ictcp.x + 0.00861421 * ictcp.y + 0.11102749 * ictcp.z;
+    lmsPrime.y = ictcp.x - 0.00861421 * ictcp.y - 0.11102749 * ictcp.z;
+    lmsPrime.z = ictcp.x + 0.56003196 * ictcp.y - 0.32062666 * ictcp.z;
+
+    vec3 lms = sign(lmsPrime) * (lmsPrime * lmsPrime * lmsPrime * lmsPrime);
+
+    vec3 rgb;
+    rgb.x = dot(lms, vec3( 3.4811960, -3.1132484,  0.5588873));
+    rgb.y = dot(lms, vec3(-0.3604555,  1.5987806, -0.2307671));
+    rgb.z = dot(lms, vec3(-0.0175594, -0.0918741,  1.1098062));
+    return max(vec3(0.0), rgb);
+}
+
+vec3 ToClampSpace(vec3 rgb)  {
+    if (pc.u_ColorSpace == 0u) return RGBtoYCoCg(rgb);
+    if (pc.u_ColorSpace == 2u) return RGBtoICtCp(rgb);
+    return rgb;
+}
+vec3 FromClampSpace(vec3 c)  {
+    if (pc.u_ColorSpace == 0u) return YCoCgtoRGB(c);
+    if (pc.u_ColorSpace == 2u) return ICtCptoRGB(c);
+    return c;
+}
 
 // =============================================================================
 // Checkerboard sample mapping. MIRRORS include/cbr/checkerboard_mapping.h: keep the two in sync

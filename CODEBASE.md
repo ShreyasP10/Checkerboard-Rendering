@@ -799,7 +799,8 @@ enum class DepthConvention {
 
 enum class ColorSpace {
     YCoCg,
-    RGB
+    RGB,
+    ICtCp // HDR10 / BT.2100 Wide Color Gamut (Rec.2020) with perceptual quantization
 };
 
 enum class SamplingStrategy {
@@ -1324,7 +1325,7 @@ struct ReconstructionPushConstants {
     uint32_t debugView;
     uint32_t enableColorClamping;
     float    mipLodBias;
-    uint32_t colorSpace;            // 0 = YCoCg, 1 = RGB
+    uint32_t colorSpace;            // 0 = YCoCg, 1 = RGB, 2 = ICtCp (HDR10 / BT.2100)
     uint32_t enableSpatialFallback; // 1 = on
     float    jitterDelta[2];        // subpixel projection jitter delta (jc - jp)
     uint32_t enableMotionDilation;  // 1 = 3x3 closest-depth motion dilation
@@ -1533,6 +1534,7 @@ private:
 
 #include <atomic>
 #include <cstdint>
+#include "cbr/config.h"
 
 namespace cbr {
 
@@ -1548,6 +1550,9 @@ struct OverlayMetrics {
     double   vramFootprintMB{ 0.0 };
     bool     isHooked{ false };
 };
+
+// Function callback signature for custom in-game HUD or Dear ImGui renderers
+typedef void (*HudRenderCallback)(const OverlayMetrics& metrics);
 
 class UIOverlay {
 public:
@@ -1565,13 +1570,27 @@ public:
 
     OverlayMetrics GetCurrentMetrics() const;
 
+    // Interactive Control HUD API (Category 7, Item 96)
+    void SetHistoryWeight(float weight);
+    void SetDepthTolerance(float tolerance);
+    void SetMipLodBias(float bias);
+    void SetDebugView(DebugViewMode mode);
+    void SetColorSpace(ColorSpace colorSpace);
+    void SetColorClamping(bool enable);
+    void SetSpatialFallback(bool enable);
+    void SetMotionDilation(bool enable);
+    void SetCbrEnabled(bool enable);
+
+    void RegisterHudRenderCallback(HudRenderCallback callback);
+
 private:
     UIOverlay() = default;
     ~UIOverlay() = default;
 
-    std::atomic<bool> m_visible{ false };
-    std::atomic<bool> m_initialized{ false };
-    std::atomic<bool> m_lastHotkeyDown{ false };
+    std::atomic<bool>              m_visible{ false };
+    std::atomic<bool>              m_initialized{ false };
+    std::atomic<bool>              m_lastHotkeyDown{ false };
+    std::atomic<HudRenderCallback> m_hudCallback{ nullptr };
 };
 
 } // namespace cbr
@@ -2238,7 +2257,14 @@ bool ConfigManager::Load(const std::filesystem::path& configPath) {
             } else if (key == "EnableColorClamping") {
                 parsed.enableColorClamping = ParseBool(val, parsed.enableColorClamping);
             } else if (key == "ColorSpace") {
-                parsed.colorSpace = (ToUpper(val) == "RGB") ? ColorSpace::RGB : ColorSpace::YCoCg;
+                const std::string cs = ToUpper(val);
+                if (cs == "RGB") {
+                    parsed.colorSpace = ColorSpace::RGB;
+                } else if (cs == "ICTCP" || cs == "HDR" || cs == "BT2020") {
+                    parsed.colorSpace = ColorSpace::ICtCp;
+                } else {
+                    parsed.colorSpace = ColorSpace::YCoCg;
+                }
             } else if (key == "HistoryWeight") {
                 parsed.historyWeight = ParseFloat(val, parsed.historyWeight, 0.0f, 1.0f);
             } else if (key == "EnableSpatialFallback") {
@@ -2342,7 +2368,8 @@ bool ConfigManager::Save(const std::filesystem::path& configPath) {
     file << "[Reconstruction]\n";
     file << "DepthTolerance = " << snapshot.depthTolerance << "\n";
     file << "EnableColorClamping = " << (snapshot.enableColorClamping ? "true" : "false") << "\n";
-    file << "ColorSpace = " << (snapshot.colorSpace == ColorSpace::RGB ? "RGB" : "YCoCg") << "\n";
+    const char* csStr = (snapshot.colorSpace == ColorSpace::RGB) ? "RGB" : ((snapshot.colorSpace == ColorSpace::ICtCp) ? "ICtCp" : "YCoCg");
+    file << "ColorSpace = " << csStr << "\n";
     file << "HistoryWeight = " << snapshot.historyWeight << "\n";
     file << "EnableSpatialFallback = " << (snapshot.enableSpatialFallback ? "true" : "false") << "\n";
     file << "EnableMotionDilation = " << (snapshot.enableMotionDilation ? "true" : "false") << "\n";
@@ -4718,12 +4745,177 @@ void Logger::Log(LogLevel level, const std::string& message) {
 #include "cbr/jitter_manager.h"
 #include "cbr/logger.h"
 
+#if defined(_MSC_VER)
+#include <intrin.h>
+#elif defined(__GNUC__) || defined(__clang__)
+#include <cpuid.h>
+#endif
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#include <immintrin.h>
+#endif
+
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #endif
 
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpsabi"
+#endif
+
 namespace cbr {
+
+namespace {
+
+bool DetectAVX2() {
+#if defined(__x86_64__) || defined(_M_X64)
+#if defined(_MSC_VER)
+    int info[4] = { 0 };
+    __cpuid(info, 0);
+    if (info[0] >= 7) {
+        __cpuidex(info, 7, 0);
+        return (info[1] & (1 << 5)) != 0; // EBX bit 5 = AVX2
+    }
+#elif defined(__GNUC__) || defined(__clang__)
+    #if defined(__builtin_cpu_supports)
+    return __builtin_cpu_supports("avx2");
+    #else
+    unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
+    if (__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx)) {
+        return (ebx & (1u << 5)) != 0;
+    }
+    #endif
+#endif
+#endif
+    return false;
+}
+
+const bool g_hasAVX2 = DetectAVX2();
+
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC push_options
+#pragma GCC target("avx2")
+#endif
+
+#if defined(__x86_64__) || defined(_M_X64)
+const uint8_t* FindPatternAVX2(const uint8_t* base, size_t size, const char* signature, const char* mask, size_t maskLen) {
+    const size_t scanLimit = size - maskLen;
+    const uint8_t firstByte = static_cast<uint8_t>(signature[0]);
+    const __m256i target = _mm256_set1_epi8(static_cast<char>(firstByte));
+
+    size_t i = 0;
+    while (i + 32 <= scanLimit + 1) {
+        const __m256i chunk = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(base + i));
+        const __m256i cmp = _mm256_cmpeq_epi8(chunk, target);
+        uint32_t maskBits = static_cast<uint32_t>(_mm256_movemask_epi8(cmp));
+
+        while (maskBits != 0) {
+#if defined(_MSC_VER)
+            unsigned long bitIdx = 0;
+            _BitScanForward(&bitIdx, maskBits);
+#else
+            uint32_t bitIdx = static_cast<uint32_t>(__builtin_ctz(maskBits));
+#endif
+            const size_t candidateIdx = i + bitIdx;
+            if (candidateIdx <= scanLimit) {
+                bool match = true;
+                for (size_t j = 1; j < maskLen; ++j) {
+                    if (mask[j] == 'x' && base[candidateIdx + j] != static_cast<uint8_t>(signature[j])) {
+                        match = false;
+                        break;
+                    }
+                }
+                if (match) {
+                    return base + candidateIdx;
+                }
+            }
+            maskBits &= (maskBits - 1u);
+        }
+        i += 32;
+    }
+
+    for (; i <= scanLimit; ++i) {
+        if (base[i] == firstByte) {
+            bool match = true;
+            for (size_t j = 1; j < maskLen; ++j) {
+                if (mask[j] == 'x' && base[i + j] != static_cast<uint8_t>(signature[j])) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) return base + i;
+        }
+    }
+    return nullptr;
+}
+#endif
+
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC pop_options
+#pragma GCC push_options
+#pragma GCC target("sse2")
+#endif
+
+#if defined(__x86_64__) || defined(_M_X64)
+const uint8_t* FindPatternSSE2(const uint8_t* base, size_t size, const char* signature, const char* mask, size_t maskLen) {
+    const size_t scanLimit = size - maskLen;
+    const uint8_t firstByte = static_cast<uint8_t>(signature[0]);
+    const __m128i target = _mm_set1_epi8(static_cast<char>(firstByte));
+
+    size_t i = 0;
+    while (i + 16 <= scanLimit + 1) {
+        const __m128i chunk = _mm_loadu_si128(reinterpret_cast<const __m128i*>(base + i));
+        const __m128i cmp = _mm_cmpeq_epi8(chunk, target);
+        uint32_t maskBits = static_cast<uint32_t>(_mm_movemask_epi8(cmp));
+
+        while (maskBits != 0) {
+#if defined(_MSC_VER)
+            unsigned long bitIdx = 0;
+            _BitScanForward(&bitIdx, maskBits);
+#else
+            uint32_t bitIdx = static_cast<uint32_t>(__builtin_ctz(maskBits));
+#endif
+            const size_t candidateIdx = i + bitIdx;
+            if (candidateIdx <= scanLimit) {
+                bool match = true;
+                for (size_t j = 1; j < maskLen; ++j) {
+                    if (mask[j] == 'x' && base[candidateIdx + j] != static_cast<uint8_t>(signature[j])) {
+                        match = false;
+                        break;
+                    }
+                }
+                if (match) {
+                    return base + candidateIdx;
+                }
+            }
+            maskBits &= (maskBits - 1u);
+        }
+        i += 16;
+    }
+
+    for (; i <= scanLimit; ++i) {
+        if (base[i] == firstByte) {
+            bool match = true;
+            for (size_t j = 1; j < maskLen; ++j) {
+                if (mask[j] == 'x' && base[i + j] != static_cast<uint8_t>(signature[j])) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) return base + i;
+        }
+    }
+    return nullptr;
+}
+#endif
+
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC pop_options
+#pragma GCC diagnostic pop
+#endif
+
+} // namespace
 
 const uint8_t* PatternScanner::FindPattern(const uint8_t* base, size_t size, const char* signature, const char* mask) {
     if (!base || size == 0 || !signature || !mask) {
@@ -4735,8 +4927,18 @@ const uint8_t* PatternScanner::FindPattern(const uint8_t* base, size_t size, con
         return nullptr;
     }
 
-    const size_t scanLimit = size - maskLen;
     const bool firstByteFixed = (mask[0] == 'x');
+    if (firstByteFixed) {
+#if defined(__x86_64__) || defined(_M_X64)
+        if (g_hasAVX2 && (size - maskLen) >= 32) {
+            return FindPatternAVX2(base, size, signature, mask, maskLen);
+        } else if ((size - maskLen) >= 16) {
+            return FindPatternSSE2(base, size, signature, mask, maskLen);
+        }
+#endif
+    }
+
+    const size_t scanLimit = size - maskLen;
     const uint8_t firstByte = static_cast<uint8_t>(signature[0]);
 
     for (size_t i = 0; i <= scanLimit; ) {
@@ -5883,7 +6085,7 @@ ReconstructionPushConstants BuildReconstructionPushConstants(uint32_t frameIndex
     pc.debugView = config.debugView;
     pc.enableColorClamping = config.enableColorClamping ? 1u : 0u;
     pc.mipLodBias = config.mipLodBias;
-    pc.colorSpace = (config.colorSpace == ColorSpace::RGB) ? 1u : 0u;
+    pc.colorSpace = (config.colorSpace == ColorSpace::RGB) ? 1u : ((config.colorSpace == ColorSpace::ICtCp) ? 2u : 0u);
     pc.enableSpatialFallback = config.enableSpatialFallback ? 1u : 0u;
     pc.jitterDelta[0] = jitterDelta.x;
     pc.jitterDelta[1] = jitterDelta.y;
@@ -6593,6 +6795,7 @@ bool RenderTargetManager::IsQuarterPassCandidate(uint32_t width, uint32_t height
 ### `src/ui_overlay.cpp`
 ```cpp
 #include "cbr/ui_overlay.h"
+#include <algorithm>
 #include "cbr/config.h"
 #include "cbr/cbr_engine.h"
 #include "cbr/render_target_manager.h"
@@ -6692,6 +6895,65 @@ OverlayMetrics UIOverlay::GetCurrentMetrics() const {
     return metrics;
 }
 
+void UIOverlay::SetHistoryWeight(float weight) {
+    const float clamped = std::clamp(weight, 0.0f, 1.0f);
+    ConfigManager::Get().Modify([clamped](CBRConfig& c) {
+        c.historyWeight = clamped;
+    });
+}
+
+void UIOverlay::SetDepthTolerance(float tolerance) {
+    const float clamped = std::clamp(tolerance, 1e-5f, 1.0f);
+    ConfigManager::Get().Modify([clamped](CBRConfig& c) {
+        c.depthTolerance = clamped;
+    });
+}
+
+void UIOverlay::SetMipLodBias(float bias) {
+    const float clamped = std::clamp(bias, -4.0f, 4.0f);
+    ConfigManager::Get().Modify([clamped](CBRConfig& c) {
+        c.mipLodBias = clamped;
+    });
+}
+
+void UIOverlay::SetDebugView(DebugViewMode mode) {
+    ConfigManager::Get().Modify([mode](CBRConfig& c) {
+        c.debugView = static_cast<uint32_t>(mode);
+    });
+}
+
+void UIOverlay::SetColorSpace(ColorSpace colorSpace) {
+    ConfigManager::Get().Modify([colorSpace](CBRConfig& c) {
+        c.colorSpace = colorSpace;
+    });
+}
+
+void UIOverlay::SetColorClamping(bool enable) {
+    ConfigManager::Get().Modify([enable](CBRConfig& c) {
+        c.enableColorClamping = enable;
+    });
+}
+
+void UIOverlay::SetSpatialFallback(bool enable) {
+    ConfigManager::Get().Modify([enable](CBRConfig& c) {
+        c.enableSpatialFallback = enable;
+    });
+}
+
+void UIOverlay::SetMotionDilation(bool enable) {
+    ConfigManager::Get().Modify([enable](CBRConfig& c) {
+        c.enableMotionDilation = enable;
+    });
+}
+
+void UIOverlay::SetCbrEnabled(bool enable) {
+    CBREngine::Get().SetEnabled(enable);
+}
+
+void UIOverlay::RegisterHudRenderCallback(HudRenderCallback callback) {
+    m_hudCallback.store(callback, std::memory_order_release);
+}
+
 void UIOverlay::Render() {
     // Check toggle hotkeys every presentation interval regardless of current visibility
     CheckHotkeys();
@@ -6700,12 +6962,10 @@ void UIOverlay::Render() {
         return;
     }
 
-    // Diagnostics are ready for presentation when ImGui context is bound:
-    // Controls:
-    //   - CBREngine::Get().SetEnabled(...)
-    //   - ConfigManager::Get().Modify(...) for debugView, historyWeight, depthTolerance, mipLodBias
-    // Telemetry:
-    //   - GetCurrentMetrics()
+    auto cb = m_hudCallback.load(std::memory_order_acquire);
+    if (cb) {
+        cb(GetCurrentMetrics());
+    }
 }
 
 } // namespace cbr
@@ -6768,7 +7028,7 @@ layout(push_constant) uniform CBRConstants {
     uint  u_DebugView;              // 0=Normal, 1=Mask, 2=Disocclusion, 3=Motion, 4=Raw
     uint  u_EnableColorClamping;    // 1 = True, 0 = False
     float u_MipLodBias;             // Texture LOD bias (-1.0f: compensates for quarter-res 2x MSAA, see CHECKERBOARD.md)
-    uint  u_ColorSpace;             // 0 = YCoCg clamp, 1 = RGB clamp
+    uint  u_ColorSpace;             // 0 = YCoCg clamp, 1 = RGB clamp, 2 = ICtCp clamp (HDR10/BT.2100)
     uint  u_EnableSpatialFallback;  // 1 = cross-bilateral fallback, 0 = use raw current sample
     vec2  u_JitterDelta;            // Subpixel projection jitter delta (jc - jp)
     uint  u_EnableMotionDilation;   // 1 = closest-depth motion dilation over the active 3x3 neighbours
@@ -6800,8 +7060,47 @@ vec3 YCoCgtoRGB(vec3 ycocg) {
     return max(vec3(0.0), vec3(R, G, B));
 }
 
-vec3 ToClampSpace(vec3 rgb)  { return (pc.u_ColorSpace == 0u) ? RGBtoYCoCg(rgb) : rgb; }
-vec3 FromClampSpace(vec3 c)  { return (pc.u_ColorSpace == 0u) ? YCoCgtoRGB(c) : c; }
+// ITU-R BT.2100 ICtCp color space transform for HDR10 and Wide Color Gamut (Rec.2020)
+vec3 RGBtoICtCp(vec3 rgb) {
+    vec3 lms;
+    lms.x = dot(rgb, vec3(0.3593094, 0.6976081, -0.0358878));
+    lms.y = dot(rgb, vec3(0.0828188, 0.7938356,  0.1233592));
+    lms.z = dot(rgb, vec3(0.0125411, 0.0767544,  0.9107026));
+
+    vec3 lmsPrime = sign(lms) * pow(abs(lms), vec3(0.25));
+
+    vec3 ictcp;
+    ictcp.x = dot(lmsPrime, vec3(0.5, 0.5, 0.0));
+    ictcp.y = dot(lmsPrime, vec3(1.613769, -3.323439, 1.709670));
+    ictcp.z = dot(lmsPrime, vec3(4.378183, -4.245536, -0.132647));
+    return ictcp;
+}
+
+vec3 ICtCptoRGB(vec3 ictcp) {
+    vec3 lmsPrime;
+    lmsPrime.x = ictcp.x + 0.00861421 * ictcp.y + 0.11102749 * ictcp.z;
+    lmsPrime.y = ictcp.x - 0.00861421 * ictcp.y - 0.11102749 * ictcp.z;
+    lmsPrime.z = ictcp.x + 0.56003196 * ictcp.y - 0.32062666 * ictcp.z;
+
+    vec3 lms = sign(lmsPrime) * (lmsPrime * lmsPrime * lmsPrime * lmsPrime);
+
+    vec3 rgb;
+    rgb.x = dot(lms, vec3( 3.4811960, -3.1132484,  0.5588873));
+    rgb.y = dot(lms, vec3(-0.3604555,  1.5987806, -0.2307671));
+    rgb.z = dot(lms, vec3(-0.0175594, -0.0918741,  1.1098062));
+    return max(vec3(0.0), rgb);
+}
+
+vec3 ToClampSpace(vec3 rgb)  {
+    if (pc.u_ColorSpace == 0u) return RGBtoYCoCg(rgb);
+    if (pc.u_ColorSpace == 2u) return RGBtoICtCp(rgb);
+    return rgb;
+}
+vec3 FromClampSpace(vec3 c)  {
+    if (pc.u_ColorSpace == 0u) return YCoCgtoRGB(c);
+    if (pc.u_ColorSpace == 2u) return ICtCptoRGB(c);
+    return c;
+}
 
 // =============================================================================
 // Checkerboard sample mapping. MIRRORS include/cbr/checkerboard_mapping.h: keep the two in sync
@@ -7177,6 +7476,8 @@ void main() {
 ### `shaders/cbr_reconstruct_quad.comp`
 ```glsl
 #version 450 core
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_quad : enable
 
 /**
  * RDR2 Checkerboard Rendering Mod (CBR) - Quad-Based Reconstruction Compute Shader
@@ -7213,7 +7514,7 @@ layout(push_constant) uniform CBRConstants {
     uint  u_DebugView;              // 0=Normal, 1=Mask, 2=Disocclusion, 3=Motion, 4=Raw
     uint  u_EnableColorClamping;    // 1 = True, 0 = False
     float u_MipLodBias;             // Texture LOD bias (-1.0 per CHECKERBOARD.md)
-    uint  u_ColorSpace;             // 0 = YCoCg clamp, 1 = RGB clamp
+    uint  u_ColorSpace;             // 0 = YCoCg clamp, 1 = RGB clamp, 2 = ICtCp clamp (HDR10/BT.2100)
     uint  u_EnableSpatialFallback;  // 1 = cross-bilateral fallback
     vec2  u_JitterDelta;            // Subpixel projection jitter delta
     uint  u_EnableMotionDilation;  // 1 = closest-depth motion dilation
@@ -7241,8 +7542,47 @@ vec3 YCoCgtoRGB(vec3 ycocg) {
     return max(vec3(0.0), vec3(R, G, B));
 }
 
-vec3 ToClampSpace(vec3 rgb)  { return (pc.u_ColorSpace == 0u) ? RGBtoYCoCg(rgb) : rgb; }
-vec3 FromClampSpace(vec3 c)  { return (pc.u_ColorSpace == 0u) ? YCoCgtoRGB(c) : c; }
+// ITU-R BT.2100 ICtCp color space transform for HDR10 and Wide Color Gamut (Rec.2020)
+vec3 RGBtoICtCp(vec3 rgb) {
+    vec3 lms;
+    lms.x = dot(rgb, vec3(0.3593094, 0.6976081, -0.0358878));
+    lms.y = dot(rgb, vec3(0.0828188, 0.7938356,  0.1233592));
+    lms.z = dot(rgb, vec3(0.0125411, 0.0767544,  0.9107026));
+
+    vec3 lmsPrime = sign(lms) * pow(abs(lms), vec3(0.25));
+
+    vec3 ictcp;
+    ictcp.x = dot(lmsPrime, vec3(0.5, 0.5, 0.0));
+    ictcp.y = dot(lmsPrime, vec3(1.613769, -3.323439, 1.709670));
+    ictcp.z = dot(lmsPrime, vec3(4.378183, -4.245536, -0.132647));
+    return ictcp;
+}
+
+vec3 ICtCptoRGB(vec3 ictcp) {
+    vec3 lmsPrime;
+    lmsPrime.x = ictcp.x + 0.00861421 * ictcp.y + 0.11102749 * ictcp.z;
+    lmsPrime.y = ictcp.x - 0.00861421 * ictcp.y - 0.11102749 * ictcp.z;
+    lmsPrime.z = ictcp.x + 0.56003196 * ictcp.y - 0.32062666 * ictcp.z;
+
+    vec3 lms = sign(lmsPrime) * (lmsPrime * lmsPrime * lmsPrime * lmsPrime);
+
+    vec3 rgb;
+    rgb.x = dot(lms, vec3( 3.4811960, -3.1132484,  0.5588873));
+    rgb.y = dot(lms, vec3(-0.3604555,  1.5987806, -0.2307671));
+    rgb.z = dot(lms, vec3(-0.0175594, -0.0918741,  1.1098062));
+    return max(vec3(0.0), rgb);
+}
+
+vec3 ToClampSpace(vec3 rgb)  {
+    if (pc.u_ColorSpace == 0u) return RGBtoYCoCg(rgb);
+    if (pc.u_ColorSpace == 2u) return RGBtoICtCp(rgb);
+    return rgb;
+}
+vec3 FromClampSpace(vec3 c)  {
+    if (pc.u_ColorSpace == 0u) return YCoCgtoRGB(c);
+    if (pc.u_ColorSpace == 2u) return ICtCptoRGB(c);
+    return c;
+}
 
 struct CbrSample {
     bool  isActive;
@@ -7592,7 +7932,7 @@ cbuffer CBRConstants : register(b0)
     uint   g_DebugView;              // 0=Normal, 1=Mask, 2=Disocclusion, 3=Motion, 4=Raw
     uint   g_EnableColorClamping;    // 1 = True, 0 = False
     float  g_MipLodBias;             // Texture LOD bias (-0.5f)
-    uint   g_ColorSpace;             // 0 = YCoCg clamp, 1 = RGB clamp
+    uint   g_ColorSpace;             // 0 = YCoCg clamp, 1 = RGB clamp, 2 = ICtCp clamp (HDR10/BT.2100)
     uint   g_EnableSpatialFallback;  // 1 = cross-bilateral fallback, 0 = raw current sample
     float2 g_JitterDelta;            // subpixel projection jitter delta (jc - jp)
         uint   g_EnableMotionDilation;  // 1 = closest-depth motion dilation over the active 3x3 neighbours
@@ -7626,8 +7966,52 @@ float3 YCoCgtoRGB(float3 ycocg)
     return max(float3(0.0f, 0.0f, 0.0f), float3(R, G, B));
 }
 
-float3 ToClampSpace(float3 rgb)   { return (g_ColorSpace == 0u) ? RGBtoYCoCg(rgb) : rgb; }
-float3 FromClampSpace(float3 c)   { return (g_ColorSpace == 0u) ? YCoCgtoRGB(c) : c; }
+// ITU-R BT.2100 ICtCp color space transform for HDR10 and Wide Color Gamut (Rec.2020)
+float3 RGBtoICtCp(float3 rgb)
+{
+    float3 lms;
+    lms.x = dot(rgb, float3(0.3593094f, 0.6976081f, -0.0358878f));
+    lms.y = dot(rgb, float3(0.0828188f, 0.7938356f,  0.1233592f));
+    lms.z = dot(rgb, float3(0.0125411f, 0.0767544f,  0.9107026f));
+
+    float3 lmsPrime = sign(lms) * pow(abs(lms), float3(0.25f, 0.25f, 0.25f));
+
+    float3 ictcp;
+    ictcp.x = dot(lmsPrime, float3(0.5f, 0.5f, 0.0f));
+    ictcp.y = dot(lmsPrime, float3(1.613769f, -3.323439f, 1.709670f));
+    ictcp.z = dot(lmsPrime, float3(4.378183f, -4.245536f, -0.132647f));
+    return ictcp;
+}
+
+float3 ICtCptoRGB(float3 ictcp)
+{
+    float3 lmsPrime;
+    lmsPrime.x = ictcp.x + 0.00861421f * ictcp.y + 0.11102749f * ictcp.z;
+    lmsPrime.y = ictcp.x - 0.00861421f * ictcp.y - 0.11102749f * ictcp.z;
+    lmsPrime.z = ictcp.x + 0.56003196f * ictcp.y - 0.32062666f * ictcp.z;
+
+    float3 lms = sign(lmsPrime) * (lmsPrime * lmsPrime * lmsPrime * lmsPrime);
+
+    float3 rgb;
+    rgb.x = dot(lms, float3( 3.4811960f, -3.1132484f,  0.5588873f));
+    rgb.y = dot(lms, float3(-0.3604555f,  1.5987806f, -0.2307671f));
+    rgb.z = dot(lms, float3(-0.0175594f, -0.0918741f,  1.1098062f));
+    return max(float3(0.0f, 0.0f, 0.0f), rgb);
+}
+
+float3 ToClampSpace(float3 rgb)
+{
+    if (g_ColorSpace == 0u) return RGBtoYCoCg(rgb);
+    if (g_ColorSpace == 2u) return RGBtoICtCp(rgb);
+    return rgb;
+}
+
+float3 FromClampSpace(float3 c)
+{
+    if (g_ColorSpace == 0u) return YCoCgtoRGB(c);
+    if (g_ColorSpace == 2u) return ICtCptoRGB(c);
+    return c;
+}
 
 // =============================================================================
 // Checkerboard sample mapping. MIRRORS include/cbr/checkerboard_mapping.h: keep the two in sync
@@ -8478,6 +8862,12 @@ static void TestPushConstantBuilder() {
     const ReconstructionPushConstants pc2 = BuildReconstructionPushConstants(0);
     CHECK(pc2.enableSpatialFallback == 1u && pc2.enableMotionDilation == 1u && pc2.colorSpace == 0u);
     CHECK(pc2.shiftDirection == 1 && pc2.depthMode == 1u && pc2.depthFar == 0.0f);
+
+    ConfigManager::Get().Modify([](CBRConfig& c) {
+        c.colorSpace = ColorSpace::ICtCp;
+    });
+    const ReconstructionPushConstants pc3 = BuildReconstructionPushConstants(0);
+    CHECK(pc3.colorSpace == 2u);
 }
 
 static void TestRenderTargets() {
@@ -8625,6 +9015,24 @@ static void TestPatternScanner() {
     // 3. Negative search (pattern not present)
     const uint8_t* notFound = PatternScanner::FindIdaPattern(mockMemory, sizeof(mockMemory), "FF 15 ? ? ? ?");
     CHECK(notFound == nullptr);
+
+    // 3b. SIMD (SSE2/AVX2) buffer testing with large buffers and non-trivial offsets
+    uint8_t largeMemory[256];
+    std::memset(largeMemory, 0x90, sizeof(largeMemory));
+    // Embed pattern at offset 73 (crosses 32-byte and 16-byte SIMD chunk boundaries)
+    const uint8_t targetSignature[] = { 0x48, 0x8B, 0x05, 0xAA, 0xBB, 0xCC, 0xDD, 0x48, 0x8B, 0x48, 0x08 };
+    std::memcpy(largeMemory + 73, targetSignature, sizeof(targetSignature));
+    const uint8_t* foundSimd = PatternScanner::FindIdaPattern(largeMemory, sizeof(largeMemory), "48 8B 05 ? ? ? ? 48 8B 48 08");
+    CHECK(foundSimd == largeMemory + 73);
+
+    // 3c. SIMD false-positive prefix rejection (first byte matches multiple times, rest differs)
+    largeMemory[10] = 0x48;
+    largeMemory[11] = 0x00;
+    largeMemory[32] = 0x48;
+    largeMemory[33] = 0x8B;
+    largeMemory[34] = 0x00; // mismatch
+    const uint8_t* foundPrefixReject = PatternScanner::FindIdaPattern(largeMemory, sizeof(largeMemory), "48 8B 05 ? ? ? ? 48 8B 48 08");
+    CHECK(foundPrefixReject == largeMemory + 73);
 
     // 4. RIP-relative resolution: instruction address + instruction length + displacement
     // Instruction starts at mockMemory + 3, length is 7 bytes (48 8B 05 12 34 00 00), displacement is 0x00003412
@@ -8826,6 +9234,26 @@ static void RunVulkanTests() {
     CHECK(metrics.cbrEnabled == true);
     CHECK(metrics.vramFootprintMiB > 300.0);
     CHECK(metrics.vramFootprintMB > 310.0);
+
+    // Interactive HUD control testing (Item 96)
+    ui.SetHistoryWeight(0.75f);
+    CHECK(ConfigManager::Get().GetConfig().historyWeight == 0.75f);
+    ui.SetDepthTolerance(0.025f);
+    CHECK(ConfigManager::Get().GetConfig().depthTolerance == 0.025f);
+    ui.SetMipLodBias(-1.5f);
+    CHECK(ConfigManager::Get().GetConfig().mipLodBias == -1.5f);
+    ui.SetDebugView(DebugViewMode::DisocclusionHeatmap);
+    CHECK(ConfigManager::Get().GetConfig().debugView == 2u);
+    ui.SetColorSpace(ColorSpace::ICtCp);
+    CHECK(ConfigManager::Get().GetConfig().colorSpace == ColorSpace::ICtCp);
+
+    static bool s_customHudRendered = false;
+    ui.RegisterHudRenderCallback([](const OverlayMetrics& m) {
+        if (m.targetWidth == 3840) s_customHudRendered = true;
+    });
+    ui.SetVisible(true);
+    ui.Render();
+    CHECK(s_customHudRendered);
 }
 
 static void RunAutoTests() {

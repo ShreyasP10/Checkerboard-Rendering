@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include "cbr/config.h"
 
 namespace cbr {
 
@@ -17,6 +18,9 @@ struct OverlayMetrics {
     double   vramFootprintMB{ 0.0 };
     bool     isHooked{ false };
 };
+
+// Function callback signature for custom in-game HUD or Dear ImGui renderers
+typedef void (*HudRenderCallback)(const OverlayMetrics& metrics);
 
 class UIOverlay {
 public:
@@ -34,13 +38,27 @@ public:
 
     OverlayMetrics GetCurrentMetrics() const;
 
+    // Interactive Control HUD API (Category 7, Item 96)
+    void SetHistoryWeight(float weight);
+    void SetDepthTolerance(float tolerance);
+    void SetMipLodBias(float bias);
+    void SetDebugView(DebugViewMode mode);
+    void SetColorSpace(ColorSpace colorSpace);
+    void SetColorClamping(bool enable);
+    void SetSpatialFallback(bool enable);
+    void SetMotionDilation(bool enable);
+    void SetCbrEnabled(bool enable);
+
+    void RegisterHudRenderCallback(HudRenderCallback callback);
+
 private:
     UIOverlay() = default;
     ~UIOverlay() = default;
 
-    std::atomic<bool> m_visible{ false };
-    std::atomic<bool> m_initialized{ false };
-    std::atomic<bool> m_lastHotkeyDown{ false };
+    std::atomic<bool>              m_visible{ false };
+    std::atomic<bool>              m_initialized{ false };
+    std::atomic<bool>              m_lastHotkeyDown{ false };
+    std::atomic<HudRenderCallback> m_hudCallback{ nullptr };
 };
 
 } // namespace cbr

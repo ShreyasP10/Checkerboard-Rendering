@@ -5,12 +5,177 @@
 #include "cbr/jitter_manager.h"
 #include "cbr/logger.h"
 
+#if defined(_MSC_VER)
+#include <intrin.h>
+#elif defined(__GNUC__) || defined(__clang__)
+#include <cpuid.h>
+#endif
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#include <immintrin.h>
+#endif
+
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #endif
 
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpsabi"
+#endif
+
 namespace cbr {
+
+namespace {
+
+bool DetectAVX2() {
+#if defined(__x86_64__) || defined(_M_X64)
+#if defined(_MSC_VER)
+    int info[4] = { 0 };
+    __cpuid(info, 0);
+    if (info[0] >= 7) {
+        __cpuidex(info, 7, 0);
+        return (info[1] & (1 << 5)) != 0; // EBX bit 5 = AVX2
+    }
+#elif defined(__GNUC__) || defined(__clang__)
+    #if defined(__builtin_cpu_supports)
+    return __builtin_cpu_supports("avx2");
+    #else
+    unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
+    if (__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx)) {
+        return (ebx & (1u << 5)) != 0;
+    }
+    #endif
+#endif
+#endif
+    return false;
+}
+
+const bool g_hasAVX2 = DetectAVX2();
+
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC push_options
+#pragma GCC target("avx2")
+#endif
+
+#if defined(__x86_64__) || defined(_M_X64)
+const uint8_t* FindPatternAVX2(const uint8_t* base, size_t size, const char* signature, const char* mask, size_t maskLen) {
+    const size_t scanLimit = size - maskLen;
+    const uint8_t firstByte = static_cast<uint8_t>(signature[0]);
+    const __m256i target = _mm256_set1_epi8(static_cast<char>(firstByte));
+
+    size_t i = 0;
+    while (i + 32 <= scanLimit + 1) {
+        const __m256i chunk = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(base + i));
+        const __m256i cmp = _mm256_cmpeq_epi8(chunk, target);
+        uint32_t maskBits = static_cast<uint32_t>(_mm256_movemask_epi8(cmp));
+
+        while (maskBits != 0) {
+#if defined(_MSC_VER)
+            unsigned long bitIdx = 0;
+            _BitScanForward(&bitIdx, maskBits);
+#else
+            uint32_t bitIdx = static_cast<uint32_t>(__builtin_ctz(maskBits));
+#endif
+            const size_t candidateIdx = i + bitIdx;
+            if (candidateIdx <= scanLimit) {
+                bool match = true;
+                for (size_t j = 1; j < maskLen; ++j) {
+                    if (mask[j] == 'x' && base[candidateIdx + j] != static_cast<uint8_t>(signature[j])) {
+                        match = false;
+                        break;
+                    }
+                }
+                if (match) {
+                    return base + candidateIdx;
+                }
+            }
+            maskBits &= (maskBits - 1u);
+        }
+        i += 32;
+    }
+
+    for (; i <= scanLimit; ++i) {
+        if (base[i] == firstByte) {
+            bool match = true;
+            for (size_t j = 1; j < maskLen; ++j) {
+                if (mask[j] == 'x' && base[i + j] != static_cast<uint8_t>(signature[j])) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) return base + i;
+        }
+    }
+    return nullptr;
+}
+#endif
+
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC pop_options
+#pragma GCC push_options
+#pragma GCC target("sse2")
+#endif
+
+#if defined(__x86_64__) || defined(_M_X64)
+const uint8_t* FindPatternSSE2(const uint8_t* base, size_t size, const char* signature, const char* mask, size_t maskLen) {
+    const size_t scanLimit = size - maskLen;
+    const uint8_t firstByte = static_cast<uint8_t>(signature[0]);
+    const __m128i target = _mm_set1_epi8(static_cast<char>(firstByte));
+
+    size_t i = 0;
+    while (i + 16 <= scanLimit + 1) {
+        const __m128i chunk = _mm_loadu_si128(reinterpret_cast<const __m128i*>(base + i));
+        const __m128i cmp = _mm_cmpeq_epi8(chunk, target);
+        uint32_t maskBits = static_cast<uint32_t>(_mm_movemask_epi8(cmp));
+
+        while (maskBits != 0) {
+#if defined(_MSC_VER)
+            unsigned long bitIdx = 0;
+            _BitScanForward(&bitIdx, maskBits);
+#else
+            uint32_t bitIdx = static_cast<uint32_t>(__builtin_ctz(maskBits));
+#endif
+            const size_t candidateIdx = i + bitIdx;
+            if (candidateIdx <= scanLimit) {
+                bool match = true;
+                for (size_t j = 1; j < maskLen; ++j) {
+                    if (mask[j] == 'x' && base[candidateIdx + j] != static_cast<uint8_t>(signature[j])) {
+                        match = false;
+                        break;
+                    }
+                }
+                if (match) {
+                    return base + candidateIdx;
+                }
+            }
+            maskBits &= (maskBits - 1u);
+        }
+        i += 16;
+    }
+
+    for (; i <= scanLimit; ++i) {
+        if (base[i] == firstByte) {
+            bool match = true;
+            for (size_t j = 1; j < maskLen; ++j) {
+                if (mask[j] == 'x' && base[i + j] != static_cast<uint8_t>(signature[j])) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) return base + i;
+        }
+    }
+    return nullptr;
+}
+#endif
+
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC pop_options
+#pragma GCC diagnostic pop
+#endif
+
+} // namespace
 
 const uint8_t* PatternScanner::FindPattern(const uint8_t* base, size_t size, const char* signature, const char* mask) {
     if (!base || size == 0 || !signature || !mask) {
@@ -22,8 +187,18 @@ const uint8_t* PatternScanner::FindPattern(const uint8_t* base, size_t size, con
         return nullptr;
     }
 
-    const size_t scanLimit = size - maskLen;
     const bool firstByteFixed = (mask[0] == 'x');
+    if (firstByteFixed) {
+#if defined(__x86_64__) || defined(_M_X64)
+        if (g_hasAVX2 && (size - maskLen) >= 32) {
+            return FindPatternAVX2(base, size, signature, mask, maskLen);
+        } else if ((size - maskLen) >= 16) {
+            return FindPatternSSE2(base, size, signature, mask, maskLen);
+        }
+#endif
+    }
+
+    const size_t scanLimit = size - maskLen;
     const uint8_t firstByte = static_cast<uint8_t>(signature[0]);
 
     for (size_t i = 0; i <= scanLimit; ) {

@@ -28,7 +28,8 @@ enum class DepthConvention {
 
 enum class ColorSpace {
     YCoCg,
-    RGB
+    RGB,
+    ICtCp // HDR10 / BT.2100 Wide Color Gamut (Rec.2020) with perceptual quantization
 };
 
 enum class SamplingStrategy {

@@ -17,7 +17,7 @@ struct ReconstructionPushConstants {
     uint32_t debugView;
     uint32_t enableColorClamping;
     float    mipLodBias;
-    uint32_t colorSpace;            // 0 = YCoCg, 1 = RGB
+    uint32_t colorSpace;            // 0 = YCoCg, 1 = RGB, 2 = ICtCp (HDR10 / BT.2100)
     uint32_t enableSpatialFallback; // 1 = on
     float    jitterDelta[2];        // subpixel projection jitter delta (jc - jp)
     uint32_t enableMotionDilation;  // 1 = 3x3 closest-depth motion dilation

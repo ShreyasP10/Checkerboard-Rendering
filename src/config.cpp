@@ -215,7 +215,14 @@ bool ConfigManager::Load(const std::filesystem::path& configPath) {
             } else if (key == "EnableColorClamping") {
                 parsed.enableColorClamping = ParseBool(val, parsed.enableColorClamping);
             } else if (key == "ColorSpace") {
-                parsed.colorSpace = (ToUpper(val) == "RGB") ? ColorSpace::RGB : ColorSpace::YCoCg;
+                const std::string cs = ToUpper(val);
+                if (cs == "RGB") {
+                    parsed.colorSpace = ColorSpace::RGB;
+                } else if (cs == "ICTCP" || cs == "HDR" || cs == "BT2020") {
+                    parsed.colorSpace = ColorSpace::ICtCp;
+                } else {
+                    parsed.colorSpace = ColorSpace::YCoCg;
+                }
             } else if (key == "HistoryWeight") {
                 parsed.historyWeight = ParseFloat(val, parsed.historyWeight, 0.0f, 1.0f);
             } else if (key == "EnableSpatialFallback") {
@@ -319,7 +326,8 @@ bool ConfigManager::Save(const std::filesystem::path& configPath) {
     file << "[Reconstruction]\n";
     file << "DepthTolerance = " << snapshot.depthTolerance << "\n";
     file << "EnableColorClamping = " << (snapshot.enableColorClamping ? "true" : "false") << "\n";
-    file << "ColorSpace = " << (snapshot.colorSpace == ColorSpace::RGB ? "RGB" : "YCoCg") << "\n";
+    const char* csStr = (snapshot.colorSpace == ColorSpace::RGB) ? "RGB" : ((snapshot.colorSpace == ColorSpace::ICtCp) ? "ICtCp" : "YCoCg");
+    file << "ColorSpace = " << csStr << "\n";
     file << "HistoryWeight = " << snapshot.historyWeight << "\n";
     file << "EnableSpatialFallback = " << (snapshot.enableSpatialFallback ? "true" : "false") << "\n";
     file << "EnableMotionDilation = " << (snapshot.enableMotionDilation ? "true" : "false") << "\n";
