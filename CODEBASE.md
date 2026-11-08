@@ -7456,7 +7456,6 @@ void main() {
 <a id="teststestcorecpp"></a>
 ### `tests/test_core.cpp`
 ```cpp
-#include "cbr/cbr_engine.h"
 #include "cbr/checkerboard_mapping.h"
 #include "cbr/config.h"
 #include "cbr/crash_handler.h"
@@ -8005,8 +8004,8 @@ static void TestPatternScanner() {
     CHECK(ripTarget == (mockMemory + 3 + 7 + expectedDisplacement));
 }
 
-static void TestCrashHandlerAndSecurity(const fs::path& dir) {
-    // 1. Crash handler installation and telemetry
+static void TestCrashHandler(const fs::path& dir) {
+    // Crash handler installation and telemetry
     auto& handler = CrashHandler::Get();
     CHECK(!handler.IsInstalled());
     handler.Install(dir);
@@ -8014,10 +8013,6 @@ static void TestCrashHandlerAndSecurity(const fs::path& dir) {
     handler.LogSystemTelemetry();
     handler.Uninstall();
     CHECK(!handler.IsInstalled());
-
-    // 2. Anti-cheat safety check (clean test environment)
-    auto& engine = CBREngine::Get();
-    CHECK(!engine.CheckAntiCheatModules());
 }
 
 int main() {
@@ -8036,7 +8031,7 @@ int main() {
     TestProjectionJitterSign();
     TestReconstructionPass(dir);
     TestPatternScanner();
-    TestCrashHandlerAndSecurity(dir);
+    TestCrashHandler(dir);
 
     fs::remove_all(dir);
     if (g_failures == 0) {
@@ -8112,6 +8107,7 @@ static void RunVulkanTests() {
     auto& rt = RenderTargetManager::Get();
 
     CHECK(e.Initialize());
+    CHECK(!e.CheckAntiCheatModules());
     CHECK(e.GetActiveApi() == GraphicsApi::Vulkan);
     CHECK(g_vulkanAttempts.load() == 0);                  // Initialize() must not install hooks itself
 

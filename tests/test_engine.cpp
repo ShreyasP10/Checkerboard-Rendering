@@ -59,6 +59,7 @@ static void RunVulkanTests() {
     auto& rt = RenderTargetManager::Get();
 
     CHECK(e.Initialize());
+    CHECK(!e.CheckAntiCheatModules());
     CHECK(e.GetActiveApi() == GraphicsApi::Vulkan);
     CHECK(g_vulkanAttempts.load() == 0);                  // Initialize() must not install hooks itself
 
