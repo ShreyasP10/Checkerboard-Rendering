@@ -256,6 +256,14 @@ bool PatternScanner::UpdateCameraJitter(uint32_t frameIndex, bool isVulkan) {
             return false;
         }
 #else
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(g_cachedCameraMatrix, &mbi, sizeof(mbi)) != sizeof(mbi) ||
+            mbi.State != MEM_COMMIT ||
+            (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) == 0) {
+            g_cachedCameraMatrix = nullptr;
+            CBR_LOG_WARN("Camera projection matrix memory unreadable or not committed; falling back to Viewport Redirection.");
+            return false;
+        }
         try {
             JitterManager::Get().Update(frameIndex);
             JitterManager::Get().ApplyJitterToProjection(g_cachedCameraMatrix, isVulkan);

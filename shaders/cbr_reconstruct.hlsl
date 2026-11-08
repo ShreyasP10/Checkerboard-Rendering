@@ -126,10 +126,13 @@ float LinearizeDepth(float d) {
         float n = g_DepthNear;
         float f = g_DepthFar;
         if (g_DepthMode == 1u) {
-            return (f > 0.0f) ? (n * f) / (n + d * (f - n)) : n / max(d, 1e-7f);
+            float denom = (n + d * (f - n));
+            if (abs(denom) < 1e-7f || isnan(denom) || isinf(denom)) return asfloat(0x7fc00000u);
+            return (f > 0.0f) ? (n * f) / denom : n / max(d, 1e-7f);
         }
         float denom = (f - d * (f - n));
-        if (denom != 0.0f && !isinf(denom) && !isnan(denom)) return (n * f) / denom;
+        if (abs(denom) < 1e-7f || isinf(denom) || isnan(denom)) return asfloat(0x7fc00000u);
+        return (n * f) / denom;
     }
     return asfloat(0x7fc00000u); // quiet NaN
 }

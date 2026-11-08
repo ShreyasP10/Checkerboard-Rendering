@@ -480,6 +480,11 @@ void ReconstructionPass::DestroyVulkanPipeline() {
         return reinterpret_cast<void*>(GetProcAddress(vulkanModule, name));
     };
 
+    auto pfnDeviceWaitIdle = reinterpret_cast<int (*)(void*)>(resolveDeviceFunc("vkDeviceWaitIdle"));
+    if (m_device && pfnDeviceWaitIdle) {
+        pfnDeviceWaitIdle(m_device);
+    }
+
     auto pfnDestroyPipeline = reinterpret_cast<PFN_vkDestroyPipeline>(resolveDeviceFunc("vkDestroyPipeline"));
     auto pfnDestroyPipelineLayout = reinterpret_cast<PFN_vkDestroyPipelineLayout>(resolveDeviceFunc("vkDestroyPipelineLayout"));
     auto pfnDestroyDescriptorSetLayout = reinterpret_cast<PFN_vkDestroyDescriptorSetLayout>(resolveDeviceFunc("vkDestroyDescriptorSetLayout"));
@@ -894,14 +899,52 @@ void ReconstructionPass::DispatchVulkan(void* vkCommandBuffer, uint32_t frameInd
     pfnCmdDispatch(vkCommandBuffer, groupCountX, groupCountY, 1);
 
     if (pfnCmdPipelineBarrier) {
-        MinimalVkMemoryBarrier barrier{};
-        barrier.sType = kVkStructureTypeMemoryBarrier;
-        barrier.srcAccessMask = kVkAccessShaderWriteBit;
-        barrier.dstAccessMask = kVkAccessShaderReadBit | kVkAccessMemoryReadBit;
-        pfnCmdPipelineBarrier(vkCommandBuffer,
-                              kVkPipelineStageComputeShaderBit,
-                              kVkPipelineStageAllCommandsBit,
-                              0, 1, &barrier, 0, nullptr, 0, nullptr);
+        if (RenderTargetManager::Get().AreVulkanResourcesCreated()) {
+            const auto& res = RenderTargetManager::Get().GetVulkanResources();
+            MinimalVkImageMemoryBarrier barriers[2]{};
+
+            barriers[0].sType = kVkStructureTypeImageMemoryBarrier;
+            barriers[0].srcAccessMask = kVkAccessShaderWriteBit;
+            barriers[0].dstAccessMask = kVkAccessTransferReadBit | kVkAccessShaderReadBit;
+            barriers[0].oldLayout = kVkImageLayoutGeneral;
+            barriers[0].newLayout = kVkImageLayoutGeneral;
+            barriers[0].srcQueueFamilyIndex = ~0u;
+            barriers[0].dstQueueFamilyIndex = ~0u;
+            barriers[0].image = res.outputColor.image;
+            barriers[0].subresourceRange.aspectMask = kVkImageAspectColorBit;
+            barriers[0].subresourceRange.baseMipLevel = 0;
+            barriers[0].subresourceRange.levelCount = 1;
+            barriers[0].subresourceRange.baseArrayLayer = 0;
+            barriers[0].subresourceRange.layerCount = 1;
+
+            barriers[1].sType = kVkStructureTypeImageMemoryBarrier;
+            barriers[1].srcAccessMask = kVkAccessShaderWriteBit;
+            barriers[1].dstAccessMask = kVkAccessShaderReadBit;
+            barriers[1].oldLayout = kVkImageLayoutGeneral;
+            barriers[1].newLayout = kVkImageLayoutGeneral;
+            barriers[1].srcQueueFamilyIndex = ~0u;
+            barriers[1].dstQueueFamilyIndex = ~0u;
+            barriers[1].image = res.outputDepth.image;
+            barriers[1].subresourceRange.aspectMask = kVkImageAspectColorBit;
+            barriers[1].subresourceRange.baseMipLevel = 0;
+            barriers[1].subresourceRange.levelCount = 1;
+            barriers[1].subresourceRange.baseArrayLayer = 0;
+            barriers[1].subresourceRange.layerCount = 1;
+
+            pfnCmdPipelineBarrier(vkCommandBuffer,
+                                  kVkPipelineStageComputeShaderBit,
+                                  kVkPipelineStageTransferBit | kVkPipelineStageComputeShaderBit,
+                                  0, 0, nullptr, 0, nullptr, 2, barriers);
+        } else {
+            MinimalVkMemoryBarrier barrier{};
+            barrier.sType = kVkStructureTypeMemoryBarrier;
+            barrier.srcAccessMask = kVkAccessShaderWriteBit;
+            barrier.dstAccessMask = kVkAccessShaderReadBit | kVkAccessMemoryReadBit;
+            pfnCmdPipelineBarrier(vkCommandBuffer,
+                                  kVkPipelineStageComputeShaderBit,
+                                  kVkPipelineStageAllCommandsBit,
+                                  0, 1, &barrier, 0, nullptr, 0, nullptr);
+        }
     }
 #else
     (void)frameIndex;

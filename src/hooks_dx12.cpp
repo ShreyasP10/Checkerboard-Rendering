@@ -16,11 +16,14 @@ namespace cbr {
 namespace {
 
 typedef long (__stdcall *PFN_D3D12Present)(void* swapChain, unsigned int syncInterval, unsigned int flags);
+typedef long (__stdcall *PFN_D3D12Present1)(void* swapChain, unsigned int syncInterval, unsigned int flags, const void* pPresentParameters);
 typedef long (__stdcall *PFN_D3D12ResizeBuffers)(void* swapChain, unsigned int bufferCount, unsigned int width, unsigned int height, unsigned int newFormat, unsigned int swapChainFlags);
 
 PFN_D3D12Present       g_Original_D3D12Present = nullptr;
+PFN_D3D12Present1      g_Original_D3D12Present1 = nullptr;
 PFN_D3D12ResizeBuffers g_Original_D3D12ResizeBuffers = nullptr;
 void*                  g_HookedPresentTarget = nullptr;
+void*                  g_HookedPresent1Target = nullptr;
 void*                  g_HookedResizeBuffersTarget = nullptr;
 
 constexpr long kHResultFail = static_cast<long>(0x80004005u); // E_FAIL
@@ -37,6 +40,25 @@ long __stdcall Hooked_D3D12Present(void* swapChain, unsigned int syncInterval, u
     }
 
     long result = g_Original_D3D12Present(swapChain, syncInterval, flags);
+
+    try {
+        CBREngine::Get().OnPostPresent(swapChain);
+    } catch (...) {
+    }
+    return result;
+}
+
+long __stdcall Hooked_D3D12Present1(void* swapChain, unsigned int syncInterval, unsigned int flags, const void* pPresentParameters) {
+    if (!g_Original_D3D12Present1) {
+        return kHResultFail;
+    }
+
+    try {
+        CBREngine::Get().OnPrePresent(swapChain, nullptr);
+    } catch (...) {
+    }
+
+    long result = g_Original_D3D12Present1(swapChain, syncInterval, flags, pPresentParameters);
 
     try {
         CBREngine::Get().OnPostPresent(swapChain);
@@ -154,7 +176,10 @@ bool HookManager::InstallDX12Hooks() {
     wc.lpfnWndProc = DefWindowProcA;
     wc.hInstance = GetModuleHandleA(nullptr);
     wc.lpszClassName = "CBR_DX12DummyWindow";
-    RegisterClassA(&wc);
+    WNDCLASSA existingClass{};
+    if (!GetClassInfoA(wc.hInstance, wc.lpszClassName, &existingClass)) {
+        RegisterClassA(&wc);
+    }
 
     HWND dummyHwnd = CreateWindowExA(0, wc.lpszClassName, "CBR_DX12Dummy", WS_OVERLAPPEDWINDOW, 0, 0, 100, 100, nullptr, nullptr, wc.hInstance, nullptr);
     if (!dummyHwnd) {
@@ -221,6 +246,18 @@ bool HookManager::InstallDX12Hooks() {
             }
         }
 
+        // VMT index 22 on IDXGISwapChain1: Present1
+        void* pfnPresent1 = swapChainVmt[22];
+        if (pfnPresent1) {
+            mhStatus = MH_CreateHook(pfnPresent1, reinterpret_cast<LPVOID>(&Hooked_D3D12Present1), reinterpret_cast<LPVOID*>(&g_Original_D3D12Present1));
+            if (mhStatus == MH_OK || mhStatus == MH_ERROR_ALREADY_CREATED) {
+                MH_EnableHook(pfnPresent1);
+                g_HookedPresent1Target = pfnPresent1;
+                hooked = true;
+                CBR_LOG_INFO("MinHook: Successfully detoured D3D12/DXGI Present1 (VMT[22] at 0x%p).", pfnPresent1);
+            }
+        }
+
         if (pfnResize) {
             mhStatus = MH_CreateHook(pfnResize, reinterpret_cast<LPVOID>(&Hooked_D3D12ResizeBuffers), reinterpret_cast<LPVOID*>(&g_Original_D3D12ResizeBuffers));
             if (mhStatus == MH_OK || mhStatus == MH_ERROR_ALREADY_CREATED) {
@@ -257,9 +294,18 @@ void HookManager::UninstallDX12Hooks() {
         CBR_LOG_INFO("Restoring original DXGI/DX12 VMT hooks.");
         if (g_HookedPresentTarget) {
             MH_DisableHook(g_HookedPresentTarget);
+            MH_RemoveHook(g_HookedPresentTarget);
+            g_HookedPresentTarget = nullptr;
+        }
+        if (g_HookedPresent1Target) {
+            MH_DisableHook(g_HookedPresent1Target);
+            MH_RemoveHook(g_HookedPresent1Target);
+            g_HookedPresent1Target = nullptr;
         }
         if (g_HookedResizeBuffersTarget) {
             MH_DisableHook(g_HookedResizeBuffersTarget);
+            MH_RemoveHook(g_HookedResizeBuffersTarget);
+            g_HookedResizeBuffersTarget = nullptr;
         }
         m_dx12Hooked.store(false);
     }

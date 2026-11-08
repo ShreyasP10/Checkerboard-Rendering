@@ -304,6 +304,9 @@ static void TestDepthConvention() {
         CHECK(!std::isfinite(LinearizeDepth(inf, DepthConvention::Standard, 0.1f, 1000.0f)));
         CHECK(RelativeDepthDelta(nan, 1.0f) > 1.0f);
         CHECK(RelativeDepthDelta(1.0f, inf) > 1.0f);
+        // Test near-zero denominator edge cases
+        CHECK(!std::isfinite(LinearizeDepth(1.0f, DepthConvention::Standard, 0.0f, 0.0f)));
+        CHECK(!std::isfinite(LinearizeDepth(0.0f, DepthConvention::Reversed, 0.0f, 0.0f)));
     }
     // Round trip: project a view-space distance to device depth, linearize it back.
     for (double z : { 0.2, 1.0, 10.0, 100.0, 1000.0, 5000.0 }) {

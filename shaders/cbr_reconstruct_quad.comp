@@ -103,10 +103,12 @@ float LinearizeDepth(float d) {
     float n = pc.u_DepthNear;
     float f = pc.u_DepthFar;
     if (pc.u_DepthMode == 1u) {
-        return (f > 0.0) ? (n * f) / (n + d * (f - n)) : n / max(d, 1e-7);
+        float denom = (n + d * (f - n));
+        if (abs(denom) < 1e-7 || isnan(denom) || isinf(denom)) return uintBitsToFloat(0x7fc00000u);
+        return (f > 0.0) ? (n * f) / denom : n / max(d, 1e-7);
     }
     float denom = (f - d * (f - n));
-    if (denom == 0.0 || isinf(denom) || isnan(denom)) return uintBitsToFloat(0x7fc00000u);
+    if (abs(denom) < 1e-7 || isinf(denom) || isnan(denom)) return uintBitsToFloat(0x7fc00000u);
     return (n * f) / denom;
 }
 

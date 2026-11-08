@@ -117,7 +117,8 @@ if(MSVC)
         /guard:cf
         /DYNAMICBASE
         /NXCOMPAT
-        $<$<CONFIG:Release>:/LTCG /OPT:REF /OPT:ICF /CETCOMPAT:NO>
+        /CETCOMPAT:NO
+        $<$<CONFIG:Release>:/LTCG /OPT:REF /OPT:ICF>
     )
 endif()
 

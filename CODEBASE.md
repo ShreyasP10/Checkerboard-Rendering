@@ -201,7 +201,8 @@ if(MSVC)
         /guard:cf
         /DYNAMICBASE
         /NXCOMPAT
-        $<$<CONFIG:Release>:/LTCG /OPT:REF /OPT:ICF /CETCOMPAT:NO>
+        /CETCOMPAT:NO
+        $<$<CONFIG:Release>:/LTCG /OPT:REF /OPT:ICF>
     )
 endif()
 
@@ -941,11 +942,11 @@ inline float LinearizeDepth(float d, DepthConvention convention, float zNear, fl
     if (convention == DepthConvention::Reversed) {
         if (zFar <= 0.0f) return zNear / std::max(d, kMinDeviceDepth);
         const float denom = (zNear + d * (zFar - zNear));
-        if (!std::isfinite(denom) || denom == 0.0f) return std::numeric_limits<float>::quiet_NaN();
+        if (!std::isfinite(denom) || std::fabs(denom) < 1e-7f) return std::numeric_limits<float>::quiet_NaN();
         return (zNear * zFar) / denom;
     }
     const float denom = (zFar - d * (zFar - zNear));
-    if (!std::isfinite(denom) || denom == 0.0f) return std::numeric_limits<float>::quiet_NaN();
+    if (!std::isfinite(denom) || std::fabs(denom) < 1e-7f) return std::numeric_limits<float>::quiet_NaN();
     return (zNear * zFar) / denom;
 }
 
@@ -2816,11 +2817,15 @@ typedef int   (*PFN_vkGetSwapchainImagesKHR)(void* device, void* swapchain, uint
 typedef int   (*PFN_vkAcquireNextImageKHR)(void* device, void* swapchain, uint64_t timeout, void* semaphore, void* fence, uint32_t* pImageIndex);
 typedef void  (*PFN_vkCmdDraw)(void* commandBuffer, uint32_t vertexCount, uint32_t instanceCount, uint32_t firstVertex, uint32_t firstInstance);
 typedef void  (*PFN_vkCmdDrawIndexed)(void* commandBuffer, uint32_t indexCount, uint32_t instanceCount, uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance);
+typedef int   (*PFN_vkCreateDevice)(void* physicalDevice, const void* pCreateInfo, const void* pAllocator, void** pDevice);
+typedef void  (*PFN_vkDestroySwapchainKHR)(void* device, void* swapchain, const void* pAllocator);
 
 PFN_vkGetDeviceProcAddr        g_Original_vkGetDeviceProcAddr = nullptr;
 PFN_vkGetInstanceProcAddr      g_Original_vkGetInstanceProcAddr = nullptr;
 PFN_vkQueuePresentKHR          g_Original_vkQueuePresentKHR = nullptr;
 PFN_vkCreateSwapchainKHR       g_Original_vkCreateSwapchainKHR = nullptr;
+PFN_vkDestroySwapchainKHR      g_Original_vkDestroySwapchainKHR = nullptr;
+PFN_vkCreateDevice             g_Original_vkCreateDevice = nullptr;
 PFN_vkGetSwapchainImagesKHR    g_Original_vkGetSwapchainImagesKHR = nullptr;
 PFN_vkAcquireNextImageKHR      g_Original_vkAcquireNextImageKHR = nullptr;
 PFN_vkCmdSetViewport           g_Original_vkCmdSetViewport = nullptr;
@@ -2833,6 +2838,8 @@ PFN_vkCmdSetSampleLocationsEXT g_Original_vkCmdSetSampleLocationsEXT = nullptr;
 
 void* Hooked_vkGetDeviceProcAddr(void* device, const char* pName);
 void* Hooked_vkGetInstanceProcAddr(void* instance, const char* pName);
+int   Hooked_vkCreateDevice(void* physicalDevice, const void* pCreateInfo, const void* pAllocator, void** pDevice);
+void  Hooked_vkDestroySwapchainKHR(void* device, void* swapchain, const void* pAllocator);
 int   Hooked_vkGetSwapchainImagesKHR(void* device, void* swapchain, uint32_t* pSwapchainImageCount, void** pSwapchainImages);
 int   Hooked_vkAcquireNextImageKHR(void* device, void* swapchain, uint64_t timeout, void* semaphore, void* fence, uint32_t* pImageIndex);
 void  Hooked_vkCmdSetViewport(void* commandBuffer, uint32_t firstViewport, uint32_t viewportCount, const MinimalVkViewport* pViewports);
@@ -2977,6 +2984,7 @@ std::mutex g_swapchainMutex;
 std::unordered_map<void*, std::vector<void*>> g_swapchainImages;
 std::atomic<void*> g_activeSwapchain{ nullptr };
 std::atomic<uint32_t> g_activeImageIndex{ 0 };
+std::atomic<void*> g_activePhysicalDevice{ nullptr };
 
 inline void* GetActiveSwapchainImage() {
     std::lock_guard<std::mutex> lock(g_swapchainMutex);
@@ -3066,8 +3074,9 @@ int Hooked_vkCreateSwapchainKHR(void* device, const void* pCreateInfo, const voi
         }
         try {
             CBREngine::Get().OnSwapchainRecreated(w, h);
-            RenderTargetManager::Get().CreateVulkanResources(device, nullptr);
-            ReconstructionPass::Get().InitializeVulkan(device, nullptr);
+            void* physDev = g_activePhysicalDevice.load();
+            RenderTargetManager::Get().CreateVulkanResources(device, physDev);
+            ReconstructionPass::Get().InitializeVulkan(device, physDev);
             const auto& res = RenderTargetManager::Get().GetVulkanResources();
             ReconstructionPass::Get().UpdateVulkanPingPongDescriptors(
                 res.quarterColor.view, res.quarterDepth.view,
@@ -3080,6 +3089,35 @@ int Hooked_vkCreateSwapchainKHR(void* device, const void* pCreateInfo, const voi
         } catch (...) {}
     }
     return result;
+}
+
+int Hooked_vkCreateDevice(void* physicalDevice, const void* pCreateInfo, const void* pAllocator, void** pDevice) {
+    if (!g_Original_vkCreateDevice) {
+        return kVkErrorInitializationFailed;
+    }
+    if (physicalDevice) {
+        g_activePhysicalDevice.store(physicalDevice);
+        CBR_LOG_INFO("Vulkan physical device captured from vkCreateDevice: %p", physicalDevice);
+    }
+    return g_Original_vkCreateDevice(physicalDevice, pCreateInfo, pAllocator, pDevice);
+}
+
+void Hooked_vkDestroySwapchainKHR(void* device, void* swapchain, const void* pAllocator) {
+    if (swapchain) {
+        {
+            std::lock_guard<std::mutex> lock(g_swapchainMutex);
+            g_swapchainImages.erase(swapchain);
+        }
+        void* activeSc = g_activeSwapchain.load();
+        if (activeSc == swapchain) {
+            g_activeSwapchain.store(nullptr);
+            g_activeImageIndex.store(0);
+        }
+        CBR_LOG_INFO("Vulkan swapchain %p destroyed; resources purged from tracking map.", swapchain);
+    }
+    if (g_Original_vkDestroySwapchainKHR) {
+        g_Original_vkDestroySwapchainKHR(device, swapchain, pAllocator);
+    }
 }
 
 int Hooked_vkGetSwapchainImagesKHR(void* device, void* swapchain, uint32_t* pSwapchainImageCount, void** pSwapchainImages) {
@@ -3315,6 +3353,12 @@ void* Hooked_vkGetDeviceProcAddr(void* device, const char* pName) {
         return nullptr;
     }
 
+    if (std::strcmp(pName, "vkCreateDevice") == 0) {
+        if (!g_Original_vkCreateDevice) {
+            g_Original_vkCreateDevice = reinterpret_cast<PFN_vkCreateDevice>(realProc);
+        }
+        return reinterpret_cast<void*>(&Hooked_vkCreateDevice);
+    }
     if (std::strcmp(pName, "vkQueuePresentKHR") == 0) {
         if (!g_Original_vkQueuePresentKHR) {
             g_Original_vkQueuePresentKHR = reinterpret_cast<PFN_vkQueuePresentKHR>(realProc);
@@ -3326,6 +3370,12 @@ void* Hooked_vkGetDeviceProcAddr(void* device, const char* pName) {
             g_Original_vkCreateSwapchainKHR = reinterpret_cast<PFN_vkCreateSwapchainKHR>(realProc);
         }
         return reinterpret_cast<void*>(&Hooked_vkCreateSwapchainKHR);
+    }
+    if (std::strcmp(pName, "vkDestroySwapchainKHR") == 0) {
+        if (!g_Original_vkDestroySwapchainKHR) {
+            g_Original_vkDestroySwapchainKHR = reinterpret_cast<PFN_vkDestroySwapchainKHR>(realProc);
+        }
+        return reinterpret_cast<void*>(&Hooked_vkDestroySwapchainKHR);
     }
     if (std::strcmp(pName, "vkGetSwapchainImagesKHR") == 0) {
         if (!g_Original_vkGetSwapchainImagesKHR) {
@@ -3394,6 +3444,12 @@ void* Hooked_vkGetInstanceProcAddr(void* instance, const char* pName) {
         return nullptr;
     }
 
+    if (std::strcmp(pName, "vkCreateDevice") == 0) {
+        if (!g_Original_vkCreateDevice) {
+            g_Original_vkCreateDevice = reinterpret_cast<PFN_vkCreateDevice>(realProc);
+        }
+        return reinterpret_cast<void*>(&Hooked_vkCreateDevice);
+    }
     if (std::strcmp(pName, "vkQueuePresentKHR") == 0) {
         if (!g_Original_vkQueuePresentKHR) {
             g_Original_vkQueuePresentKHR = reinterpret_cast<PFN_vkQueuePresentKHR>(realProc);
@@ -3405,6 +3461,12 @@ void* Hooked_vkGetInstanceProcAddr(void* instance, const char* pName) {
             g_Original_vkCreateSwapchainKHR = reinterpret_cast<PFN_vkCreateSwapchainKHR>(realProc);
         }
         return reinterpret_cast<void*>(&Hooked_vkCreateSwapchainKHR);
+    }
+    if (std::strcmp(pName, "vkDestroySwapchainKHR") == 0) {
+        if (!g_Original_vkDestroySwapchainKHR) {
+            g_Original_vkDestroySwapchainKHR = reinterpret_cast<PFN_vkDestroySwapchainKHR>(realProc);
+        }
+        return reinterpret_cast<void*>(&Hooked_vkDestroySwapchainKHR);
     }
     if (std::strcmp(pName, "vkGetSwapchainImagesKHR") == 0) {
         if (!g_Original_vkGetSwapchainImagesKHR) {
@@ -3528,6 +3590,36 @@ bool HookManager::InstallVulkanHooks() {
             hookedAny = true;
         } else {
             CBR_LOG_WARN("MinHook: Could not detour vkCreateSwapchainKHR (status: %d).", mhStatus);
+        }
+    }
+
+    // 2a. Detour vkDestroySwapchainKHR
+    auto pfnDestroySwapchain = reinterpret_cast<void*>(GetProcAddress(vulkanModule, "vkDestroySwapchainKHR"));
+    if (pfnDestroySwapchain) {
+        mhStatus = MH_CreateHook(
+            pfnDestroySwapchain,
+            reinterpret_cast<LPVOID>(&Hooked_vkDestroySwapchainKHR),
+            reinterpret_cast<LPVOID*>(&g_Original_vkDestroySwapchainKHR)
+        );
+        if (mhStatus == MH_OK || mhStatus == MH_ERROR_ALREADY_CREATED) {
+            MH_EnableHook(pfnDestroySwapchain);
+            CBR_LOG_INFO("MinHook: Successfully detoured vkDestroySwapchainKHR (export at 0x%p).", pfnDestroySwapchain);
+            hookedAny = true;
+        }
+    }
+
+    // 2a2. Detour vkCreateDevice
+    auto pfnCreateDevice = reinterpret_cast<void*>(GetProcAddress(vulkanModule, "vkCreateDevice"));
+    if (pfnCreateDevice) {
+        mhStatus = MH_CreateHook(
+            pfnCreateDevice,
+            reinterpret_cast<LPVOID>(&Hooked_vkCreateDevice),
+            reinterpret_cast<LPVOID*>(&g_Original_vkCreateDevice)
+        );
+        if (mhStatus == MH_OK || mhStatus == MH_ERROR_ALREADY_CREATED) {
+            MH_EnableHook(pfnCreateDevice);
+            CBR_LOG_INFO("MinHook: Successfully detoured vkCreateDevice (export at 0x%p).", pfnCreateDevice);
+            hookedAny = true;
         }
     }
 
@@ -3735,11 +3827,14 @@ namespace cbr {
 namespace {
 
 typedef long (__stdcall *PFN_D3D12Present)(void* swapChain, unsigned int syncInterval, unsigned int flags);
+typedef long (__stdcall *PFN_D3D12Present1)(void* swapChain, unsigned int syncInterval, unsigned int flags, const void* pPresentParameters);
 typedef long (__stdcall *PFN_D3D12ResizeBuffers)(void* swapChain, unsigned int bufferCount, unsigned int width, unsigned int height, unsigned int newFormat, unsigned int swapChainFlags);
 
 PFN_D3D12Present       g_Original_D3D12Present = nullptr;
+PFN_D3D12Present1      g_Original_D3D12Present1 = nullptr;
 PFN_D3D12ResizeBuffers g_Original_D3D12ResizeBuffers = nullptr;
 void*                  g_HookedPresentTarget = nullptr;
+void*                  g_HookedPresent1Target = nullptr;
 void*                  g_HookedResizeBuffersTarget = nullptr;
 
 constexpr long kHResultFail = static_cast<long>(0x80004005u); // E_FAIL
@@ -3756,6 +3851,25 @@ long __stdcall Hooked_D3D12Present(void* swapChain, unsigned int syncInterval, u
     }
 
     long result = g_Original_D3D12Present(swapChain, syncInterval, flags);
+
+    try {
+        CBREngine::Get().OnPostPresent(swapChain);
+    } catch (...) {
+    }
+    return result;
+}
+
+long __stdcall Hooked_D3D12Present1(void* swapChain, unsigned int syncInterval, unsigned int flags, const void* pPresentParameters) {
+    if (!g_Original_D3D12Present1) {
+        return kHResultFail;
+    }
+
+    try {
+        CBREngine::Get().OnPrePresent(swapChain, nullptr);
+    } catch (...) {
+    }
+
+    long result = g_Original_D3D12Present1(swapChain, syncInterval, flags, pPresentParameters);
 
     try {
         CBREngine::Get().OnPostPresent(swapChain);
@@ -3873,7 +3987,10 @@ bool HookManager::InstallDX12Hooks() {
     wc.lpfnWndProc = DefWindowProcA;
     wc.hInstance = GetModuleHandleA(nullptr);
     wc.lpszClassName = "CBR_DX12DummyWindow";
-    RegisterClassA(&wc);
+    WNDCLASSA existingClass{};
+    if (!GetClassInfoA(wc.hInstance, wc.lpszClassName, &existingClass)) {
+        RegisterClassA(&wc);
+    }
 
     HWND dummyHwnd = CreateWindowExA(0, wc.lpszClassName, "CBR_DX12Dummy", WS_OVERLAPPEDWINDOW, 0, 0, 100, 100, nullptr, nullptr, wc.hInstance, nullptr);
     if (!dummyHwnd) {
@@ -3940,6 +4057,18 @@ bool HookManager::InstallDX12Hooks() {
             }
         }
 
+        // VMT index 22 on IDXGISwapChain1: Present1
+        void* pfnPresent1 = swapChainVmt[22];
+        if (pfnPresent1) {
+            mhStatus = MH_CreateHook(pfnPresent1, reinterpret_cast<LPVOID>(&Hooked_D3D12Present1), reinterpret_cast<LPVOID*>(&g_Original_D3D12Present1));
+            if (mhStatus == MH_OK || mhStatus == MH_ERROR_ALREADY_CREATED) {
+                MH_EnableHook(pfnPresent1);
+                g_HookedPresent1Target = pfnPresent1;
+                hooked = true;
+                CBR_LOG_INFO("MinHook: Successfully detoured D3D12/DXGI Present1 (VMT[22] at 0x%p).", pfnPresent1);
+            }
+        }
+
         if (pfnResize) {
             mhStatus = MH_CreateHook(pfnResize, reinterpret_cast<LPVOID>(&Hooked_D3D12ResizeBuffers), reinterpret_cast<LPVOID*>(&g_Original_D3D12ResizeBuffers));
             if (mhStatus == MH_OK || mhStatus == MH_ERROR_ALREADY_CREATED) {
@@ -3976,9 +4105,18 @@ void HookManager::UninstallDX12Hooks() {
         CBR_LOG_INFO("Restoring original DXGI/DX12 VMT hooks.");
         if (g_HookedPresentTarget) {
             MH_DisableHook(g_HookedPresentTarget);
+            MH_RemoveHook(g_HookedPresentTarget);
+            g_HookedPresentTarget = nullptr;
+        }
+        if (g_HookedPresent1Target) {
+            MH_DisableHook(g_HookedPresent1Target);
+            MH_RemoveHook(g_HookedPresent1Target);
+            g_HookedPresent1Target = nullptr;
         }
         if (g_HookedResizeBuffersTarget) {
             MH_DisableHook(g_HookedResizeBuffersTarget);
+            MH_RemoveHook(g_HookedResizeBuffersTarget);
+            g_HookedResizeBuffersTarget = nullptr;
         }
         m_dx12Hooked.store(false);
     }
@@ -4578,6 +4716,14 @@ bool PatternScanner::UpdateCameraJitter(uint32_t frameIndex, bool isVulkan) {
             return false;
         }
 #else
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(g_cachedCameraMatrix, &mbi, sizeof(mbi)) != sizeof(mbi) ||
+            mbi.State != MEM_COMMIT ||
+            (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) == 0) {
+            g_cachedCameraMatrix = nullptr;
+            CBR_LOG_WARN("Camera projection matrix memory unreadable or not committed; falling back to Viewport Redirection.");
+            return false;
+        }
         try {
             JitterManager::Get().Update(frameIndex);
             JitterManager::Get().ApplyJitterToProjection(g_cachedCameraMatrix, isVulkan);
@@ -5081,6 +5227,11 @@ void ReconstructionPass::DestroyVulkanPipeline() {
         return reinterpret_cast<void*>(GetProcAddress(vulkanModule, name));
     };
 
+    auto pfnDeviceWaitIdle = reinterpret_cast<int (*)(void*)>(resolveDeviceFunc("vkDeviceWaitIdle"));
+    if (m_device && pfnDeviceWaitIdle) {
+        pfnDeviceWaitIdle(m_device);
+    }
+
     auto pfnDestroyPipeline = reinterpret_cast<PFN_vkDestroyPipeline>(resolveDeviceFunc("vkDestroyPipeline"));
     auto pfnDestroyPipelineLayout = reinterpret_cast<PFN_vkDestroyPipelineLayout>(resolveDeviceFunc("vkDestroyPipelineLayout"));
     auto pfnDestroyDescriptorSetLayout = reinterpret_cast<PFN_vkDestroyDescriptorSetLayout>(resolveDeviceFunc("vkDestroyDescriptorSetLayout"));
@@ -5495,14 +5646,52 @@ void ReconstructionPass::DispatchVulkan(void* vkCommandBuffer, uint32_t frameInd
     pfnCmdDispatch(vkCommandBuffer, groupCountX, groupCountY, 1);
 
     if (pfnCmdPipelineBarrier) {
-        MinimalVkMemoryBarrier barrier{};
-        barrier.sType = kVkStructureTypeMemoryBarrier;
-        barrier.srcAccessMask = kVkAccessShaderWriteBit;
-        barrier.dstAccessMask = kVkAccessShaderReadBit | kVkAccessMemoryReadBit;
-        pfnCmdPipelineBarrier(vkCommandBuffer,
-                              kVkPipelineStageComputeShaderBit,
-                              kVkPipelineStageAllCommandsBit,
-                              0, 1, &barrier, 0, nullptr, 0, nullptr);
+        if (RenderTargetManager::Get().AreVulkanResourcesCreated()) {
+            const auto& res = RenderTargetManager::Get().GetVulkanResources();
+            MinimalVkImageMemoryBarrier barriers[2]{};
+
+            barriers[0].sType = kVkStructureTypeImageMemoryBarrier;
+            barriers[0].srcAccessMask = kVkAccessShaderWriteBit;
+            barriers[0].dstAccessMask = kVkAccessTransferReadBit | kVkAccessShaderReadBit;
+            barriers[0].oldLayout = kVkImageLayoutGeneral;
+            barriers[0].newLayout = kVkImageLayoutGeneral;
+            barriers[0].srcQueueFamilyIndex = ~0u;
+            barriers[0].dstQueueFamilyIndex = ~0u;
+            barriers[0].image = res.outputColor.image;
+            barriers[0].subresourceRange.aspectMask = kVkImageAspectColorBit;
+            barriers[0].subresourceRange.baseMipLevel = 0;
+            barriers[0].subresourceRange.levelCount = 1;
+            barriers[0].subresourceRange.baseArrayLayer = 0;
+            barriers[0].subresourceRange.layerCount = 1;
+
+            barriers[1].sType = kVkStructureTypeImageMemoryBarrier;
+            barriers[1].srcAccessMask = kVkAccessShaderWriteBit;
+            barriers[1].dstAccessMask = kVkAccessShaderReadBit;
+            barriers[1].oldLayout = kVkImageLayoutGeneral;
+            barriers[1].newLayout = kVkImageLayoutGeneral;
+            barriers[1].srcQueueFamilyIndex = ~0u;
+            barriers[1].dstQueueFamilyIndex = ~0u;
+            barriers[1].image = res.outputDepth.image;
+            barriers[1].subresourceRange.aspectMask = kVkImageAspectColorBit;
+            barriers[1].subresourceRange.baseMipLevel = 0;
+            barriers[1].subresourceRange.levelCount = 1;
+            barriers[1].subresourceRange.baseArrayLayer = 0;
+            barriers[1].subresourceRange.layerCount = 1;
+
+            pfnCmdPipelineBarrier(vkCommandBuffer,
+                                  kVkPipelineStageComputeShaderBit,
+                                  kVkPipelineStageTransferBit | kVkPipelineStageComputeShaderBit,
+                                  0, 0, nullptr, 0, nullptr, 2, barriers);
+        } else {
+            MinimalVkMemoryBarrier barrier{};
+            barrier.sType = kVkStructureTypeMemoryBarrier;
+            barrier.srcAccessMask = kVkAccessShaderWriteBit;
+            barrier.dstAccessMask = kVkAccessShaderReadBit | kVkAccessMemoryReadBit;
+            pfnCmdPipelineBarrier(vkCommandBuffer,
+                                  kVkPipelineStageComputeShaderBit,
+                                  kVkPipelineStageAllCommandsBit,
+                                  0, 1, &barrier, 0, nullptr, 0, nullptr);
+        }
     }
 #else
     (void)frameIndex;
@@ -5558,6 +5747,7 @@ constexpr uint32_t kVkImageTilingOptimal                  = 0;
 constexpr uint32_t kVkSharingModeExclusive                = 0;
 constexpr uint32_t kVkImageLayoutUndefined                = 0;
 constexpr uint32_t kVkSampleCount1Bit                     = 0x00000001;
+constexpr uint32_t kVkSampleCount2Bit                     = 0x00000002;
 
 constexpr uint32_t kVkImageUsageTransferSrcBit            = 0x00000001;
 constexpr uint32_t kVkImageUsageTransferDstBit            = 0x00000002;
@@ -5769,6 +5959,11 @@ bool RenderTargetManager::CreateVulkanResources(void* vkDevice, void* vkPhysical
     };
 
     auto pfnCreateImage = reinterpret_cast<PFN_vkCreateImage>(resolveDeviceFunc("vkCreateImage"));
+    auto pfnDeviceWaitIdle = reinterpret_cast<int (*)(void*)>(resolveDeviceFunc("vkDeviceWaitIdle"));
+    if (m_vkDevice && pfnDeviceWaitIdle) {
+        pfnDeviceWaitIdle(m_vkDevice);
+    }
+
     auto pfnDestroyImage = reinterpret_cast<PFN_vkDestroyImage>(resolveDeviceFunc("vkDestroyImage"));
     auto pfnGetImageMemoryRequirements = reinterpret_cast<PFN_vkGetImageMemoryRequirements>(resolveDeviceFunc("vkGetImageMemoryRequirements"));
     auto pfnAllocateMemory = reinterpret_cast<PFN_vkAllocateMemory>(resolveDeviceFunc("vkAllocateMemory"));
@@ -5812,7 +6007,8 @@ bool RenderTargetManager::CreateVulkanResources(void* vkDevice, void* vkPhysical
     const TargetDimensions dims = GetDimensions();
 
     auto createTexture = [&](uint32_t width, uint32_t height, uint32_t format,
-                             uint32_t usage, uint32_t aspectMask, VulkanTextureResource& out) -> bool {
+                             uint32_t usage, uint32_t aspectMask, VulkanTextureResource& out,
+                             uint32_t samples = kVkSampleCount1Bit) -> bool {
         MinimalVkImageCreateInfo imageInfo{};
         imageInfo.sType = kVkStructureTypeImageCreateInfo;
         imageInfo.imageType = kVkImageType2D;
@@ -5820,7 +6016,7 @@ bool RenderTargetManager::CreateVulkanResources(void* vkDevice, void* vkPhysical
         imageInfo.extent = { width, height, 1 };
         imageInfo.mipLevels = 1;
         imageInfo.arrayLayers = 1;
-        imageInfo.samples = kVkSampleCount1Bit;
+        imageInfo.samples = samples;
         imageInfo.tiling = kVkImageTilingOptimal;
         imageInfo.usage = usage;
         imageInfo.sharingMode = kVkSharingModeExclusive;
@@ -5880,14 +6076,15 @@ bool RenderTargetManager::CreateVulkanResources(void* vkDevice, void* vkPhysical
                                     kVkImageUsageTransferSrcBit | kVkImageUsageTransferDstBit;
 
     // 1. Create Quarter-Res 2x MSAA / Input Color, Depth, and Velocity targets
+    // Binding 0 & 1 in cbr_reconstruct.comp sample these as sampler2DMS (2x MSAA required)
     if (!createTexture(dims.quarterWidth, dims.quarterHeight, kVkFormatR16G16B16A16Sfloat,
-                       colorUsage, kVkImageAspectColorBit, m_vkResources.quarterColor)) {
-        CBR_LOG_ERROR("Failed to allocate device-local QuarterColor buffer");
+                       colorUsage, kVkImageAspectColorBit, m_vkResources.quarterColor, kVkSampleCount2Bit)) {
+        CBR_LOG_ERROR("Failed to allocate device-local QuarterColor buffer (2x MSAA)");
         return false;
     }
     if (!createTexture(dims.quarterWidth, dims.quarterHeight, kVkFormatR32Sfloat,
-                       depthUsage, kVkImageAspectColorBit, m_vkResources.quarterDepth)) {
-        CBR_LOG_ERROR("Failed to allocate device-local QuarterDepth buffer");
+                       depthUsage, kVkImageAspectColorBit, m_vkResources.quarterDepth, kVkSampleCount2Bit)) {
+        CBR_LOG_ERROR("Failed to allocate device-local QuarterDepth buffer (2x MSAA)");
         return false;
     }
     if (!createTexture(dims.quarterWidth, dims.quarterHeight, kVkFormatR16G16B16A16Sfloat,
@@ -5975,6 +6172,11 @@ void RenderTargetManager::DestroyVulkanResources() {
         }
         return reinterpret_cast<void*>(GetProcAddress(vulkanModule, name));
     };
+
+    auto pfnDeviceWaitIdle = reinterpret_cast<int (*)(void*)>(resolveDeviceFunc("vkDeviceWaitIdle"));
+    if (m_vkDevice && pfnDeviceWaitIdle) {
+        pfnDeviceWaitIdle(m_vkDevice);
+    }
 
     auto pfnDestroyImage = reinterpret_cast<PFN_vkDestroyImage>(resolveDeviceFunc("vkDestroyImage"));
     auto pfnFreeMemory = reinterpret_cast<PFN_vkFreeMemory>(resolveDeviceFunc("vkFreeMemory"));
@@ -6302,10 +6504,12 @@ float LinearizeDepth(float d) {
     float n = pc.u_DepthNear;
     float f = pc.u_DepthFar;
     if (pc.u_DepthMode == 1u) {
-        return (f > 0.0) ? (n * f) / (n + d * (f - n)) : n / max(d, 1e-7);
+        float denom = (n + d * (f - n));
+        if (abs(denom) < 1e-7 || isnan(denom) || isinf(denom)) return uintBitsToFloat(0x7fc00000u);
+        return (f > 0.0) ? (n * f) / denom : n / max(d, 1e-7);
     }
     float denom = (f - d * (f - n));
-    if (denom == 0.0 || isinf(denom) || isnan(denom)) return uintBitsToFloat(0x7fc00000u);
+    if (abs(denom) < 1e-7 || isinf(denom) || isnan(denom)) return uintBitsToFloat(0x7fc00000u);
     return (n * f) / denom;
 }
 
@@ -6713,10 +6917,12 @@ float LinearizeDepth(float d) {
     float n = pc.u_DepthNear;
     float f = pc.u_DepthFar;
     if (pc.u_DepthMode == 1u) {
-        return (f > 0.0) ? (n * f) / (n + d * (f - n)) : n / max(d, 1e-7);
+        float denom = (n + d * (f - n));
+        if (abs(denom) < 1e-7 || isnan(denom) || isinf(denom)) return uintBitsToFloat(0x7fc00000u);
+        return (f > 0.0) ? (n * f) / denom : n / max(d, 1e-7);
     }
     float denom = (f - d * (f - n));
-    if (denom == 0.0 || isinf(denom) || isnan(denom)) return uintBitsToFloat(0x7fc00000u);
+    if (abs(denom) < 1e-7 || isinf(denom) || isnan(denom)) return uintBitsToFloat(0x7fc00000u);
     return (n * f) / denom;
 }
 
@@ -7082,10 +7288,13 @@ float LinearizeDepth(float d) {
         float n = g_DepthNear;
         float f = g_DepthFar;
         if (g_DepthMode == 1u) {
-            return (f > 0.0f) ? (n * f) / (n + d * (f - n)) : n / max(d, 1e-7f);
+            float denom = (n + d * (f - n));
+            if (abs(denom) < 1e-7f || isnan(denom) || isinf(denom)) return asfloat(0x7fc00000u);
+            return (f > 0.0f) ? (n * f) / denom : n / max(d, 1e-7f);
         }
         float denom = (f - d * (f - n));
-        if (denom != 0.0f && !isinf(denom) && !isnan(denom)) return (n * f) / denom;
+        if (abs(denom) < 1e-7f || isinf(denom) || isnan(denom)) return asfloat(0x7fc00000u);
+        return (n * f) / denom;
     }
     return asfloat(0x7fc00000u); // quiet NaN
 }
@@ -7762,6 +7971,9 @@ static void TestDepthConvention() {
         CHECK(!std::isfinite(LinearizeDepth(inf, DepthConvention::Standard, 0.1f, 1000.0f)));
         CHECK(RelativeDepthDelta(nan, 1.0f) > 1.0f);
         CHECK(RelativeDepthDelta(1.0f, inf) > 1.0f);
+        // Test near-zero denominator edge cases
+        CHECK(!std::isfinite(LinearizeDepth(1.0f, DepthConvention::Standard, 0.0f, 0.0f)));
+        CHECK(!std::isfinite(LinearizeDepth(0.0f, DepthConvention::Reversed, 0.0f, 0.0f)));
     }
     // Round trip: project a view-space distance to device depth, linearize it back.
     for (double z : { 0.2, 1.0, 10.0, 100.0, 1000.0, 5000.0 }) {

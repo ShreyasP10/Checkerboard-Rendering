@@ -41,11 +41,15 @@ typedef int   (*PFN_vkGetSwapchainImagesKHR)(void* device, void* swapchain, uint
 typedef int   (*PFN_vkAcquireNextImageKHR)(void* device, void* swapchain, uint64_t timeout, void* semaphore, void* fence, uint32_t* pImageIndex);
 typedef void  (*PFN_vkCmdDraw)(void* commandBuffer, uint32_t vertexCount, uint32_t instanceCount, uint32_t firstVertex, uint32_t firstInstance);
 typedef void  (*PFN_vkCmdDrawIndexed)(void* commandBuffer, uint32_t indexCount, uint32_t instanceCount, uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance);
+typedef int   (*PFN_vkCreateDevice)(void* physicalDevice, const void* pCreateInfo, const void* pAllocator, void** pDevice);
+typedef void  (*PFN_vkDestroySwapchainKHR)(void* device, void* swapchain, const void* pAllocator);
 
 PFN_vkGetDeviceProcAddr        g_Original_vkGetDeviceProcAddr = nullptr;
 PFN_vkGetInstanceProcAddr      g_Original_vkGetInstanceProcAddr = nullptr;
 PFN_vkQueuePresentKHR          g_Original_vkQueuePresentKHR = nullptr;
 PFN_vkCreateSwapchainKHR       g_Original_vkCreateSwapchainKHR = nullptr;
+PFN_vkDestroySwapchainKHR      g_Original_vkDestroySwapchainKHR = nullptr;
+PFN_vkCreateDevice             g_Original_vkCreateDevice = nullptr;
 PFN_vkGetSwapchainImagesKHR    g_Original_vkGetSwapchainImagesKHR = nullptr;
 PFN_vkAcquireNextImageKHR      g_Original_vkAcquireNextImageKHR = nullptr;
 PFN_vkCmdSetViewport           g_Original_vkCmdSetViewport = nullptr;
@@ -58,6 +62,8 @@ PFN_vkCmdSetSampleLocationsEXT g_Original_vkCmdSetSampleLocationsEXT = nullptr;
 
 void* Hooked_vkGetDeviceProcAddr(void* device, const char* pName);
 void* Hooked_vkGetInstanceProcAddr(void* instance, const char* pName);
+int   Hooked_vkCreateDevice(void* physicalDevice, const void* pCreateInfo, const void* pAllocator, void** pDevice);
+void  Hooked_vkDestroySwapchainKHR(void* device, void* swapchain, const void* pAllocator);
 int   Hooked_vkGetSwapchainImagesKHR(void* device, void* swapchain, uint32_t* pSwapchainImageCount, void** pSwapchainImages);
 int   Hooked_vkAcquireNextImageKHR(void* device, void* swapchain, uint64_t timeout, void* semaphore, void* fence, uint32_t* pImageIndex);
 void  Hooked_vkCmdSetViewport(void* commandBuffer, uint32_t firstViewport, uint32_t viewportCount, const MinimalVkViewport* pViewports);
@@ -202,6 +208,7 @@ std::mutex g_swapchainMutex;
 std::unordered_map<void*, std::vector<void*>> g_swapchainImages;
 std::atomic<void*> g_activeSwapchain{ nullptr };
 std::atomic<uint32_t> g_activeImageIndex{ 0 };
+std::atomic<void*> g_activePhysicalDevice{ nullptr };
 
 inline void* GetActiveSwapchainImage() {
     std::lock_guard<std::mutex> lock(g_swapchainMutex);
@@ -291,8 +298,9 @@ int Hooked_vkCreateSwapchainKHR(void* device, const void* pCreateInfo, const voi
         }
         try {
             CBREngine::Get().OnSwapchainRecreated(w, h);
-            RenderTargetManager::Get().CreateVulkanResources(device, nullptr);
-            ReconstructionPass::Get().InitializeVulkan(device, nullptr);
+            void* physDev = g_activePhysicalDevice.load();
+            RenderTargetManager::Get().CreateVulkanResources(device, physDev);
+            ReconstructionPass::Get().InitializeVulkan(device, physDev);
             const auto& res = RenderTargetManager::Get().GetVulkanResources();
             ReconstructionPass::Get().UpdateVulkanPingPongDescriptors(
                 res.quarterColor.view, res.quarterDepth.view,
@@ -305,6 +313,35 @@ int Hooked_vkCreateSwapchainKHR(void* device, const void* pCreateInfo, const voi
         } catch (...) {}
     }
     return result;
+}
+
+int Hooked_vkCreateDevice(void* physicalDevice, const void* pCreateInfo, const void* pAllocator, void** pDevice) {
+    if (!g_Original_vkCreateDevice) {
+        return kVkErrorInitializationFailed;
+    }
+    if (physicalDevice) {
+        g_activePhysicalDevice.store(physicalDevice);
+        CBR_LOG_INFO("Vulkan physical device captured from vkCreateDevice: %p", physicalDevice);
+    }
+    return g_Original_vkCreateDevice(physicalDevice, pCreateInfo, pAllocator, pDevice);
+}
+
+void Hooked_vkDestroySwapchainKHR(void* device, void* swapchain, const void* pAllocator) {
+    if (swapchain) {
+        {
+            std::lock_guard<std::mutex> lock(g_swapchainMutex);
+            g_swapchainImages.erase(swapchain);
+        }
+        void* activeSc = g_activeSwapchain.load();
+        if (activeSc == swapchain) {
+            g_activeSwapchain.store(nullptr);
+            g_activeImageIndex.store(0);
+        }
+        CBR_LOG_INFO("Vulkan swapchain %p destroyed; resources purged from tracking map.", swapchain);
+    }
+    if (g_Original_vkDestroySwapchainKHR) {
+        g_Original_vkDestroySwapchainKHR(device, swapchain, pAllocator);
+    }
 }
 
 int Hooked_vkGetSwapchainImagesKHR(void* device, void* swapchain, uint32_t* pSwapchainImageCount, void** pSwapchainImages) {
@@ -540,6 +577,12 @@ void* Hooked_vkGetDeviceProcAddr(void* device, const char* pName) {
         return nullptr;
     }
 
+    if (std::strcmp(pName, "vkCreateDevice") == 0) {
+        if (!g_Original_vkCreateDevice) {
+            g_Original_vkCreateDevice = reinterpret_cast<PFN_vkCreateDevice>(realProc);
+        }
+        return reinterpret_cast<void*>(&Hooked_vkCreateDevice);
+    }
     if (std::strcmp(pName, "vkQueuePresentKHR") == 0) {
         if (!g_Original_vkQueuePresentKHR) {
             g_Original_vkQueuePresentKHR = reinterpret_cast<PFN_vkQueuePresentKHR>(realProc);
@@ -551,6 +594,12 @@ void* Hooked_vkGetDeviceProcAddr(void* device, const char* pName) {
             g_Original_vkCreateSwapchainKHR = reinterpret_cast<PFN_vkCreateSwapchainKHR>(realProc);
         }
         return reinterpret_cast<void*>(&Hooked_vkCreateSwapchainKHR);
+    }
+    if (std::strcmp(pName, "vkDestroySwapchainKHR") == 0) {
+        if (!g_Original_vkDestroySwapchainKHR) {
+            g_Original_vkDestroySwapchainKHR = reinterpret_cast<PFN_vkDestroySwapchainKHR>(realProc);
+        }
+        return reinterpret_cast<void*>(&Hooked_vkDestroySwapchainKHR);
     }
     if (std::strcmp(pName, "vkGetSwapchainImagesKHR") == 0) {
         if (!g_Original_vkGetSwapchainImagesKHR) {
@@ -619,6 +668,12 @@ void* Hooked_vkGetInstanceProcAddr(void* instance, const char* pName) {
         return nullptr;
     }
 
+    if (std::strcmp(pName, "vkCreateDevice") == 0) {
+        if (!g_Original_vkCreateDevice) {
+            g_Original_vkCreateDevice = reinterpret_cast<PFN_vkCreateDevice>(realProc);
+        }
+        return reinterpret_cast<void*>(&Hooked_vkCreateDevice);
+    }
     if (std::strcmp(pName, "vkQueuePresentKHR") == 0) {
         if (!g_Original_vkQueuePresentKHR) {
             g_Original_vkQueuePresentKHR = reinterpret_cast<PFN_vkQueuePresentKHR>(realProc);
@@ -630,6 +685,12 @@ void* Hooked_vkGetInstanceProcAddr(void* instance, const char* pName) {
             g_Original_vkCreateSwapchainKHR = reinterpret_cast<PFN_vkCreateSwapchainKHR>(realProc);
         }
         return reinterpret_cast<void*>(&Hooked_vkCreateSwapchainKHR);
+    }
+    if (std::strcmp(pName, "vkDestroySwapchainKHR") == 0) {
+        if (!g_Original_vkDestroySwapchainKHR) {
+            g_Original_vkDestroySwapchainKHR = reinterpret_cast<PFN_vkDestroySwapchainKHR>(realProc);
+        }
+        return reinterpret_cast<void*>(&Hooked_vkDestroySwapchainKHR);
     }
     if (std::strcmp(pName, "vkGetSwapchainImagesKHR") == 0) {
         if (!g_Original_vkGetSwapchainImagesKHR) {
@@ -753,6 +814,36 @@ bool HookManager::InstallVulkanHooks() {
             hookedAny = true;
         } else {
             CBR_LOG_WARN("MinHook: Could not detour vkCreateSwapchainKHR (status: %d).", mhStatus);
+        }
+    }
+
+    // 2a. Detour vkDestroySwapchainKHR
+    auto pfnDestroySwapchain = reinterpret_cast<void*>(GetProcAddress(vulkanModule, "vkDestroySwapchainKHR"));
+    if (pfnDestroySwapchain) {
+        mhStatus = MH_CreateHook(
+            pfnDestroySwapchain,
+            reinterpret_cast<LPVOID>(&Hooked_vkDestroySwapchainKHR),
+            reinterpret_cast<LPVOID*>(&g_Original_vkDestroySwapchainKHR)
+        );
+        if (mhStatus == MH_OK || mhStatus == MH_ERROR_ALREADY_CREATED) {
+            MH_EnableHook(pfnDestroySwapchain);
+            CBR_LOG_INFO("MinHook: Successfully detoured vkDestroySwapchainKHR (export at 0x%p).", pfnDestroySwapchain);
+            hookedAny = true;
+        }
+    }
+
+    // 2a2. Detour vkCreateDevice
+    auto pfnCreateDevice = reinterpret_cast<void*>(GetProcAddress(vulkanModule, "vkCreateDevice"));
+    if (pfnCreateDevice) {
+        mhStatus = MH_CreateHook(
+            pfnCreateDevice,
+            reinterpret_cast<LPVOID>(&Hooked_vkCreateDevice),
+            reinterpret_cast<LPVOID*>(&g_Original_vkCreateDevice)
+        );
+        if (mhStatus == MH_OK || mhStatus == MH_ERROR_ALREADY_CREATED) {
+            MH_EnableHook(pfnCreateDevice);
+            CBR_LOG_INFO("MinHook: Successfully detoured vkCreateDevice (export at 0x%p).", pfnCreateDevice);
+            hookedAny = true;
         }
     }
 

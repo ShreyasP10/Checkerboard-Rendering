@@ -23,11 +23,11 @@ inline float LinearizeDepth(float d, DepthConvention convention, float zNear, fl
     if (convention == DepthConvention::Reversed) {
         if (zFar <= 0.0f) return zNear / std::max(d, kMinDeviceDepth);
         const float denom = (zNear + d * (zFar - zNear));
-        if (!std::isfinite(denom) || denom == 0.0f) return std::numeric_limits<float>::quiet_NaN();
+        if (!std::isfinite(denom) || std::fabs(denom) < 1e-7f) return std::numeric_limits<float>::quiet_NaN();
         return (zNear * zFar) / denom;
     }
     const float denom = (zFar - d * (zFar - zNear));
-    if (!std::isfinite(denom) || denom == 0.0f) return std::numeric_limits<float>::quiet_NaN();
+    if (!std::isfinite(denom) || std::fabs(denom) < 1e-7f) return std::numeric_limits<float>::quiet_NaN();
     return (zNear * zFar) / denom;
 }
 

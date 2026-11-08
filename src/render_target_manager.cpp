@@ -23,6 +23,7 @@ constexpr uint32_t kVkImageTilingOptimal                  = 0;
 constexpr uint32_t kVkSharingModeExclusive                = 0;
 constexpr uint32_t kVkImageLayoutUndefined                = 0;
 constexpr uint32_t kVkSampleCount1Bit                     = 0x00000001;
+constexpr uint32_t kVkSampleCount2Bit                     = 0x00000002;
 
 constexpr uint32_t kVkImageUsageTransferSrcBit            = 0x00000001;
 constexpr uint32_t kVkImageUsageTransferDstBit            = 0x00000002;
@@ -234,6 +235,11 @@ bool RenderTargetManager::CreateVulkanResources(void* vkDevice, void* vkPhysical
     };
 
     auto pfnCreateImage = reinterpret_cast<PFN_vkCreateImage>(resolveDeviceFunc("vkCreateImage"));
+    auto pfnDeviceWaitIdle = reinterpret_cast<int (*)(void*)>(resolveDeviceFunc("vkDeviceWaitIdle"));
+    if (m_vkDevice && pfnDeviceWaitIdle) {
+        pfnDeviceWaitIdle(m_vkDevice);
+    }
+
     auto pfnDestroyImage = reinterpret_cast<PFN_vkDestroyImage>(resolveDeviceFunc("vkDestroyImage"));
     auto pfnGetImageMemoryRequirements = reinterpret_cast<PFN_vkGetImageMemoryRequirements>(resolveDeviceFunc("vkGetImageMemoryRequirements"));
     auto pfnAllocateMemory = reinterpret_cast<PFN_vkAllocateMemory>(resolveDeviceFunc("vkAllocateMemory"));
@@ -277,7 +283,8 @@ bool RenderTargetManager::CreateVulkanResources(void* vkDevice, void* vkPhysical
     const TargetDimensions dims = GetDimensions();
 
     auto createTexture = [&](uint32_t width, uint32_t height, uint32_t format,
-                             uint32_t usage, uint32_t aspectMask, VulkanTextureResource& out) -> bool {
+                             uint32_t usage, uint32_t aspectMask, VulkanTextureResource& out,
+                             uint32_t samples = kVkSampleCount1Bit) -> bool {
         MinimalVkImageCreateInfo imageInfo{};
         imageInfo.sType = kVkStructureTypeImageCreateInfo;
         imageInfo.imageType = kVkImageType2D;
@@ -285,7 +292,7 @@ bool RenderTargetManager::CreateVulkanResources(void* vkDevice, void* vkPhysical
         imageInfo.extent = { width, height, 1 };
         imageInfo.mipLevels = 1;
         imageInfo.arrayLayers = 1;
-        imageInfo.samples = kVkSampleCount1Bit;
+        imageInfo.samples = samples;
         imageInfo.tiling = kVkImageTilingOptimal;
         imageInfo.usage = usage;
         imageInfo.sharingMode = kVkSharingModeExclusive;
@@ -345,14 +352,15 @@ bool RenderTargetManager::CreateVulkanResources(void* vkDevice, void* vkPhysical
                                     kVkImageUsageTransferSrcBit | kVkImageUsageTransferDstBit;
 
     // 1. Create Quarter-Res 2x MSAA / Input Color, Depth, and Velocity targets
+    // Binding 0 & 1 in cbr_reconstruct.comp sample these as sampler2DMS (2x MSAA required)
     if (!createTexture(dims.quarterWidth, dims.quarterHeight, kVkFormatR16G16B16A16Sfloat,
-                       colorUsage, kVkImageAspectColorBit, m_vkResources.quarterColor)) {
-        CBR_LOG_ERROR("Failed to allocate device-local QuarterColor buffer");
+                       colorUsage, kVkImageAspectColorBit, m_vkResources.quarterColor, kVkSampleCount2Bit)) {
+        CBR_LOG_ERROR("Failed to allocate device-local QuarterColor buffer (2x MSAA)");
         return false;
     }
     if (!createTexture(dims.quarterWidth, dims.quarterHeight, kVkFormatR32Sfloat,
-                       depthUsage, kVkImageAspectColorBit, m_vkResources.quarterDepth)) {
-        CBR_LOG_ERROR("Failed to allocate device-local QuarterDepth buffer");
+                       depthUsage, kVkImageAspectColorBit, m_vkResources.quarterDepth, kVkSampleCount2Bit)) {
+        CBR_LOG_ERROR("Failed to allocate device-local QuarterDepth buffer (2x MSAA)");
         return false;
     }
     if (!createTexture(dims.quarterWidth, dims.quarterHeight, kVkFormatR16G16B16A16Sfloat,
@@ -440,6 +448,11 @@ void RenderTargetManager::DestroyVulkanResources() {
         }
         return reinterpret_cast<void*>(GetProcAddress(vulkanModule, name));
     };
+
+    auto pfnDeviceWaitIdle = reinterpret_cast<int (*)(void*)>(resolveDeviceFunc("vkDeviceWaitIdle"));
+    if (m_vkDevice && pfnDeviceWaitIdle) {
+        pfnDeviceWaitIdle(m_vkDevice);
+    }
 
     auto pfnDestroyImage = reinterpret_cast<PFN_vkDestroyImage>(resolveDeviceFunc("vkDestroyImage"));
     auto pfnFreeMemory = reinterpret_cast<PFN_vkFreeMemory>(resolveDeviceFunc("vkFreeMemory"));
