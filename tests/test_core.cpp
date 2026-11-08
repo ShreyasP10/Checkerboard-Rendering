@@ -1,5 +1,7 @@
+#include "cbr/cbr_engine.h"
 #include "cbr/checkerboard_mapping.h"
 #include "cbr/config.h"
+#include "cbr/crash_handler.h"
 #include "cbr/depth_convention.h"
 #include "cbr/jitter_manager.h"
 #include "cbr/logger.h"
@@ -545,6 +547,21 @@ static void TestPatternScanner() {
     CHECK(ripTarget == (mockMemory + 3 + 7 + expectedDisplacement));
 }
 
+static void TestCrashHandlerAndSecurity(const fs::path& dir) {
+    // 1. Crash handler installation and telemetry
+    auto& handler = CrashHandler::Get();
+    CHECK(!handler.IsInstalled());
+    handler.Install(dir);
+    CHECK(handler.IsInstalled());
+    handler.LogSystemTelemetry();
+    handler.Uninstall();
+    CHECK(!handler.IsInstalled());
+
+    // 2. Anti-cheat safety check (clean test environment)
+    auto& engine = CBREngine::Get();
+    CHECK(!engine.CheckAntiCheatModules());
+}
+
 int main() {
     const fs::path dir = fs::temp_directory_path() / "cbr_tests";
     fs::create_directories(dir);
@@ -561,6 +578,7 @@ int main() {
     TestProjectionJitterSign();
     TestReconstructionPass(dir);
     TestPatternScanner();
+    TestCrashHandlerAndSecurity(dir);
 
     fs::remove_all(dir);
     if (g_failures == 0) {
