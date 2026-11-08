@@ -155,6 +155,8 @@ bool HookManager::InstallDX12Hooks() {
     }
 
 
+    MH_STATUS mhStatus = MH_OK;
+
     typedef HRESULT (WINAPI *PFN_D3D12CreateDevice)(IUnknown*, int, REFIID, void**);
     typedef HRESULT (WINAPI *PFN_CreateDXGIFactory1)(REFIID, void**);
 
