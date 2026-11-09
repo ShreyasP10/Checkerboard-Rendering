@@ -288,8 +288,12 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
         }
     }
 
-    // Exact texel fetch of velocity using integer motionCoord prevents cross-edge interpolation
-    float2 velocity = g_Velocity.Load(int3(motionCoord, 0)).xy;
+    // Sample velocity: adaptively handle quarter-res or full-res velocity buffers (Item C-05)
+    uint velWidth = 0, velHeight = 0, numLevels = 0;
+    g_Velocity.GetDimensions(0, velWidth, velHeight, numLevels);
+    int2 velCoord = ((int)velWidth < (int)g_TargetResolution.x) ? (motionCoord >> 1) : motionCoord;
+    velCoord = clamp(velCoord, int2(0, 0), max(int2((int)velWidth - 1, (int)velHeight - 1), int2(0, 0)));
+    float2 velocity = g_Velocity.Load(int3(velCoord, 0)).xy;
     velocity = clamp(velocity, float2(-0.5f, -0.5f), float2(0.5f, 0.5f));
     bool velocityBad = isinf(velocity.x) || isnan(velocity.x) || isinf(velocity.y) || isnan(velocity.y)
         || isinf(uv.x) || isnan(uv.x) || isinf(uv.y) || isnan(uv.y);

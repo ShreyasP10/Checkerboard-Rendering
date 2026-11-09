@@ -64,6 +64,7 @@ private:
     std::pair<float, float> m_cachedProjectionOffsetVk[2]{};
     std::pair<float, float> m_cachedProjectionOffsetDx[2]{};
     mutable float           m_lastProj0{ 0.0f };
+    mutable std::pair<float, float> m_lastAppliedOffset{ 0.0f, 0.0f };
 };
 
 } // namespace cbr

@@ -76,6 +76,16 @@ public:
                             uint32_t dstWidth, uint32_t dstHeight,
                             uint32_t targetDstLayout = 1000001002 /* VK_IMAGE_LAYOUT_PRESENT_SRC_KHR */);
 
+    // Helper function to copy an image region (e.g. game attachments to mod intermediate buffers, Item C-01)
+    static void CopyImageRegion(void* vkCommandBuffer, void* srcImage, void* dstImage,
+                                uint32_t srcX, uint32_t srcY,
+                                uint32_t dstX, uint32_t dstY,
+                                uint32_t width, uint32_t height,
+                                uint32_t aspectMask = 1);
+
+    void EnsureInitialLayoutsTransitioned(void* vkCommandBuffer);
+    void ResetLayoutTransitions() { m_initialLayoutsTransitioned.store(false, std::memory_order_release); }
+
     bool AreDescriptorsBound() const { return m_descriptorsBound.load(); }
 
     void SetShaderDirectory(const std::filesystem::path& dir) { m_shaderDir = dir; }
@@ -101,6 +111,7 @@ private:
     std::atomic<bool>     m_initialized{ false };
     std::atomic<bool>     m_descriptorsBound{ false };
     std::atomic<bool>     m_isVulkan{ true };
+    std::atomic<bool>     m_initialLayoutsTransitioned{ false };
     std::filesystem::path m_shaderDir;
 
     void* m_device{ nullptr };
@@ -120,10 +131,17 @@ private:
 
     PFN_CmdPipelineBarrier    m_pfnCmdPipelineBarrier{ nullptr };
     PFN_CmdBlitImage          m_pfnCmdBlitImage{ nullptr };
+    using PFN_CmdCopyImage = void (*)(void*, void*, uint32_t, void*, uint32_t, uint32_t, const void*);
+    PFN_CmdCopyImage          m_pfnCmdCopyImage{ nullptr };
     PFN_CmdBindPipeline       m_pfnCmdBindPipeline{ nullptr };
     PFN_CmdBindDescriptorSets m_pfnCmdBindDescriptorSets{ nullptr };
     PFN_CmdPushConstants      m_pfnCmdPushConstants{ nullptr };
     PFN_CmdDispatch           m_pfnCmdDispatch{ nullptr };
+
+    // DirectX 12 Pipeline State (Item H-02)
+    void*                     m_d3d12Device{ nullptr };
+    void*                     m_d3d12RootSignature{ nullptr };
+    void*                     m_d3d12PipelineState{ nullptr };
 };
 
 } // namespace cbr

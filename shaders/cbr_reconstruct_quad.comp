@@ -229,8 +229,11 @@ void ResolvePixel(ivec2 pixelCoord, ivec2 targetSize, uint frameParity) {
         }
     }
 
-    // Sample velocity using texelFetch to avoid cross-edge interpolation/ghosting
-    vec2 velocity = texelFetch(u_Velocity, motionCoord, 0).xy;
+    // Sample velocity: adaptively handle quarter-res or full-res velocity buffers (Item C-05)
+    ivec2 velSize = textureSize(u_Velocity, 0);
+    ivec2 velCoord = (velSize.x < targetSize.x) ? (motionCoord >> 1) : motionCoord;
+    velCoord = clamp(velCoord, ivec2(0), max(velSize - ivec2(1), ivec2(0)));
+    vec2 velocity = texelFetch(u_Velocity, velCoord, 0).xy;
     velocity = clamp(velocity, vec2(-0.5), vec2(0.5));
     bool velocityBad = isinf(velocity.x) || isnan(velocity.x) || isinf(velocity.y) || isnan(velocity.y)
         || isinf(uv.x) || isnan(uv.x) || isinf(uv.y) || isnan(uv.y);

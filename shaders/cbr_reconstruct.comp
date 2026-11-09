@@ -288,8 +288,11 @@ void main() {
         }
     }
 
-    // Point-sample velocity via texelFetch at integer motionCoord to prevent cross-edge velocity bleeding
-    vec2 velocity = texelFetch(u_Velocity, motionCoord, 0).xy;
+    // Point-sample velocity: adaptively handle quarter-res or full-res velocity buffers (Item C-05)
+    ivec2 velSize = textureSize(u_Velocity, 0);
+    ivec2 velCoord = (velSize.x < targetSize.x) ? (motionCoord >> 1) : motionCoord;
+    velCoord = clamp(velCoord, ivec2(0), max(velSize - ivec2(1), ivec2(0)));
+    vec2 velocity = texelFetch(u_Velocity, velCoord, 0).xy;
     velocity = clamp(velocity, vec2(-0.5), vec2(0.5));
     // NaN/Inf velocity or UV must disocclude: ivec2(NaN) is UB and NaN comparisons are false.
     bool velocityBad = isinf(velocity.x) || isnan(velocity.x) || isinf(velocity.y) || isnan(velocity.y)

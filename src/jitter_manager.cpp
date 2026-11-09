@@ -28,6 +28,8 @@ void JitterManager::Initialize(uint32_t targetWidth, uint32_t targetHeight) {
         m_targetHeight = (targetHeight > 0) ? targetHeight : 2160;
         m_currentJitter = { 0.0f, 0.0f };
         m_previousJitter = { 0.0f, 0.0f };
+        m_lastProj0 = 0.0f;
+        m_lastAppliedOffset = { 0.0f, 0.0f };
         w = m_targetWidth; h = m_targetHeight;
 
         const float pixelWidth = 1.0f / static_cast<float>(m_targetWidth);
@@ -109,28 +111,35 @@ void JitterManager::ApplyJitterToProjection(float* projMatrix4x4, bool isVulkan)
     }
 
     std::pair<float, float> offset;
+    std::pair<float, float> lastOffset;
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         const uint32_t phase = (m_currentJitter.x != 0.0f) ? 1u : 0u;
         offset = isVulkan ? m_cachedProjectionOffsetVk[phase] : m_cachedProjectionOffsetDx[phase];
+        lastOffset = m_lastAppliedOffset;
+        m_lastAppliedOffset = offset;
     }
+
+    // Subtract previously applied offset to prevent cumulative drift on persistent engine matrices (Item H-01)
+    projMatrix4x4[8] -= lastOffset.first;
+    projMatrix4x4[9] -= lastOffset.second;
 
     projMatrix4x4[8] += offset.first;
     projMatrix4x4[9] += offset.second;
 }
 
-void JitterManager::RemoveJitterFromProjection(float* projMatrix4x4, bool isVulkan) const {
+void JitterManager::RemoveJitterFromProjection(float* projMatrix4x4, bool /*isVulkan*/) const {
     if (!projMatrix4x4) return;
 
-    std::pair<float, float> offset;
+    std::pair<float, float> lastOffset;
     {
         std::lock_guard<std::mutex> lock(m_mutex);
-        const uint32_t phase = (m_currentJitter.x != 0.0f) ? 1u : 0u;
-        offset = isVulkan ? m_cachedProjectionOffsetVk[phase] : m_cachedProjectionOffsetDx[phase];
+        lastOffset = m_lastAppliedOffset;
+        m_lastAppliedOffset = { 0.0f, 0.0f };
     }
 
-    projMatrix4x4[8] -= offset.first;
-    projMatrix4x4[9] -= offset.second;
+    projMatrix4x4[8] -= lastOffset.first;
+    projMatrix4x4[9] -= lastOffset.second;
 }
 
 void JitterManager::SetProjectionJitter(float* outMatrix4x4, const float* inUnjitteredMatrix4x4, bool isVulkan) const {

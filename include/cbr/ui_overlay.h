@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <string>
 #include "cbr/config.h"
 
 namespace cbr {
@@ -37,6 +38,7 @@ public:
     bool IsInitialized() const { return m_initialized.load(std::memory_order_relaxed); }
 
     OverlayMetrics GetCurrentMetrics() const;
+    std::string    GetFormattedTelemetry() const;
 
     // Interactive Control HUD API (Category 7, Item 96)
     void SetHistoryWeight(float weight);

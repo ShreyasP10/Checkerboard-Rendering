@@ -1,5 +1,6 @@
 #include "cbr/ui_overlay.h"
 #include <algorithm>
+#include <cstdio>
 #include "cbr/config.h"
 #include "cbr/cbr_engine.h"
 #include "cbr/render_target_manager.h"
@@ -158,6 +159,35 @@ void UIOverlay::RegisterHudRenderCallback(HudRenderCallback callback) {
     m_hudCallback.store(callback, std::memory_order_release);
 }
 
+std::string UIOverlay::GetFormattedTelemetry() const {
+    const auto m = GetCurrentMetrics();
+    const auto& config = ConfigManager::Get().GetConfig();
+    char buf[512];
+    std::snprintf(buf, sizeof(buf),
+                  "=== RDR2 CBR Telemetry Overlay ===\n"
+                  "Status:          %s\n"
+                  "Frame:           %u\n"
+                  "Resolution:      %ux%u (Quarter: %ux%u)\n"
+                  "VRAM Allocated:  %.2f MiB\n"
+                  "API Hooked:      %s\n"
+                  "Debug View:      %u\n"
+                  "History Weight:  %.2f\n"
+                  "Depth Tolerance: %.4f\n"
+                  "Mip LOD Bias:    %.2f\n"
+                  "Color Space:     %s\n",
+                  m.cbrEnabled ? "ACTIVE (Checkerboard 2x MSAA)" : "BYPASS",
+                  m.currentFrame,
+                  m.targetWidth, m.targetHeight, m.quarterWidth, m.quarterHeight,
+                  m.vramFootprintMiB,
+                  m.isHooked ? "YES" : "NO",
+                  m.debugView,
+                  config.historyWeight,
+                  config.depthTolerance,
+                  config.mipLodBias,
+                  (config.colorSpace == ColorSpace::RGB) ? "RGB" : ((config.colorSpace == ColorSpace::ICtCp) ? "ICtCp" : "YCoCg"));
+    return std::string(buf);
+}
+
 void UIOverlay::Render() {
     // Check toggle hotkeys every presentation interval regardless of current visibility
     CheckHotkeys();
@@ -169,6 +199,20 @@ void UIOverlay::Render() {
     auto cb = m_hudCallback.load(std::memory_order_acquire);
     if (cb) {
         cb(GetCurrentMetrics());
+    } else {
+        // Built-in Telemetry HUD fallback (Item H-04):
+        // When no external ImGui callback is hooked, periodically emit OSD telemetry
+        static std::atomic<uint32_t> s_lastOutputFrame{ ~0u };
+        const uint32_t curFrame = CBREngine::Get().GetCurrentFrameIndex();
+        const uint32_t last = s_lastOutputFrame.load(std::memory_order_relaxed);
+        if (last == ~0u || (curFrame >= last && curFrame - last >= 60)) {
+            s_lastOutputFrame.store(curFrame, std::memory_order_relaxed);
+            std::string text = GetFormattedTelemetry();
+#if defined(_WIN32)
+            OutputDebugStringA(text.c_str());
+#endif
+            CBR_LOG_INFO("HUD OSD:\n%s", text.c_str());
+        }
     }
 }
 

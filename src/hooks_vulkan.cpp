@@ -33,6 +33,9 @@ struct MinimalVkRect2D;
 struct MinimalVkSampleLocationsInfoEXT;
 struct MinimalVkSamplerCreateInfo;
 
+struct MinimalVkImageViewCreateInfo;
+struct MinimalVkFramebufferCreateInfo;
+
 // Function pointer typedefs matching Vulkan loader signatures
 typedef void* (*PFN_vkGetDeviceProcAddr)(void* device, const char* pName);
 typedef void* (*PFN_vkGetInstanceProcAddr)(void* instance, const char* pName);
@@ -50,6 +53,10 @@ typedef void  (*PFN_vkCmdDrawIndexed)(void* commandBuffer, uint32_t indexCount, 
 typedef int   (*PFN_vkCreateDevice)(void* physicalDevice, const void* pCreateInfo, const void* pAllocator, void** pDevice);
 typedef void  (*PFN_vkDestroySwapchainKHR)(void* device, void* swapchain, const void* pAllocator);
 typedef int   (*PFN_vkCreateSampler)(void* device, const MinimalVkSamplerCreateInfo* pCreateInfo, const void* pAllocator, void* pSampler);
+typedef int   (*PFN_vkCreateImageView)(void* device, const MinimalVkImageViewCreateInfo* pCreateInfo, const void* pAllocator, void** pView);
+typedef void  (*PFN_vkDestroyImageView)(void* device, void* imageView, const void* pAllocator);
+typedef int   (*PFN_vkCreateFramebuffer)(void* device, const MinimalVkFramebufferCreateInfo* pCreateInfo, const void* pAllocator, void** pFramebuffer);
+typedef void  (*PFN_vkDestroyFramebuffer)(void* device, void* framebuffer, const void* pAllocator);
 
 PFN_vkGetDeviceProcAddr        g_Original_vkGetDeviceProcAddr = nullptr;
 PFN_vkGetInstanceProcAddr      g_Original_vkGetInstanceProcAddr = nullptr;
@@ -67,6 +74,10 @@ PFN_vkCmdDraw                  g_Original_vkCmdDraw = nullptr;
 PFN_vkCmdDrawIndexed           g_Original_vkCmdDrawIndexed = nullptr;
 PFN_vkCmdSetSampleLocationsEXT g_Original_vkCmdSetSampleLocationsEXT = nullptr;
 PFN_vkCreateSampler            g_Original_vkCreateSampler = nullptr;
+PFN_vkCreateImageView          g_Original_vkCreateImageView = nullptr;
+PFN_vkDestroyImageView         g_Original_vkDestroyImageView = nullptr;
+PFN_vkCreateFramebuffer        g_Original_vkCreateFramebuffer = nullptr;
+PFN_vkDestroyFramebuffer       g_Original_vkDestroyFramebuffer = nullptr;
 
 void* Hooked_vkGetDeviceProcAddr(void* device, const char* pName);
 void* Hooked_vkGetInstanceProcAddr(void* instance, const char* pName);
@@ -82,6 +93,10 @@ void  Hooked_vkCmdDraw(void* commandBuffer, uint32_t vertexCount, uint32_t insta
 void  Hooked_vkCmdDrawIndexed(void* commandBuffer, uint32_t indexCount, uint32_t instanceCount, uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance);
 void  Hooked_vkCmdSetSampleLocationsEXT(void* commandBuffer, const MinimalVkSampleLocationsInfoEXT* pSampleLocationsInfo);
 int   Hooked_vkCreateSampler(void* device, const MinimalVkSamplerCreateInfo* pCreateInfo, const void* pAllocator, void* pSampler);
+int   Hooked_vkCreateImageView(void* device, const MinimalVkImageViewCreateInfo* pCreateInfo, const void* pAllocator, void** pView);
+void  Hooked_vkDestroyImageView(void* device, void* imageView, const void* pAllocator);
+int   Hooked_vkCreateFramebuffer(void* device, const MinimalVkFramebufferCreateInfo* pCreateInfo, const void* pAllocator, void** pFramebuffer);
+void  Hooked_vkDestroyFramebuffer(void* device, void* framebuffer, const void* pAllocator);
 
 // VK_ERROR_INITIALIZATION_FAILED: returned if a hook is ever invoked without a valid trampoline,
 // so the failure is visible to the caller instead of silently dropping frames / swapchains.
@@ -199,6 +214,48 @@ struct MinimalVkRect2D {
     MinimalVkExtent2D extent;
 };
 
+struct MinimalVkSubresourceRange {
+    uint32_t aspectMask;
+    uint32_t baseMipLevel;
+    uint32_t levelCount;
+    uint32_t baseArrayLayer;
+    uint32_t layerCount;
+};
+
+struct MinimalVkImageViewCreateInfo {
+    uint32_t                  sType;
+    const void*               pNext;
+    uint32_t                  flags;
+    void*                     image;
+    int32_t                   viewType;
+    int32_t                   format;
+    int32_t                   components[4];
+    MinimalVkSubresourceRange subresourceRange;
+};
+
+struct MinimalVkFramebufferCreateInfo {
+    uint32_t            sType;
+    const void*         pNext;
+    uint32_t            flags;
+    void*               renderPass;
+    uint32_t            attachmentCount;
+    const void* const*  pAttachments;
+    uint32_t            width;
+    uint32_t            height;
+    uint32_t            layers;
+};
+
+#if defined(_WIN64) || defined(__x86_64__) || defined(_M_X64)
+static_assert(offsetof(MinimalVkFramebufferCreateInfo, sType) == 0, "ABI drift");
+static_assert(offsetof(MinimalVkFramebufferCreateInfo, attachmentCount) == 32, "ABI drift: attachmentCount offset");
+static_assert(offsetof(MinimalVkFramebufferCreateInfo, pAttachments) == 40, "ABI drift: pAttachments offset");
+static_assert(offsetof(MinimalVkFramebufferCreateInfo, width) == 48, "ABI drift: width offset");
+static_assert(offsetof(MinimalVkFramebufferCreateInfo, height) == 52, "ABI drift: height offset");
+static_assert(offsetof(MinimalVkImageViewCreateInfo, sType) == 0, "ABI drift");
+static_assert(offsetof(MinimalVkImageViewCreateInfo, image) == 24, "ABI drift: image offset");
+static_assert(offsetof(MinimalVkImageViewCreateInfo, format) == 36, "ABI drift: format offset");
+#endif
+
 // Configures alternating 2x MSAA sample locations per frame according to CHECKERBOARD.md (Strategy B).
 // NOTE (MUTUAL EXCLUSIVITY): When using programmable sample locations (Strategy B),
 // viewport horizontal jittering (Strategy A via GetQuarterViewportShiftX) MUST be disabled (set to 0).
@@ -254,12 +311,32 @@ inline void* GetActiveSwapchainImage() {
     return nullptr;
 }
 
+// Game Attachment & Framebuffer Tracking (Item C-01)
+struct TrackedImageView {
+    void*    image{ nullptr };
+    int32_t  format{ 0 };
+    uint32_t aspectMask{ 0 };
+};
+
+struct TrackedFramebuffer {
+    uint32_t           width{ 0 };
+    uint32_t           height{ 0 };
+    std::vector<void*> attachments;
+};
+
+std::mutex g_attachmentMutex;
+std::unordered_map<void*, TrackedImageView> g_imageViews;
+std::unordered_map<void*, TrackedFramebuffer> g_framebuffers;
+
 // Scene pass identification and draw tracking using lock-free slot pool
 struct PassSlot {
     std::atomic<void*>    cmdBuffer{ nullptr };
     std::atomic<bool>     hasMatchingExtent{ false };
     std::atomic<bool>     viewportDownscaled{ false };
     std::atomic<uint32_t> drawCount{ 0 };
+    std::atomic<void*>    activeFramebuffer{ nullptr };
+    std::atomic<uint32_t> renderWidth{ 0 };
+    std::atomic<uint32_t> renderHeight{ 0 };
 };
 
 constexpr size_t kMaxTrackedPassSlots = 64;
@@ -444,6 +521,64 @@ int Hooked_vkAcquireNextImageKHR(void* device, void* swapchain, uint64_t timeout
     return result;
 }
 
+int Hooked_vkCreateImageView(void* device, const MinimalVkImageViewCreateInfo* pCreateInfo, const void* pAllocator, void** pView) {
+    if (!g_Original_vkCreateImageView) {
+        return kVkErrorInitializationFailed;
+    }
+    const int result = g_Original_vkCreateImageView(device, pCreateInfo, pAllocator, pView);
+    if (result == 0 && pView && *pView && pCreateInfo) {
+        MinimalVkImageViewCreateInfo info{};
+        std::memcpy(&info, pCreateInfo, sizeof(info));
+        std::lock_guard<std::mutex> lock(g_attachmentMutex);
+        g_imageViews[*pView] = { info.image, info.format, info.subresourceRange.aspectMask };
+    }
+    return result;
+}
+
+void Hooked_vkDestroyImageView(void* device, void* imageView, const void* pAllocator) {
+    if (imageView) {
+        std::lock_guard<std::mutex> lock(g_attachmentMutex);
+        g_imageViews.erase(imageView);
+    }
+    if (g_Original_vkDestroyImageView) {
+        g_Original_vkDestroyImageView(device, imageView, pAllocator);
+    }
+}
+
+int Hooked_vkCreateFramebuffer(void* device, const MinimalVkFramebufferCreateInfo* pCreateInfo, const void* pAllocator, void** pFramebuffer) {
+    if (!g_Original_vkCreateFramebuffer) {
+        return kVkErrorInitializationFailed;
+    }
+    const int result = g_Original_vkCreateFramebuffer(device, pCreateInfo, pAllocator, pFramebuffer);
+    if (result == 0 && pFramebuffer && *pFramebuffer && pCreateInfo) {
+        MinimalVkFramebufferCreateInfo info{};
+        std::memcpy(&info, pCreateInfo, sizeof(info));
+        TrackedFramebuffer fb{};
+        fb.width = info.width;
+        fb.height = info.height;
+        if (info.attachmentCount > 0 && info.attachmentCount < 32 && info.pAttachments) {
+            for (uint32_t i = 0; i < info.attachmentCount; ++i) {
+                void* attView = nullptr;
+                std::memcpy(&attView, &info.pAttachments[i], sizeof(attView));
+                fb.attachments.push_back(attView);
+            }
+        }
+        std::lock_guard<std::mutex> lock(g_attachmentMutex);
+        g_framebuffers[*pFramebuffer] = std::move(fb);
+    }
+    return result;
+}
+
+void Hooked_vkDestroyFramebuffer(void* device, void* framebuffer, const void* pAllocator) {
+    if (framebuffer) {
+        std::lock_guard<std::mutex> lock(g_attachmentMutex);
+        g_framebuffers.erase(framebuffer);
+    }
+    if (g_Original_vkDestroyFramebuffer) {
+        g_Original_vkDestroyFramebuffer(device, framebuffer, pAllocator);
+    }
+}
+
 void Hooked_vkCmdSetViewport(void* commandBuffer, uint32_t firstViewport, uint32_t viewportCount, const MinimalVkViewport* pViewports) {
     if (!g_Original_vkCmdSetViewport) return;
 
@@ -545,6 +680,9 @@ void Hooked_vkCmdBeginRenderPass(void* commandBuffer, const void* pRenderPassBeg
                 slot->hasMatchingExtent.store(matching, std::memory_order_release);
                 slot->viewportDownscaled.store(false, std::memory_order_release);
                 slot->drawCount.store(0, std::memory_order_release);
+                slot->activeFramebuffer.store(info.framebuffer, std::memory_order_release);
+                slot->renderWidth.store(w, std::memory_order_release);
+                slot->renderHeight.store(h, std::memory_order_release);
             }
         }
     }
@@ -576,37 +714,115 @@ void Hooked_vkCmdEndRenderPass(void* commandBuffer) {
     if (CBREngine::Get().IsEnabled()) {
         try {
             bool isScenePass = false;
+            void* activeFb = nullptr;
+            uint32_t rw = 0, rh = 0;
             PassSlot* slot = FindPassSlot(commandBuffer);
             if (slot) {
                 const bool downscaled = slot->viewportDownscaled.load(std::memory_order_acquire);
                 const bool matching = slot->hasMatchingExtent.load(std::memory_order_acquire);
                 const uint32_t draws = slot->drawCount.load(std::memory_order_acquire);
                 isScenePass = downscaled || (matching && draws >= 20);
+                activeFb = slot->activeFramebuffer.load(std::memory_order_acquire);
+                rw = slot->renderWidth.load(std::memory_order_acquire);
+                rh = slot->renderHeight.load(std::memory_order_acquire);
 
                 // Release slot back to pool
                 slot->hasMatchingExtent.store(false, std::memory_order_relaxed);
                 slot->viewportDownscaled.store(false, std::memory_order_relaxed);
                 slot->drawCount.store(0, std::memory_order_relaxed);
+                slot->activeFramebuffer.store(nullptr, std::memory_order_relaxed);
+                slot->renderWidth.store(0, std::memory_order_relaxed);
+                slot->renderHeight.store(0, std::memory_order_relaxed);
                 slot->cmdBuffer.store(nullptr, std::memory_order_release);
             }
 
             // Trigger reconstruction if identified as scene pass or engine marked active
             const bool wasCandidateActive = CBREngine::Get().ConsumeCandidatePassActive(commandBuffer);
             if (isScenePass || wasCandidateActive) {
-                CBREngine::Get().OnScenePassEnd(commandBuffer);
+                void* gameColorImage = nullptr;
+                void* gameDepthImage = nullptr;
+                void* gameVelocityImage = nullptr;
+                uint32_t colorAspect = 1; // VK_IMAGE_ASPECT_COLOR_BIT
+                uint32_t depthAspect = 2; // VK_IMAGE_ASPECT_DEPTH_BIT
+                uint32_t velocityAspect = 1; // VK_IMAGE_ASPECT_COLOR_BIT
 
-                // Presentation path: blit reconstructed output to swapchain backbuffer image
-                void* backbuffer = GetActiveSwapchainImage();
-                if (backbuffer && RenderTargetManager::Get().AreVulkanResourcesCreated()) {
+                if (activeFb) {
+                    std::lock_guard<std::mutex> lock(g_attachmentMutex);
+                    auto fbit = g_framebuffers.find(activeFb);
+                    if (fbit != g_framebuffers.end()) {
+                        for (void* attView : fbit->second.attachments) {
+                            auto vit = g_imageViews.find(attView);
+                            if (vit != g_imageViews.end()) {
+                                if ((vit->second.aspectMask & 2 /* DEPTH */) ||
+                                    (vit->second.format >= 124 && vit->second.format <= 130)) {
+                                    if (!gameDepthImage) {
+                                        gameDepthImage = vit->second.image;
+                                        depthAspect = vit->second.aspectMask;
+                                    }
+                                } else if (!gameColorImage) {
+                                    gameColorImage = vit->second.image;
+                                    colorAspect = vit->second.aspectMask;
+                                } else if (!gameVelocityImage) {
+                                    gameVelocityImage = vit->second.image;
+                                    velocityAspect = vit->second.aspectMask;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (RenderTargetManager::Get().AreVulkanResourcesCreated()) {
                     const auto& res = RenderTargetManager::Get().GetVulkanResources();
                     const auto dims = RenderTargetManager::Get().GetDimensions();
-                    ReconstructionPass::BlitToImage(
-                        commandBuffer,
-                        res.outputColor.image,
-                        backbuffer,
-                        dims.fullWidth, dims.fullHeight,
-                        dims.fullWidth, dims.fullHeight
-                    );
+
+                    // Step 1: Copy game's rendered quarter-res geometry into mod's quarterColor, quarterDepth, and velocity (Item C-01)
+                    if (gameColorImage) {
+                        ReconstructionPass::CopyImageRegion(
+                            commandBuffer,
+                            gameColorImage, res.quarterColor.image,
+                            0, 0, 0, 0,
+                            dims.quarterWidth, dims.quarterHeight,
+                            colorAspect
+                        );
+                    }
+                    if (gameDepthImage) {
+                        ReconstructionPass::CopyImageRegion(
+                            commandBuffer,
+                            gameDepthImage, res.quarterDepth.image,
+                            0, 0, 0, 0,
+                            dims.quarterWidth, dims.quarterHeight,
+                            depthAspect
+                        );
+                    }
+                    if (gameVelocityImage) {
+                        ReconstructionPass::CopyImageRegion(
+                            commandBuffer,
+                            gameVelocityImage, res.velocity.image,
+                            0, 0, 0, 0,
+                            dims.quarterWidth, dims.quarterHeight,
+                            velocityAspect
+                        );
+                    }
+
+                    // Step 2: Transition layouts and execute CBR reconstruction compute dispatch
+                    CBREngine::Get().OnScenePassEnd(commandBuffer);
+
+                    // Step 3: Upscale and blit reconstructed full-resolution output back into the game's color attachment (Item C-01, C-02, C-04)
+                    // Subsequent game passes (post-processing, tonemapping, UI/HUD) now read full-resolution scene geometry!
+                    if (gameColorImage) {
+                        const uint32_t targetDstW = (rw > 0) ? rw : dims.fullWidth;
+                        const uint32_t targetDstH = (rh > 0) ? rh : dims.fullHeight;
+                        const uint32_t justWrittenIdx = RenderTargetManager::Get().GetCurrentHistoryIndex() & 1u;
+                        void* blitSource = res.historyColor[justWrittenIdx].image ? res.historyColor[justWrittenIdx].image : res.outputColor.image;
+                        ReconstructionPass::BlitToImage(
+                            commandBuffer,
+                            blitSource,
+                            gameColorImage,
+                            dims.fullWidth, dims.fullHeight,
+                            targetDstW, targetDstH,
+                            2 /* kVkImageLayoutColorAttachmentOptimal */
+                        );
+                    }
                 }
             }
         } catch (...) {
@@ -740,6 +956,30 @@ void* Hooked_vkGetDeviceProcAddr(void* device, const char* pName) {
         }
         return reinterpret_cast<void*>(&Hooked_vkCreateSampler);
     }
+    if (std::strcmp(pName, "vkCreateImageView") == 0) {
+        if (!g_Original_vkCreateImageView) {
+            g_Original_vkCreateImageView = reinterpret_cast<PFN_vkCreateImageView>(realProc);
+        }
+        return reinterpret_cast<void*>(&Hooked_vkCreateImageView);
+    }
+    if (std::strcmp(pName, "vkDestroyImageView") == 0) {
+        if (!g_Original_vkDestroyImageView) {
+            g_Original_vkDestroyImageView = reinterpret_cast<PFN_vkDestroyImageView>(realProc);
+        }
+        return reinterpret_cast<void*>(&Hooked_vkDestroyImageView);
+    }
+    if (std::strcmp(pName, "vkCreateFramebuffer") == 0) {
+        if (!g_Original_vkCreateFramebuffer) {
+            g_Original_vkCreateFramebuffer = reinterpret_cast<PFN_vkCreateFramebuffer>(realProc);
+        }
+        return reinterpret_cast<void*>(&Hooked_vkCreateFramebuffer);
+    }
+    if (std::strcmp(pName, "vkDestroyFramebuffer") == 0) {
+        if (!g_Original_vkDestroyFramebuffer) {
+            g_Original_vkDestroyFramebuffer = reinterpret_cast<PFN_vkDestroyFramebuffer>(realProc);
+        }
+        return reinterpret_cast<void*>(&Hooked_vkDestroyFramebuffer);
+    }
     return realProc;
 }
 
@@ -836,6 +1076,30 @@ void* Hooked_vkGetInstanceProcAddr(void* instance, const char* pName) {
             g_Original_vkCreateSampler = reinterpret_cast<PFN_vkCreateSampler>(realProc);
         }
         return reinterpret_cast<void*>(&Hooked_vkCreateSampler);
+    }
+    if (std::strcmp(pName, "vkCreateImageView") == 0) {
+        if (!g_Original_vkCreateImageView) {
+            g_Original_vkCreateImageView = reinterpret_cast<PFN_vkCreateImageView>(realProc);
+        }
+        return reinterpret_cast<void*>(&Hooked_vkCreateImageView);
+    }
+    if (std::strcmp(pName, "vkDestroyImageView") == 0) {
+        if (!g_Original_vkDestroyImageView) {
+            g_Original_vkDestroyImageView = reinterpret_cast<PFN_vkDestroyImageView>(realProc);
+        }
+        return reinterpret_cast<void*>(&Hooked_vkDestroyImageView);
+    }
+    if (std::strcmp(pName, "vkCreateFramebuffer") == 0) {
+        if (!g_Original_vkCreateFramebuffer) {
+            g_Original_vkCreateFramebuffer = reinterpret_cast<PFN_vkCreateFramebuffer>(realProc);
+        }
+        return reinterpret_cast<void*>(&Hooked_vkCreateFramebuffer);
+    }
+    if (std::strcmp(pName, "vkDestroyFramebuffer") == 0) {
+        if (!g_Original_vkDestroyFramebuffer) {
+            g_Original_vkDestroyFramebuffer = reinterpret_cast<PFN_vkDestroyFramebuffer>(realProc);
+        }
+        return reinterpret_cast<void*>(&Hooked_vkDestroyFramebuffer);
     }
     if (std::strcmp(pName, "vkGetDeviceProcAddr") == 0) {
         if (!g_Original_vkGetDeviceProcAddr) {
@@ -1109,6 +1373,66 @@ bool HookManager::InstallVulkanHooks() {
             hookedAny = true;
         } else {
             CBR_LOG_WARN("MinHook: Could not detour vkCreateSampler (status: %d).", mhStatus);
+        }
+    }
+
+    // 10. Intercept vkCreateImageView for attachment tracking (Item C-01)
+    auto pfnCreateImageView = reinterpret_cast<void*>(GetProcAddress(vulkanModule, "vkCreateImageView"));
+    if (pfnCreateImageView) {
+        mhStatus = MH_CreateHook(
+            pfnCreateImageView,
+            reinterpret_cast<LPVOID>(&Hooked_vkCreateImageView),
+            reinterpret_cast<LPVOID*>(&g_Original_vkCreateImageView)
+        );
+        if (mhStatus == MH_OK || mhStatus == MH_ERROR_ALREADY_CREATED) {
+            MH_EnableHook(pfnCreateImageView);
+            CBR_LOG_INFO("MinHook: Successfully detoured vkCreateImageView (export at 0x%p).", pfnCreateImageView);
+            hookedAny = true;
+        }
+    }
+
+    // 11. Intercept vkDestroyImageView for attachment cleanup
+    auto pfnDestroyImageView = reinterpret_cast<void*>(GetProcAddress(vulkanModule, "vkDestroyImageView"));
+    if (pfnDestroyImageView) {
+        mhStatus = MH_CreateHook(
+            pfnDestroyImageView,
+            reinterpret_cast<LPVOID>(&Hooked_vkDestroyImageView),
+            reinterpret_cast<LPVOID*>(&g_Original_vkDestroyImageView)
+        );
+        if (mhStatus == MH_OK || mhStatus == MH_ERROR_ALREADY_CREATED) {
+            MH_EnableHook(pfnDestroyImageView);
+            CBR_LOG_INFO("MinHook: Successfully detoured vkDestroyImageView (export at 0x%p).", pfnDestroyImageView);
+            hookedAny = true;
+        }
+    }
+
+    // 12. Intercept vkCreateFramebuffer for attachment mapping (Item C-01)
+    auto pfnCreateFramebuffer = reinterpret_cast<void*>(GetProcAddress(vulkanModule, "vkCreateFramebuffer"));
+    if (pfnCreateFramebuffer) {
+        mhStatus = MH_CreateHook(
+            pfnCreateFramebuffer,
+            reinterpret_cast<LPVOID>(&Hooked_vkCreateFramebuffer),
+            reinterpret_cast<LPVOID*>(&g_Original_vkCreateFramebuffer)
+        );
+        if (mhStatus == MH_OK || mhStatus == MH_ERROR_ALREADY_CREATED) {
+            MH_EnableHook(pfnCreateFramebuffer);
+            CBR_LOG_INFO("MinHook: Successfully detoured vkCreateFramebuffer (export at 0x%p).", pfnCreateFramebuffer);
+            hookedAny = true;
+        }
+    }
+
+    // 13. Intercept vkDestroyFramebuffer for framebuffer cleanup
+    auto pfnDestroyFramebuffer = reinterpret_cast<void*>(GetProcAddress(vulkanModule, "vkDestroyFramebuffer"));
+    if (pfnDestroyFramebuffer) {
+        mhStatus = MH_CreateHook(
+            pfnDestroyFramebuffer,
+            reinterpret_cast<LPVOID>(&Hooked_vkDestroyFramebuffer),
+            reinterpret_cast<LPVOID*>(&g_Original_vkDestroyFramebuffer)
+        );
+        if (mhStatus == MH_OK || mhStatus == MH_ERROR_ALREADY_CREATED) {
+            MH_EnableHook(pfnDestroyFramebuffer);
+            CBR_LOG_INFO("MinHook: Successfully detoured vkDestroyFramebuffer (export at 0x%p).", pfnDestroyFramebuffer);
+            hookedAny = true;
         }
     }
 

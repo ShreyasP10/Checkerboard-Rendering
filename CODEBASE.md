@@ -1112,6 +1112,7 @@ private:
     std::pair<float, float> m_cachedProjectionOffsetVk[2]{};
     std::pair<float, float> m_cachedProjectionOffsetDx[2]{};
     mutable float           m_lastProj0{ 0.0f };
+    mutable std::pair<float, float> m_lastAppliedOffset{ 0.0f, 0.0f };
 };
 
 } // namespace cbr
@@ -1384,6 +1385,16 @@ public:
                             uint32_t dstWidth, uint32_t dstHeight,
                             uint32_t targetDstLayout = 1000001002 /* VK_IMAGE_LAYOUT_PRESENT_SRC_KHR */);
 
+    // Helper function to copy an image region (e.g. game attachments to mod intermediate buffers, Item C-01)
+    static void CopyImageRegion(void* vkCommandBuffer, void* srcImage, void* dstImage,
+                                uint32_t srcX, uint32_t srcY,
+                                uint32_t dstX, uint32_t dstY,
+                                uint32_t width, uint32_t height,
+                                uint32_t aspectMask = 1);
+
+    void EnsureInitialLayoutsTransitioned(void* vkCommandBuffer);
+    void ResetLayoutTransitions() { m_initialLayoutsTransitioned.store(false, std::memory_order_release); }
+
     bool AreDescriptorsBound() const { return m_descriptorsBound.load(); }
 
     void SetShaderDirectory(const std::filesystem::path& dir) { m_shaderDir = dir; }
@@ -1409,6 +1420,7 @@ private:
     std::atomic<bool>     m_initialized{ false };
     std::atomic<bool>     m_descriptorsBound{ false };
     std::atomic<bool>     m_isVulkan{ true };
+    std::atomic<bool>     m_initialLayoutsTransitioned{ false };
     std::filesystem::path m_shaderDir;
 
     void* m_device{ nullptr };
@@ -1428,10 +1440,17 @@ private:
 
     PFN_CmdPipelineBarrier    m_pfnCmdPipelineBarrier{ nullptr };
     PFN_CmdBlitImage          m_pfnCmdBlitImage{ nullptr };
+    using PFN_CmdCopyImage = void (*)(void*, void*, uint32_t, void*, uint32_t, uint32_t, const void*);
+    PFN_CmdCopyImage          m_pfnCmdCopyImage{ nullptr };
     PFN_CmdBindPipeline       m_pfnCmdBindPipeline{ nullptr };
     PFN_CmdBindDescriptorSets m_pfnCmdBindDescriptorSets{ nullptr };
     PFN_CmdPushConstants      m_pfnCmdPushConstants{ nullptr };
     PFN_CmdDispatch           m_pfnCmdDispatch{ nullptr };
+
+    // DirectX 12 Pipeline State (Item H-02)
+    void*                     m_d3d12Device{ nullptr };
+    void*                     m_d3d12RootSignature{ nullptr };
+    void*                     m_d3d12PipelineState{ nullptr };
 };
 
 } // namespace cbr
@@ -1534,6 +1553,7 @@ private:
 
 #include <atomic>
 #include <cstdint>
+#include <string>
 #include "cbr/config.h"
 
 namespace cbr {
@@ -1569,6 +1589,7 @@ public:
     bool IsInitialized() const { return m_initialized.load(std::memory_order_relaxed); }
 
     OverlayMetrics GetCurrentMetrics() const;
+    std::string    GetFormattedTelemetry() const;
 
     // Interactive Control HUD API (Category 7, Item 96)
     void SetHistoryWeight(float weight);
@@ -2921,6 +2942,9 @@ struct MinimalVkRect2D;
 struct MinimalVkSampleLocationsInfoEXT;
 struct MinimalVkSamplerCreateInfo;
 
+struct MinimalVkImageViewCreateInfo;
+struct MinimalVkFramebufferCreateInfo;
+
 // Function pointer typedefs matching Vulkan loader signatures
 typedef void* (*PFN_vkGetDeviceProcAddr)(void* device, const char* pName);
 typedef void* (*PFN_vkGetInstanceProcAddr)(void* instance, const char* pName);
@@ -2938,6 +2962,10 @@ typedef void  (*PFN_vkCmdDrawIndexed)(void* commandBuffer, uint32_t indexCount, 
 typedef int   (*PFN_vkCreateDevice)(void* physicalDevice, const void* pCreateInfo, const void* pAllocator, void** pDevice);
 typedef void  (*PFN_vkDestroySwapchainKHR)(void* device, void* swapchain, const void* pAllocator);
 typedef int   (*PFN_vkCreateSampler)(void* device, const MinimalVkSamplerCreateInfo* pCreateInfo, const void* pAllocator, void* pSampler);
+typedef int   (*PFN_vkCreateImageView)(void* device, const MinimalVkImageViewCreateInfo* pCreateInfo, const void* pAllocator, void** pView);
+typedef void  (*PFN_vkDestroyImageView)(void* device, void* imageView, const void* pAllocator);
+typedef int   (*PFN_vkCreateFramebuffer)(void* device, const MinimalVkFramebufferCreateInfo* pCreateInfo, const void* pAllocator, void** pFramebuffer);
+typedef void  (*PFN_vkDestroyFramebuffer)(void* device, void* framebuffer, const void* pAllocator);
 
 PFN_vkGetDeviceProcAddr        g_Original_vkGetDeviceProcAddr = nullptr;
 PFN_vkGetInstanceProcAddr      g_Original_vkGetInstanceProcAddr = nullptr;
@@ -2955,6 +2983,10 @@ PFN_vkCmdDraw                  g_Original_vkCmdDraw = nullptr;
 PFN_vkCmdDrawIndexed           g_Original_vkCmdDrawIndexed = nullptr;
 PFN_vkCmdSetSampleLocationsEXT g_Original_vkCmdSetSampleLocationsEXT = nullptr;
 PFN_vkCreateSampler            g_Original_vkCreateSampler = nullptr;
+PFN_vkCreateImageView          g_Original_vkCreateImageView = nullptr;
+PFN_vkDestroyImageView         g_Original_vkDestroyImageView = nullptr;
+PFN_vkCreateFramebuffer        g_Original_vkCreateFramebuffer = nullptr;
+PFN_vkDestroyFramebuffer       g_Original_vkDestroyFramebuffer = nullptr;
 
 void* Hooked_vkGetDeviceProcAddr(void* device, const char* pName);
 void* Hooked_vkGetInstanceProcAddr(void* instance, const char* pName);
@@ -2970,6 +3002,10 @@ void  Hooked_vkCmdDraw(void* commandBuffer, uint32_t vertexCount, uint32_t insta
 void  Hooked_vkCmdDrawIndexed(void* commandBuffer, uint32_t indexCount, uint32_t instanceCount, uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance);
 void  Hooked_vkCmdSetSampleLocationsEXT(void* commandBuffer, const MinimalVkSampleLocationsInfoEXT* pSampleLocationsInfo);
 int   Hooked_vkCreateSampler(void* device, const MinimalVkSamplerCreateInfo* pCreateInfo, const void* pAllocator, void* pSampler);
+int   Hooked_vkCreateImageView(void* device, const MinimalVkImageViewCreateInfo* pCreateInfo, const void* pAllocator, void** pView);
+void  Hooked_vkDestroyImageView(void* device, void* imageView, const void* pAllocator);
+int   Hooked_vkCreateFramebuffer(void* device, const MinimalVkFramebufferCreateInfo* pCreateInfo, const void* pAllocator, void** pFramebuffer);
+void  Hooked_vkDestroyFramebuffer(void* device, void* framebuffer, const void* pAllocator);
 
 // VK_ERROR_INITIALIZATION_FAILED: returned if a hook is ever invoked without a valid trampoline,
 // so the failure is visible to the caller instead of silently dropping frames / swapchains.
@@ -3087,6 +3123,48 @@ struct MinimalVkRect2D {
     MinimalVkExtent2D extent;
 };
 
+struct MinimalVkSubresourceRange {
+    uint32_t aspectMask;
+    uint32_t baseMipLevel;
+    uint32_t levelCount;
+    uint32_t baseArrayLayer;
+    uint32_t layerCount;
+};
+
+struct MinimalVkImageViewCreateInfo {
+    uint32_t                  sType;
+    const void*               pNext;
+    uint32_t                  flags;
+    void*                     image;
+    int32_t                   viewType;
+    int32_t                   format;
+    int32_t                   components[4];
+    MinimalVkSubresourceRange subresourceRange;
+};
+
+struct MinimalVkFramebufferCreateInfo {
+    uint32_t            sType;
+    const void*         pNext;
+    uint32_t            flags;
+    void*               renderPass;
+    uint32_t            attachmentCount;
+    const void* const*  pAttachments;
+    uint32_t            width;
+    uint32_t            height;
+    uint32_t            layers;
+};
+
+#if defined(_WIN64) || defined(__x86_64__) || defined(_M_X64)
+static_assert(offsetof(MinimalVkFramebufferCreateInfo, sType) == 0, "ABI drift");
+static_assert(offsetof(MinimalVkFramebufferCreateInfo, attachmentCount) == 32, "ABI drift: attachmentCount offset");
+static_assert(offsetof(MinimalVkFramebufferCreateInfo, pAttachments) == 40, "ABI drift: pAttachments offset");
+static_assert(offsetof(MinimalVkFramebufferCreateInfo, width) == 48, "ABI drift: width offset");
+static_assert(offsetof(MinimalVkFramebufferCreateInfo, height) == 52, "ABI drift: height offset");
+static_assert(offsetof(MinimalVkImageViewCreateInfo, sType) == 0, "ABI drift");
+static_assert(offsetof(MinimalVkImageViewCreateInfo, image) == 24, "ABI drift: image offset");
+static_assert(offsetof(MinimalVkImageViewCreateInfo, format) == 36, "ABI drift: format offset");
+#endif
+
 // Configures alternating 2x MSAA sample locations per frame according to CHECKERBOARD.md (Strategy B).
 // NOTE (MUTUAL EXCLUSIVITY): When using programmable sample locations (Strategy B),
 // viewport horizontal jittering (Strategy A via GetQuarterViewportShiftX) MUST be disabled (set to 0).
@@ -3142,12 +3220,32 @@ inline void* GetActiveSwapchainImage() {
     return nullptr;
 }
 
+// Game Attachment & Framebuffer Tracking (Item C-01)
+struct TrackedImageView {
+    void*    image{ nullptr };
+    int32_t  format{ 0 };
+    uint32_t aspectMask{ 0 };
+};
+
+struct TrackedFramebuffer {
+    uint32_t           width{ 0 };
+    uint32_t           height{ 0 };
+    std::vector<void*> attachments;
+};
+
+std::mutex g_attachmentMutex;
+std::unordered_map<void*, TrackedImageView> g_imageViews;
+std::unordered_map<void*, TrackedFramebuffer> g_framebuffers;
+
 // Scene pass identification and draw tracking using lock-free slot pool
 struct PassSlot {
     std::atomic<void*>    cmdBuffer{ nullptr };
     std::atomic<bool>     hasMatchingExtent{ false };
     std::atomic<bool>     viewportDownscaled{ false };
     std::atomic<uint32_t> drawCount{ 0 };
+    std::atomic<void*>    activeFramebuffer{ nullptr };
+    std::atomic<uint32_t> renderWidth{ 0 };
+    std::atomic<uint32_t> renderHeight{ 0 };
 };
 
 constexpr size_t kMaxTrackedPassSlots = 64;
@@ -3332,6 +3430,64 @@ int Hooked_vkAcquireNextImageKHR(void* device, void* swapchain, uint64_t timeout
     return result;
 }
 
+int Hooked_vkCreateImageView(void* device, const MinimalVkImageViewCreateInfo* pCreateInfo, const void* pAllocator, void** pView) {
+    if (!g_Original_vkCreateImageView) {
+        return kVkErrorInitializationFailed;
+    }
+    const int result = g_Original_vkCreateImageView(device, pCreateInfo, pAllocator, pView);
+    if (result == 0 && pView && *pView && pCreateInfo) {
+        MinimalVkImageViewCreateInfo info{};
+        std::memcpy(&info, pCreateInfo, sizeof(info));
+        std::lock_guard<std::mutex> lock(g_attachmentMutex);
+        g_imageViews[*pView] = { info.image, info.format, info.subresourceRange.aspectMask };
+    }
+    return result;
+}
+
+void Hooked_vkDestroyImageView(void* device, void* imageView, const void* pAllocator) {
+    if (imageView) {
+        std::lock_guard<std::mutex> lock(g_attachmentMutex);
+        g_imageViews.erase(imageView);
+    }
+    if (g_Original_vkDestroyImageView) {
+        g_Original_vkDestroyImageView(device, imageView, pAllocator);
+    }
+}
+
+int Hooked_vkCreateFramebuffer(void* device, const MinimalVkFramebufferCreateInfo* pCreateInfo, const void* pAllocator, void** pFramebuffer) {
+    if (!g_Original_vkCreateFramebuffer) {
+        return kVkErrorInitializationFailed;
+    }
+    const int result = g_Original_vkCreateFramebuffer(device, pCreateInfo, pAllocator, pFramebuffer);
+    if (result == 0 && pFramebuffer && *pFramebuffer && pCreateInfo) {
+        MinimalVkFramebufferCreateInfo info{};
+        std::memcpy(&info, pCreateInfo, sizeof(info));
+        TrackedFramebuffer fb{};
+        fb.width = info.width;
+        fb.height = info.height;
+        if (info.attachmentCount > 0 && info.attachmentCount < 32 && info.pAttachments) {
+            for (uint32_t i = 0; i < info.attachmentCount; ++i) {
+                void* attView = nullptr;
+                std::memcpy(&attView, &info.pAttachments[i], sizeof(attView));
+                fb.attachments.push_back(attView);
+            }
+        }
+        std::lock_guard<std::mutex> lock(g_attachmentMutex);
+        g_framebuffers[*pFramebuffer] = std::move(fb);
+    }
+    return result;
+}
+
+void Hooked_vkDestroyFramebuffer(void* device, void* framebuffer, const void* pAllocator) {
+    if (framebuffer) {
+        std::lock_guard<std::mutex> lock(g_attachmentMutex);
+        g_framebuffers.erase(framebuffer);
+    }
+    if (g_Original_vkDestroyFramebuffer) {
+        g_Original_vkDestroyFramebuffer(device, framebuffer, pAllocator);
+    }
+}
+
 void Hooked_vkCmdSetViewport(void* commandBuffer, uint32_t firstViewport, uint32_t viewportCount, const MinimalVkViewport* pViewports) {
     if (!g_Original_vkCmdSetViewport) return;
 
@@ -3433,6 +3589,9 @@ void Hooked_vkCmdBeginRenderPass(void* commandBuffer, const void* pRenderPassBeg
                 slot->hasMatchingExtent.store(matching, std::memory_order_release);
                 slot->viewportDownscaled.store(false, std::memory_order_release);
                 slot->drawCount.store(0, std::memory_order_release);
+                slot->activeFramebuffer.store(info.framebuffer, std::memory_order_release);
+                slot->renderWidth.store(w, std::memory_order_release);
+                slot->renderHeight.store(h, std::memory_order_release);
             }
         }
     }
@@ -3464,37 +3623,115 @@ void Hooked_vkCmdEndRenderPass(void* commandBuffer) {
     if (CBREngine::Get().IsEnabled()) {
         try {
             bool isScenePass = false;
+            void* activeFb = nullptr;
+            uint32_t rw = 0, rh = 0;
             PassSlot* slot = FindPassSlot(commandBuffer);
             if (slot) {
                 const bool downscaled = slot->viewportDownscaled.load(std::memory_order_acquire);
                 const bool matching = slot->hasMatchingExtent.load(std::memory_order_acquire);
                 const uint32_t draws = slot->drawCount.load(std::memory_order_acquire);
                 isScenePass = downscaled || (matching && draws >= 20);
+                activeFb = slot->activeFramebuffer.load(std::memory_order_acquire);
+                rw = slot->renderWidth.load(std::memory_order_acquire);
+                rh = slot->renderHeight.load(std::memory_order_acquire);
 
                 // Release slot back to pool
                 slot->hasMatchingExtent.store(false, std::memory_order_relaxed);
                 slot->viewportDownscaled.store(false, std::memory_order_relaxed);
                 slot->drawCount.store(0, std::memory_order_relaxed);
+                slot->activeFramebuffer.store(nullptr, std::memory_order_relaxed);
+                slot->renderWidth.store(0, std::memory_order_relaxed);
+                slot->renderHeight.store(0, std::memory_order_relaxed);
                 slot->cmdBuffer.store(nullptr, std::memory_order_release);
             }
 
             // Trigger reconstruction if identified as scene pass or engine marked active
             const bool wasCandidateActive = CBREngine::Get().ConsumeCandidatePassActive(commandBuffer);
             if (isScenePass || wasCandidateActive) {
-                CBREngine::Get().OnScenePassEnd(commandBuffer);
+                void* gameColorImage = nullptr;
+                void* gameDepthImage = nullptr;
+                void* gameVelocityImage = nullptr;
+                uint32_t colorAspect = 1; // VK_IMAGE_ASPECT_COLOR_BIT
+                uint32_t depthAspect = 2; // VK_IMAGE_ASPECT_DEPTH_BIT
+                uint32_t velocityAspect = 1; // VK_IMAGE_ASPECT_COLOR_BIT
 
-                // Presentation path: blit reconstructed output to swapchain backbuffer image
-                void* backbuffer = GetActiveSwapchainImage();
-                if (backbuffer && RenderTargetManager::Get().AreVulkanResourcesCreated()) {
+                if (activeFb) {
+                    std::lock_guard<std::mutex> lock(g_attachmentMutex);
+                    auto fbit = g_framebuffers.find(activeFb);
+                    if (fbit != g_framebuffers.end()) {
+                        for (void* attView : fbit->second.attachments) {
+                            auto vit = g_imageViews.find(attView);
+                            if (vit != g_imageViews.end()) {
+                                if ((vit->second.aspectMask & 2 /* DEPTH */) ||
+                                    (vit->second.format >= 124 && vit->second.format <= 130)) {
+                                    if (!gameDepthImage) {
+                                        gameDepthImage = vit->second.image;
+                                        depthAspect = vit->second.aspectMask;
+                                    }
+                                } else if (!gameColorImage) {
+                                    gameColorImage = vit->second.image;
+                                    colorAspect = vit->second.aspectMask;
+                                } else if (!gameVelocityImage) {
+                                    gameVelocityImage = vit->second.image;
+                                    velocityAspect = vit->second.aspectMask;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (RenderTargetManager::Get().AreVulkanResourcesCreated()) {
                     const auto& res = RenderTargetManager::Get().GetVulkanResources();
                     const auto dims = RenderTargetManager::Get().GetDimensions();
-                    ReconstructionPass::BlitToImage(
-                        commandBuffer,
-                        res.outputColor.image,
-                        backbuffer,
-                        dims.fullWidth, dims.fullHeight,
-                        dims.fullWidth, dims.fullHeight
-                    );
+
+                    // Step 1: Copy game's rendered quarter-res geometry into mod's quarterColor, quarterDepth, and velocity (Item C-01)
+                    if (gameColorImage) {
+                        ReconstructionPass::CopyImageRegion(
+                            commandBuffer,
+                            gameColorImage, res.quarterColor.image,
+                            0, 0, 0, 0,
+                            dims.quarterWidth, dims.quarterHeight,
+                            colorAspect
+                        );
+                    }
+                    if (gameDepthImage) {
+                        ReconstructionPass::CopyImageRegion(
+                            commandBuffer,
+                            gameDepthImage, res.quarterDepth.image,
+                            0, 0, 0, 0,
+                            dims.quarterWidth, dims.quarterHeight,
+                            depthAspect
+                        );
+                    }
+                    if (gameVelocityImage) {
+                        ReconstructionPass::CopyImageRegion(
+                            commandBuffer,
+                            gameVelocityImage, res.velocity.image,
+                            0, 0, 0, 0,
+                            dims.quarterWidth, dims.quarterHeight,
+                            velocityAspect
+                        );
+                    }
+
+                    // Step 2: Transition layouts and execute CBR reconstruction compute dispatch
+                    CBREngine::Get().OnScenePassEnd(commandBuffer);
+
+                    // Step 3: Upscale and blit reconstructed full-resolution output back into the game's color attachment (Item C-01, C-02, C-04)
+                    // Subsequent game passes (post-processing, tonemapping, UI/HUD) now read full-resolution scene geometry!
+                    if (gameColorImage) {
+                        const uint32_t targetDstW = (rw > 0) ? rw : dims.fullWidth;
+                        const uint32_t targetDstH = (rh > 0) ? rh : dims.fullHeight;
+                        const uint32_t justWrittenIdx = RenderTargetManager::Get().GetCurrentHistoryIndex() & 1u;
+                        void* blitSource = res.historyColor[justWrittenIdx].image ? res.historyColor[justWrittenIdx].image : res.outputColor.image;
+                        ReconstructionPass::BlitToImage(
+                            commandBuffer,
+                            blitSource,
+                            gameColorImage,
+                            dims.fullWidth, dims.fullHeight,
+                            targetDstW, targetDstH,
+                            2 /* kVkImageLayoutColorAttachmentOptimal */
+                        );
+                    }
                 }
             }
         } catch (...) {
@@ -3628,6 +3865,30 @@ void* Hooked_vkGetDeviceProcAddr(void* device, const char* pName) {
         }
         return reinterpret_cast<void*>(&Hooked_vkCreateSampler);
     }
+    if (std::strcmp(pName, "vkCreateImageView") == 0) {
+        if (!g_Original_vkCreateImageView) {
+            g_Original_vkCreateImageView = reinterpret_cast<PFN_vkCreateImageView>(realProc);
+        }
+        return reinterpret_cast<void*>(&Hooked_vkCreateImageView);
+    }
+    if (std::strcmp(pName, "vkDestroyImageView") == 0) {
+        if (!g_Original_vkDestroyImageView) {
+            g_Original_vkDestroyImageView = reinterpret_cast<PFN_vkDestroyImageView>(realProc);
+        }
+        return reinterpret_cast<void*>(&Hooked_vkDestroyImageView);
+    }
+    if (std::strcmp(pName, "vkCreateFramebuffer") == 0) {
+        if (!g_Original_vkCreateFramebuffer) {
+            g_Original_vkCreateFramebuffer = reinterpret_cast<PFN_vkCreateFramebuffer>(realProc);
+        }
+        return reinterpret_cast<void*>(&Hooked_vkCreateFramebuffer);
+    }
+    if (std::strcmp(pName, "vkDestroyFramebuffer") == 0) {
+        if (!g_Original_vkDestroyFramebuffer) {
+            g_Original_vkDestroyFramebuffer = reinterpret_cast<PFN_vkDestroyFramebuffer>(realProc);
+        }
+        return reinterpret_cast<void*>(&Hooked_vkDestroyFramebuffer);
+    }
     return realProc;
 }
 
@@ -3724,6 +3985,30 @@ void* Hooked_vkGetInstanceProcAddr(void* instance, const char* pName) {
             g_Original_vkCreateSampler = reinterpret_cast<PFN_vkCreateSampler>(realProc);
         }
         return reinterpret_cast<void*>(&Hooked_vkCreateSampler);
+    }
+    if (std::strcmp(pName, "vkCreateImageView") == 0) {
+        if (!g_Original_vkCreateImageView) {
+            g_Original_vkCreateImageView = reinterpret_cast<PFN_vkCreateImageView>(realProc);
+        }
+        return reinterpret_cast<void*>(&Hooked_vkCreateImageView);
+    }
+    if (std::strcmp(pName, "vkDestroyImageView") == 0) {
+        if (!g_Original_vkDestroyImageView) {
+            g_Original_vkDestroyImageView = reinterpret_cast<PFN_vkDestroyImageView>(realProc);
+        }
+        return reinterpret_cast<void*>(&Hooked_vkDestroyImageView);
+    }
+    if (std::strcmp(pName, "vkCreateFramebuffer") == 0) {
+        if (!g_Original_vkCreateFramebuffer) {
+            g_Original_vkCreateFramebuffer = reinterpret_cast<PFN_vkCreateFramebuffer>(realProc);
+        }
+        return reinterpret_cast<void*>(&Hooked_vkCreateFramebuffer);
+    }
+    if (std::strcmp(pName, "vkDestroyFramebuffer") == 0) {
+        if (!g_Original_vkDestroyFramebuffer) {
+            g_Original_vkDestroyFramebuffer = reinterpret_cast<PFN_vkDestroyFramebuffer>(realProc);
+        }
+        return reinterpret_cast<void*>(&Hooked_vkDestroyFramebuffer);
     }
     if (std::strcmp(pName, "vkGetDeviceProcAddr") == 0) {
         if (!g_Original_vkGetDeviceProcAddr) {
@@ -3997,6 +4282,66 @@ bool HookManager::InstallVulkanHooks() {
             hookedAny = true;
         } else {
             CBR_LOG_WARN("MinHook: Could not detour vkCreateSampler (status: %d).", mhStatus);
+        }
+    }
+
+    // 10. Intercept vkCreateImageView for attachment tracking (Item C-01)
+    auto pfnCreateImageView = reinterpret_cast<void*>(GetProcAddress(vulkanModule, "vkCreateImageView"));
+    if (pfnCreateImageView) {
+        mhStatus = MH_CreateHook(
+            pfnCreateImageView,
+            reinterpret_cast<LPVOID>(&Hooked_vkCreateImageView),
+            reinterpret_cast<LPVOID*>(&g_Original_vkCreateImageView)
+        );
+        if (mhStatus == MH_OK || mhStatus == MH_ERROR_ALREADY_CREATED) {
+            MH_EnableHook(pfnCreateImageView);
+            CBR_LOG_INFO("MinHook: Successfully detoured vkCreateImageView (export at 0x%p).", pfnCreateImageView);
+            hookedAny = true;
+        }
+    }
+
+    // 11. Intercept vkDestroyImageView for attachment cleanup
+    auto pfnDestroyImageView = reinterpret_cast<void*>(GetProcAddress(vulkanModule, "vkDestroyImageView"));
+    if (pfnDestroyImageView) {
+        mhStatus = MH_CreateHook(
+            pfnDestroyImageView,
+            reinterpret_cast<LPVOID>(&Hooked_vkDestroyImageView),
+            reinterpret_cast<LPVOID*>(&g_Original_vkDestroyImageView)
+        );
+        if (mhStatus == MH_OK || mhStatus == MH_ERROR_ALREADY_CREATED) {
+            MH_EnableHook(pfnDestroyImageView);
+            CBR_LOG_INFO("MinHook: Successfully detoured vkDestroyImageView (export at 0x%p).", pfnDestroyImageView);
+            hookedAny = true;
+        }
+    }
+
+    // 12. Intercept vkCreateFramebuffer for attachment mapping (Item C-01)
+    auto pfnCreateFramebuffer = reinterpret_cast<void*>(GetProcAddress(vulkanModule, "vkCreateFramebuffer"));
+    if (pfnCreateFramebuffer) {
+        mhStatus = MH_CreateHook(
+            pfnCreateFramebuffer,
+            reinterpret_cast<LPVOID>(&Hooked_vkCreateFramebuffer),
+            reinterpret_cast<LPVOID*>(&g_Original_vkCreateFramebuffer)
+        );
+        if (mhStatus == MH_OK || mhStatus == MH_ERROR_ALREADY_CREATED) {
+            MH_EnableHook(pfnCreateFramebuffer);
+            CBR_LOG_INFO("MinHook: Successfully detoured vkCreateFramebuffer (export at 0x%p).", pfnCreateFramebuffer);
+            hookedAny = true;
+        }
+    }
+
+    // 13. Intercept vkDestroyFramebuffer for framebuffer cleanup
+    auto pfnDestroyFramebuffer = reinterpret_cast<void*>(GetProcAddress(vulkanModule, "vkDestroyFramebuffer"));
+    if (pfnDestroyFramebuffer) {
+        mhStatus = MH_CreateHook(
+            pfnDestroyFramebuffer,
+            reinterpret_cast<LPVOID>(&Hooked_vkDestroyFramebuffer),
+            reinterpret_cast<LPVOID*>(&g_Original_vkDestroyFramebuffer)
+        );
+        if (mhStatus == MH_OK || mhStatus == MH_ERROR_ALREADY_CREATED) {
+            MH_EnableHook(pfnDestroyFramebuffer);
+            CBR_LOG_INFO("MinHook: Successfully detoured vkDestroyFramebuffer (export at 0x%p).", pfnDestroyFramebuffer);
+            hookedAny = true;
         }
     }
 
@@ -4381,6 +4726,8 @@ void JitterManager::Initialize(uint32_t targetWidth, uint32_t targetHeight) {
         m_targetHeight = (targetHeight > 0) ? targetHeight : 2160;
         m_currentJitter = { 0.0f, 0.0f };
         m_previousJitter = { 0.0f, 0.0f };
+        m_lastProj0 = 0.0f;
+        m_lastAppliedOffset = { 0.0f, 0.0f };
         w = m_targetWidth; h = m_targetHeight;
 
         const float pixelWidth = 1.0f / static_cast<float>(m_targetWidth);
@@ -4462,28 +4809,35 @@ void JitterManager::ApplyJitterToProjection(float* projMatrix4x4, bool isVulkan)
     }
 
     std::pair<float, float> offset;
+    std::pair<float, float> lastOffset;
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         const uint32_t phase = (m_currentJitter.x != 0.0f) ? 1u : 0u;
         offset = isVulkan ? m_cachedProjectionOffsetVk[phase] : m_cachedProjectionOffsetDx[phase];
+        lastOffset = m_lastAppliedOffset;
+        m_lastAppliedOffset = offset;
     }
+
+    // Subtract previously applied offset to prevent cumulative drift on persistent engine matrices (Item H-01)
+    projMatrix4x4[8] -= lastOffset.first;
+    projMatrix4x4[9] -= lastOffset.second;
 
     projMatrix4x4[8] += offset.first;
     projMatrix4x4[9] += offset.second;
 }
 
-void JitterManager::RemoveJitterFromProjection(float* projMatrix4x4, bool isVulkan) const {
+void JitterManager::RemoveJitterFromProjection(float* projMatrix4x4, bool /*isVulkan*/) const {
     if (!projMatrix4x4) return;
 
-    std::pair<float, float> offset;
+    std::pair<float, float> lastOffset;
     {
         std::lock_guard<std::mutex> lock(m_mutex);
-        const uint32_t phase = (m_currentJitter.x != 0.0f) ? 1u : 0u;
-        offset = isVulkan ? m_cachedProjectionOffsetVk[phase] : m_cachedProjectionOffsetDx[phase];
+        lastOffset = m_lastAppliedOffset;
+        m_lastAppliedOffset = { 0.0f, 0.0f };
     }
 
-    projMatrix4x4[8] -= offset.first;
-    projMatrix4x4[9] -= offset.second;
+    projMatrix4x4[8] -= lastOffset.first;
+    projMatrix4x4[9] -= lastOffset.second;
 }
 
 void JitterManager::SetProjectionJitter(float* outMatrix4x4, const float* inUnjitteredMatrix4x4, bool isVulkan) const {
@@ -5250,6 +5604,11 @@ constexpr uint32_t kVkImageLayoutShaderReadOnlyOptimal = 5;
 constexpr uint32_t kVkImageLayoutTransferSrcOptimal = 6;
 constexpr uint32_t kVkImageLayoutTransferDstOptimal = 7;
 constexpr uint32_t kVkImageLayoutPresentSrcKHR = 1000001002;
+constexpr uint32_t kVkImageLayoutColorAttachmentOptimal = 2;
+constexpr uint32_t kVkImageLayoutDepthStencilAttachmentOptimal = 3;
+constexpr uint32_t kVkPipelineStageColorAttachmentOutputBit = 0x00000400;
+constexpr uint32_t kVkAccessColorAttachmentWriteBit = 0x00000100;
+constexpr uint32_t kVkAccessColorAttachmentReadBit = 0x00000080;
 constexpr uint32_t kVkFilterLinear = 1;
 constexpr uint32_t kVkImageAspectColorBit = 0x00000001;
 
@@ -5442,6 +5801,25 @@ typedef void (*PFN_vkCmdBlitImage)(void* commandBuffer,
                                    void* dstImage, uint32_t dstImageLayout,
                                    uint32_t regionCount, const MinimalVkImageBlit* pRegions,
                                    uint32_t filter);
+
+struct MinimalVkExtent3D {
+    uint32_t width;
+    uint32_t height;
+    uint32_t depth;
+};
+
+struct MinimalVkImageCopy {
+    MinimalVkImageSubresourceLayers srcSubresource;
+    MinimalVkOffset3D               srcOffset;
+    MinimalVkImageSubresourceLayers dstSubresource;
+    MinimalVkOffset3D               dstOffset;
+    MinimalVkExtent3D               extent;
+};
+
+typedef void (*PFN_vkCmdCopyImage)(void* commandBuffer,
+                                   void* srcImage, uint32_t srcImageLayout,
+                                   void* dstImage, uint32_t dstImageLayout,
+                                   uint32_t regionCount, const MinimalVkImageCopy* pRegions);
 
 } // namespace
 #endif
@@ -5769,10 +6147,11 @@ bool ReconstructionPass::InitializeVulkan(void* vkDevice, void* /*vkPhysicalDevi
     return pipelineCreated;
 }
 
-bool ReconstructionPass::InitializeDX12(void* /*d3d12Device*/) {
+bool ReconstructionPass::InitializeDX12(void* d3d12Device) {
     m_isVulkan.store(false);
+    m_d3d12Device = d3d12Device;
     m_initialized.store(true);
-    CBR_LOG_INFO("ReconstructionPass initialized for DirectX 12 API pipeline.");
+    CBR_LOG_INFO("ReconstructionPass initialized for DirectX 12 API pipeline (device: %p).", d3d12Device);
     return true;
 }
 
@@ -5787,6 +6166,10 @@ void ReconstructionPass::Shutdown() {
     m_descriptorPool = nullptr;
     m_descriptorSets[0] = nullptr;
     m_descriptorSets[1] = nullptr;
+    m_d3d12Device = nullptr;
+    m_d3d12RootSignature = nullptr;
+    m_d3d12PipelineState = nullptr;
+    m_pfnCmdCopyImage = nullptr;
     m_descriptorsBound.store(false);
     m_initialized.store(false);
     CBR_LOG_INFO("ReconstructionPass shut down cleanly.");
@@ -5892,25 +6275,25 @@ bool ReconstructionPass::UpdateVulkanPingPongDescriptors(void* quarterColorView,
     auto pfnUpdateDescriptorSets = reinterpret_cast<PFN_vkUpdateDescriptorSets>(resolveDeviceFunc("vkUpdateDescriptorSets"));
     if (!pfnUpdateDescriptorSets) return false;
 
-    // Set 0: Reads History A, writes to Output / History B
+    // Set 0: Reads History A, writes to History B (Item C-02: ping-pong feedback loop)
     MinimalVkDescriptorImageInfo imageInfos0[7]{};
     imageInfos0[0] = { pointSampler, quarterColorView, kVkImageLayoutShaderReadOnlyOptimal };
     imageInfos0[1] = { pointSampler, quarterDepthView, kVkImageLayoutShaderReadOnlyOptimal };
     imageInfos0[2] = { linearSampler, historyColorViewA, kVkImageLayoutShaderReadOnlyOptimal };
     imageInfos0[3] = { pointSampler, historyDepthViewA, kVkImageLayoutShaderReadOnlyOptimal };
     imageInfos0[4] = { pointSampler, velocityView, kVkImageLayoutShaderReadOnlyOptimal };
-    imageInfos0[5] = { nullptr, outputImageView ? outputImageView : historyColorViewB, kVkImageLayoutGeneral };
-    imageInfos0[6] = { nullptr, outputDepthView ? outputDepthView : historyDepthViewB, kVkImageLayoutGeneral };
+    imageInfos0[5] = { nullptr, historyColorViewB, kVkImageLayoutGeneral };
+    imageInfos0[6] = { nullptr, historyDepthViewB, kVkImageLayoutGeneral };
 
-    // Set 1: Reads History B, writes to Output / History A
+    // Set 1: Reads History B, writes to History A (Item C-02: ping-pong feedback loop)
     MinimalVkDescriptorImageInfo imageInfos1[7]{};
     imageInfos1[0] = { pointSampler, quarterColorView, kVkImageLayoutShaderReadOnlyOptimal };
     imageInfos1[1] = { pointSampler, quarterDepthView, kVkImageLayoutShaderReadOnlyOptimal };
     imageInfos1[2] = { linearSampler, historyColorViewB, kVkImageLayoutShaderReadOnlyOptimal };
     imageInfos1[3] = { pointSampler, historyDepthViewB, kVkImageLayoutShaderReadOnlyOptimal };
     imageInfos1[4] = { pointSampler, velocityView, kVkImageLayoutShaderReadOnlyOptimal };
-    imageInfos1[5] = { nullptr, outputImageView ? outputImageView : historyColorViewA, kVkImageLayoutGeneral };
-    imageInfos1[6] = { nullptr, outputDepthView ? outputDepthView : historyDepthViewA, kVkImageLayoutGeneral };
+    imageInfos1[5] = { nullptr, historyColorViewA, kVkImageLayoutGeneral };
+    imageInfos1[6] = { nullptr, historyDepthViewA, kVkImageLayoutGeneral };
 
     MinimalVkWriteDescriptorSet writes[14]{};
     for (uint32_t i = 0; i < 7; ++i) {
@@ -6035,11 +6418,6 @@ void ReconstructionPass::BlitToImage(void* vkCommandBuffer, void* srcImage, void
                     1, &blitRegion, kVkFilterLinear);
 
     // Transition dstImage to targetDstLayout (e.g. PRESENT_SRC_KHR or COLOR_ATTACHMENT_OPTIMAL)
-    constexpr uint32_t kVkImageLayoutColorAttachmentOptimal = 2;
-    constexpr uint32_t kVkPipelineStageColorAttachmentOutputBit = 0x00000400;
-    constexpr uint32_t kVkAccessColorAttachmentWriteBit = 0x00000100;
-    constexpr uint32_t kVkAccessColorAttachmentReadBit = 0x00000080;
-
     if (targetDstLayout == kVkImageLayoutColorAttachmentOptimal) {
         TransitionImageLayout(vkCommandBuffer, dstImage,
                               kVkImageLayoutTransferDstOptimal, kVkImageLayoutColorAttachmentOptimal,
@@ -6064,6 +6442,143 @@ void ReconstructionPass::BlitToImage(void* vkCommandBuffer, void* srcImage, void
     (void)vkCommandBuffer; (void)srcImage; (void)dstImage;
     (void)srcWidth; (void)srcHeight; (void)dstWidth; (void)dstHeight;
     (void)targetDstLayout;
+#endif
+}
+
+void ReconstructionPass::CopyImageRegion(void* vkCommandBuffer, void* srcImage, void* dstImage,
+                                         uint32_t srcX, uint32_t srcY,
+                                         uint32_t dstX, uint32_t dstY,
+                                         uint32_t width, uint32_t height,
+                                         uint32_t aspectMask) {
+#if defined(_WIN32)
+    if (!vkCommandBuffer || !srcImage || !dstImage || width == 0 || height == 0) return;
+
+    auto pfnCmdCopyImage = ReconstructionPass::Get().m_pfnCmdCopyImage;
+    if (!pfnCmdCopyImage) {
+        HMODULE vulkanModule = GetModuleHandleA("vulkan-1.dll");
+        if (vulkanModule) {
+            pfnCmdCopyImage = reinterpret_cast<PFN_CmdCopyImage>(GetProcAddress(vulkanModule, "vkCmdCopyImage"));
+            ReconstructionPass::Get().m_pfnCmdCopyImage = pfnCmdCopyImage;
+        }
+    }
+    if (!pfnCmdCopyImage) return;
+
+    // Transition srcImage to TRANSFER_SRC_OPTIMAL
+    TransitionImageLayout(vkCommandBuffer, srcImage,
+                          0 /* UNDEFINED or current */, kVkImageLayoutTransferSrcOptimal,
+                          kVkPipelineStageAllCommandsBit, kVkPipelineStageTransferBit,
+                          0, kVkAccessTransferReadBit,
+                          aspectMask);
+
+    // Transition dstImage to TRANSFER_DST_OPTIMAL
+    TransitionImageLayout(vkCommandBuffer, dstImage,
+                          0 /* UNDEFINED or current */, kVkImageLayoutTransferDstOptimal,
+                          kVkPipelineStageAllCommandsBit, kVkPipelineStageTransferBit,
+                          0, kVkAccessTransferWriteBit,
+                          aspectMask);
+
+    MinimalVkImageCopy region{};
+    region.srcSubresource.aspectMask = aspectMask;
+    region.srcSubresource.mipLevel = 0;
+    region.srcSubresource.baseArrayLayer = 0;
+    region.srcSubresource.layerCount = 1;
+    region.srcOffset = { static_cast<int32_t>(srcX), static_cast<int32_t>(srcY), 0 };
+
+    region.dstSubresource.aspectMask = aspectMask;
+    region.dstSubresource.mipLevel = 0;
+    region.dstSubresource.baseArrayLayer = 0;
+    region.dstSubresource.layerCount = 1;
+    region.dstOffset = { static_cast<int32_t>(dstX), static_cast<int32_t>(dstY), 0 };
+
+    region.extent = { width, height, 1 };
+
+    pfnCmdCopyImage(vkCommandBuffer,
+                    srcImage, kVkImageLayoutTransferSrcOptimal,
+                    dstImage, kVkImageLayoutTransferDstOptimal,
+                    1, &region);
+
+    // Transition dstImage to SHADER_READ_ONLY_OPTIMAL for compute sampling
+    TransitionImageLayout(vkCommandBuffer, dstImage,
+                          kVkImageLayoutTransferDstOptimal, kVkImageLayoutShaderReadOnlyOptimal,
+                          kVkPipelineStageTransferBit, kVkPipelineStageComputeShaderBit,
+                          kVkAccessTransferWriteBit, kVkAccessShaderReadBit,
+                          aspectMask);
+
+    // Transition srcImage back to COLOR_ATTACHMENT_OPTIMAL (or DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+    const uint32_t restoreLayout = (aspectMask & 2 /* DEPTH */) ? kVkImageLayoutDepthStencilAttachmentOptimal : kVkImageLayoutColorAttachmentOptimal;
+    TransitionImageLayout(vkCommandBuffer, srcImage,
+                          kVkImageLayoutTransferSrcOptimal, restoreLayout,
+                          kVkPipelineStageTransferBit, kVkPipelineStageColorAttachmentOutputBit,
+                          kVkAccessTransferReadBit, kVkAccessColorAttachmentWriteBit | kVkAccessColorAttachmentReadBit,
+                          aspectMask);
+#else
+    (void)vkCommandBuffer; (void)srcImage; (void)dstImage;
+    (void)srcX; (void)srcY; (void)dstX; (void)dstY;
+    (void)width; (void)height; (void)aspectMask;
+#endif
+}
+
+void ReconstructionPass::EnsureInitialLayoutsTransitioned(void* vkCommandBuffer) {
+#if defined(_WIN32)
+    if (!vkCommandBuffer || m_initialLayoutsTransitioned.load(std::memory_order_acquire)) {
+        return;
+    }
+    if (m_initialLayoutsTransitioned.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+
+    if (!RenderTargetManager::Get().AreVulkanResourcesCreated()) return;
+    const auto& res = RenderTargetManager::Get().GetVulkanResources();
+
+    // Transition all 7 CBR images from UNDEFINED to initial operational layouts (Item C-03)
+    TransitionImageLayout(vkCommandBuffer, res.quarterColor.image,
+                          0 /* VK_IMAGE_LAYOUT_UNDEFINED */, kVkImageLayoutShaderReadOnlyOptimal,
+                          kVkPipelineStageBottomOfPipeBit, kVkPipelineStageComputeShaderBit,
+                          0, kVkAccessShaderReadBit, kVkImageAspectColorBit);
+
+    TransitionImageLayout(vkCommandBuffer, res.quarterDepth.image,
+                          0 /* VK_IMAGE_LAYOUT_UNDEFINED */, kVkImageLayoutShaderReadOnlyOptimal,
+                          kVkPipelineStageBottomOfPipeBit, kVkPipelineStageComputeShaderBit,
+                          0, kVkAccessShaderReadBit, kVkImageAspectColorBit);
+
+    TransitionImageLayout(vkCommandBuffer, res.historyColor[0].image,
+                          0 /* VK_IMAGE_LAYOUT_UNDEFINED */, kVkImageLayoutShaderReadOnlyOptimal,
+                          kVkPipelineStageBottomOfPipeBit, kVkPipelineStageComputeShaderBit,
+                          0, kVkAccessShaderReadBit, kVkImageAspectColorBit);
+
+    TransitionImageLayout(vkCommandBuffer, res.historyColor[1].image,
+                          0 /* VK_IMAGE_LAYOUT_UNDEFINED */, kVkImageLayoutGeneral,
+                          kVkPipelineStageBottomOfPipeBit, kVkPipelineStageComputeShaderBit,
+                          0, kVkAccessShaderWriteBit, kVkImageAspectColorBit);
+
+    TransitionImageLayout(vkCommandBuffer, res.historyDepth[0].image,
+                          0 /* VK_IMAGE_LAYOUT_UNDEFINED */, kVkImageLayoutShaderReadOnlyOptimal,
+                          kVkPipelineStageBottomOfPipeBit, kVkPipelineStageComputeShaderBit,
+                          0, kVkAccessShaderReadBit, kVkImageAspectColorBit);
+
+    TransitionImageLayout(vkCommandBuffer, res.historyDepth[1].image,
+                          0 /* VK_IMAGE_LAYOUT_UNDEFINED */, kVkImageLayoutGeneral,
+                          kVkPipelineStageBottomOfPipeBit, kVkPipelineStageComputeShaderBit,
+                          0, kVkAccessShaderWriteBit, kVkImageAspectColorBit);
+
+    TransitionImageLayout(vkCommandBuffer, res.velocity.image,
+                          0 /* VK_IMAGE_LAYOUT_UNDEFINED */, kVkImageLayoutShaderReadOnlyOptimal,
+                          kVkPipelineStageBottomOfPipeBit, kVkPipelineStageComputeShaderBit,
+                          0, kVkAccessShaderReadBit, kVkImageAspectColorBit);
+
+    TransitionImageLayout(vkCommandBuffer, res.outputColor.image,
+                          0 /* VK_IMAGE_LAYOUT_UNDEFINED */, kVkImageLayoutGeneral,
+                          kVkPipelineStageBottomOfPipeBit, kVkPipelineStageComputeShaderBit,
+                          0, kVkAccessShaderWriteBit, kVkImageAspectColorBit);
+
+    TransitionImageLayout(vkCommandBuffer, res.outputDepth.image,
+                          0 /* VK_IMAGE_LAYOUT_UNDEFINED */, kVkImageLayoutGeneral,
+                          kVkPipelineStageBottomOfPipeBit, kVkPipelineStageComputeShaderBit,
+                          0, kVkAccessShaderWriteBit, kVkImageAspectColorBit);
+
+    CBR_LOG_INFO("ReconstructionPass: Initial layout transitions from VK_IMAGE_LAYOUT_UNDEFINED executed.");
+#else
+    (void)vkCommandBuffer;
 #endif
 }
 
@@ -6121,6 +6636,9 @@ void ReconstructionPass::DispatchVulkan(void* vkCommandBuffer, uint32_t frameInd
     }
 
 #if defined(_WIN32)
+    // Item C-03: Transition all 7 CBR images out of VK_IMAGE_LAYOUT_UNDEFINED before first dispatch
+    EnsureInitialLayoutsTransitioned(vkCommandBuffer);
+
     auto pfnCmdBindPipeline = m_pfnCmdBindPipeline;
     auto pfnCmdBindDescriptorSets = m_pfnCmdBindDescriptorSets;
     auto pfnCmdPushConstants = m_pfnCmdPushConstants;
@@ -6152,9 +6670,47 @@ void ReconstructionPass::DispatchVulkan(void* vkCommandBuffer, uint32_t frameInd
     const uint32_t groupCountX = (targetW + kWorkgroupSizeX - 1u) / kWorkgroupSizeX;
     const uint32_t groupCountY = (targetH + kWorkgroupSizeY - 1u) / kWorkgroupSizeY;
 
+    const uint32_t activeSetIdx = RenderTargetManager::Get().GetCurrentHistoryIndex() & 1u;
+    const uint32_t writeIdx = 1u - activeSetIdx;
+    const uint32_t readIdx  = activeSetIdx;
+
+    if (RenderTargetManager::Get().AreVulkanResourcesCreated()) {
+        const auto& res = RenderTargetManager::Get().GetVulkanResources();
+
+        // Transition current frame inputs to SHADER_READ_ONLY_OPTIMAL (Item C-03)
+        TransitionImageLayout(vkCommandBuffer, res.quarterColor.image, 0, kVkImageLayoutShaderReadOnlyOptimal,
+                              kVkPipelineStageAllCommandsBit, kVkPipelineStageComputeShaderBit,
+                              0, kVkAccessShaderReadBit, kVkImageAspectColorBit);
+        TransitionImageLayout(vkCommandBuffer, res.quarterDepth.image, 0, kVkImageLayoutShaderReadOnlyOptimal,
+                              kVkPipelineStageAllCommandsBit, kVkPipelineStageComputeShaderBit,
+                              0, kVkAccessShaderReadBit, kVkImageAspectColorBit);
+        TransitionImageLayout(vkCommandBuffer, res.velocity.image, 0, kVkImageLayoutShaderReadOnlyOptimal,
+                              kVkPipelineStageAllCommandsBit, kVkPipelineStageComputeShaderBit,
+                              0, kVkAccessShaderReadBit, kVkImageAspectColorBit);
+
+        // Transition read history to SHADER_READ_ONLY_OPTIMAL (or clear on frameIndex == 0)
+        TransitionImageLayout(vkCommandBuffer, res.historyColor[readIdx].image,
+                              (frameIndex == 0) ? 0 : kVkImageLayoutGeneral, kVkImageLayoutShaderReadOnlyOptimal,
+                              kVkPipelineStageComputeShaderBit, kVkPipelineStageComputeShaderBit,
+                              kVkAccessShaderWriteBit, kVkAccessShaderReadBit, kVkImageAspectColorBit);
+        TransitionImageLayout(vkCommandBuffer, res.historyDepth[readIdx].image,
+                              (frameIndex == 0) ? 0 : kVkImageLayoutGeneral, kVkImageLayoutShaderReadOnlyOptimal,
+                              kVkPipelineStageComputeShaderBit, kVkPipelineStageComputeShaderBit,
+                              kVkAccessShaderWriteBit, kVkAccessShaderReadBit, kVkImageAspectColorBit);
+
+        // Transition write history / output to GENERAL
+        TransitionImageLayout(vkCommandBuffer, res.historyColor[writeIdx].image,
+                              0, kVkImageLayoutGeneral,
+                              kVkPipelineStageComputeShaderBit, kVkPipelineStageComputeShaderBit,
+                              kVkAccessShaderReadBit, kVkAccessShaderWriteBit, kVkImageAspectColorBit);
+        TransitionImageLayout(vkCommandBuffer, res.historyDepth[writeIdx].image,
+                              0, kVkImageLayoutGeneral,
+                              kVkPipelineStageComputeShaderBit, kVkPipelineStageComputeShaderBit,
+                              kVkAccessShaderReadBit, kVkAccessShaderWriteBit, kVkImageAspectColorBit);
+    }
+
     pfnCmdBindPipeline(vkCommandBuffer, kVkPipelineBindPointCompute, m_pipeline);
 
-    const uint32_t activeSetIdx = RenderTargetManager::Get().GetCurrentHistoryIndex() & 1u;
     void* activeSet = m_descriptorSets[activeSetIdx] ? m_descriptorSets[activeSetIdx] : m_descriptorSets[0];
 
     if (activeSet && pfnCmdBindDescriptorSets) {
@@ -6177,7 +6733,7 @@ void ReconstructionPass::DispatchVulkan(void* vkCommandBuffer, uint32_t frameInd
             barriers[0].newLayout = kVkImageLayoutGeneral;
             barriers[0].srcQueueFamilyIndex = ~0u;
             barriers[0].dstQueueFamilyIndex = ~0u;
-            barriers[0].image = res.outputColor.image;
+            barriers[0].image = res.historyColor[writeIdx].image;
             barriers[0].subresourceRange.aspectMask = kVkImageAspectColorBit;
             barriers[0].subresourceRange.baseMipLevel = 0;
             barriers[0].subresourceRange.levelCount = 1;
@@ -6191,7 +6747,7 @@ void ReconstructionPass::DispatchVulkan(void* vkCommandBuffer, uint32_t frameInd
             barriers[1].newLayout = kVkImageLayoutGeneral;
             barriers[1].srcQueueFamilyIndex = ~0u;
             barriers[1].dstQueueFamilyIndex = ~0u;
-            barriers[1].image = res.outputDepth.image;
+            barriers[1].image = res.historyDepth[writeIdx].image;
             barriers[1].subresourceRange.aspectMask = kVkImageAspectColorBit;
             barriers[1].subresourceRange.baseMipLevel = 0;
             barriers[1].subresourceRange.levelCount = 1;
@@ -6202,6 +6758,28 @@ void ReconstructionPass::DispatchVulkan(void* vkCommandBuffer, uint32_t frameInd
                                   kVkPipelineStageComputeShaderBit,
                                   kVkPipelineStageTransferBit | kVkPipelineStageComputeShaderBit,
                                   0, 0, nullptr, 0, nullptr, 2, barriers);
+
+            // Copy written history buffer to outputColor image (Item C-02)
+            CopyImageRegion(vkCommandBuffer,
+                            res.historyColor[writeIdx].image, res.outputColor.image,
+                            0, 0, 0, 0,
+                            targetW, targetH,
+                            kVkImageAspectColorBit);
+
+            // Ping-pong layout transitions for next frame:
+            // Written historyColor[writeIdx] transitions to SHADER_READ_ONLY_OPTIMAL for next frame's read
+            TransitionImageLayout(vkCommandBuffer, res.historyColor[writeIdx].image,
+                                  kVkImageLayoutGeneral, kVkImageLayoutShaderReadOnlyOptimal,
+                                  kVkPipelineStageTransferBit | kVkPipelineStageComputeShaderBit, kVkPipelineStageComputeShaderBit,
+                                  kVkAccessTransferReadBit | kVkAccessShaderWriteBit, kVkAccessShaderReadBit,
+                                  kVkImageAspectColorBit);
+
+            // Previously read historyColor[activeSetIdx] transitions to GENERAL for next frame's write
+            TransitionImageLayout(vkCommandBuffer, res.historyColor[activeSetIdx].image,
+                                  kVkImageLayoutShaderReadOnlyOptimal, kVkImageLayoutGeneral,
+                                  kVkPipelineStageComputeShaderBit, kVkPipelineStageComputeShaderBit,
+                                  kVkAccessShaderReadBit, kVkAccessShaderWriteBit,
+                                  kVkImageAspectColorBit);
         } else {
             MinimalVkMemoryBarrier barrier{};
             barrier.sType = kVkStructureTypeMemoryBarrier;
@@ -6218,22 +6796,51 @@ void ReconstructionPass::DispatchVulkan(void* vkCommandBuffer, uint32_t frameInd
 #endif
 }
 
-void ReconstructionPass::DispatchDX12(void* /*d3d12GraphicsCommandList*/, uint32_t frameIndex) {
-    if (!m_initialized.load()) {
+void ReconstructionPass::DispatchDX12(void* d3d12GraphicsCommandList, uint32_t frameIndex) {
+    if (!m_initialized.load() || !d3d12GraphicsCommandList) {
         static std::atomic<bool> s_warned{ false };
-        if (!s_warned.exchange(true)) CBR_LOG_WARN("DispatchDX12 dropped: ReconstructionPass not initialized.");
+        if (!s_warned.exchange(true)) CBR_LOG_WARN("DispatchDX12 dropped: ReconstructionPass not initialized or null command list.");
         return;
     }
 
     const ReconstructionPushConstants pushConstants = BuildReconstructionPushConstants(frameIndex);
     const auto dims = RenderTargetManager::Get().GetDimensions();
 
-    const uint32_t groupCountX = (dims.fullWidth + 15u) / 16u;
-    const uint32_t groupCountY = (dims.fullHeight + 15u) / 16u;
+    const uint32_t targetW = dims.fullWidth > 0 ? dims.fullWidth : 3840u;
+    const uint32_t targetH = dims.fullHeight > 0 ? dims.fullHeight : 2160u;
+    constexpr uint32_t kWorkgroupSizeX = 16u;
+    constexpr uint32_t kWorkgroupSizeY = 16u;
+    const uint32_t groupCountX = (targetW + kWorkgroupSizeX - 1u) / kWorkgroupSizeX;
+    const uint32_t groupCountY = (targetH + kWorkgroupSizeY - 1u) / kWorkgroupSizeY;
 
+#if defined(_WIN32)
+    // ID3D12GraphicsCommandList VMT call dispatch (Item H-02)
+    if (m_d3d12RootSignature && m_d3d12PipelineState) {
+        typedef void (__stdcall *PFN_SetComputeRootSignature)(void*, void*);
+        typedef void (__stdcall *PFN_SetPipelineState)(void*, void*);
+        typedef void (__stdcall *PFN_SetComputeRoot32BitConstants)(void*, unsigned int, unsigned int, const void*, unsigned int);
+        typedef void (__stdcall *PFN_Dispatch)(void*, unsigned int, unsigned int, unsigned int);
+
+        void** vmt = *reinterpret_cast<void***>(d3d12GraphicsCommandList);
+        if (vmt) {
+            auto pfnSetPipelineState = reinterpret_cast<PFN_SetPipelineState>(vmt[25]);
+            auto pfnSetComputeRootSignature = reinterpret_cast<PFN_SetComputeRootSignature>(vmt[30]);
+            auto pfnSetConstants = reinterpret_cast<PFN_SetComputeRoot32BitConstants>(vmt[33]);
+            auto pfnDispatch = reinterpret_cast<PFN_Dispatch>(vmt[29]);
+
+            if (pfnSetPipelineState && pfnSetComputeRootSignature && pfnSetConstants && pfnDispatch) {
+                pfnSetPipelineState(d3d12GraphicsCommandList, m_d3d12PipelineState);
+                pfnSetComputeRootSignature(d3d12GraphicsCommandList, m_d3d12RootSignature);
+                pfnSetConstants(d3d12GraphicsCommandList, 0, sizeof(pushConstants) / 4, &pushConstants, 0);
+                pfnDispatch(d3d12GraphicsCommandList, groupCountX, groupCountY, 1);
+            }
+        }
+    }
+#else
     (void)pushConstants;
     (void)groupCountX;
     (void)groupCountY;
+#endif
 }
 
 } // namespace cbr
@@ -6796,6 +7403,7 @@ bool RenderTargetManager::IsQuarterPassCandidate(uint32_t width, uint32_t height
 ```cpp
 #include "cbr/ui_overlay.h"
 #include <algorithm>
+#include <cstdio>
 #include "cbr/config.h"
 #include "cbr/cbr_engine.h"
 #include "cbr/render_target_manager.h"
@@ -6954,6 +7562,35 @@ void UIOverlay::RegisterHudRenderCallback(HudRenderCallback callback) {
     m_hudCallback.store(callback, std::memory_order_release);
 }
 
+std::string UIOverlay::GetFormattedTelemetry() const {
+    const auto m = GetCurrentMetrics();
+    const auto& config = ConfigManager::Get().GetConfig();
+    char buf[512];
+    std::snprintf(buf, sizeof(buf),
+                  "=== RDR2 CBR Telemetry Overlay ===\n"
+                  "Status:          %s\n"
+                  "Frame:           %u\n"
+                  "Resolution:      %ux%u (Quarter: %ux%u)\n"
+                  "VRAM Allocated:  %.2f MiB\n"
+                  "API Hooked:      %s\n"
+                  "Debug View:      %u\n"
+                  "History Weight:  %.2f\n"
+                  "Depth Tolerance: %.4f\n"
+                  "Mip LOD Bias:    %.2f\n"
+                  "Color Space:     %s\n",
+                  m.cbrEnabled ? "ACTIVE (Checkerboard 2x MSAA)" : "BYPASS",
+                  m.currentFrame,
+                  m.targetWidth, m.targetHeight, m.quarterWidth, m.quarterHeight,
+                  m.vramFootprintMiB,
+                  m.isHooked ? "YES" : "NO",
+                  m.debugView,
+                  config.historyWeight,
+                  config.depthTolerance,
+                  config.mipLodBias,
+                  (config.colorSpace == ColorSpace::RGB) ? "RGB" : ((config.colorSpace == ColorSpace::ICtCp) ? "ICtCp" : "YCoCg"));
+    return std::string(buf);
+}
+
 void UIOverlay::Render() {
     // Check toggle hotkeys every presentation interval regardless of current visibility
     CheckHotkeys();
@@ -6965,6 +7602,20 @@ void UIOverlay::Render() {
     auto cb = m_hudCallback.load(std::memory_order_acquire);
     if (cb) {
         cb(GetCurrentMetrics());
+    } else {
+        // Built-in Telemetry HUD fallback (Item H-04):
+        // When no external ImGui callback is hooked, periodically emit OSD telemetry
+        static std::atomic<uint32_t> s_lastOutputFrame{ ~0u };
+        const uint32_t curFrame = CBREngine::Get().GetCurrentFrameIndex();
+        const uint32_t last = s_lastOutputFrame.load(std::memory_order_relaxed);
+        if (last == ~0u || (curFrame >= last && curFrame - last >= 60)) {
+            s_lastOutputFrame.store(curFrame, std::memory_order_relaxed);
+            std::string text = GetFormattedTelemetry();
+#if defined(_WIN32)
+            OutputDebugStringA(text.c_str());
+#endif
+            CBR_LOG_INFO("HUD OSD:\n%s", text.c_str());
+        }
     }
 }
 
@@ -7267,8 +7918,11 @@ void main() {
         }
     }
 
-    // Point-sample velocity via texelFetch at integer motionCoord to prevent cross-edge velocity bleeding
-    vec2 velocity = texelFetch(u_Velocity, motionCoord, 0).xy;
+    // Point-sample velocity: adaptively handle quarter-res or full-res velocity buffers (Item C-05)
+    ivec2 velSize = textureSize(u_Velocity, 0);
+    ivec2 velCoord = (velSize.x < targetSize.x) ? (motionCoord >> 1) : motionCoord;
+    velCoord = clamp(velCoord, ivec2(0), max(velSize - ivec2(1), ivec2(0)));
+    vec2 velocity = texelFetch(u_Velocity, velCoord, 0).xy;
     velocity = clamp(velocity, vec2(-0.5), vec2(0.5));
     // NaN/Inf velocity or UV must disocclude: ivec2(NaN) is UB and NaN comparisons are false.
     bool velocityBad = isinf(velocity.x) || isnan(velocity.x) || isinf(velocity.y) || isnan(velocity.y)
@@ -7706,8 +8360,11 @@ void ResolvePixel(ivec2 pixelCoord, ivec2 targetSize, uint frameParity) {
         }
     }
 
-    // Sample velocity using texelFetch to avoid cross-edge interpolation/ghosting
-    vec2 velocity = texelFetch(u_Velocity, motionCoord, 0).xy;
+    // Sample velocity: adaptively handle quarter-res or full-res velocity buffers (Item C-05)
+    ivec2 velSize = textureSize(u_Velocity, 0);
+    ivec2 velCoord = (velSize.x < targetSize.x) ? (motionCoord >> 1) : motionCoord;
+    velCoord = clamp(velCoord, ivec2(0), max(velSize - ivec2(1), ivec2(0)));
+    vec2 velocity = texelFetch(u_Velocity, velCoord, 0).xy;
     velocity = clamp(velocity, vec2(-0.5), vec2(0.5));
     bool velocityBad = isinf(velocity.x) || isnan(velocity.x) || isinf(velocity.y) || isnan(velocity.y)
         || isinf(uv.x) || isnan(uv.x) || isinf(uv.y) || isnan(uv.y);
@@ -8178,8 +8835,12 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
         }
     }
 
-    // Exact texel fetch of velocity using integer motionCoord prevents cross-edge interpolation
-    float2 velocity = g_Velocity.Load(int3(motionCoord, 0)).xy;
+    // Sample velocity: adaptively handle quarter-res or full-res velocity buffers (Item C-05)
+    uint velWidth = 0, velHeight = 0, numLevels = 0;
+    g_Velocity.GetDimensions(0, velWidth, velHeight, numLevels);
+    int2 velCoord = ((int)velWidth < (int)g_TargetResolution.x) ? (motionCoord >> 1) : motionCoord;
+    velCoord = clamp(velCoord, int2(0, 0), max(int2((int)velWidth - 1, (int)velHeight - 1), int2(0, 0)));
+    float2 velocity = g_Velocity.Load(int3(velCoord, 0)).xy;
     velocity = clamp(velocity, float2(-0.5f, -0.5f), float2(0.5f, 0.5f));
     bool velocityBad = isinf(velocity.x) || isnan(velocity.x) || isinf(velocity.y) || isnan(velocity.y)
         || isinf(uv.x) || isnan(uv.x) || isinf(uv.y) || isnan(uv.y);
