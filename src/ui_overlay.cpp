@@ -1,4 +1,5 @@
 #include "cbr/ui_overlay.h"
+#include <algorithm>
 #include "cbr/config.h"
 #include "cbr/cbr_engine.h"
 #include "cbr/render_target_manager.h"
@@ -98,6 +99,65 @@ OverlayMetrics UIOverlay::GetCurrentMetrics() const {
     return metrics;
 }
 
+void UIOverlay::SetHistoryWeight(float weight) {
+    const float clamped = std::clamp(weight, 0.0f, 1.0f);
+    ConfigManager::Get().Modify([clamped](CBRConfig& c) {
+        c.historyWeight = clamped;
+    });
+}
+
+void UIOverlay::SetDepthTolerance(float tolerance) {
+    const float clamped = std::clamp(tolerance, 1e-5f, 1.0f);
+    ConfigManager::Get().Modify([clamped](CBRConfig& c) {
+        c.depthTolerance = clamped;
+    });
+}
+
+void UIOverlay::SetMipLodBias(float bias) {
+    const float clamped = std::clamp(bias, -4.0f, 4.0f);
+    ConfigManager::Get().Modify([clamped](CBRConfig& c) {
+        c.mipLodBias = clamped;
+    });
+}
+
+void UIOverlay::SetDebugView(DebugViewMode mode) {
+    ConfigManager::Get().Modify([mode](CBRConfig& c) {
+        c.debugView = static_cast<uint32_t>(mode);
+    });
+}
+
+void UIOverlay::SetColorSpace(ColorSpace colorSpace) {
+    ConfigManager::Get().Modify([colorSpace](CBRConfig& c) {
+        c.colorSpace = colorSpace;
+    });
+}
+
+void UIOverlay::SetColorClamping(bool enable) {
+    ConfigManager::Get().Modify([enable](CBRConfig& c) {
+        c.enableColorClamping = enable;
+    });
+}
+
+void UIOverlay::SetSpatialFallback(bool enable) {
+    ConfigManager::Get().Modify([enable](CBRConfig& c) {
+        c.enableSpatialFallback = enable;
+    });
+}
+
+void UIOverlay::SetMotionDilation(bool enable) {
+    ConfigManager::Get().Modify([enable](CBRConfig& c) {
+        c.enableMotionDilation = enable;
+    });
+}
+
+void UIOverlay::SetCbrEnabled(bool enable) {
+    CBREngine::Get().SetEnabled(enable);
+}
+
+void UIOverlay::RegisterHudRenderCallback(HudRenderCallback callback) {
+    m_hudCallback.store(callback, std::memory_order_release);
+}
+
 void UIOverlay::Render() {
     // Check toggle hotkeys every presentation interval regardless of current visibility
     CheckHotkeys();
@@ -106,12 +166,10 @@ void UIOverlay::Render() {
         return;
     }
 
-    // Diagnostics are ready for presentation when ImGui context is bound:
-    // Controls:
-    //   - CBREngine::Get().SetEnabled(...)
-    //   - ConfigManager::Get().Modify(...) for debugView, historyWeight, depthTolerance, mipLodBias
-    // Telemetry:
-    //   - GetCurrentMetrics()
+    auto cb = m_hudCallback.load(std::memory_order_acquire);
+    if (cb) {
+        cb(GetCurrentMetrics());
+    }
 }
 
 } // namespace cbr

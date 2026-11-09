@@ -24,7 +24,7 @@ layout(set = 0, binding = 1) uniform sampler2DMS u_QuarterDepthMSAA;
 // History frame: full-resolution reconstructed color & depth buffers
 // SAMPLER REQUIREMENT (must match HLSL LinearClamp/PointClamp):
 //   u_HistoryColor -> LINEAR + CLAMP_TO_EDGE, u_HistoryDepth -> NEAREST + CLAMP_TO_EDGE,
-//   u_Velocity -> LINEAR + CLAMP_TO_EDGE. Depth history uses texelFetch (sampler-independent).
+//   u_Velocity -> POINT + CLAMP_TO_EDGE (texelFetch avoids cross-edge velocity interpolation).
 layout(set = 0, binding = 2) uniform sampler2D   u_HistoryColor;
 layout(set = 0, binding = 3) uniform sampler2D   u_HistoryDepth;
 
@@ -49,7 +49,7 @@ layout(push_constant) uniform CBRConstants {
     uint  u_DebugView;              // 0=Normal, 1=Mask, 2=Disocclusion, 3=Motion, 4=Raw
     uint  u_EnableColorClamping;    // 1 = True, 0 = False
     float u_MipLodBias;             // Texture LOD bias (-1.0f: compensates for quarter-res 2x MSAA, see CHECKERBOARD.md)
-    uint  u_ColorSpace;             // 0 = YCoCg clamp, 1 = RGB clamp
+    uint  u_ColorSpace;             // 0 = YCoCg clamp, 1 = RGB clamp, 2 = ICtCp clamp (HDR10/BT.2100)
     uint  u_EnableSpatialFallback;  // 1 = cross-bilateral fallback, 0 = use raw current sample
     vec2  u_JitterDelta;            // Subpixel projection jitter delta (jc - jp)
     uint  u_EnableMotionDilation;   // 1 = closest-depth motion dilation over the active 3x3 neighbours
@@ -81,8 +81,47 @@ vec3 YCoCgtoRGB(vec3 ycocg) {
     return max(vec3(0.0), vec3(R, G, B));
 }
 
-vec3 ToClampSpace(vec3 rgb)  { return (pc.u_ColorSpace == 0u) ? RGBtoYCoCg(rgb) : rgb; }
-vec3 FromClampSpace(vec3 c)  { return (pc.u_ColorSpace == 0u) ? YCoCgtoRGB(c) : max(vec3(0.0), c); }
+// ITU-R BT.2100 ICtCp color space transform for HDR10 and Wide Color Gamut (Rec.2020)
+vec3 RGBtoICtCp(vec3 rgb) {
+    vec3 lms;
+    lms.x = dot(rgb, vec3(0.3593094, 0.6976081, -0.0358878));
+    lms.y = dot(rgb, vec3(0.0828188, 0.7938356,  0.1233592));
+    lms.z = dot(rgb, vec3(0.0125411, 0.0767544,  0.9107026));
+
+    vec3 lmsPrime = sign(lms) * pow(abs(lms), vec3(0.25));
+
+    vec3 ictcp;
+    ictcp.x = dot(lmsPrime, vec3(0.5, 0.5, 0.0));
+    ictcp.y = dot(lmsPrime, vec3(1.613769, -3.323439, 1.709670));
+    ictcp.z = dot(lmsPrime, vec3(4.378183, -4.245536, -0.132647));
+    return ictcp;
+}
+
+vec3 ICtCptoRGB(vec3 ictcp) {
+    vec3 lmsPrime;
+    lmsPrime.x = ictcp.x + 0.00861421 * ictcp.y + 0.11102749 * ictcp.z;
+    lmsPrime.y = ictcp.x - 0.00861421 * ictcp.y - 0.11102749 * ictcp.z;
+    lmsPrime.z = ictcp.x + 0.56003196 * ictcp.y - 0.32062666 * ictcp.z;
+
+    vec3 lms = sign(lmsPrime) * (lmsPrime * lmsPrime * lmsPrime * lmsPrime);
+
+    vec3 rgb;
+    rgb.x = dot(lms, vec3( 3.4811960, -3.1132484,  0.5588873));
+    rgb.y = dot(lms, vec3(-0.3604555,  1.5987806, -0.2307671));
+    rgb.z = dot(lms, vec3(-0.0175594, -0.0918741,  1.1098062));
+    return max(vec3(0.0), rgb);
+}
+
+vec3 ToClampSpace(vec3 rgb)  {
+    if (pc.u_ColorSpace == 0u) return RGBtoYCoCg(rgb);
+    if (pc.u_ColorSpace == 2u) return RGBtoICtCp(rgb);
+    return rgb;
+}
+vec3 FromClampSpace(vec3 c)  {
+    if (pc.u_ColorSpace == 0u) return YCoCgtoRGB(c);
+    if (pc.u_ColorSpace == 2u) return ICtCptoRGB(c);
+    return c;
+}
 
 // =============================================================================
 // Checkerboard sample mapping. MIRRORS include/cbr/checkerboard_mapping.h: keep the two in sync
@@ -127,14 +166,16 @@ float FetchDepth(CbrSample s) {
 // MIRRORS include/cbr/depth_convention.h
 // NaN/Inf device depth yields NaN so the disocclusion test must reject it.
 float LinearizeDepth(float d) {
-    if (isnan(d) || isinf(d)) return uintBitsToFloat(0x7fc00000u); // quiet NaN
+    if (isnan(d) || isinf(d) || pc.u_DepthNear <= 0.0) return uintBitsToFloat(0x7fc00000u); // quiet NaN
     float n = pc.u_DepthNear;
     float f = pc.u_DepthFar;
     if (pc.u_DepthMode == 1u) {
-        return (f > 0.0) ? (n * f) / (n + d * (f - n)) : n / max(d, 1e-7);
+        float denom = (n + d * (f - n));
+        if (abs(denom) < 1e-7 || isnan(denom) || isinf(denom)) return uintBitsToFloat(0x7fc00000u);
+        return (f > 0.0) ? (n * f) / denom : n / max(d, 1e-7);
     }
     float denom = (f - d * (f - n));
-    if (denom == 0.0 || isinf(denom) || isnan(denom)) return uintBitsToFloat(0x7fc00000u);
+    if (abs(denom) < 1e-7 || isinf(denom) || isnan(denom)) return uintBitsToFloat(0x7fc00000u);
     return (n * f) / denom;
 }
 
@@ -174,6 +215,7 @@ void main() {
     // The 4 cardinal neighbours of a reconstructed pixel are always natively shaded (mirrored at borders).
     ivec2 cardinalCoord[4] = ivec2[](ivec2(0), ivec2(0), ivec2(0), ivec2(0));
     float cardinalDepth[4] = float[](0.0, 0.0, 0.0, 0.0);
+    vec3  cardinalColor[4] = vec3[](vec3(0.0), vec3(0.0), vec3(0.0), vec3(0.0));
 
     if (isCurrentSampleActive) {
         currentColor = FetchColor(self);
@@ -193,7 +235,9 @@ void main() {
                 c = pixelCoord;
             }
             cardinalCoord[i] = c;
-            cardinalDepth[i] = FetchDepth(MapPixelToSample(c, frameParity));
+            CbrSample s = MapPixelToSample(c, frameParity);
+            cardinalDepth[i] = FetchDepth(s);
+            cardinalColor[i] = FetchColor(s);
             float raw = cardinalDepth[i];
             float lin = LinearizeDepth(raw);
             if (!isnan(raw) && !isinf(raw) && !isnan(lin) && !isinf(lin)) {
@@ -219,8 +263,8 @@ void main() {
     // For inactive pixels, the 4 cardinal neighbours are already fetched in step 1, avoiding redundant texture fetches.
     ivec2 motionCoord = pixelCoord;
     if (pc.u_EnableMotionDilation != 0u) {
+        float best = currentDepth;
         if (isCurrentSampleActive) {
-            float best = currentDepth;
             const ivec2 kDiagonal[4] = ivec2[](ivec2(-1, -1), ivec2(1, -1), ivec2(-1, 1), ivec2(1, 1));
             for (int i = 0; i < 4; ++i) {
                 ivec2 n = pixelCoord + kDiagonal[i];
@@ -232,14 +276,11 @@ void main() {
                 }
             }
         } else {
-            bool found = false;
-            float best = 0.0;
             for (int i = 0; i < 4; ++i) {
                 ivec2 n = pixelCoord + kCardinal[i];
                 if (!InBounds(n, targetSize)) continue;
                 float d = cardinalDepth[i];
-                if (!found || IsNearer(d, best)) {
-                    found = true;
+                if (IsNearer(d, best)) {
                     best = d;
                     motionCoord = n;
                 }
@@ -247,12 +288,20 @@ void main() {
         }
     }
 
-    vec2 dilatedUV = (vec2(motionCoord) + 0.5) * pc.u_InvTargetResolution;
-    vec2 velocity = textureLod(u_Velocity, dilatedUV, 0.0).xy;
+    // Point-sample velocity via texelFetch at integer motionCoord to prevent cross-edge velocity bleeding
+    vec2 velocity = texelFetch(u_Velocity, motionCoord, 0).xy;
+    velocity = clamp(velocity, vec2(-0.5), vec2(0.5));
     // NaN/Inf velocity or UV must disocclude: ivec2(NaN) is UB and NaN comparisons are false.
     bool velocityBad = isinf(velocity.x) || isnan(velocity.x) || isinf(velocity.y) || isnan(velocity.y)
         || isinf(uv.x) || isnan(uv.x) || isinf(uv.y) || isnan(uv.y);
-    vec2 historyUV = uv - velocity - pc.u_JitterDelta * pc.u_JitterCompensation;
+    // Jitter dampener: dampens jitter compensation on zero-velocity passes (transparent particles, fog, smoke)
+    // to prevent half-pixel oscillation when alpha-blended particles lack motion vectors.
+    float jitterDampener = (dot(velocity, velocity) < 1e-9) ? 0.0 : 1.0;
+    vec2 historyUV = uv - velocity - (pc.u_JitterDelta * (pc.u_JitterCompensation * jitterDampener));
+    // Clamp historyUV to valid subpixel inner border to prevent edge sample bleeding
+    vec2 minUV = 0.5 * pc.u_InvTargetResolution;
+    vec2 maxUV = vec2(1.0) - minUV;
+    historyUV = clamp(historyUV, minUV, maxUV);
     bool historyUVBad = velocityBad || isinf(historyUV.x) || isnan(historyUV.x)
         || isinf(historyUV.y) || isnan(historyUV.y);
 
@@ -262,6 +311,7 @@ void main() {
     bool isDisoccluded = false;
     vec4 historyColor = vec4(0.0);
     float previousDepth = currentDepth;
+    float depthDelta = 0.0;
 
     if (historyUVBad || pc.u_FrameIndex == 0u || historyUV.x < 0.0 || historyUV.x > 1.0 || historyUV.y < 0.0 || historyUV.y > 1.0) {
         isDisoccluded = true; // First frame, bad velocity/UV, or sample moved outside screen space
@@ -271,12 +321,13 @@ void main() {
         previousDepth = texelFetch(u_HistoryDepth, historyCoord, 0).r;
         float prevLin = LinearizeDepth(previousDepth);
         bool depthBad = isinf(currentLinear) || isnan(currentLinear) || isinf(prevLin) || isnan(prevLin);
-        float depthDelta = depthBad ? 10.0 : abs(currentLinear - prevLin) / max(currentLinear, 1e-5);
-        if (depthDelta > pc.u_DepthTolerance) {
+        depthDelta = depthBad ? 10.0 : abs(currentLinear - prevLin) / max(currentLinear, 1e-5);
+        float dynamicTolerance = pc.u_DepthTolerance * max(1.0, 1.0 + 0.0005 * currentLinear);
+        if (depthDelta > dynamicTolerance) {
             isDisoccluded = true;
         } else {
             historyColor = textureLod(u_HistoryColor, historyUV, 0.0);
-            if (historyColor.a <= 0.0) {
+            if (historyColor.a < 0.5) {
                 isDisoccluded = true; // Cleared history buffer
             }
         }
@@ -287,8 +338,10 @@ void main() {
     // Uses ONLY natively shaded neighbours: samples that do not exist this frame must not enter the statistics.
     // Clamping is active on both static and moving geometry: static geometry subject to dynamic lighting,
     // shadows, or moving occluders still requires history bounding to prevent temporal ghosting.
+    // Variance clipping is bypassed on strictly static geometry with sub-tolerance depth variance.
     // -------------------------------------------------------------------------
-    if (!isDisoccluded && pc.u_EnableColorClamping != 0u) {
+    const bool isStatic = dot(velocity, velocity) < 1e-9 && depthDelta < (0.05 * pc.u_DepthTolerance);
+    if (!isDisoccluded && pc.u_EnableColorClamping != 0u && !isStatic) {
         vec3 colorMin = vec3(1e6);
         vec3 colorMax = vec3(-1e6);
         vec3 m1 = vec3(0.0);
@@ -312,6 +365,8 @@ void main() {
             vec3 c;
             if (isCurrentSampleActive && i == 0) {
                 c = ToClampSpace(currentColor);
+            } else if (!isCurrentSampleActive) {
+                c = ToClampSpace(cardinalColor[i]);
             } else {
                 c = ToClampSpace(FetchColor(MapPixelToSample(nc, frameParity)));
             }
@@ -326,7 +381,8 @@ void main() {
         if (n >= 2.0) {
             // Variance clipping: clamp history inside [mean - gamma * stdDev, mean + gamma * stdDev]
             vec3 mean = m1 / n;
-            vec3 stdDev = sqrt(max(vec3(0.0), (m2 / n) - (mean * mean)));
+            vec3 rawStdDev = sqrt(max(vec3(0.0), (m2 / n) - (mean * mean)));
+            vec3 stdDev = max(rawStdDev, vec3(0.005)); // Enforce floor to avoid shadow collapse and retain specular headroom
             const float gamma = 1.25; // kVarianceClipGamma (include/cbr/limits.h)
             vec3 varianceMin = max(colorMin, mean - gamma * stdDev);
             vec3 varianceMax = min(colorMax, mean + gamma * stdDev);
@@ -362,11 +418,12 @@ void main() {
             float accumWeight = 0.0;
 
             for (int i = 0; i < 4 && pc.u_EnableSpatialFallback != 0u; ++i) {
-                vec3 sCol = FetchColor(MapPixelToSample(cardinalCoord[i], frameParity));
+                vec3 sCol = cardinalColor[i];
                 float sLin = LinearizeDepth(cardinalDepth[i]);
 
                 // Relative linear-depth weighting: scale-invariant, independent of the depth convention
-                float depthWeight = exp(-abs(currentLinear - sLin) / (max(currentLinear, 1e-5) * max(pc.u_DepthTolerance, 1e-4)));
+                // Fast base-2 exponentiation: exp(-x) == exp2(-x * log2(e))
+                float depthWeight = exp2((-abs(currentLinear - sLin) / (max(currentLinear, 1e-5) * max(pc.u_DepthTolerance, 1e-4))) * 1.4426950408889634);
 
                 accumColor += sCol * depthWeight;
                 accumDepth += cardinalDepth[i] * depthWeight;
@@ -377,8 +434,10 @@ void main() {
                 finalColor = accumColor / accumWeight;
                 spatialDepth = accumDepth / accumWeight;
             } else {
-                finalColor = isCurrentSampleActive ? currentColor : FetchColor(MapPixelToSample(cardinalCoord[0], frameParity));
-                spatialDepth = isCurrentSampleActive ? currentDepth : cardinalDepth[0];
+                // When depth divergence across all 4 samples is high, average cardinal samples
+                // to prevent single-pixel directional bias (Item 58)
+                finalColor = isCurrentSampleActive ? currentColor : (cardinalColor[0] + cardinalColor[1] + cardinalColor[2] + cardinalColor[3]) * 0.25;
+                spatialDepth = isCurrentSampleActive ? currentDepth : (cardinalDepth[0] + cardinalDepth[1] + cardinalDepth[2] + cardinalDepth[3]) * 0.25;
             }
         }
     }
@@ -387,7 +446,7 @@ void main() {
     if (isnan(finalColor.r) || isinf(finalColor.r) ||
         isnan(finalColor.g) || isinf(finalColor.g) ||
         isnan(finalColor.b) || isinf(finalColor.b)) {
-        finalColor = isCurrentSampleActive ? currentColor : FetchColor(MapPixelToSample(cardinalCoord[0], frameParity));
+        finalColor = isCurrentSampleActive ? currentColor : cardinalColor[0];
     }
 
     // -------------------------------------------------------------------------
@@ -397,22 +456,22 @@ void main() {
         // Checkerboard mask: White = natively shaded this frame, Black = reconstructed
         finalColor = isCurrentSampleActive ? vec3(1.0, 1.0, 1.0) : vec3(0.05, 0.05, 0.05);
     } else if (pc.u_DebugView == 2u) {
-        // Disocclusion heatmap: Green = temporal history, Red = spatial disocclusion
-        finalColor = isDisoccluded ? vec3(1.0, 0.1, 0.1) : vec3(0.1, 0.9, 0.1);
+        // Continuous gradient heatmap: Green = 0 delta, Yellow = mid delta, Red = disoccluded (Item 66)
+        float t = clamp(depthDelta / max(pc.u_DepthTolerance, 1e-4), 0.0, 1.0);
+        finalColor = isDisoccluded ? vec3(1.0, 0.1, 0.1) : mix(vec3(0.1, 0.9, 0.1), vec3(1.0, 0.9, 0.1), t);
     } else if (pc.u_DebugView == 3u) {
-        // Motion vector field
-        finalColor = vec3(abs(velocity) * 50.0, 0.0);
+        // Directional color wheel: RG = direction, B = normalized speed (Item 69)
+        vec2 normVel = velocity * 20.0;
+        float speed = clamp(length(normVel), 0.0, 1.0);
+        finalColor = vec3(clamp(normVel * 0.5 + 0.5, 0.0, 1.0), speed);
     } else if (pc.u_DebugView == 4u) {
-        // Quarter-resolution raw colour (nearest native sample for reconstructed pixels)
-        finalColor = isCurrentSampleActive ? currentColor : FetchColor(MapPixelToSample(cardinalCoord[0], frameParity));
+        // Quarter-resolution raw colour without directional bias (Item 61)
+        finalColor = isCurrentSampleActive ? currentColor : (cardinalColor[0] + cardinalColor[1] + cardinalColor[2] + cardinalColor[3]) * 0.25;
     } else if (pc.u_DebugView == 5u) {
         // Spatial baseline resolve: average of 4 cardinal samples for reconstructed pixels
         // (direct visual A/B baseline comparison against temporal CBR, matching reference Space toggle)
         finalColor = isCurrentSampleActive ? currentColor : (
-            FetchColor(MapPixelToSample(cardinalCoord[0], frameParity)) +
-            FetchColor(MapPixelToSample(cardinalCoord[1], frameParity)) +
-            FetchColor(MapPixelToSample(cardinalCoord[2], frameParity)) +
-            FetchColor(MapPixelToSample(cardinalCoord[3], frameParity))
+            cardinalColor[0] + cardinalColor[1] + cardinalColor[2] + cardinalColor[3]
         ) * 0.25;
     }
 
@@ -428,5 +487,7 @@ void main() {
     if (isnan(outDepth) || isinf(outDepth)) {
         outDepth = (pc.u_DepthMode == 1u) ? 0.0 : 1.0;
     }
+    // GLSL 4.50 section 8.14 mandates 4-component vector parameter for imageStore;
+    // GPU hardware routes the red channel to r32f and discards yzw (Item 86).
     imageStore(u_OutputDepth, pixelCoord, vec4(outDepth, 0.0, 0.0, 0.0));
 }

@@ -28,12 +28,22 @@ enum class DepthConvention {
 
 enum class ColorSpace {
     YCoCg,
-    RGB
+    RGB,
+    ICtCp // HDR10 / BT.2100 Wide Color Gamut (Rec.2020) with perceptual quantization
 };
 
 enum class SamplingStrategy {
     StrategyA, // ViewportShift (standard 2x MSAA sample locations + horizontal viewport half-pixel jitter on odd frames)
     StrategyB  // ProgrammableSampleLocations (VK_EXT_sample_locations 2x MSAA alternation per frame, stationary viewport)
+};
+
+enum class DebugViewMode : uint32_t {
+    Normal = 0,
+    CheckerboardMask = 1,
+    DisocclusionHeatmap = 2,
+    MotionVectors = 3,
+    QuarterResRaw = 4,
+    SpatialUpscaleBaseline = 5
 };
 
 struct CBRConfig {
@@ -86,7 +96,7 @@ public:
     bool Load(const std::filesystem::path& configPath);
     bool Save(const std::filesystem::path& configPath);
 
-    CBRConfig GetConfig() const {
+    [[nodiscard]] CBRConfig GetConfig() const {
         std::lock_guard<std::mutex> lock(m_mutex);
         return m_config;
     }
@@ -99,8 +109,16 @@ public:
     }
     template<typename Fn>
     void Modify(Fn&& fn) {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        fn(m_config);
+        CBRConfig cfg;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            cfg = m_config;
+        }
+        fn(cfg);
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_config = cfg;
+        }
     }
 
 private:

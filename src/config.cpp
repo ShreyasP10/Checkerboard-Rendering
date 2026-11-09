@@ -1,4 +1,5 @@
 #include "cbr/config.h"
+#include "cbr/depth_convention.h"
 #include "cbr/logger.h"
 #include <fstream>
 #include <sstream>
@@ -20,13 +21,41 @@ std::string Trim(const std::string& str) {
     return str.substr(first, (last - first + 1));
 }
 
-// Strip inline comments starting with ';' or '#'
+// Strip inline comments starting with ';' or '#' unless escaped or inside quotes
 std::string StripComment(const std::string& str) {
-    auto pos = str.find_first_of(";#");
-    if (pos != std::string::npos) {
-        return str.substr(0, pos);
+    std::string result;
+    result.reserve(str.size());
+    bool inQuotes = false;
+    char quoteChar = '\0';
+    for (size_t i = 0; i < str.size(); ++i) {
+        char c = str[i];
+        if (c == '\\' && i + 1 < str.size() &&
+            (str[i + 1] == ';' || str[i + 1] == '#' || str[i + 1] == '"' || str[i + 1] == '\'')) {
+            result += str[++i];
+            continue;
+        }
+        if ((c == '"' || c == '\'') && !inQuotes) {
+            inQuotes = true;
+            quoteChar = c;
+            result += c;
+            continue;
+        } else if (inQuotes && c == quoteChar) {
+            inQuotes = false;
+            quoteChar = '\0';
+            result += c;
+            continue;
+        }
+        if (!inQuotes && (c == ';' || c == '#')) {
+            break;
+        }
+        result += c;
     }
-    return str;
+    std::string trimmed = Trim(result);
+    if (trimmed.size() >= 2 && ((trimmed.front() == '"' && trimmed.back() == '"') ||
+                                (trimmed.front() == '\'' && trimmed.back() == '\''))) {
+        return trimmed.substr(1, trimmed.size() - 2);
+    }
+    return result;
 }
 
 bool ParseBool(const std::string& val, bool defaultVal) {
@@ -40,12 +69,15 @@ bool ParseBool(const std::string& val, bool defaultVal) {
 uint32_t ParseUInt(const std::string& val, uint32_t defaultVal, uint32_t minVal, uint32_t maxVal) {
     if (val.empty()) return defaultVal;
     try {
-        // std::stoul accepts a leading '-' (wrapping around) and ignores trailing text ("4k" -> 4);
-        // reject both so typos fall back to the default instead of becoming a bogus value.
+        // Reject leading '-' (avoid unsigned wrap-around) and trailing text ("4k" -> rejected)
         if (val.front() == '-') return defaultVal;
         size_t idx = 0;
-        unsigned long result = std::stoul(val, &idx);
+        // Use unsigned long long (64-bit on both Windows LLP64 and Linux LP64) to prevent platform divergence
+        unsigned long long result = std::stoull(val, &idx);
         if (idx == 0 || idx != val.size()) return defaultVal;
+        if (result > static_cast<unsigned long long>(UINT32_MAX)) {
+            result = UINT32_MAX;
+        }
         if (result < minVal) result = minVal;
         if (result > maxVal) result = maxVal;
         return static_cast<uint32_t>(result);
@@ -56,9 +88,18 @@ uint32_t ParseUInt(const std::string& val, uint32_t defaultVal, uint32_t minVal,
 
 float ParseFloat(const std::string& val, float defaultVal, float minVal, float maxVal) {
     if (val.empty()) return defaultVal;
+    float result = defaultVal;
+    // Locale-independent float parsing (Item 71)
+    auto [ptr, ec] = std::from_chars(val.data(), val.data() + val.size(), result);
+    if (ec == std::errc() && ptr == val.data() + val.size()) {
+        if (std::isnan(result) || std::isinf(result)) return defaultVal;
+        if (result < minVal) result = minVal;
+        if (result > maxVal) result = maxVal;
+        return result;
+    }
     try {
         size_t idx = 0;
-        float result = std::stof(val, &idx);
+        result = std::stof(val, &idx);
         if (idx == 0 || idx != val.size() || std::isnan(result) || std::isinf(result)) return defaultVal;
         if (result < minVal) result = minVal;
         if (result > maxVal) result = maxVal;
@@ -174,7 +215,14 @@ bool ConfigManager::Load(const std::filesystem::path& configPath) {
             } else if (key == "EnableColorClamping") {
                 parsed.enableColorClamping = ParseBool(val, parsed.enableColorClamping);
             } else if (key == "ColorSpace") {
-                parsed.colorSpace = (ToUpper(val) == "RGB") ? ColorSpace::RGB : ColorSpace::YCoCg;
+                const std::string cs = ToUpper(val);
+                if (cs == "RGB") {
+                    parsed.colorSpace = ColorSpace::RGB;
+                } else if (cs == "ICTCP" || cs == "HDR" || cs == "BT2020") {
+                    parsed.colorSpace = ColorSpace::ICtCp;
+                } else {
+                    parsed.colorSpace = ColorSpace::YCoCg;
+                }
             } else if (key == "HistoryWeight") {
                 parsed.historyWeight = ParseFloat(val, parsed.historyWeight, 0.0f, 1.0f);
             } else if (key == "EnableSpatialFallback") {
@@ -278,7 +326,8 @@ bool ConfigManager::Save(const std::filesystem::path& configPath) {
     file << "[Reconstruction]\n";
     file << "DepthTolerance = " << snapshot.depthTolerance << "\n";
     file << "EnableColorClamping = " << (snapshot.enableColorClamping ? "true" : "false") << "\n";
-    file << "ColorSpace = " << (snapshot.colorSpace == ColorSpace::RGB ? "RGB" : "YCoCg") << "\n";
+    const char* csStr = (snapshot.colorSpace == ColorSpace::RGB) ? "RGB" : ((snapshot.colorSpace == ColorSpace::ICtCp) ? "ICtCp" : "YCoCg");
+    file << "ColorSpace = " << csStr << "\n";
     file << "HistoryWeight = " << snapshot.historyWeight << "\n";
     file << "EnableSpatialFallback = " << (snapshot.enableSpatialFallback ? "true" : "false") << "\n";
     file << "EnableMotionDilation = " << (snapshot.enableMotionDilation ? "true" : "false") << "\n";

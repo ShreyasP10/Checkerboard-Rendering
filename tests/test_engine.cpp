@@ -59,6 +59,7 @@ static void RunVulkanTests() {
     auto& rt = RenderTargetManager::Get();
 
     CHECK(e.Initialize());
+    CHECK(!e.CheckAntiCheatModules());
     CHECK(e.GetActiveApi() == GraphicsApi::Vulkan);
     CHECK(g_vulkanAttempts.load() == 0);                  // Initialize() must not install hooks itself
 
@@ -148,6 +149,26 @@ static void RunVulkanTests() {
     CHECK(metrics.cbrEnabled == true);
     CHECK(metrics.vramFootprintMiB > 300.0);
     CHECK(metrics.vramFootprintMB > 310.0);
+
+    // Interactive HUD control testing (Item 96)
+    ui.SetHistoryWeight(0.75f);
+    CHECK(ConfigManager::Get().GetConfig().historyWeight == 0.75f);
+    ui.SetDepthTolerance(0.025f);
+    CHECK(ConfigManager::Get().GetConfig().depthTolerance == 0.025f);
+    ui.SetMipLodBias(-1.5f);
+    CHECK(ConfigManager::Get().GetConfig().mipLodBias == -1.5f);
+    ui.SetDebugView(DebugViewMode::DisocclusionHeatmap);
+    CHECK(ConfigManager::Get().GetConfig().debugView == 2u);
+    ui.SetColorSpace(ColorSpace::ICtCp);
+    CHECK(ConfigManager::Get().GetConfig().colorSpace == ColorSpace::ICtCp);
+
+    static bool s_customHudRendered = false;
+    ui.RegisterHudRenderCallback([](const OverlayMetrics& m) {
+        if (m.targetWidth == 3840) s_customHudRendered = true;
+    });
+    ui.SetVisible(true);
+    ui.Render();
+    CHECK(s_customHudRendered);
 }
 
 static void RunAutoTests() {

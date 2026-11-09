@@ -1,5 +1,6 @@
 #include "cbr/checkerboard_mapping.h"
 #include "cbr/config.h"
+#include "cbr/crash_handler.h"
 #include "cbr/depth_convention.h"
 #include "cbr/jitter_manager.h"
 #include "cbr/logger.h"
@@ -110,6 +111,12 @@ static void TestConfigHardening(const fs::path& dir) {
     CHECK(ConfigManager::Get().GetConfig().projectionJitterSign == -1);
     CHECK(ConfigManager::Get().GetConfig().samplingStrategy == SamplingStrategy::StrategyB);
     CHECK(ConfigManager::Get().GetConfig().depthConvention == DepthConvention::Standard);
+
+    // Hardened integer parsing (large 64-bit clamp) and quoted comment stripping
+    WriteFile(dir / "hardened.ini", "[General]\nTargetWidth = 9999999999999999\nPreferredApi = \"Vulkan\" ; inline comment\n");
+    CHECK(ConfigManager::Get().Load(dir / "hardened.ini"));
+    CHECK(ConfigManager::Get().GetConfig().targetWidth == 7680); // clamped to kMaxTargetWidth
+    CHECK(ConfigManager::Get().GetConfig().preferredApi == GraphicsApi::Vulkan);
 }
 
 static void TestConfigMissingFileAndRoundTrip(const fs::path& dir) {
@@ -130,6 +137,12 @@ static void TestConfigMissingFileAndRoundTrip(const fs::path& dir) {
     CHECK(after.samplingStrategy == before.samplingStrategy);
     CHECK(after.depthConvention == before.depthConvention);
     CHECK(after.depthNear == before.depthNear && after.depthFar == before.depthFar);
+
+    // Verify thread-safe Modify callback executes and commits successfully
+    ConfigManager::Get().Modify([](CBRConfig& cfg) {
+        cfg.targetWidth = 1920;
+    });
+    CHECK(ConfigManager::Get().GetConfig().targetWidth == 1920);
 }
 
 static void TestLoggerBufferingAndLevel(const fs::path& dir) {
@@ -297,6 +310,9 @@ static void TestDepthConvention() {
         CHECK(!std::isfinite(LinearizeDepth(inf, DepthConvention::Standard, 0.1f, 1000.0f)));
         CHECK(RelativeDepthDelta(nan, 1.0f) > 1.0f);
         CHECK(RelativeDepthDelta(1.0f, inf) > 1.0f);
+        // Test near-zero denominator edge cases
+        CHECK(!std::isfinite(LinearizeDepth(1.0f, DepthConvention::Standard, 0.0f, 0.0f)));
+        CHECK(!std::isfinite(LinearizeDepth(0.0f, DepthConvention::Reversed, 0.0f, 0.0f)));
     }
     // Round trip: project a view-space distance to device depth, linearize it back.
     for (double z : { 0.2, 1.0, 10.0, 100.0, 1000.0, 5000.0 }) {
@@ -384,6 +400,12 @@ static void TestPushConstantBuilder() {
     const ReconstructionPushConstants pc2 = BuildReconstructionPushConstants(0);
     CHECK(pc2.enableSpatialFallback == 1u && pc2.enableMotionDilation == 1u && pc2.colorSpace == 0u);
     CHECK(pc2.shiftDirection == 1 && pc2.depthMode == 1u && pc2.depthFar == 0.0f);
+
+    ConfigManager::Get().Modify([](CBRConfig& c) {
+        c.colorSpace = ColorSpace::ICtCp;
+    });
+    const ReconstructionPushConstants pc3 = BuildReconstructionPushConstants(0);
+    CHECK(pc3.colorSpace == 2u);
 }
 
 static void TestRenderTargets() {
@@ -412,6 +434,12 @@ static void TestRenderTargets() {
     r.SwapHistoryBuffers();
     CHECK(r.GetCurrentHistoryIndex() == 1 && r.GetPreviousHistoryIndex() == 0);
     r.ResetHistory();
+
+    // Vulkan resource lifecycle sanity checks
+    CHECK(!r.AreVulkanResourcesCreated());
+    CHECK(!r.CreateVulkanResources(nullptr, nullptr));
+    r.DestroyVulkanResources();
+    CHECK(!r.AreVulkanResourcesCreated());
     CHECK(r.GetCurrentHistoryIndex() == 0);
 }
 
@@ -482,19 +510,23 @@ static void TestReconstructionPass(const fs::path& dir) {
     CHECK(!pass.IsInitialized());
     CHECK(pass.GetDescriptorSetLayout() == nullptr);
     CHECK(pass.GetDescriptorPool() == nullptr);
-    CHECK(pass.GetDescriptorSet() == nullptr);
+    CHECK(pass.GetDescriptorSet(0) == nullptr);
+    CHECK(pass.GetDescriptorSet(1) == nullptr);
     CHECK(pass.InitializeVulkan(nullptr, nullptr));
     CHECK(pass.IsInitialized());
 
-    // 4. Safe dispatch with null command buffer
+    // 4. Safe dispatch, barrier transition, and blit with null command buffer
     pass.DispatchVulkan(nullptr, 0);
+    pass.TransitionImageLayout(nullptr, nullptr, 0, 1, 0, 0, 0, 0);
+    pass.BlitToImage(nullptr, nullptr, nullptr, 1920, 1080, 3840, 2160);
 
     // 5. Clean shutdown
     pass.Shutdown();
     CHECK(!pass.IsInitialized());
     CHECK(pass.GetDescriptorSetLayout() == nullptr);
     CHECK(pass.GetDescriptorPool() == nullptr);
-    CHECK(pass.GetDescriptorSet() == nullptr);
+    CHECK(pass.GetDescriptorSet(0) == nullptr);
+    CHECK(pass.GetDescriptorSet(1) == nullptr);
 }
 
 static void TestPatternScanner() {
@@ -522,11 +554,40 @@ static void TestPatternScanner() {
     const uint8_t* notFound = PatternScanner::FindIdaPattern(mockMemory, sizeof(mockMemory), "FF 15 ? ? ? ?");
     CHECK(notFound == nullptr);
 
+    // 3b. SIMD (SSE2/AVX2) buffer testing with large buffers and non-trivial offsets
+    uint8_t largeMemory[256];
+    std::memset(largeMemory, 0x90, sizeof(largeMemory));
+    // Embed pattern at offset 73 (crosses 32-byte and 16-byte SIMD chunk boundaries)
+    const uint8_t targetSignature[] = { 0x48, 0x8B, 0x05, 0xAA, 0xBB, 0xCC, 0xDD, 0x48, 0x8B, 0x48, 0x08 };
+    std::memcpy(largeMemory + 73, targetSignature, sizeof(targetSignature));
+    const uint8_t* foundSimd = PatternScanner::FindIdaPattern(largeMemory, sizeof(largeMemory), "48 8B 05 ? ? ? ? 48 8B 48 08");
+    CHECK(foundSimd == largeMemory + 73);
+
+    // 3c. SIMD false-positive prefix rejection (first byte matches multiple times, rest differs)
+    largeMemory[10] = 0x48;
+    largeMemory[11] = 0x00;
+    largeMemory[32] = 0x48;
+    largeMemory[33] = 0x8B;
+    largeMemory[34] = 0x00; // mismatch
+    const uint8_t* foundPrefixReject = PatternScanner::FindIdaPattern(largeMemory, sizeof(largeMemory), "48 8B 05 ? ? ? ? 48 8B 48 08");
+    CHECK(foundPrefixReject == largeMemory + 73);
+
     // 4. RIP-relative resolution: instruction address + instruction length + displacement
     // Instruction starts at mockMemory + 3, length is 7 bytes (48 8B 05 12 34 00 00), displacement is 0x00003412
     const uint8_t* ripTarget = PatternScanner::ResolveRipRelative(mockMemory + 3, 7, 3);
     const int32_t expectedDisplacement = 0x00003412;
     CHECK(ripTarget == (mockMemory + 3 + 7 + expectedDisplacement));
+}
+
+static void TestCrashHandler(const fs::path& dir) {
+    // Crash handler installation and telemetry
+    auto& handler = CrashHandler::Get();
+    CHECK(!handler.IsInstalled());
+    handler.Install(dir);
+    CHECK(handler.IsInstalled());
+    handler.LogSystemTelemetry();
+    handler.Uninstall();
+    CHECK(!handler.IsInstalled());
 }
 
 int main() {
@@ -545,6 +606,7 @@ int main() {
     TestProjectionJitterSign();
     TestReconstructionPass(dir);
     TestPatternScanner();
+    TestCrashHandler(dir);
 
     fs::remove_all(dir);
     if (g_failures == 0) {

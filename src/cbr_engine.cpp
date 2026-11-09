@@ -7,8 +7,19 @@
 #include "cbr/ui_overlay.h"
 #include "cbr/hooks.h"
 #include "cbr/crash_handler.h"
+#include "cbr/pattern_scanner.h"
 #include <cctype>
 #include <string>
+
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace cbr {
 
@@ -48,6 +59,14 @@ bool CBREngine::Initialize() {
         }
 
         CBR_LOG_INFO("Initializing CBREngine for Red Dead Redemption 2...");
+
+        // 2a. Anti-Cheat & Online Safety Verification: refuse execution if anti-cheat or online DLLs are detected
+        if (CheckAntiCheatModules()) {
+            CBR_LOG_ERROR("CRITICAL: CBREngine initialization refused due to detected anti-cheat / online security modules.");
+            m_initialized.store(false);
+            return;
+        }
+
         CrashHandler::Get().Install(baseDir);
         CrashHandler::Get().LogSystemTelemetry();
         m_enabled.store(config.enabled);
@@ -65,6 +84,11 @@ bool CBREngine::Initialize() {
             }
         }
         m_activeApi.store(api);
+
+        {
+            std::lock_guard<std::mutex> lock(m_frameConfigMutex);
+            m_cachedFrameConfig = config;
+        }
 
         // 3. Initialize Render Target & Jitter Managers
         RenderTargetManager::Get().Initialize(config.targetWidth, config.targetHeight);
@@ -137,16 +161,38 @@ void CBREngine::Shutdown(bool isProcessExit) {
     m_initialized.store(false);
 }
 
+bool CBREngine::ConsumeCandidatePassActive(void* cmdBuffer) {
+    if (!cmdBuffer) return true; // allow manual/null calls (e.g. tests)
+    void* active = m_activeCandidateCmdBuffer.load();
+    if (active == cmdBuffer) {
+        return m_activeCandidateCmdBuffer.compare_exchange_strong(active, nullptr);
+    }
+    return false;
+}
+
 void CBREngine::OnBeginFrame() {
     if (!m_enabled.load()) return;
 
+    {
+        std::lock_guard<std::mutex> lock(m_frameConfigMutex);
+        m_cachedFrameConfig = ConfigManager::Get().GetConfig();
+    }
+
     uint32_t currentFrame = m_frameIndex.load();
     JitterManager::Get().Update(currentFrame);
+
+#if defined(_WIN32)
+    const auto config = GetCachedFrameConfig();
+    if (config.samplingStrategy == SamplingStrategy::StrategyA && config.jitterDirection != 0) {
+        PatternScanner::UpdateCameraJitter(currentFrame, m_activeApi.load() == GraphicsApi::Vulkan);
+    }
+#endif
 }
 
 void CBREngine::OnPreRender() {
     if (!m_enabled.load()) return;
     // Jitter is active for projection matrix during scene geometry pass
+    // (Camera projection jitter is applied in OnBeginFrame; avoid duplicate application here)
 }
 
 void CBREngine::OnPostRender() {
@@ -203,26 +249,60 @@ void CBREngine::OnPostPresent(void* presentTarget) {
 
     if (m_mainPresentTarget.load() == presentTarget) {
         m_frameIndex.fetch_add(1);
+        OnBeginFrame();
     }
 }
 
 void CBREngine::OnSwapchainRecreated(uint32_t width, uint32_t height) {
     m_mainPresentTarget.store(nullptr);
+    m_activeCandidateCmdBuffer.store(nullptr);
     m_frameIndex.store(0);
     m_lastDispatchedFrame.store(kNoFrame);
 
-    // Swapchain extents are untrusted: odd sizes round up to even, implausible ones are ignored.
+    // Swapchain extents are untrusted: odd sizes round up to even for 2x MSAA symmetry (Item 91)
     if (width >= kMinSwapchainExtent && width <= kMaxSwapchainExtent &&
         height >= kMinSwapchainExtent && height <= kMaxSwapchainExtent) {
-        width = MakeEvenUp(width);
-        height = MakeEvenUp(height);
+        const uint32_t evenW = MakeEvenUp(width);
+        const uint32_t evenH = MakeEvenUp(height);
+        if (evenW != width || evenH != height) {
+            CBR_LOG_INFO("Swapchain odd extent (%ux%u) rounded up to even (%ux%u) for 2x MSAA symmetry (Item 91).",
+                         width, height, evenW, evenH);
+        }
+        width = evenW;
+        height = evenH;
         RenderTargetManager::Get().Initialize(width, height);
         JitterManager::Get().Initialize(width, height);
         CBR_LOG_INFO("Swapchain recreated with new resolution %ux%u: frame parity and history reset.", width, height);
+        OnBeginFrame();
     } else {
         RenderTargetManager::Get().ResetHistory();
         CBR_LOG_INFO("Swapchain recreated: frame parity and history reset.");
     }
+}
+
+bool CBREngine::CheckAntiCheatModules() const {
+#if defined(_WIN32)
+    static const char* const kKnownAntiCheatModules[] = {
+        "BEClient_x64.dll",
+        "BEClient.dll",
+        "BattlEye.dll",
+        "EasyAntiCheat_x64.dll",
+        "EasyAntiCheat.dll",
+        "eac_server64.dll",
+        "eac_server.dll",
+        "EOSOVH-Win64-Shipping.dll",
+        "vanguard.dll",
+        "Denuvo.dll"
+    };
+
+    for (const char* modName : kKnownAntiCheatModules) {
+        if (GetModuleHandleA(modName) != nullptr) {
+            CBR_LOG_ERROR("CRITICAL: Detected active anti-cheat / online security module '%s' in host process! Aborting CBREngine initialization to protect account standing.", modName);
+            return true;
+        }
+    }
+#endif
+    return false;
 }
 
 } // namespace cbr

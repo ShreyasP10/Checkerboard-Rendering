@@ -35,6 +35,16 @@ public:
     // Call when the game (re)creates its swapchain: resets frame parity, history, and updates dimensions if provided
     void OnSwapchainRecreated(uint32_t width = 0, uint32_t height = 0);
 
+    // Candidate scene pass tracking to prevent premature dispatch on shadow/SSAO passes
+    void MarkCandidatePassActive(void* cmdBuffer) { m_activeCandidateCmdBuffer.store(cmdBuffer); }
+    bool ConsumeCandidatePassActive(void* cmdBuffer);
+    bool IsCandidatePassActive(void* cmdBuffer) const {
+        return cmdBuffer != nullptr && m_activeCandidateCmdBuffer.load() == cmdBuffer;
+    }
+
+    // Scans loaded process modules for known anti-cheat or online multiplayer binaries
+    bool CheckAntiCheatModules() const;
+
     uint32_t    GetCurrentFrameIndex() const { return m_frameIndex.load(); }
     bool        IsEnabled() const { return m_enabled.load(); }
     void        SetEnabled(bool enabled) { m_enabled.store(enabled); }
@@ -43,6 +53,11 @@ public:
 
     // Performance metrics
     float GetLastReconstructionDurationMs() const { return m_lastReconDurationMs.load(); }
+
+    CBRConfig GetCachedFrameConfig() const {
+        std::lock_guard<std::mutex> lock(m_frameConfigMutex);
+        return m_cachedFrameConfig;
+    }
 
 private:
     CBREngine() = default;
@@ -61,9 +76,12 @@ private:
     std::atomic<uint32_t>      m_lastDispatchedFrame{ kNoFrame };
     // PreferredApi = Auto and no runtime was loaded yet: re-detect on each hook attempt
     std::atomic<bool>          m_apiPending{ false };
+    std::atomic<void*>         m_activeCandidateCmdBuffer{ nullptr };
     std::atomic<float>         m_lastReconDurationMs{ 0.0f };
     std::atomic<GraphicsApi>   m_activeApi{ GraphicsApi::Vulkan };
     std::filesystem::path      m_moduleDirectory;
+    mutable std::mutex         m_frameConfigMutex;
+    CBRConfig                  m_cachedFrameConfig;
 };
 
 } // namespace cbr

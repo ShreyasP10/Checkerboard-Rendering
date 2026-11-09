@@ -9,6 +9,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <MinHook.h>
 #endif
 
 namespace cbr {
@@ -27,6 +28,16 @@ GraphicsApi HookManager::DetectLoadedApi() const {
 }
 
 bool HookManager::Initialize() {
+#if defined(_WIN32)
+    MH_STATUS status = MH_Initialize();
+    if (status != MH_OK && status != MH_ERROR_ALREADY_INITIALIZED) {
+        CBR_LOG_ERROR("HookManager: MH_Initialize failed with code: %d", status);
+        return false;
+    }
+    if (status == MH_ERROR_ALREADY_INITIALIZED) {
+        CBR_LOG_INFO("HookManager: MinHook was previously initialized by host or companion module (Item 87).");
+    }
+#endif
     CBR_LOG_INFO("HookManager initialized.");
     return true;
 }
@@ -34,6 +45,9 @@ bool HookManager::Initialize() {
 void HookManager::Shutdown() {
     UninstallVulkanHooks();
     UninstallDX12Hooks();
+#if defined(_WIN32)
+    MH_Uninitialize();
+#endif
     CBR_LOG_INFO("HookManager shut down.");
 }
 

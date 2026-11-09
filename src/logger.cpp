@@ -2,6 +2,7 @@
 #include <chrono>
 #include <ctime>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 
 namespace cbr {
@@ -9,6 +10,10 @@ namespace cbr {
 Logger& Logger::Get() {
     static Logger instance;
     return instance;
+}
+
+Logger::~Logger() {
+    Shutdown();
 }
 
 void Logger::Initialize(const std::filesystem::path& logFilePath) {
@@ -35,6 +40,10 @@ void Logger::Initialize(const std::filesystem::path& logFilePath) {
                       << kMaxPendingMessages << ").\n";
         }
         m_logFile.flush();
+
+        // Start asynchronous background writer thread
+        m_running.store(true);
+        m_workerThread = std::thread(&Logger::WorkerThread, this);
     }
     m_pending.clear();
     m_droppedPending = 0;
@@ -44,10 +53,25 @@ void Logger::Disable() {
     std::lock_guard<std::mutex> lock(m_mutex);
     m_disabled = true;
     m_pending.clear();
+    m_queue.clear();
     m_droppedPending = 0;
+    m_droppedQueue = 0;
 }
 
 void Logger::Shutdown() {
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (!m_initialized && !m_running.load()) {
+            return;
+        }
+        m_running.store(false);
+        m_cv.notify_all();
+    }
+
+    if (m_workerThread.joinable()) {
+        m_workerThread.join();
+    }
+
     std::lock_guard<std::mutex> lock(m_mutex);
     if (m_initialized && m_logFile.is_open()) {
         m_logFile << "[INFO] Logger shutting down.\n";
@@ -57,7 +81,9 @@ void Logger::Shutdown() {
     m_initialized = false;
     m_disabled = true;
     m_pending.clear();
+    m_queue.clear();
     m_droppedPending = 0;
+    m_droppedQueue = 0;
 }
 
 void Logger::SetMinLevel(LogLevel level) {
@@ -66,17 +92,67 @@ void Logger::SetMinLevel(LogLevel level) {
 }
 
 void Logger::Flush() {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    if (m_initialized && m_logFile.is_open()) {
-        m_logFile.flush();
+    if (m_running.load()) {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        m_flushRequested.store(true);
+        m_cv.notify_one();
+        m_flushCv.wait_for(lock, std::chrono::milliseconds(100), [this]() {
+            return m_queue.empty() && !m_flushRequested.load();
+        });
+    } else {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_initialized && m_logFile.is_open()) {
+            m_logFile.flush();
+        }
+    }
+}
+
+void Logger::WorkerThread() {
+    auto lastFlushTime = std::chrono::steady_clock::now();
+    while (true) {
+        std::vector<std::string> batch;
+        bool doFlush = false;
+
+        {
+            std::unique_lock<std::mutex> lock(m_mutex);
+            m_cv.wait_for(lock, std::chrono::seconds(1), [this]() {
+                return !m_running.load() || !m_queue.empty() || m_flushRequested.load();
+            });
+
+            if (!m_running.load() && m_queue.empty()) {
+                break;
+            }
+
+            batch.swap(m_queue);
+            doFlush = m_flushRequested.exchange(false);
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        const bool periodicFlush = (now - lastFlushTime >= std::chrono::seconds(1));
+
+        // Perform disk I/O on background thread outside mutex lock
+        if (m_logFile.is_open()) {
+            for (const auto& msg : batch) {
+                m_logFile << msg;
+            }
+            if (doFlush || periodicFlush || !m_running.load()) {
+                m_logFile.flush();
+                lastFlushTime = now;
+            }
+        }
+
+        if (doFlush) {
+            m_flushCv.notify_all();
+        }
     }
 }
 
 void Logger::Log(LogLevel level, const std::string& message) {
-    std::lock_guard<std::mutex> lock(m_mutex);
-
-    if (level < m_minLevel) {
-        return;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (level < m_minLevel) {
+            return;
+        }
     }
 
     const char* levelStr = "INFO";
@@ -98,21 +174,42 @@ void Logger::Log(LogLevel level, const std::string& message) {
     localtime_r(&in_time_t, &timeInfo);
 #endif
 
-    std::stringstream ss;
-    ss << std::put_time(&timeInfo, "%Y-%m-%d %H:%M:%S")
-       << '.' << std::setfill('0') << std::setw(3) << ms.count()
-       << " [" << levelStr << "] " << message << "\n";
+    char timeBuffer[64];
+    std::snprintf(timeBuffer, sizeof(timeBuffer), "%04d-%02d-%02d %02d:%02d:%02d.%03d [%s] ",
+                  timeInfo.tm_year + 1900, timeInfo.tm_mon + 1, timeInfo.tm_mday,
+                  timeInfo.tm_hour, timeInfo.tm_min, timeInfo.tm_sec,
+                  static_cast<int>(ms.count()), levelStr);
 
-    std::string formatted = ss.str();
+    std::string formatted;
+    formatted.reserve(std::strlen(timeBuffer) + message.size() + 2);
+    formatted.append(timeBuffer);
+    formatted.append(message);
+    formatted.push_back('\n');
 
-    if (m_initialized && m_logFile.is_open()) {
-        m_logFile << formatted;
-        m_logFile.flush(); // Immediate flush ensures zero loss on game crash
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (m_initialized && m_running.load()) {
+        // Enqueue to background writer (bounded ring/queue to avoid runaway memory)
+        if (m_queue.size() < kMaxQueueMessages) {
+            m_queue.push_back(std::move(formatted));
+        } else {
+            // Saturating increment to prevent drop counter overflow (Item 88)
+            if (m_droppedQueue < std::numeric_limits<size_t>::max()) {
+                ++m_droppedQueue;
+            }
+        }
+
+        if (level >= LogLevel::Warning) {
+            m_flushRequested.store(true);
+        }
+        m_cv.notify_one();
     } else if (!m_initialized && !m_disabled) {
         if (m_pending.size() < kMaxPendingMessages) {
             m_pending.push_back(formatted);
         } else {
-            ++m_droppedPending;
+            // Saturating increment to prevent drop counter overflow (Item 88)
+            if (m_droppedPending < std::numeric_limits<size_t>::max()) {
+                ++m_droppedPending;
+            }
         }
     }
 

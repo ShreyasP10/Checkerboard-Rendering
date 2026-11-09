@@ -17,7 +17,7 @@ struct ReconstructionPushConstants {
     uint32_t debugView;
     uint32_t enableColorClamping;
     float    mipLodBias;
-    uint32_t colorSpace;            // 0 = YCoCg, 1 = RGB
+    uint32_t colorSpace;            // 0 = YCoCg, 1 = RGB, 2 = ICtCp (HDR10 / BT.2100)
     uint32_t enableSpatialFallback; // 1 = on
     float    jitterDelta[2];        // subpixel projection jitter delta (jc - jp)
     uint32_t enableMotionDilation;  // 1 = 3x3 closest-depth motion dilation
@@ -48,6 +48,36 @@ public:
     void DispatchVulkan(void* vkCommandBuffer, uint32_t frameIndex);
     void DispatchDX12(void* d3d12GraphicsCommandList, uint32_t frameIndex);
 
+    // Updates descriptor set with active Vulkan image views and samplers
+    bool UpdateVulkanDescriptors(void* quarterColorView, void* quarterDepthView,
+                                void* historyColorView, void* historyDepthView,
+                                void* velocityView,
+                                void* outputImageView, void* outputDepthView,
+                                void* linearSampler, void* pointSampler);
+
+    // Updates both ping-pong descriptor sets (set 0: read A/write B, set 1: read B/write A)
+    bool UpdateVulkanPingPongDescriptors(void* quarterColorView, void* quarterDepthView,
+                                        void* historyColorViewA, void* historyDepthViewA,
+                                        void* historyColorViewB, void* historyDepthViewB,
+                                        void* velocityView,
+                                        void* outputImageView, void* outputDepthView,
+                                        void* linearSampler, void* pointSampler);
+
+    // Helper function to transition image layouts and insert memory barriers with correct stage/access masks
+    static void TransitionImageLayout(void* vkCommandBuffer, void* vkImage,
+                                      uint32_t oldLayout, uint32_t newLayout,
+                                      uint32_t srcStage, uint32_t dstStage,
+                                      uint32_t srcAccess, uint32_t dstAccess,
+                                      uint32_t aspectMask = 1);
+
+    // Helper function to blit reconstructed color image to a destination image (e.g. swapchain backbuffer)
+    static void BlitToImage(void* vkCommandBuffer, void* srcImage, void* dstImage,
+                            uint32_t srcWidth, uint32_t srcHeight,
+                            uint32_t dstWidth, uint32_t dstHeight,
+                            uint32_t targetDstLayout = 1000001002 /* VK_IMAGE_LAYOUT_PRESENT_SRC_KHR */);
+
+    bool AreDescriptorsBound() const { return m_descriptorsBound.load(); }
+
     void SetShaderDirectory(const std::filesystem::path& dir) { m_shaderDir = dir; }
     const std::filesystem::path& GetShaderDirectory() const { return m_shaderDir; }
 
@@ -56,7 +86,7 @@ public:
     void* GetPipelineLayout() const { return m_pipelineLayout; }
     void* GetDescriptorSetLayout() const { return m_descriptorSetLayout; }
     void* GetDescriptorPool() const { return m_descriptorPool; }
-    void* GetDescriptorSet() const { return m_descriptorSet; }
+    void* GetDescriptorSet(uint32_t index = 0) const { return m_descriptorSets[index < 2 ? index : 0]; }
 
     // Helper to load SPIR-V bytecode from disk
     static std::vector<uint32_t> LoadSpvFile(const std::filesystem::path& path);
@@ -69,6 +99,7 @@ private:
     void DestroyVulkanPipeline();
 
     std::atomic<bool>     m_initialized{ false };
+    std::atomic<bool>     m_descriptorsBound{ false };
     std::atomic<bool>     m_isVulkan{ true };
     std::filesystem::path m_shaderDir;
 
@@ -77,7 +108,22 @@ private:
     void* m_pipelineLayout{ nullptr };
     void* m_descriptorSetLayout{ nullptr };
     void* m_descriptorPool{ nullptr };
-    void* m_descriptorSet{ nullptr };
+    void* m_descriptorSets[2]{ nullptr, nullptr };
+
+    // Cached Vulkan device function pointers to avoid GetProcAddress overhead in render hot loop
+    using PFN_CmdPipelineBarrier = void (*)(void*, uint32_t, uint32_t, uint32_t, uint32_t, const void*, uint32_t, const void*, uint32_t, const void*);
+    using PFN_CmdBlitImage = void (*)(void*, void*, uint32_t, void*, uint32_t, uint32_t, const void*, uint32_t);
+    using PFN_CmdBindPipeline = void (*)(void*, uint32_t, void*);
+    using PFN_CmdBindDescriptorSets = void (*)(void*, uint32_t, void*, uint32_t, uint32_t, const void* const*, uint32_t, const uint32_t*);
+    using PFN_CmdPushConstants = void (*)(void*, void*, uint32_t, uint32_t, uint32_t, const void*);
+    using PFN_CmdDispatch = void (*)(void*, uint32_t, uint32_t, uint32_t);
+
+    PFN_CmdPipelineBarrier    m_pfnCmdPipelineBarrier{ nullptr };
+    PFN_CmdBlitImage          m_pfnCmdBlitImage{ nullptr };
+    PFN_CmdBindPipeline       m_pfnCmdBindPipeline{ nullptr };
+    PFN_CmdBindDescriptorSets m_pfnCmdBindDescriptorSets{ nullptr };
+    PFN_CmdPushConstants      m_pfnCmdPushConstants{ nullptr };
+    PFN_CmdDispatch           m_pfnCmdDispatch{ nullptr };
 };
 
 } // namespace cbr
