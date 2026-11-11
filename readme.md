@@ -1,52 +1,74 @@
 # RDR2 Checkerboard Rendering Mod (CBR)
 
-[![Status: Planning & Prototyping](https://img.shields.io/badge/status-prototyping-yellow.svg)]()
-[![Platform: Windows](https://img.shields.io/badge/platform-Windows-blue.svg)]()
-[![API: Vulkan / DX12](https://img.shields.io/badge/API-Vulkan%20%7C%20DX12-green.svg)]()
-[![Target: GTX 1070 Ti](https://img.shields.io/badge/Target-GTX%201070%20Ti%20(Pascal)-orange.svg)]()
-[![License: MIT](https://img.shields.io/badge/License-MIT-lightgrey.svg)](LICENSE)
-[![Latest Release](https://img.shields.io/github/v/release/ShreyasP10/Checkerboard-Rendering?color=blue&label=Release)](https://github.com/ShreyasP10/Checkerboard-Rendering/releases)
+<p align="center">
+  <strong>PlayStation 4 Pro-style 2× MSAA temporal checkerboard reconstruction for <em>Red Dead Redemption 2</em> (PC)</strong>
+</p>
 
-A community-driven graphics modification implementing **Checkerboard Rendering (CBR)** in *Red Dead Redemption 2* (PC), bringing the PlayStation 4 Pro's hardware-assisted temporal reconstruction technique to modern PC GPUs—specifically targeting the **NVIDIA GeForce GTX 1070 Ti** and Pascal-architecture hardware.
+<p align="center">
+  <a href="https://github.com/ShreyasP10/Checkerboard-Rendering/actions/workflows/build.yml"><img src="https://img.shields.io/github/actions/workflow/status/ShreyasP10/Checkerboard-Rendering/build.yml?branch=feature%2Fcbr-pipeline&style=flat-square&label=ci" alt="CI status"></a>
+  <a href="https://github.com/ShreyasP10/Checkerboard-Rendering/releases"><img src="https://img.shields.io/github/v/release/ShreyasP10/Checkerboard-Rendering?style=flat-square&color=blue&label=release" alt="Latest Release"></a>
+  <img src="https://img.shields.io/badge/platform-Windows%20x64-blue?style=flat-square" alt="Platform: Windows x64">
+  <img src="https://img.shields.io/badge/API-Vulkan%20%7C%20DX12-green?style=flat-square" alt="API: Vulkan | DX12">
+  <img src="https://img.shields.io/badge/target-GTX%201070%20Ti%20%7C%20Vega%207-orange?style=flat-square" alt="Target: GTX 1070 Ti | Vega 7">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-lightgrey?style=flat-square" alt="License: MIT"></a>
+</p>
+
+A community-driven native ASI graphics modification implementing **Checkerboard Rendering (CBR)** in *Red Dead Redemption 2* (PC), bringing PlayStation 4 Pro-style half-rate 2× MSAA temporal reconstruction to PC GPUs—specifically targeting the **NVIDIA GeForce GTX 1070 Ti (Pascal)** and **AMD Radeon Vega 7 (GCN 5.0 APU)** without Tensor cores.
+
+**Offline, with no catch.** Configuration (`cbr.ini`), diagnostic logs (`cbr.log`), crash telemetry, and compiled SPIR-V shaders live strictly inside your local RDR2 folder. The ASI binary is compiled with a static CRT (zero external Visual C++ Redistributables required), makes zero network requests, and enforces strict single-player safety via `CheckAntiCheatModules()` so CBR remains inert outside offline Story Mode. Architecture specs, shader equivalence proofs, and in-game telemetry reports live in the [Documentation](#documentation).
+
+<p align="center">
+  <a href="#download-releases">Releases</a> ·
+  <a href="#install">Install</a> ·
+  <a href="#why-checkerboard-rendering-cbr-vs-dlss--fsr">Why CBR</a> ·
+  <a href="#how-it-works">How It Works</a> ·
+  <a href="#documentation">Docs</a> ·
+  <a href="#configuration-cbrini">Configuration</a> ·
+  <a href="#testing">Testing</a> ·
+  <a href="#changelog">Changelog</a> ·
+  <a href="#contributing">Contributing</a>
+</p>
 
 > **🚀 Project Status: Active Graphics Interception & Pipeline Execution Phase**  
-> The mod features active MinHook detours across the Vulkan graphics pipeline: intercepting full 4K viewports (`vkCmdSetViewport`), downscaling scene geometry passes to 1080p 2× MSAA while keeping UI/HUD at native 4K, injecting Strategy A (subpixel jitter) or Strategy B (`VK_EXT_sample_locations`), scanning camera projection matrices via AOB pattern scanning, and executing the SPIR-V reconstruction compute pass (`cbr_reconstruct.spv`) on `vkCmdEndRenderPass` with descriptor pool binding and memory barrier synchronization. Pre-built binaries are live on [GitHub Releases](https://github.com/ShreyasP10/Checkerboard-Rendering/releases).
+> The mod runs active **MinHook** detours across the **Vulkan** pipeline (`vkQueuePresentKHR`, `vkCreateSwapchainKHR`, `vkCreateFramebuffer`, `vkCreateImageView`, `vkCmdSetViewport`, `vkCmdSetScissor`, `vkCmdBeginRenderPass`, `vkCmdEndRenderPass`, `vkCmdSetSampleLocationsEXT`), capturing rendered geometry into quarter-res 2× MSAA buffers, managing ping-pong history descriptor sets (`historyColorViewA`/`B`) with pre-dispatch barrier transitions, executing `cbr_reconstruct.spv` mid-frame on `vkCmdEndRenderPass`, and blitting the reconstructed output back into the HDR scene attachment without overwriting UI/HUD overlays. It also includes mutual-exclusive Strategy A / Strategy B sampling, an AVX2 SIMD camera AOB scanner, HDR10 `ICtCp` / `YCoCg` / `RGB` color spaces, and `F11` / `Insert` HUD telemetry controls.  
+> *Note on parity:* DirectX 12 hooks (`hooks_dx12.cpp`) currently intercept DXGI `Present`, `Present1`, and `ResizeBuffers` alongside VMT compute-dispatch plumbing, while live DX12 scene attachment capture remains in active development; Vulkan (`PreferredApi = Vulkan`) is the primary active backend. Pre-built binaries are available on [GitHub Releases](https://github.com/ShreyasP10/Checkerboard-Rendering/releases).
 
 ---
 
+<a id="download-releases"></a>
 ## 📥 Download & Releases
 
-Pre-built binaries and complete all-in-one packages are available for download:
+Pre-built binaries and complete packages are published via CI on [GitHub Releases](https://github.com/ShreyasP10/Checkerboard-Rendering/releases):
 
 | Package / Asset | Description | Direct Download |
-|---|---|:---:|
+|---|---|---|
 | **`rdr2-cbr-v0.1.0-alpha.zip`** | **Complete Package** (`rdr2-cbr.asi`, `cbr.ini`, `shaders/`, `README_INSTALL.txt`) | [⬇️ **Download ZIP**](https://github.com/ShreyasP10/Checkerboard-Rendering/releases/download/v0.1.0-alpha/rdr2-cbr-v0.1.0-alpha.zip) |
-| **`rdr2-cbr.asi`** | Native ASI Mod Plugin binary only | [⬇️ **Download .asi**](https://github.com/ShreyasP10/Checkerboard-Rendering/releases/download/v0.1.0-alpha/rdr2-cbr.asi) |
-| **`cbr.ini`** | Default configuration settings file | [⬇️ **Download .ini**](https://github.com/ShreyasP10/Checkerboard-Rendering/releases/download/v0.1.0-alpha/cbr.ini) |
-| **Release Page** | Changelogs, checksums (`SHA256SUMS.txt`), and all tagged releases | [🔗 **View GitHub Releases**](https://github.com/ShreyasP10/Checkerboard-Rendering/releases) |
+| **`rdr2-cbr.asi`** | Native Windows x64 ASI Mod Plugin binary | [⬇️ **Download .asi**](https://github.com/ShreyasP10/Checkerboard-Rendering/releases/download/v0.1.0-alpha/rdr2-cbr.asi) |
+| **`cbr.ini`** | Default runtime configuration file | [⬇️ **Download .ini**](https://github.com/ShreyasP10/Checkerboard-Rendering/releases/download/v0.1.0-alpha/cbr.ini) |
+| **Release Page** | Changelogs, checksums (`SHA256SUMS.txt`), and all tagged builds | [🔗 **View GitHub Releases**](https://github.com/ShreyasP10/Checkerboard-Rendering/releases) |
 
+<a id="quick-start"></a>
 ### ⚡ Quick 3-Step Setup
-1. **Download:** Grab [`rdr2-cbr-v0.1.0-alpha.zip`](https://github.com/ShreyasP10/Checkerboard-Rendering/releases/download/v0.1.0-alpha/rdr2-cbr-v0.1.0-alpha.zip) from the table above.
-2. **Install ASI Loader:** Ensure `dinput8.dll` (from official [Script Hook RDR2](https://www.dev-c.com/rdr2/scripthookrdr2/)) is placed in your main game directory (`where RDR2.exe is located`).
-3. **Deploy Mod:** Extract `rdr2-cbr.asi` and `cbr.ini` directly into your main game directory next to `RDR2.exe`. Run the game in **Story Mode**!
+1. **Download:** Grab [`rdr2-cbr-v0.1.0-alpha.zip`](https://github.com/ShreyasP10/Checkerboard-Rendering/releases/download/v0.1.0-alpha/rdr2-cbr-v0.1.0-alpha.zip) from the table above (and verify against `SHA256SUMS.txt`).
+2. **Install ASI Loader:** Place `dinput8.dll` from the official [Script Hook RDR2](https://www.dev-c.com/rdr2/scripthookrdr2/) release into your main RDR2 directory (where `RDR2.exe` lives).
+3. **Deploy & Launch:** Extract `rdr2-cbr.asi`, `cbr.ini`, and the `shaders/` directory next to `RDR2.exe`, confirm `Graphics API = Vulkan` in RDR2 settings, and launch **Story Mode**.
 
 ---
 
 ## 📖 Table of Contents
-- [Download & Releases](#-download--releases)
+- [Download & Releases](#download-releases)
 - [About](#about)
 - [Why Checkerboard Rendering? (CBR vs. DLSS / FSR)](#why-checkerboard-rendering-cbr-vs-dlss--fsr)
 - [How It Works](#how-it-works)
 - [Key Features](#key-features)
 - [Architecture & Repository Structure](#architecture--repository-structure)
-- [Complete Source Codebase (Single Document)](CODEBASE.md)
-- [Engineering Documentation](#engineering-documentation)
+- [Engineering Documentation](#documentation)
 - [Reconstruction Shader Math](#reconstruction-shader-math)
 - [Hardware & Development Requirements](#hardware--development-requirements)
-- [How to Install & Run](#-how-to-install--run)
-- [Configuration](#configuration-cbrini)
+- [How to Install & Run](#install)
+- [Configuration (`cbr.ini`)](#configuration-cbrini)
 - [Testing](#testing)
-- [Changelog](#changelog--recent-updates-v010-alpha)
+- [Changelog](#changelog)
 - [Contributing](#contributing)
 - [Collaborators & Maintainers](#collaborators--maintainers)
 - [License](#license)
@@ -56,175 +78,187 @@ Pre-built binaries and complete all-in-one packages are available for download:
 
 ## About
 
-On the PlayStation 4 Pro, *Red Dead Redemption 2* outputs a 4K presentation by rendering only half the pixels per frame (1920×2160 or quarter-resolution with 2× MSAA) in an alternating checkerboard pattern, reconstructing missing details across time. 
+On the PlayStation 4 Pro, *Red Dead Redemption 2* targets 4K output by rendering half the shaded pixels per frame (quarter-resolution targets configured with **2× MSAA**) in an alternating checkerboard lattice and reconstructing the missing subpixels over time.
 
-On PC, players on mid-range GPUs such as the **NVIDIA GeForce GTX 1070 Ti** face a difficult dilemma:
-- **Native 4K (3840×2160)** is too demanding for 60 FPS gameplay on Pascal hardware.
-- **DLSS** requires RTX hardware (Tensor cores) and cannot run on Pascal GPUs.
-- **FSR** provides spatial/temporal upscaling but has a distinct aesthetic and does not replicate the console presentation.
+On PC, players on mid-range discrete GPUs (such as the **NVIDIA GeForce GTX 1070 Ti**) or integrated APUs (**AMD Radeon Vega 7**) face a clear gap:
+- **Native 4K (3840×2160)** saturates fill-rate and memory bandwidth well short of 60 FPS.
+- **DLSS** requires RTX Tensor cores and cannot run on GTX 10-series Pascal or Vega APUs.
+- **FSR** upscales a conventional flat 2D render target and carries its own temporal sharpening/edge signature rather than hardware MSAA checkerboard geometry.
 
-This project delivers a **native ASI plugin** that intercepts RDR2's rendering passes, renders the primary geometry at half shading cost, and reconstructs a full 4K frame using an optimized compute shader with temporal reprojection, depth disocclusion detection, and YCoCg neighborhood color clamping.
+This project provides a **native ASI plugin** (`rdr2-cbr.asi`) that intercepts RDR2's primary scene render pass, captures quarter-resolution 2× MSAA color/depth targets with a 2-frame alternating subpixel pattern, reconstructs full resolution via compute shaders with depth disocclusion testing and neighborhood variance clipping (`YCoCg`, `RGB`, or HDR10 `ICtCp`), and restores native texture clarity with a **-1.0 MIP LOD bias** before post-processing and UI composition.
 
 ---
 
 ## Why Checkerboard Rendering? (CBR vs. DLSS / FSR)
 
 **Inspiration: The PlayStation 4 Pro**  
-When *Red Dead Redemption 2* launched on the PS4 Pro, it achieved a gorgeous 4K presentation despite the console's mid-range GPU architecture. It accomplished this using **Checkerboard Rendering (CBR)**: shading only half the pixels of a 4K frame (using a 2× MSAA alternating grid pattern) and mathematically reconstructing the missing pixels using historical frame data. This mod brings that exact algorithmic elegance and console presentation to the PC version of RDR2.
+By shading half the pixels per frame on an offset 2× MSAA grid and mathematically filling the complement from historical frames, CBR preserves real geometric edge detail at half the fragment-shading cost. This mod brings that architecture to PC Vulkan/DX12 hardware without proprietary ML cores.
 
 **How is CBR different from DLSS or FSR?**  
-Modern upscaling solutions (like DLSS, FSR, and XeSS) operate on lower-resolution flat 2D buffers (e.g., rendering natively at 1080p and scaling up to 4K). 
-* **DLSS / XeSS:** Rely on AI machine learning and specialized hardware (Tensor cores) to hallucinate missing details. They are extremely effective, but **DLSS cannot run on older hardware like the GTX 10-series (Pascal)**.
-* **FSR 2.0+:** A spatial-temporal algorithmic upscaler that runs on any GPU. However, because it reconstructs a full 4K image from a standard, lower-resolution flat grid, it introduces a distinctly different aesthetic, often resulting in over-sharpening, shimmering, or loss of high-frequency geometry details.
+Conventional spatial/temporal upscalers operate on uniform, non-MSAA low-resolution buffers:
+* **DLSS / XeSS (XMX):** Depend on specialized AI matrix/Tensor hardware and **cannot run on Pascal GTX 10-series or Vega APUs**.
+* **FSR 2.0+:** Runs across GPUs, but reconstructs from a flat rectangular grid, which can soften thin geometry or accentuate sharpening halos.
 
-**What extra benefits does CBR provide?**  
-1. **Geometric Fidelity (2× MSAA):** Unlike FSR which renders a standard flat 1080p image, CBR renders using 2× MSAA arranged in a subpixel checkerboard pattern. This means that across two frames, CBR physically samples **100% of the 4K geometry**, providing native-like edge clarity without the temporal smearing of standard upscalers.
-2. **Universal Compatibility & Hardware Efficiency:** CBR is a pure algorithmic math shader (utilizing YCoCg neighborhood color clamping and temporal motion vector reprojection). It requires **no AI Tensor cores** and **no proprietary hardware**, making it the ultimate solution for aging but powerful architectures like the GTX 1070 Ti, GTX 1080, and AMD Vega APUs.
-3. **The Authentic "Console" Look:** It exactly replicates the specific temporal aesthetic of the PS4 Pro, giving players the intended cinematic console experience with PC framerates.
+**What extra benefits does CBR provide?**
+1. **Geometric Fidelity (2× MSAA):** Because odd/even frames stagger 2× MSAA sample centroids across complementary subpixel quadrants, two frames physically sample **100% of the 4K (or 1080p) geometric grid**, retaining crisp silhouette and foliage edges.
+2. **Universal Hardware Efficiency:** Pure compute math—compatible with NVIDIA Pascal (Wave32, 16×16 or 8×8 quad workgroups) and AMD GCN 5.0 Vega APUs (Wave64 alignment) with zero AI hardware dependencies.
+3. **Authentic Console Temporal Look:** Preserves the temporal response and texture crispness (`MipLodBias = -1.0`) of PS4 Pro-style reconstruction on PC.
 
 ---
 
 ## How It Works
 
-```
-Frame N:     [ X ] [   ] [ X ] [   ]  <-- Shaded at Quarter-Res 2x MSAA + Jitter
-             [   ] [ X ] [   ] [ X ]
+```text
+Frame N:     [ X ] [   ] [ X ] [   ]  <-- Shaded at Quarter-Res 2× MSAA + Strategy A/B Jitter
+             [   ] [ X ] [   ] [ X ]      (Scene render pass intercepted; UI/HUD stays full-res)
                |
                v
-Reconstruct: Current Active Pixels  <─── Keep 2x MSAA Samples
-             Missing Holes          <─── Sample Previous Frame (N-1) using Motion Vectors
-                                         [Depth Validation & 3x3 YCoCg Clamping]
+Reconstruct: Current Active Pixels  <─── Unpack exact MSAA Sample 0 / Sample 1
+             Missing Holes          <─── Reproject History Buffer (N-1) via Motion Vectors
+                                         [Depth Linearization, Clamping & Spatial Fallback]
                |
                v
-Output:      Full 3840×2160 4K Image
+Output:      Full 3840×2160 Frame   ───> Blitted back to Game Scene HDR Attachment pre-UI
 ```
 
-1. **Target Interception:** Intercepts main scene color and depth attachments, routing them to quarter-resolution (1920×1080) targets configured with 2× MSAA.
-2. **Projection Jitter:** Alternates the camera projection matrix horizontally by 1 full-resolution pixel on odd frames (0 on even frames), shifting the 2× MSAA subpixel grid to achieve 100% 4-quadrant geometric coverage across two frames.
-3. **MIP LOD Bias Injection:** Injects a $-0.5$ LOD bias into scene texture samplers, ensuring high-frequency textures sample at full 4K Nyquist clarity despite reduced geometry resolution.
-4. **Compute Shader Reconstruction:** Runs a compute shader (`cbr_reconstruct.comp` / `cbr_reconstruct.hlsl`) that evaluates pixel parity, reprojects history using motion vectors, tests depth for disocclusion, and clamps against the 3×3 color neighborhood.
+1. **Target Interception & Dynamic Redirection:** Intercepts `vkCreateFramebuffer`, `vkCreateImageView`, `vkCmdSetViewport`, `vkCmdSetScissor`, and `vkCmdBeginRenderPass` to redirect full-resolution geometry passes to quarter-resolution (e.g., 1920×1080 for 4K, 960×540 for 1080p) 2× MSAA targets while keeping HUD/UI passes at native output resolution.
+2. **Mutual-Exclusive Subpixel Sampling (`StrategyA` vs. `StrategyB`):**
+   - **`StrategyA` (Viewport Shift / Projection Jitter):** Shifts the viewport / camera projection horizontally by a complementary subpixel offset on odd frames, scanned dynamically in `RDR2.exe` memory via the AVX2 SIMD AOB scanner (`pattern_scanner.cpp`) with non-accumulating previous-offset removal.
+   - **`StrategyB` (`VK_EXT_sample_locations`):** Alternates hardware 2× MSAA programmable sample coordinates (`(0.75, 0.25) / (0.25, 0.75)` on even frames, mirrored on odd frames) while keeping the viewport stationary.
+3. **MIP LOD Bias (`-1.0`):** Applies a `-1.0` texture LOD bias (`kMipLodBias`, matching `CHECKERBOARD.md` / El Mansouri 2016) to compensate for 2× wider texture gradients at quarter resolution so surfaces retain full-res Nyquist sharpness.
+4. **Mid-Frame Compute Reconstruction & Scene Blit:** At `vkCmdEndRenderPass` (prior to UI/HUD compositing), copies scene attachments into quarter-res buffers, transitions all 7 ping-pong images safely out of `UNDEFINED`, binds the alternating `VkDescriptorSet`, runs `cbr_reconstruct.spv` (or quad-subgroup `cbr_reconstruct_quad.comp` / HLSL `cbr_reconstruct.hlsl`) with linearized depth disocclusion, `YCoCg`/`RGB`/`ICtCp` variance clipping (`gamma = 1.25`), and cross-bilateral fallback, then blits the reconstructed frame back to the game's HDR scene attachment.
 
 ---
 
 ## Key Features
 
-- [x] Full architectural specification & requirements documentation (PRD, SRD, SRS, TRD, DEV_PLAN, RISK_REGISTER).
-- [x] Complete GLSL & HLSL reconstruction compute shaders with 2× MSAA unpack and subpixel parity testing.
-- [x] Temporal reprojection math with velocity vector sampling.
-- [x] Live Vulkan graphics detours via MinHook (`vkQueuePresentKHR`, `vkCreateSwapchainKHR`, `vkCmdSetViewport`, `vkCmdSetScissor`, `vkCmdBeginRenderPass`, `vkCmdEndRenderPass`, `vkCmdSetSampleLocationsEXT`).
-- [x] Dynamic viewport & scissor downscaling (redirects 4K geometry passes to 1080p 2× MSAA while keeping UI/HUD at native 4K).
-- [x] Mid-frame scene pass completion interception on `vkCmdEndRenderPass` triggering reconstruction prior to compositing.
-- [x] Sampling strategy selection: **Strategy A** (0.5px horizontal viewport jitter) and **Strategy B** (hardware `VK_EXT_sample_locations` alternation with stationary viewport) with strict mutual exclusivity.
-- [x] Automated camera projection matrix scanning via AOB pattern scanner (`pattern_scanner.cpp`) with RIP-relative math and memory protection fallback.
-- [x] Vulkan SPIR-V compute pipeline, 7-binding `VkDescriptorSetLayout`, `VkDescriptorPool`, `VkDescriptorSet`, and `vkCmdPipelineBarrier` memory barrier synchronization.
-- [x] Depth delta disocclusion detection with spatial cross-bilateral filter fallback.
-- [x] 3×3 neighborhood color bounding box clamping (YCoCg or RGB, selectable via `ColorSpace`) to suppress ghosting.
-- [x] Reconstruction pass writes a full-resolution history-depth target for the next frame's disocclusion test.
-- [x] Closest-depth motion-vector dilation, variance clipping and jitter-compensated history reprojection in the shaders.
-- [x] Automated CI build workflow producing pre-compiled SPIR-V shaders and packaged `rdr2-cbr-release.zip` on GitHub Releases.
-- [x] Pascal-oriented design (16×16 thread groups, guarded neighborhood fetches to cut bandwidth).
-- [x] Runtime configuration via `cbr.ini`.
-- [x] Multi-mode debug visualizer (checkerboard grid mask, disocclusion heatmap, motion vector field).
-- [ ] In-game ImGui debug overlay (placeholder only; interactive F11/Insert key toggle in progress).
-- [ ] DirectX 12 graphics hooking parity (Vulkan primary; DX12 dummy device swapchain method planned for Phase 3).
+- [x] **Engineering Specifications & Hardware Guides:** Complete PRD, SRD, SRS, TRD, DEV_PLAN, RISK_REGISTER, Intel 2018 CBR reference analysis, AMD Vega 7 optimization guide, Vulkan hooking guide, and live test report (`docs/IN_GAME_TEST_REPORT_v1491.md`).
+- [x] **Multi-Backend Reconstruction Shaders:** GLSL (`cbr_reconstruct.comp`), subgroup-quad accelerated GLSL (`cbr_reconstruct_quad.comp`, `GL_KHR_shader_subgroup_quad`), spatial baseline fallback (`cbr_resolve_simple.comp`), and DirectX 12 HLSL SM 6.0 (`cbr_reconstruct.hlsl`) verified for 100% coordinate-mapping equivalence across 36,864 combinations.
+- [x] **Temporal Reprojection & Adaptive Velocity:** Reads motion vectors with automatic quarter-resolution velocity coordinate downshifting (`>> 1`), optional 3×3 closest-depth motion dilation, NaN/Inf sanitization, and full-resolution history-depth output (`u_OutputDepth` / `g_OutputDepth`).
+- [x] **Depth Convention & Disocclusion Defense:** Supports both RDR2 Reversed-Z (`DepthFar = 0.0` infinite far plane) and Standard linear depth unprojection (`depth_convention.h`) with cardinal cross-bilateral fallback on disocclusion.
+- [x] **Three Color-Space Clamping Modes (`gamma = 1.25`):** Unconditional 3×3 neighborhood variance clipping selectable between **YCoCg** (`0`), **RGB** (`1`), and **HDR10 / BT.2100 ICtCp** (`2`) to eliminate ghosting and pattern shimmer on static and dynamic scenes.
+- [x] **Live Vulkan MinHook Pipeline:** Active detours on `vkQueuePresentKHR`, `vkCreateSwapchainKHR`, `vkCreateFramebuffer`, `vkCreateImageView`, `vkCmdSetViewport`, `vkCmdSetScissor`, `vkCmdBeginRenderPass`, `vkCmdEndRenderPass`, and `vkCmdSetSampleLocationsEXT` with ping-pong descriptor sets and scene HDR attachment copy/blit.
+- [x] **AVX2 SIMD Camera AOB Scanner:** Runtime CPUID-dispatched `_mm256_cmpeq_epi8` pattern scanner with scalar fallback, IDA-style wildcard parser, RIP-relative address resolution, and SEH memory bounds protection.
+- [x] **Interactive HUD API & Telemetry (`F11` / `Insert`):** Foreground-PID-gated hotkey toggling, live parameter setters (`SetHistoryWeight`, `SetDepthTolerance`, `SetMipLodBias`, `SetDebugView`, `SetColorSpace`, etc.), formatted OSD telemetry string output (`GetFormattedTelemetry()`), and a pluggable `HudRenderCallback` hook for Dear ImGui renderers.
+- [x] **Multi-Mode Debug Visualizer (`DebugView = 0..5`):** Reconstructed Output (`0`), Checkerboard Parity Mask (`1`), Disocclusion Heatmap (`2`), Motion Vector Field (`3`), Quarter-Res Raw (`4`), and Spatial Baseline (`5`).
+- [x] **Hardened Runtime, Logging & CI:** Bounded `cbr.ini` parser, thread-safe lock-minimized async logger (`cbr.log`), Windows SEH minidump `CrashHandler`, centralized limits (`include/cbr/limits.h`), CTest C++ unit suites (`cbr_tests`, `cbr_engine_tests`), and automated GitHub Actions release builds.
+- [ ] **DirectX 12 Live Scene Capture Parity:** DXGI `Present`, `Present1`, and `ResizeBuffers` detours and VMT compute dispatch plumbing are implemented; live D3D12 command-list scene attachment extraction (`ExecuteCommandLists` / resource tracking) remains in progress.
+- [ ] **In-Game Dear ImGui Overlay Rendering & Multi-Patch AOB Sweep:** Built-in HUD telemetry OSD and callback registration work today; live Dear ImGui swapchain draw backend and broad RAGE patch signature validation remain open.
 
 ---
 
 ## Architecture & Repository Structure
 
-```
+```text
 Checkerboard-Rendering/
-├── CMakeLists.txt              # CMake build script for rdr2-cbr.asi
-├── LICENSE                     # MIT License
-├── README.md                   # Project overview and instructions
-├── CODEBASE.md                 # Consolidated single document of all source code, shaders & documentation
-├── CONTRIBUTING.md             # Contribution guidelines & coding standards
-├── cbr.ini                     # Runtime configuration file
-├── .gitignore                  # Git ignore rules
+├── CMakeLists.txt                   # CMake build script for rdr2-cbr.asi & test targets
+├── cbr.ini                          # Default runtime configuration
+├── CHECKERBOARD.md                  # Foundational checkerboard rendering paper notes & math
+├── CODEBASE.md                      # Single-file synchronized snapshot (57 tracked files)
+├── CONTRIBUTING.md                  # Contribution guidelines & C++20/GLSL/HLSL standards
+├── LICENSE                          # MIT License
+├── nextImplementationPhase.md       # Master roadmap for Phase 2 runtime interception
+├── readme.md                        # Project overview & setup guide
+├── REPORT.md                        # Final architectural engineering & verification report
+├── .github/workflows/build.yml      # CI: unit tests, glslang/dxc shaders, MinGW syntax, Release ZIP
 │
-├── docs/                       # Comprehensive engineering documentation
-│   ├── PRD.md                  # Product Requirements Document
-│   ├── SRD.md                  # System Requirements Document
-│   ├── SRS.md                  # Software Requirements Specification (IEEE 830)
-│   ├── TRD.md                  # Technical Requirements Document
-│   ├── DEV_PLAN.md             # Phased Development Roadmap & Milestones
-│   ├── RISK_REGISTER.md        # Risk Analysis & Mitigation Strategies
-│   ├── VULKAN_HOOKING_GUIDE.md # Technical implementation guide for Vulkan interception
-│   └── IN_GAME_TEST_REPORT_v1491.md # Validation report on RDR2 1.0.1491.50
+├── docs/                            # Engineering specifications, audits & hardware guides
+│   ├── PRD.md                       # Product Requirements Document
+│   ├── SRD.md                       # System Requirements Document
+│   ├── SRS.md                       # Software Requirements Specification (IEEE 830)
+│   ├── TRD.md                       # Technical Requirements Document
+│   ├── DEV_PLAN.md                  # Phased Development Roadmap & Milestones
+│   ├── RISK_REGISTER.md             # Risk Analysis & Mitigation Matrix
+│   ├── INTEL_CBR_REFERENCE.md       # Intel 2018 2× MSAA / SRT / depth disocclusion breakdown
+│   ├── AMD_VEGA_OPTIMIZATION.md     # AMD Radeon Vega 7 (GCN 5.0 / Wave64) tuning profile
+│   ├── VULKAN_HOOKING_GUIDE.md      # Vulkan detour mechanics, barriers & compute binding
+│   ├── IN_GAME_TEST_REPORT_v1491.md # Live RDR2 v1.0.1491.50 load & VRAM test report
+│   ├── IMPROVEMENTS.md              # Verified implementation changelog & prioritized backlog
+│   ├── REVIEW.md / REVIEW_v4.md     # Architecture, threading & shader audit reviews
+│   └── nextImplementationPhase.md   # Phase 2 detour implementation blueprint
 │
-├── include/cbr/                # C++ Architecture Headers
-│   ├── cbr_engine.h            # Core engine controller & frame lifecycle
-│   ├── checkerboard_mapping.h  # Checkerboard math & sample coordinate mapping
-│   ├── config.h                # cbr.ini configuration reader & settings
-│   ├── crash_handler.h         # SEH / exception crash handler & minidump generator
-│   ├── depth_convention.h      # Reversed (RDR2) vs Standard depth math
-│   ├── hooks.h                 # Vulkan & DX12 API hook declarations
-│   ├── jitter_manager.h        # Projection matrix jitter calculator
-│   ├── limits.h                # Canonical limits & bounds
-│   ├── logger.h                # Thread-safe cbr.log file logger
-│   ├── pattern_scanner.h       # AOB memory signature scanning & RIP-relative math
-│   ├── reconstruction_pass.h   # Compute shader dispatch & pipeline manager
-│   ├── render_target_manager.h # Intermediate MSAA & history buffer manager
-│   └── ui_overlay.h            # ImGui in-game debug overlay
+├── include/cbr/                     # Public & internal C++20 architecture headers (13 files)
+│   ├── cbr_engine.h                 # Core engine lifecycle, API selection & frame orchestration
+│   ├── checkerboard_mapping.h       # Subpixel parity & 2× MSAA sample coordinate mapping
+│   ├── config.h                     # Thread-safe cbr.ini parser, enums & ColorSpace::ICtCp
+│   ├── crash_handler.h              # Windows SEH exception interceptor & minidump telemetry
+│   ├── depth_convention.h           # Standard vs Reversed-Z depth linearization helpers
+│   ├── hooks.h                      # Vulkan & DX12 hook manager interface
+│   ├── jitter_manager.h             # Non-accumulating Strategy A/B projection & sample jitter
+│   ├── limits.h                     # Canonical resolution, file & clipping constants (gamma=1.25)
+│   ├── logger.h                     # Async background worker cbr.log logger
+│   ├── pattern_scanner.h            # AVX2 SIMD + scalar AOB signature scanner
+│   ├── reconstruction_pass.h        # Compute pipeline, descriptors, barriers & push constants
+│   ├── render_target_manager.h      # Quarter-res 2× MSAA & ping-pong history buffer allocation
+│   └── ui_overlay.h                 # Interactive F11/Insert HUD controls & telemetry OSD API
 │
-├── src/                        # C++ Implementation
-│   ├── main.cpp                # DLL entry point (DllMain) & loader integration
-│   ├── cbr_engine.cpp          # Pipeline orchestration
-│   ├── config.cpp              # Configuration file parser
-│   ├── crash_handler.cpp       # Crash interception implementation
-│   ├── hooks.cpp               # Hook manager core & lifecycle
-│   ├── hooks_vulkan.cpp        # Vulkan API hooks & MinHook detours
-│   ├── hooks_dx12.cpp          # DirectX 12 hooks (Present, ExecuteCommandLists)
-│   ├── jitter_manager.cpp      # Subpixel matrix perturbation
-│   ├── logger.cpp              # Logger implementation
-│   ├── pattern_scanner.cpp     # Memory signature scanner & camera locator
-│   ├── reconstruction_pass.cpp # Compute pipeline dispatch & descriptor binding
-│   ├── render_target_manager.cpp # VRAM allocation & ping-pong history buffers
-│   └── ui_overlay.cpp          # ImGui overlay rendering
+├── src/                             # C++20 implementation modules (13 files)
+│   ├── main.cpp                     # DllMain (pinned module), CBRInitThread & CBR_PluginInit
+│   ├── cbr_engine.cpp               # Anti-cheat guard, hook retry, push constants & parity
+│   ├── config.cpp                   # Bounded INI parser/serializer with validation
+│   ├── crash_handler.cpp            # Minidump & crash diagnostics
+│   ├── hooks.cpp                    # HookManager lifecycle & API routing
+│   ├── hooks_vulkan.cpp             # Vulkan detours, attachment copy & mid-frame compute trigger
+│   ├── hooks_dx12.cpp               # DXGI/D3D12 dummy-swapchain Present/ResizeBuffers detours
+│   ├── jitter_manager.cpp           # Subpixel projection jitter & delta calculation
+│   ├── logger.cpp                   # Bounded lock-free/queued asynchronous file writer
+│   ├── pattern_scanner.cpp          # AVX2 + scalar IDA pattern scanner & RIP-relative solver
+│   ├── reconstruction_pass.cpp      # Vulkan compute pipeline & D3D12 VMT dispatch implementation
+│   ├── render_target_manager.cpp    # VRAM footprint math & VkImage/VkSampler allocation
+│   └── ui_overlay.cpp               # Hotkey gating, live tuning setters & OSD formatting
 │
-└── shaders/                    # GPU Reconstruction Shaders
-    ├── cbr_reconstruct.comp    # Complete GLSL Vulkan compute shader
-    ├── cbr_reconstruct_quad.comp # Quad-subgroup accelerated GLSL shader
-    ├── cbr_reconstruct.hlsl    # Complete HLSL DirectX 12 compute shader
-    └── cbr_resolve_simple.comp # Spatial-only fallback resolve shader
+├── shaders/                         # GPU compute shaders (4 files)
+│   ├── cbr_reconstruct.comp         # Vulkan GLSL compute shader (16×16 Wave32/Wave64)
+│   ├── cbr_reconstruct_quad.comp    # Quad-subgroup GLSL compute shader (8×8, 2×2 quad/thread)
+│   ├── cbr_reconstruct.hlsl         # DirectX 12 HLSL SM 6.0 compute shader
+│   └── cbr_resolve_simple.comp      # Spatial-only fallback resolve shader
+│
+└── tests/                           # Portable unit & mathematical equivalence tests
+    ├── test_core.cpp                # Config, logger, jitter, push constants, depth & scanner tests
+    ├── test_engine.cpp              # Hook retry, once-per-frame guard, parity & HUD tests
+    └── check_shader_mapping.py      # 36,864-combination proof of 4-quadrant MSAA coverage
 ```
 
 ---
 
-## Engineering Documentation
+<a id="documentation"></a>
+## 📚 Engineering Documentation
 
-Detailed specifications are maintained in the [`docs/`](docs/) directory:
+Every architectural decision, hardware profile, and audit finding is documented and synchronized in [`CODEBASE.md`](CODEBASE.md):
 
-- 🚀 [**Next Implementation Phase Plan (Master Plan)**](nextImplementationPhase.md) – Active roadmap for Phase 2: Runtime Graphics Detours, Swapchain Interception & Frame Pipeline Execution.
-- 📋 [**In-Game Test Report (RDR2 v1.0.1491.50)**](docs/IN_GAME_TEST_REPORT_v1491.md) – Validation report from live test on GTX 1070 Ti, Alexander Blade loader, and LML.
-- 🛠️ [**Vulkan Hooking Guide**](docs/VULKAN_HOOKING_GUIDE.md) – Technical implementation guide for Vulkan loader detours, barrier management, and compute pass dispatch.
-- 📄 [**Product Requirements Document (PRD)**](docs/PRD.md) – Problem statement, target personas, KPIs, and scope.
-- 📄 [**System Requirements Document (SRD)**](docs/SRD.md) – Subsystem architecture, external interfaces, and VRAM budget.
-- 📄 [**Software Requirements Specification (SRS)**](docs/SRS.md) – Detailed functional requirements, mathematical formulas, and IEEE 830 standards.
-- 📄 [**Technical Requirements Document (TRD)**](docs/TRD.md) – Vulkan/DX12 hook mechanics, buffer formats, and Pascal GPU optimizations.
-- 📄 [**Development Plan (DEV_PLAN)**](docs/DEV_PLAN.md) – 8-phase roadmap, milestones, and deliverable schedules.
-- 📄 [**Risk Register (RISK_REGISTER)**](docs/RISK_REGISTER.md) – Assessment of motion vector extraction, Pascal bandwidth, and mitigations.
-- 📄 [**Intel CBR Reference Analysis (INTEL_CBR_REFERENCE)**](docs/INTEL_CBR_REFERENCE.md) – Reference breakdown of Mcferron & Lake (Intel 2018): 2× MSAA 4-quadrant geometry, Shade Resolve Targets (SRT), and linear depth disocclusion.
-- 📄 [**AMD Radeon Vega & Vega 7 Optimization Guide (AMD_VEGA_OPTIMIZATION)**](docs/AMD_VEGA_OPTIMIZATION.md) – Hardware profile for AMD Radeon Vega 7 APUs: GCN 5.0 Wave64 scheduling, Rapid Packed Math (FP16), DDR4 memory bandwidth throttling (ASO mode), and 1080p preset.
+| Area / Goal | Document |
+|---|---|
+| Architectural overview & verification summary | [`REPORT.md`](REPORT.md) |
+| Foundational CBR theory, 2× MSAA grids & `-1.0` LOD bias | [`CHECKERBOARD.md`](CHECKERBOARD.md) |
+| Synchronized single-file snapshot of all 57 repo files | [`CODEBASE.md`](CODEBASE.md) |
+| Phase 2 runtime detours & swapchain integration plan | [`nextImplementationPhase.md`](nextImplementationPhase.md) · [`docs/nextImplementationPhase.md`](docs/nextImplementationPhase.md) |
+| Live test report on RDR2 `1.0.1491.50` (GTX 1070 Ti + LML) | [`docs/IN_GAME_TEST_REPORT_v1491.md`](docs/IN_GAME_TEST_REPORT_v1491.md) |
+| Vulkan loader detours, image barriers & compute pass guide | [`docs/VULKAN_HOOKING_GUIDE.md`](docs/VULKAN_HOOKING_GUIDE.md) |
+| Intel 2018 CBR reference analysis (Mcferron & Lake) | [`docs/INTEL_CBR_REFERENCE.md`](docs/INTEL_CBR_REFERENCE.md) |
+| AMD Radeon Vega 7 APU profile (GCN 5.0, Wave64, DDR4) | [`docs/AMD_VEGA_OPTIMIZATION.md`](docs/AMD_VEGA_OPTIMIZATION.md) |
+| Product & system architecture requirements | [`docs/PRD.md`](docs/PRD.md) · [`docs/SRD.md`](docs/SRD.md) |
+| IEEE 830 Software & Technical Requirements (SRS / TRD) | [`docs/SRS.md`](docs/SRS.md) · [`docs/TRD.md`](docs/TRD.md) |
+| Development roadmap & risk register | [`docs/DEV_PLAN.md`](docs/DEV_PLAN.md) · [`docs/RISK_REGISTER.md`](docs/RISK_REGISTER.md) |
+| Verified implementation changelog & code review audits | [`docs/IMPROVEMENTS.md`](docs/IMPROVEMENTS.md) · [`docs/REVIEW.md`](docs/REVIEW.md) · [`docs/REVIEW_v4.md`](docs/REVIEW_v4.md) |
 
 ---
 
 ## Reconstruction Shader Math
 
-The core compute shader resolves pixels based on parity:
+The core compute shader resolves each output pixel based on checkerboard parity:
 
 $$\text{Phase}(x, y) = (x + y) \pmod 2$$
 
-- When $\text{Phase}(x, y) = (\text{FrameIndex} \pmod 2)$, the pixel is sampled directly from the current frame's 2× MSAA buffer.
-- When $\text{Phase}(x, y) \neq (\text{FrameIndex} \pmod 2)$, the pixel is reprojected from history:
+- When $\text{Phase}(x, y) = (\text{FrameIndex} \pmod 2)$, the pixel reads directly from the current frame's 2× MSAA sample mapping (`include/cbr/checkerboard_mapping.h`).
+- When $\text{Phase}(x, y) \neq (\text{FrameIndex} \pmod 2)$, the pixel reprojects history using closest-depth dilated velocity vectors:
 
-$$\mathbf{UV}_{\text{prev}} = \mathbf{UV}_{\text{curr}} - \mathbf{V}(x, y)$$
+$$\mathbf{UV}_{\text{prev}} = \mathbf{UV}_{\text{curr}} - \mathbf{V}(x, y) - (\text{JitterCompensation} \cdot \Delta \mathbf{J})$$
 
-If the depth variance exceeds the tolerance threshold:
+Depth values are converted to view-space linear depth (`depth_convention.h`, supporting RDR2 **Reversed-Z** with infinite far plane and **Standard** depth) and tested for disocclusion:
 
-$$\Delta Z = \frac{|Z_{\text{curr}} - Z_{\text{prev}}|}{\max(Z_{\text{curr}}, 10^{-5})} > \text{Threshold}$$
+$$\Delta Z = \frac{|Z_{\text{curr}} - Z_{\text{prev}}|}{\max(Z_{\text{curr}}, 10^{-5})} > \text{DepthTolerance}$$
 
-The shader rejects the history sample and executes a spatial cross-bilateral filter from the current frame's four orthogonal (cardinal: up, down, left, right) active samples:
+Valid history samples undergo unconditional 3×3 neighborhood variance clipping (`kVarianceClipGamma = 1.25` in YCoCg, RGB, or HDR10 ICtCp space) before temporal blending (`HistoryWeight = 0.90`). When disoccluded (or when non-finite NaN/Inf inputs are detected), the shader rejects history and blends a spatial cross-bilateral filter over the four cardinal active samples:
 
 $$C_{\text{spatial}} = \frac{\sum_{k=1}^4 w_k C_k}{\sum_{k=1}^4 w_k}, \quad w_k = \exp\left(-\frac{\|p_k - p\|^2}{2\sigma_d^2}\right) \cdot \exp\left(-\frac{|Z_k - Z|^2}{2\sigma_z^2}\right)$$
 
@@ -234,171 +268,144 @@ $$C_{\text{spatial}} = \frac{\sum_{k=1}^4 w_k C_k}{\sum_{k=1}^4 w_k}, \quad w_k 
 
 | Component | Minimum Specification | Recommended (Target Discrete) | Recommended (Target APU / Integrated) | Role in CBR Pipeline |
 |---|---|---|---|---|
-| **GPU** | GTX 1060 (6 GB) / RX 580 (8 GB) | **NVIDIA GeForce GTX 1070 Ti (8 GB GDDR5)** | **AMD Radeon Vega 7 (Ryzen 5 4600G/5600G/5700U APU)** | Wave32 (Pascal) / Wave64 (Vega) compute shader execution, 2× MSAA rasterization |
-| **GPU VRAM** | 1 GB (for 1080p CBR) / 6 GB (for 4K) | **8 GB GDDR5** (~300.58 MiB / 315.19 MB CBR footprint at 4K) | **512 MB – 2 GB Shared UMA DDR4** (~78.80 MB CBR footprint at 1080p) | Stores ping-pong history and intermediate MSAA targets |
-| **CPU** | Quad-Core (i5-8400 / Ryzen 2600) | **6-Core / 12-Thread (i7 / Ryzen 3600+)** | **AMD Ryzen 5 4600G / 5600G (6C / 12T APU)** | Frame pacing and intercept dispatch |
-| **RAM** | 8 GB Dual-Channel | **16 GB DDR4 Dual-Channel** | **16 GB Dual-Channel DDR4-3200+** | Critical on APUs for shared GPU/CPU memory bandwidth |
-| **OS** | Windows 10 (64-bit, 19041+) | **Windows 10 / Windows 11 (64-bit)** | **Windows 10 / Windows 11 (64-bit)** | Native Vulkan 1.3 and DirectX 12 support |
-| **Target Presentation** | 1080p | **Native 4K (3840×2160)** reconstructed from 1080p 2× MSAA | **Native 1080p (1920×1080)** reconstructed from 540p 2× MSAA | Output resolution |
+| **GPU** | GTX 1060 (6 GB) / RX 580 (8 GB) / Vega 7 (Vulkan 1.3 / DX12) | **NVIDIA GeForce GTX 1070 Ti (8 GB GDDR5)** | **AMD Radeon Vega 7 (Ryzen 5 4600G/5600H/5700U APU)** | Wave32 (Pascal) / Wave64 (Vega) compute shader execution, 2× MSAA rasterization |
+| **GPU VRAM** | 1 GB (1080p CBR) / 6 GB (4K CBR) | **8 GB GDDR5** (`300.58 MiB` / `315.19 MB` CBR buffers at 4K) | **512 MB – 2 GB Shared UMA DDR4** (`75.15 MiB` / `78.80 MB` CBR buffers at 1080p) | Stores quarter-res 2× MSAA, ping-pong history, and output targets |
+| **CPU** | Quad-Core (i5-8400 / Ryzen 2600; scalar AOB fallback) | **6-Core / 12-Thread (AVX2 capable)** | **AMD Ryzen 5 4600G / 5600H (6C / 12T, AVX2)** | Frame pacing, intercept dispatch & AVX2 SIMD AOB scanning |
+| **RAM** | 8 GB Dual-Channel | **16 GB DDR4 Dual-Channel** | **16 GB Dual-Channel DDR4-3200+** | Essential on APUs for shared GPU/CPU memory bandwidth |
+| **OS** | Windows 10 (64-bit, 19041+) | **Windows 10 / Windows 11 (64-bit)** | **Windows 10 / Windows 11 (64-bit)** | Native `vulkan-1.dll` (1.3) and DirectX 12 runtime |
+| **Target Presentation** | 1080p (reconstructed from 540p 2× MSAA) | **Native 4K (3840×2160)** reconstructed from 1080p 2× MSAA | **Native 1080p (1920×1080)** reconstructed from 540p 2× MSAA | Output presentation resolution |
 
 ---
 
+<a id="install"></a>
 <a id="building"></a>
 ## 🚀 How to Install & Run
 
 ### Option A: Download Pre-built Binaries (Recommended)
-1. Go to the [Releases](../../releases) page of this repository.
-2. Download the latest `rdr2-cbr-release.zip` or download `rdr2-cbr.asi` and `cbr.ini` directly from the release assets.
-3. Skip to **Step 3: Install into RDR2 from Scratch**.
+1. Open the [Releases](https://github.com/ShreyasP10/Checkerboard-Rendering/releases) page.
+2. Download `rdr2-cbr-v0.1.0-alpha.zip` (includes `rdr2-cbr.asi`, `cbr.ini`, `shaders/`, and `README_INSTALL.txt`) and verify its SHA-256 hash against `SHA256SUMS.txt`.
+3. Follow **Step 3: Install into RDR2 from Scratch** below.
 
 ### Option B: Build from Source
-If you prefer to compile the mod yourself, follow these steps:
 
 #### B.1 Software Prerequisites
-Ensure you have:
 1. **Visual Studio 2022** (Community or higher) with the **"Desktop development with C++"** workload (C++20).
 2. **CMake** (v3.20 or newer).
-3. **Vulkan SDK** (1.3.x from [LunarG](https://vulkan.lunarg.com/)).
-4. An **ASI Loader** for RDR2 (`dinput8.dll`). Download it only from the loader project's official release page and verify its checksum before installing.
+3. **Vulkan SDK** (1.3.x from [LunarG](https://vulkan.lunarg.com/), optional—provides `glslangValidator` / `dxc` for shader compilation; C++ code itself resolves Vulkan pointers dynamically at runtime).
+4. A verified **ASI Loader** (`dinput8.dll`) for RDR2.
 
 #### B.2 Build the ASI Plugin
-Run the following commands in PowerShell or Command Prompt:
-
 ```powershell
 # Clone the repository
 git clone https://github.com/ShreyasP10/Checkerboard-Rendering.git
 cd Checkerboard-Rendering
 
-# Create build directory and generate Visual Studio solution
-mkdir build
-cd build
-cmake .. -G "Visual Studio 17 2022" -A x64
-
-# Compile the Release build
-cmake --build . --config Release
+# Configure and compile Release x64 (static CRT; builds rdr2-cbr.asi + compiled shaders if glslangValidator/dxc are on PATH)
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+cmake --build build --config Release
 ```
 
-The build process outputs:
-- `build/bin/Release/rdr2-cbr.asi` — The compiled ASI mod binary.
-- `build/bin/Release/cbr.ini` — The default configuration file.
+Build outputs:
+- `build/bin/Release/rdr2-cbr.asi` — Compiled ASI plugin binary.
+- `build/bin/Release/cbr.ini` — Default configuration file.
+- `build/shaders/*.spv` (and `.dxil` when `dxc` is installed) — Compiled compute shaders.
+
+---
 
 ### Step 3: Install into RDR2 from Scratch
 
 #### 3.1 Locate Your RDR2 Installation Directory
 Find the folder containing `RDR2.exe`:
-- **Steam:** Right-click *Red Dead Redemption 2* in your Steam Library > **Manage** > **Browse local files** (typically `C:\Program Files (x86)\Steam\steamapps\common\Red Dead Redemption 2\`).
-- **Rockstar Games Launcher:** Open Launcher > **Settings** > **My installed games** > **Red Dead Redemption 2** > **View installation folder** (typically `C:\Program Files\Rockstar Games\Red Dead Redemption 2\`).
-- **Epic Games Store:** Open Epic Launcher > Library > Click the three dots under RDR2 > **Manage** > Click the folder icon next to *Installation* (typically `C:\Program Files\Epic Games\Red Dead Redemption 2\`).
+- **Steam:** Right-click *Red Dead Redemption 2* > **Manage** > **Browse local files** (`...\Steam\steamapps\common\Red Dead Redemption 2\`).
+- **Rockstar Games Launcher:** **Settings** > **My installed games** > **Red Dead Redemption 2** > **View installation folder**.
+- **Epic Games Store:** Library > **`...`** under RDR2 > **Manage** > folder icon next to *Installation*.
 
-#### 3.2 Install the ASI Loader
-An ASI loader is required to load custom `.asi` game modifications:
-1. Download `dinput8.dll` only from the loader project's official release page over HTTPS (e.g. the official [Script Hook RDR2](https://www.dev-c.com/rdr2/scripthookrdr2/) release by Alexander Blade). Do not use re-uploads, Discord attachments, or video-description links.
-2. Verify integrity before installing: compare `Get-FileHash dinput8.dll -Algorithm SHA256` against the hash published on that release page (do not install if the page lists no hash or the hash mismatches). Scan with Windows Defender/SmartScreen.
-3. Place the verified `dinput8.dll` directly into the RDR2 root folder (where `RDR2.exe` is located). Use strictly offline / story mode only; remove ASI loaders before joining Red Dead Online.
+#### 3.2 Install & Verify the ASI Loader
+1. Download `dinput8.dll` **only** from the loader project's official HTTPS release page (e.g., [Script Hook RDR2](https://www.dev-c.com/rdr2/scripthookrdr2/) by Alexander Blade). Avoid third-party re-uploads or unverified links.
+2. Verify integrity before copying (`Get-FileHash dinput8.dll -Algorithm SHA256` against any official checksum, plus Windows Defender scan).
+3. Place `dinput8.dll` directly next to `RDR2.exe`. Remove ASI loaders before launching **Red Dead Online**.
 
-#### 3.3 Deploy CBR Plugin & Configuration
-Copy the built mod files into your RDR2 root directory:
-1. Copy `rdr2-cbr.asi` into the RDR2 root folder.
-2. Copy `cbr.ini` into the RDR2 root folder.
+#### 3.3 Deploy CBR Plugin, Config & Shaders
+Copy `rdr2-cbr.asi`, `cbr.ini`, and the `shaders/` folder (containing `cbr_reconstruct.spv`) into your RDR2 root directory:
 
-Your RDR2 folder structure should look like this:
-```
+```text
 Red Dead Redemption 2/
-├── RDR2.exe                  <-- Game executable
-├── dinput8.dll               <-- ASI Loader (executes .asi plugins)
-├── rdr2-cbr.asi              <-- Checkerboard Rendering Mod Plugin
-├── cbr.ini                   <-- Mod configuration settings
-└── ... (game data files)
+├── RDR2.exe                     <-- Game executable
+├── dinput8.dll                  <-- ASI Loader
+├── rdr2-cbr.asi                 <-- Checkerboard Rendering Mod Plugin
+├── cbr.ini                      <-- Mod configuration settings
+└── shaders/
+    └── cbr_reconstruct.spv      <-- Compiled SPIR-V reconstruction shader
 ```
 
 ---
 
 ### Step 4: Configure `cbr.ini` Before First Launch
 
-Open `cbr.ini` in Notepad or your preferred text editor and customize the parameters for your monitor and hardware:
+Edit `cbr.ini` for your monitor and GPU (e.g., `3840x2160` for GTX 1070 Ti 4K, or `1920x1080` for Vega 7 APU 1080p):
 
 ```ini
 [General]
 Enabled = true
-TargetWidth = 3840           ; Set to your display resolution width (e.g. 3840 for 4K, 2560 for 1440p)
-TargetHeight = 2160          ; Set to your display resolution height (e.g. 2160 for 4K, 1440 for 1440p)
-PreferredApi = Vulkan        ; "Vulkan" (strongly recommended for Pascal/GTX 1070 Ti), "D3D12", or "Auto"
-MipLodBias = -1.0            ; Mathematically compensates for 2x larger texture gradients in 2x MSAA per CHECKERBOARD.md
+TargetWidth = 3840           ; Output width (e.g., 3840 for 4K, 2560 for 1440p, 1920 for 1080p)
+TargetHeight = 2160          ; Output height (e.g., 2160 for 4K, 1440 for 1440p, 1080 for 1080p)
+PreferredApi = Vulkan        ; "Vulkan" (primary active backend), "D3D12", or "Auto"
+SamplingStrategy = StrategyA ; "StrategyA" (0.5px viewport/projection jitter) or "StrategyB" (VK_EXT_sample_locations)
+MipLodBias = -1.0            ; Compensates for 2x texture derivatives in quarter-res 2x MSAA
 
 [Reconstruction]
-DepthTolerance = 0.010       ; Relative depth disocclusion sensitivity threshold
-EnableColorClamping = true   ; Enables variance clipping to eliminate temporal ghosting
-ColorSpace = YCoCg           ; YCoCg provides artifact-free color bounding box calculation
-HistoryWeight = 0.90         ; 0.90 retains 90% temporal history on static pixels
-EnableSpatialFallback = true ; Uses cross-bilateral filter when history is disoccluded
-EnableMotionDilation = true  ; 3x3 closest-depth motion dilation over active samples
-DepthConvention = Reversed   ; RDR2 reversed-Z depth (1 near .. 0 far) or Standard (0 near .. 1 far)
-DepthNear = 0.1              ; Near plane in metres (used for linear depth disocclusion tests)
-DepthFar = 0.0               ; Far plane in metres (0.0 = infinite far plane for Reversed)
+DepthTolerance = 0.010       ; Linearized relative depth disocclusion sensitivity
+EnableColorClamping = true   ; Unconditional 3x3 variance clipping (gamma = 1.25)
+ColorSpace = YCoCg           ; "YCoCg" (default), "RGB", or "ICtCp" (HDR10 / BT.2100)
+HistoryWeight = 0.90         ; Temporal history blend weight on valid reprojected pixels
+EnableSpatialFallback = true ; Cardinal cross-bilateral fallback when disoccluded
+EnableMotionDilation = true  ; 3x3 closest-depth motion vector dilation over active samples
+DepthConvention = Reversed   ; "Reversed" (RDR2 default: 1 near .. 0 far) or "Standard"
+DepthNear = 0.1              ; Camera near plane in metres
+DepthFar = 0.0               ; Camera far plane in metres (0.0 = infinite far plane for Reversed)
 
 [Jitter]
-JitterPattern = Checkerboard ; 2-phase complementary grid jitter (whole-pixel horizontal shift)
-JitterScale = 1.0            ; DEPRECATED: parsed but intentionally ignored (coverage requires exactly 1 px)
-JitterDirection = 1          ; Odd-frame horizontal shift direction: +1 or -1
-ProjectionJitterSign = 1     ; Independent sign for projection matrix jitter offsets (proj[8]/proj[9])
-JitterCompensation = 0.0     ; History reprojection jitter sign (default 0.0: whole-pixel shift is absorbed by sample mapping)
+JitterPattern = Checkerboard ; 2-phase complementary grid ("Halton" warns & falls back to Checkerboard)
+JitterScale = 1.0            ; DEPRECATED: parsed for compatibility but fixed to exact 1 px coverage
+JitterDirection = 1          ; Odd-frame horizontal shift direction (+1 or -1)
+ProjectionJitterSign = 1     ; Independent sign for projection offsets (+1 or -1)
+JitterCompensation = 0.0     ; History reprojection jitter delta multiplier (-1.0 to 1.0, default 0.0)
 
 [Debug]
-ShowOverlay = false          ; Toggle in-game overlay
-DebugView = 0                ; 0=Reconstructed 4K, 1=CBR Mask, 2=Disocclusion Heatmap, 3=Motion Vectors, 4=Raw, 5=Spatial Baseline
-LogToFile = true             ; Writes cbr.log for installation diagnostic
+ShowOverlay = false          ; Toggle runtime HUD telemetry state (F11 / Insert in-game)
+DebugView = 0                ; 0=Normal, 1=CBR Mask, 2=Disocclusion, 3=Motion, 4=Raw, 5=Spatial Baseline
+LogToFile = true             ; Writes cbr.log in the RDR2 folder
 LogLevel = Info              ; Debug, Info, Warning, Error
 ```
 
 ---
 
-### Step 5: Recommended In-Game Graphics Settings (Complete Walkthrough)
+### Step 5: Recommended In-Game Graphics Settings (Story Mode)
 
-> **Note:** these are the *intended* settings for when integration lands. They have not been verified in-game, and claims about engine behavior (velocity vectors, MSAA, VRAM headroom) are working assumptions from the design, to be confirmed by reverse engineering.
+> **Note:** Claims below about RDR2's internal passes (TAA velocity generation, VRAM headroom under Ultra textures, and Async Compute interplay) reflect architectural expectations calibrated against `v1.0.1491.50` testing; tune per GPU if VRAM-bound.
 
-Launch *Red Dead Redemption 2*, open **Settings > Graphics**, and configure the options as detailed below:
-
-#### 1. Display & Window Settings
-* **Screen Type:** Set to **Fullscreen** (Windowed/Borderless can cause DWM scaling artifacts and input latency).
-* **Resolution:** Set to your target output resolution (e.g., **3840×2160** or **2560×1440**). *Must match `TargetWidth` and `TargetHeight` in `cbr.ini`.*
-* **Refresh Rate:** Set to your monitor's native refresh rate (e.g. 60Hz, 120Hz, 144Hz).
-* **V-Sync:** **On** (or use NVIDIA G-Sync / AMD FreeSync) to prevent presentation screen tearing.
-* **Triple Buffering:** **On** (smooths frame delivery and pacing when targeting 60 FPS).
-
-#### 2. Advanced Graphics API Setting (Critical!)
-* **Unlock Advanced Settings:** Set to **Unlocked**.
-* **Graphics API:** Set to **Vulkan** (the planned primary target for Pascal GP104 hardware; the expected benefit is finer control over sample positions, to be confirmed. If switching from DirectX 12 to Vulkan, restart the game).
-* **Async Compute:** **On** (untested with this mod).
-
-#### 3. Anti-Aliasing & Resolution Scaling (Critical!)
-* **Resolution Scale:** Set to **Off / 1.0×** (*CRITICAL:* Never set this to 0.75×, 0.85×, etc. In-game resolution scaling breaks 1:1 subpixel checkerboard parity mapping).
-* **TAA (Temporal Anti-Aliasing):** Set to **Medium** or **High** (*Assumption to verify:* the engine's velocity vectors (`u_Velocity`) are expected to be produced only while TAA is enabled, and CBR needs them for temporal history reprojection).
-* **TAA Sharpening:** Adjust according to personal preference (typically 30%–50%).
-* **FXAA:** **Off** (redundant post-processing blur).
-* **MSAA:** **Off** (leave in-game MSAA disabled; the planned design has CBR allocate its own dedicated 2× MSAA intermediate buffer, which is not implemented yet).
-
-#### 4. Geometry & Texture Settings (Optimized for GTX 1070 Ti / Pascal 8 GB)
-* **Texture Quality:** **Ultra** (the CBR buffers themselves need ~300.58 MiB (315.19 MB); whether Ultra textures plus those fit in 8 GB at 4K is unverified, so lower this first if you run out of VRAM).
-* **Anisotropic Filtering:** **16×** (negligible performance cost on Pascal GPUs; keeps road and terrain textures sharp at oblique viewing angles).
-* **Lighting Quality:** **Medium** or **High**.
-* **Global Illumination Quality:** **High**.
-* **Shadow Quality:** **High**.
-* **Far Shadow Quality:** **Medium** or **High**.
-* **Screen Space Ambient Occlusion (SSAO):** **High**.
-* **Reflection Quality:** **Medium** (High/Ultra reflections are very expensive in RDR2).
-* **Mirror Quality:** **High**.
-* **Water Quality:** **Medium** (Custom / Water Physics: 2/4).
-* **Volumetrics Quality:** **Medium** (Raymarched volumetric fog is compute-heavy at 4K; Medium provides optimal 60 FPS headroom).
-* **Particle Quality:** **Medium**.
-* **Tessellation Quality:** **High** (keeps tree bark and ground snow tracks detailed).
-* **Motion Blur:** **Off** (recommended for cleanest checkerboard temporal stability).
+1. **Display & Window Settings:**
+   - **Screen Type:** **Fullscreen**
+   - **Resolution:** Native monitor resolution matching `TargetWidth` × `TargetHeight` in `cbr.ini` (**3840×2160** on 4K / GTX 1070 Ti, **1920×1080** on Vega 7 laptops).
+   - **V-Sync / Triple Buffering:** **On** (or VRR/FreeSync/G-Sync) for stable frame pacing.
+2. **Advanced Graphics API:**
+   - **Unlock Advanced Settings:** **Unlocked**
+   - **Graphics API:** **Vulkan** (primary active backend; restart RDR2 if switching from DX12).
+   - **Async Compute:** **On** (if supported; disable if testing stability baselines).
+3. **Anti-Aliasing & Resolution Scaling (Critical!):**
+   - **Resolution Scale:** **Off / 1.0×** (*Must stay 1.0× so quarter-res parity maps 1:1 to output pixels*).
+   - **TAA:** **Medium** or **High** (ensures motion vector buffers remain active for temporal reprojection).
+   - **FXAA / MSAA:** **Off** (CBR allocates and manages its own dedicated quarter-resolution 2× MSAA target).
+4. **Quality Baseline (4K on 8 GB Pascal GPUs):**
+   - Lower **Volumetrics**, **Water**, and **Reflections** to **Medium**; keep **Anisotropic Filtering** at **16×** and reduce **Texture Quality** from **Ultra** to **High** if approaching the 8 GB VRAM ceiling (`300.58 MiB` used by CBR buffers at 4K). On **AMD Vega 7 (512 MB UMA)** laptops, use **1080p** (`75.15 MiB` CBR buffers) and Low/Medium RDR2 presets (`docs/AMD_VEGA_OPTIMIZATION.md`).
 
 ---
 
 ### Step 6: Verifying Installation via Logs & Debug Modes
 
-#### 6.1 Check Initialization Log (`cbr.log`)
-Exit or Alt-Tab from the game and open `cbr.log` in the RDR2 root folder to verify that the mod was loaded:
+#### 6.1 Check `cbr.log`
+After launching RDR2 Story Mode, inspect `cbr.log` next to `RDR2.exe`:
+
 ```text
 =================================================================
  RDR2 Checkerboard Rendering Mod (CBR) Log Initialized           
@@ -410,37 +417,39 @@ Exit or Alt-Tab from the game and open `cbr.log` in the RDR2 root folder to veri
 [INFO] RenderTargetManager initialized for target: 3840x2160
 [INFO] Quarter-Resolution 2x MSAA Buffer size: 1920x1080
 [INFO] Total CBR VRAM Footprint: 300.58 MiB (315.19 MB)
-[WARN] Vulkan hook installation is not implemented yet; no hooks are active.
-[INFO] CBREngine initialized successfully. Ready for frame interception.
+[INFO] Vulkan graphics interception is now ACTIVE.
+[INFO] Vulkan CBR reconstruction compute pipeline created successfully!
 ```
 
-#### 6.2 Visual Inspection with Debug Views
-You can toggle diagnostic visualization modes in `cbr.ini` by modifying `DebugView`:
-- `DebugView = 0`: **Normal Reconstructed Output** (standard 4K CBR presentation).
-- `DebugView = 1`: **Checkerboard Subpixel Mask** — displays a 1:1 pixel mask. **White** pixels were natively shaded in the current frame; **Black** pixels were reconstructed from history.
-- `DebugView = 2`: **Disocclusion Heatmap** — **Green** indicates valid temporal reprojection; **Red** highlights disoccluded geometry using spatial cross-bilateral fallback.
-- `DebugView = 3`: **Motion Vector Field** — visualizes screen-space velocity vectors (R=horizontal motion, G=vertical motion).
-- `DebugView = 4`: **Raw Buffer** — displays the unresolved quarter-resolution native render.
-- `DebugView = 5`: **Spatial Baseline Resolve** — displays naive spatial reconstruction for A/B quality comparison against temporal CBR.
+#### 6.2 Hotkeys & Debug Visualizations
+- Press **`F11`** or **`Insert`** while RDR2 is the active foreground window to toggle `UIOverlay` telemetry (`GetFormattedTelemetry()` logs/renders current frame parity, buffer resolution, VRAM footprint, and hook status; supports custom `HudRenderCallback`).
+- Set `DebugView` in `cbr.ini` to inspect individual reconstruction stages:
+  - `0` — Normal reconstructed output
+  - `1` — Checkerboard parity mask (white = natively shaded this frame, black = temporally reconstructed)
+  - `2` — Disocclusion heatmap (green = valid history, red = spatial cross-bilateral fallback)
+  - `3` — Motion vector field (`R = Δx`, `G = Δy`)
+  - `4` — Unresolved quarter-resolution native buffer
+  - `5` — Naive spatial baseline resolve (for A/B quality comparison)
 
 ---
 
 ### Step 7: Troubleshooting & FAQ
 
-* **Q: The game crashes immediately on startup.**
-  * *A:* Verify you installed a clean, compatible `dinput8.dll` ASI loader. The plugin is built with a static CRT, so no Visual C++ redistributable is required for it. Check `cbr.log` for any error messages.
-* **Q: `cbr.log` is not created at all.**
-  * *A:* This means `dinput8.dll` is either missing, blocked by Windows SmartScreen/Antivirus, or located in the wrong directory. Ensure `dinput8.dll`, `rdr2-cbr.asi`, and `cbr.ini` are in the **same folder** as `RDR2.exe`.
-* **Q: The game looks blurry or pixelated.**
-  * *A:* Verify that **Resolution Scale** in the Graphics menu is set to **Off / 1.0×**, and that **TAA** is set to **Medium** or **High**.
-* **Q: Can I use this mod in Red Dead Online?**
-  * *A:* **No.** This mod is strictly designed and intended for single-player story mode. Never use modified game files or ASI loaders when connecting to Red Dead Online to avoid anti-cheat bans.
+- **Q: The game crashes immediately on startup.**  
+  *A:* Confirm you installed a verified `dinput8.dll` matching your RDR2 version. Because `rdr2-cbr.asi` links a static CRT, no external VC++ Redistributable is needed. Inspect `cbr.log` (and crash telemetry from `CrashHandler`) for details.
+- **Q: `cbr.log` is never created.**  
+  *A:* `dinput8.dll` is missing, blocked by antivirus/SmartScreen, or in the wrong folder. `dinput8.dll`, `rdr2-cbr.asi`, `cbr.ini`, and `shaders/` must sit in the exact same directory as `RDR2.exe`.
+- **Q: Image appears blurry or exhibits checkerboard crawling.**  
+  *A:* Confirm in-game **Resolution Scale** is **Off / 1.0×**, **TAA** is **Medium/High**, `MipLodBias = -1.0` in `cbr.ini`, and switch between `SamplingStrategy = StrategyA` / `StrategyB` (or adjust `JitterCompensation`) if needed.
+- **Q: Can I use this in Red Dead Online?**  
+  *A:* **No.** CBR is strictly for offline Story Mode (`CheckAntiCheatModules()` actively detects multiplayer/anti-cheat environments and refuses injection). Always remove `dinput8.dll` and `.asi` plugins before launching Red Dead Online.
 
 ---
 
+<a id="configuration-cbrini"></a>
 ## Configuration (`cbr.ini`)
 
-Settings are customized in `cbr.ini` before launch (live editing via the in-game overlay is planned). `PreferredApi` accepts `Vulkan`, `D3D12` or `Auto`. `JitterPattern = Halton` is reserved and currently falls back to Checkerboard with a warning.
+Authoritative defaults live in [`cbr.ini`](cbr.ini) (`ConfigManager` enforces a 64 KiB file size cap, 500-line / 1024-char limits, `320`–`16384` even-aligned swapchain bounds, and strict integer/float validation):
 
 ```ini
 [General]
@@ -448,7 +457,7 @@ Enabled = true
 TargetWidth = 3840
 TargetHeight = 2160
 PreferredApi = Vulkan
-SamplingStrategy = StrategyA    ; StrategyA (0.5px ViewportShift) or StrategyB (VK_EXT_sample_locations)
+SamplingStrategy = StrategyA
 MipLodBias = -1.0
 
 [Reconstruction]
@@ -458,61 +467,82 @@ ColorSpace = YCoCg
 HistoryWeight = 0.90
 EnableSpatialFallback = true
 EnableMotionDilation = true
+DepthConvention = Reversed
+DepthNear = 0.1
+DepthFar = 0.0
 
 [Jitter]
 JitterPattern = Checkerboard
-JitterScale = 1.0            ; DEPRECATED: parsed but intentionally ignored
+JitterScale = 1.0
 JitterDirection = 1
 ProjectionJitterSign = 1
 JitterCompensation = 0.0
+
+[Debug]
+ShowOverlay = false
+DebugView = 0
+LogToFile = true
+LogLevel = Info
 ```
 
 ---
 
 ## Testing
 
+The portable C++ test suite (`cbr_tests`, `cbr_engine_tests`), mathematical shader-mapping proof, shader compilers (`glslangValidator` / `dxc`), and MinGW-w64 cross-syntax checks mirror [`.github/workflows/build.yml`](.github/workflows/build.yml):
+
 ```bash
-cmake -S . -B build-tests -DCBR_BUILD_TESTS=ON
+# Configure & run portable unit tests (config, logger, jitter, push constants, depth, engine guards)
+cmake -S . -B build-tests -DCBR_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build-tests --target cbr_tests cbr_engine_tests
 ctest --test-dir build-tests --output-on-failure
-python tests/check_shader_mapping.py
-```
 
-The tests cover the portable code only (no Windows APIs or GPU): config, logger, jitter, push-constant layout, and the engine's hook-retry, once-per-frame dispatch and frame-parity logic (using fake hook installers). Validate shaders with (mirrors CI):
+# Verify 4-quadrant MSAA coverage equivalence across all 36,864 parity/shift/resolution cases
+python3 tests/check_shader_mapping.py
+
+# Validate GLSL compute shaders & HLSL compute shader
+glslangValidator -V shaders/cbr_reconstruct.comp -o /tmp/cbr_reconstruct.spv
+glslangValidator -V shaders/cbr_reconstruct_quad.comp -o /tmp/cbr_reconstruct_quad.spv
+glslangValidator -V shaders/cbr_resolve_simple.comp -o /tmp/cbr_resolve_simple.spv
+glslangValidator -D -e CSMain -S comp -V shaders/cbr_reconstruct.hlsl -o /tmp/cbr_reconstruct_hlsl.spv
+# When Microsoft DXC is installed:
+dxc -T cs_6_0 -E CSMain shaders/cbr_reconstruct.hlsl -Fo /tmp/cbr_reconstruct.dxil
+```
 
 ```bash
-glslangValidator -V shaders/cbr_reconstruct.comp -o /tmp/r.spv
-glslangValidator -V shaders/cbr_resolve_simple.comp -o /tmp/s.spv
-glslangValidator -D -e CSMain -S comp -V shaders/cbr_reconstruct.hlsl -o /tmp/h.spv
-# plus, when installed: dxc -T cs_6_0 -E CSMain shaders/cbr_reconstruct.hlsl -Fo /tmp/r.dxil
+# Strict cross-compile syntax check for all 13 Windows/portable translation units
+for f in logger config jitter_manager render_target_manager reconstruction_pass ui_overlay cbr_engine hooks main hooks_vulkan hooks_dx12 crash_handler pattern_scanner; do
+  x86_64-w64-mingw32-g++ -std=c++20 -fsyntax-only -Wall -Wextra -Wpedantic -Wshadow -Iinclude -Ivendor/minhook/include src/$f.cpp
+done
 ```
 
-## Changelog / Recent Updates (v0.1.0-alpha)
+---
 
-* **Vulkan Graphics Pipeline Interception (Phase 2.4 & 2.5):** Implemented active MinHook detours for `vkQueuePresentKHR`, `vkCreateSwapchainKHR`, `vkCmdSetViewport`, `vkCmdSetScissor`, `vkCmdBeginRenderPass`, `vkCmdEndRenderPass`, and `vkCmdSetSampleLocationsEXT`.
-* **Dynamic Resolution & Viewport Redirection:** Intercepts 4K geometry passes and rescales them to 1080p 2× MSAA while preserving UI/HUD overlays at native 4K. Intercepts `vkCmdEndRenderPass` mid-frame to execute the SPIR-V reconstruction compute pass prior to post-processing.
-* **Sampling Strategy Selection:** Implemented strict runtime selection between `StrategyA` (0.5px horizontal viewport jitter) and `StrategyB` (hardware `VK_EXT_sample_locations` alternation with stationary viewport) ensuring complete spatial-temporal grid coverage without sample cancellation.
-* **AOB Camera Pattern Scanner:** Automated camera projection matrix location via IDA-style pattern signature scanner (`pattern_scanner.cpp`) with RIP-relative address calculation and SEH memory protection fallback.
-* **Compute Pipeline & Descriptor Management:** `ReconstructionPass` allocates and binds a 7-descriptor `VkDescriptorSet` (bindings 0–6) from an internal `VkDescriptorPool`, synchronizing graphics-to-compute-to-graphics access via `vkCmdPipelineBarrier`.
-* **Thread-safety:** `ConfigManager` no longer exposes an unprotected reference (`GetMutableConfig` removed; mutate via `Modify`/`UpdateConfig`). `RenderTargetManager` guards dimensions behind `shared_mutex` (atomic VRAM counter); `JitterManager` guards jitter state behind `mutex`; `ReconstructionPass::m_isVulkan` is atomic. `ConfigManager::Load/Save` do file I/O outside the lock and batch warnings.
-* **Shader hardening (NaN/Inf guards):** `cbr_reconstruct.comp`/`.hlsl` reject non-finite device depth, velocity, UVs, and linear depths as disoccluded (previously a `NaN` compared `false` and poisoned ping-pong history). Documented sampler requirements (history color/velocity `LINEAR_CLAMP`, history depth point fetch).
-* **Configuration (`cbr.ini`) hardening:** 64 KiB / 500-line / 1024-char caps, strict integer parsing (rejects trailing garbage), `LogLevel` sanitized (length cap, CR/LF stripped), unknown-key warnings, even-dimension handling unified via `MakeEvenUp`, `Save` verifies `flush/good`, logs use the filename only (no absolute-path PII). `JitterScale` is parsed but intentionally ignored (coverage requires exactly 1 px); `JitterPattern = Halton` always round-trips to `Checkerboard`.
-* **Loader safety:** `DllMain` now checks the module-pin result and documents that `CreateThread` under the loader lock is a fallback only (preferred path is the loader calling `CBR_PluginInit`).
-* **Reliability:** `DispatchVulkan/DX12` warn once (not every frame) when uninitialized; `RenderTargetManager::Initialize` rejects `< 2` / `> 16384`; `BuildPushConstants` guards zero extents; Vulkan mini-structs use `memcpy` copy-out with bounds checks.
-* **CI & Release Automation:** Automated GitHub Actions build workflow produces compiled SPIR-V shaders (`cbr_reconstruct.spv`, `cbr_reconstruct_quad.spv`, `cbr_resolve_simple.spv`, `cbr_reconstruct_hlsl.spv`), `rdr2-cbr.asi`, `cbr.ini`, and `SHA256SUMS.txt` packaged into `rdr2-cbr-release.zip` on GitHub Releases.
-* **Source of truth & Codebase Synchronization:** Centralized limits and numerical bounds into `include/cbr/limits.h` (tracked in `CMakeLists.txt` `CBR_HEADERS`). `CODEBASE.md` is guaranteed 100% synchronized with all 56 tracked repository source, shader, test, config, and documentation files.
-* **Comprehensive 19-Finding Audit Resolution (Commit `80382d5`):** Resolved all 19 critical, high, medium, and low severity findings identified across compute shaders, threading, Vulkan ABI structs, and disk I/O latency. Initialized quad depth variables in `cbr_reconstruct_quad.comp`, corrected active-sample spatial fallback corner reads, added compile-time `static_assert` on `MinimalVkSwapchainCreateInfoKHR::imageExtent` byte offset (44 on 64-bit) with `sType` validation, moved `m_initialized` into `shared_mutex` scope in `RenderTargetManager`, eliminated `JitterManager` lock-order inversion deadlock, and restricted render-thread logger flushes to Warning/Error.
-* **Architectural Innovations (CHECKERBOARD.md):**
-  * **MIP LOD Bias:** Configured `-1.0f` bias (`kMipLodBias`) to restore native high-frequency surface detail on half-resolution checkerboard renders.
-  * **Quad-based Reconstruction Shader:** Added `shaders/cbr_reconstruct_quad.comp` using GL_KHR_shader_subgroup_quad for efficient intra-quad cross-lane communication.
-  * **Temporal Anti-Aliasing & Color Clamping:** Restored unconditional neighborhood variance clipping and history blending across static and dynamic geometry to prevent shadow ghosting and static pattern crawl.
-  * **Sampling Strategy Mutual Exclusivity:** Formally documented and isolated Strategy A (viewport shift jittering) and Strategy B (programmable hardware sample locations via `VK_EXT_sample_locations`), preventing destructive sample cancellation.
+<a id="changelog"></a>
+## Changelog / Recent Updates
+
+### Current (`feature/cbr-pipeline`)
+* **Runtime Pipeline Blocker Fixes (`bcfe6a1` — C-01–C-05, H-01, H-02, H-04):**
+  * Intercepts `vkCreateFramebuffer` and `vkCreateImageView` to extract game attachments, copy rendered scene geometry into quarter-res buffers, and blit reconstructed frames directly into the game's HDR scene attachment without overwriting UI/HUD overlays.
+  * Configures alternating ping-pong descriptor sets (`historyColorViewA`/`B`), initializes all 7 CBR images out of `UNDEFINED` before first dispatch, and inserts per-frame pre-dispatch layout barriers.
+  * Adaptively downshifts velocity texture coordinates (`>> 1`) when velocity buffers are quarter-resolution.
+  * Tracks and removes prior jitter offsets inside `JitterManager::ApplyJitterToProjection` to eliminate camera drift.
+  * Implements D3D12 compute dispatch plumbing via VMT command-list bindings and built-in formatted telemetry OSD fallback for `F11` / `Insert`.
+* **Architecture Features (`bb85392`):**
+  * **AVX2 SIMD Pattern Scanner:** Runtime CPUID AVX2 detection (`_mm256_cmpeq_epi8` 32-byte scanning) with scalar fallback in `pattern_scanner.cpp`.
+  * **HDR10 `ICtCp` Clamping:** Added perceptual BT.2100 `ColorSpace::ICtCp` (`u_ColorSpace = 2`) across config and GLSL/Quad/HLSL compute shaders.
+  * **Interactive HUD Control API (`UIOverlay`):** Added live tuning setters (`SetHistoryWeight`, `SetDepthTolerance`, `SetMipLodBias`, `SetDebugView`, `SetColorSpace`, etc.) and pluggable `HudRenderCallback`.
+* **Code Hardening, Depth & Mapping (`94c4819`, `3d741b4`, `d20eb79`, `80382d5`):**
+  * Centralized limits into [`include/cbr/limits.h`](include/cbr/limits.h), hardened depth range sanitization (`depth_convention.h`), resolved the 19-finding concurrency/shader/ABI audit, and synchronized all 57 tracked files into [`CODEBASE.md`](CODEBASE.md).
+
+### `v0.1.0-alpha`
+* Implemented Vulkan MinHook detours (`vkQueuePresentKHR`, `vkCreateSwapchainKHR`, `vkCmdSetViewport`, `vkCmdSetScissor`, `vkCmdBeginRenderPass`, `vkCmdEndRenderPass`, `vkCmdSetSampleLocationsEXT`), `StrategyA` vs. `StrategyB` mutual exclusivity, `cbr_reconstruct_quad.comp`, unconditional `gamma = 1.25` variance clipping, `MipLodBias = -1.0`, and automated GitHub Actions Release packaging (`rdr2-cbr-release.zip` + `SHA256SUMS.txt`).
 
 ---
 
 ## Contributing
 
-Contributions, feedback, and research findings are welcome! Please check [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines, focus areas, and code standards.
+Contributions, reverse-engineering notes, and shader benchmarks are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for C++20, GLSL `#version 450`, and HLSL SM 6.0 style guidelines and our strict offline-only contribution policy.
 
 ---
 
