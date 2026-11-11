@@ -18,6 +18,8 @@ struct OverlayMetrics {
     double   vramFootprintMiB{ 0.0 };
     double   vramFootprintMB{ 0.0 };
     bool     isHooked{ false };
+    float    lastReconDurationMs{ 0.0f };
+    uint32_t jitterPhase{ 0 };
 };
 
 // Function callback signature for custom in-game HUD or Dear ImGui renderers

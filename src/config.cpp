@@ -238,6 +238,10 @@ bool ConfigManager::Load(const std::filesystem::path& configPath) {
                 parsed.depthNear = ParseFloat(val, parsed.depthNear, 0.001f, 100.0f);
             } else if (key == "DepthFar") {
                 parsed.depthFar = ParseFloat(val, parsed.depthFar, 0.0f, 1000000.0f);
+            } else if (key == "SharpeningStrength") {
+                parsed.sharpeningStrength = ParseFloat(val, parsed.sharpeningStrength, 0.0f, 1.0f);
+            } else if (key == "EnableCameraMotionFallback") {
+                parsed.enableCameraMotionFallback = ParseBool(val, parsed.enableCameraMotionFallback);
             } else if (key == "JitterPattern") {
                 if (ToUpper(val) == "HALTON") {
                     warnings.emplace_back("JitterPattern=Halton is not implemented yet; using Checkerboard.");
@@ -333,7 +337,9 @@ bool ConfigManager::Save(const std::filesystem::path& configPath) {
     file << "EnableMotionDilation = " << (snapshot.enableMotionDilation ? "true" : "false") << "\n";
     file << "DepthConvention = " << (snapshot.depthConvention == DepthConvention::Standard ? "Standard" : "Reversed") << "\n";
     file << "DepthNear = " << snapshot.depthNear << "\n";
-    file << "DepthFar = " << snapshot.depthFar << "\n\n";
+    file << "DepthFar = " << snapshot.depthFar << "\n";
+    file << "SharpeningStrength = " << snapshot.sharpeningStrength << "\n";
+    file << "EnableCameraMotionFallback = " << (snapshot.enableCameraMotionFallback ? "true" : "false") << "\n\n";
 
     file << "[Jitter]\n";
     // Halton is reserved/not implemented: always persist Checkerboard so a

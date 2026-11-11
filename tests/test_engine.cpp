@@ -79,6 +79,7 @@ static void RunVulkanTests() {
     CHECK(rt.GetCurrentHistoryIndex() == 0);
     e.OnScenePassEnd(nullptr);
     CHECK(rt.GetCurrentHistoryIndex() == 1);
+    CHECK(e.GetLastReconstructionDurationMs() > 0.0f);
     // One duplicate call: an unguarded engine would swap twice and land back on index 0. (An odd
     // number of duplicates would pass by parity luck, so keep the total number of calls even.)
     e.OnScenePassEnd(nullptr);                            // second matching pass in the same frame
@@ -110,7 +111,8 @@ static void RunVulkanTests() {
     CHECK(e.GetCurrentFrameIndex() == 0);
     CHECK(rt.GetCurrentHistoryIndex() == 0);
     e.OnScenePassEnd(nullptr);
-    CHECK(rt.GetCurrentHistoryIndex() == 1);              // frame 0 is dispatchable again
+    CHECK(rt.GetCurrentHistoryIndex() == 1);
+    CHECK(e.GetLastReconstructionDurationMs() > 0.0f);              // frame 0 is dispatchable again
     e.OnPostPresent(&g_b);                                // a different target may become the main one
     CHECK(e.GetCurrentFrameIndex() == 1);
     e.OnPostPresent(&g_a);
@@ -149,6 +151,12 @@ static void RunVulkanTests() {
     CHECK(metrics.cbrEnabled == true);
     CHECK(metrics.vramFootprintMiB > 300.0);
     CHECK(metrics.vramFootprintMB > 310.0);
+    CHECK(metrics.lastReconDurationMs > 0.0f);
+
+    // Default HUD callback runs cleanly when visible before custom override (Item H-04)
+    ui.SetVisible(true);
+    ui.Render();
+    ui.SetVisible(false);
 
     // Interactive HUD control testing (Item 96)
     ui.SetHistoryWeight(0.75f);
@@ -169,6 +177,14 @@ static void RunVulkanTests() {
     ui.SetVisible(true);
     ui.Render();
     CHECK(s_customHudRendered);
+
+    // Online launch argument safety check (Section 4.1)
+    CHECK(!CBREngine::HasDisallowedCommandLineArgs(nullptr));
+    CHECK(!CBREngine::HasDisallowedCommandLineArgs(L""));
+    CHECK(!CBREngine::HasDisallowedCommandLineArgs(L"\"C:\\Games\\Multiplayer\\RDR2.exe\" -vulkan"));
+    CHECK(CBREngine::HasDisallowedCommandLineArgs(L"\"C:\\Program Files\\RDR2\\RDR2.exe\" -rdo"));
+    CHECK(CBREngine::HasDisallowedCommandLineArgs(L"RDR2.exe -scOnlineOnly"));
+    CHECK(CBREngine::HasDisallowedCommandLineArgs(L"RDR2.exe \"-multiplayer\""));
 }
 
 static void RunAutoTests() {

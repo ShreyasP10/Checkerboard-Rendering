@@ -40,9 +40,10 @@ public:
     // Incorporates ConfigManager::Get().GetConfig().projectionJitterSign and Vulkan Y-flip.
     [[nodiscard]] std::pair<float, float> ComputeProjectionOffset(const JitterOffset& jitter, bool isVulkan) const;
 
-    // Computes subpixel jitter offset for a 4x4 projection matrix
+    // Computes subpixel jitter offset for a 4x4 projection matrix (non-accumulating & idempotent per frame/matrix)
     void ApplyJitterToProjection(float* projMatrix4x4, bool isVulkan) const;
     void RemoveJitterFromProjection(float* projMatrix4x4, bool isVulkan) const;
+    [[nodiscard]] bool IsProjectionJitterApplied(const float* projMatrix4x4, uint32_t frameIndex, bool isVulkan) const;
 
     // Idempotent: sets jitter on outMatrix4x4 relative to inUnjitteredMatrix4x4 without accumulating.
     // IMPORTANT: inUnjitteredMatrix4x4 must really be the unjittered source. Passing the same pointer
@@ -61,10 +62,18 @@ private:
     uint32_t     m_targetHeight{ 2160 };
     JitterOffset m_currentJitter;
     JitterOffset m_previousJitter;
+    uint32_t     m_lastUpdatedFrame{ 0 };
+    bool         m_hasUpdatedFrame{ false };
     std::pair<float, float> m_cachedProjectionOffsetVk[2]{};
     std::pair<float, float> m_cachedProjectionOffsetDx[2]{};
-    mutable float           m_lastProj0{ 0.0f };
+    mutable float                   m_lastProj0{ 0.0f };
+    mutable const float*            m_trackedProjMatrix{ nullptr };
+    mutable std::pair<float, float> m_baseProjOffset{ 0.0f, 0.0f };
+    mutable std::pair<float, float> m_expectedJitteredProj{ 0.0f, 0.0f };
     mutable std::pair<float, float> m_lastAppliedOffset{ 0.0f, 0.0f };
+    mutable uint32_t                m_lastAppliedFrame{ 0 };
+    mutable bool                    m_hasAppliedToTracked{ false };
+    mutable bool                    m_hasAppliedFrame{ false };
 };
 
 } // namespace cbr

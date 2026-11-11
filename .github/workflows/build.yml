@@ -21,12 +21,7 @@ jobs:
       # Pinned by SHA = v4.2.2 (verified against the repository tags); review changelogs when updating.
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - name: Install tools
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake g++ glslang-tools
-      - name: Unit tests
-        run: |
-          cmake -S . -B build-tests -DCBR_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release
-          cmake --build build-tests --target cbr_tests cbr_engine_tests
-          ctest --test-dir build-tests --output-on-failure
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake g++ glslang-tools libvulkan1 mesa-vulkan-drivers
       - name: Validate shaders
         run: |
           mkdir -p shaders/spv
@@ -41,6 +36,11 @@ jobs:
           else
             echo "::warning::dxc not installed on this runner; HLSL verified with the glslang front-end only"
           fi
+      - name: Unit tests & headless Vulkan Lavapipe compute test
+        run: |
+          cmake -S . -B build-tests -DCBR_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-tests --target cbr_tests cbr_engine_tests cbr_vulkan_headless
+          ctest --test-dir build-tests --output-on-failure -V
       - name: Upload compiled SPIR-V shaders
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:

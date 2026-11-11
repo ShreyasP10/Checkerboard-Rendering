@@ -40,6 +40,9 @@ typedef BOOL(WINAPI* PFN_MiniDumpWriteDump)(
     const void*                       CallbackParam
 );
 
+HMODULE                      g_hDbgHelp = nullptr;
+PFN_MiniDumpWriteDump        g_pfnMiniDumpWriteDump = nullptr;
+
 const char* GetExceptionCodeString(DWORD code) {
     switch (code) {
         case EXCEPTION_ACCESS_VIOLATION:         return "EXCEPTION_ACCESS_VIOLATION (Memory Access Violation)";
@@ -100,16 +103,12 @@ void FormatModuleAndOffset(void* address, char* outBuf, size_t outSize) {
 }
 
 void WriteMinidump(EXCEPTION_POINTERS* pEx, const wchar_t* dumpPath) {
-    // Mitigate DLL preloading vulnerabilities by searching System32 only
-    HMODULE hDbgHelp = LoadLibraryExA("dbghelp.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-    if (!hDbgHelp) {
-        hDbgHelp = LoadLibraryA("dbghelp.dll");
-    }
-    if (!hDbgHelp) return;
+    // Use preloaded MiniDumpWriteDump pointer cached during CrashHandler::Install()
+    // so the unhandled exception filter never acquires the PEB loader lock (Section 4.2).
+    PFN_MiniDumpWriteDump pfnDump = g_pfnMiniDumpWriteDump;
+    if (!pfnDump) return;
 
-    auto pfnDump = reinterpret_cast<PFN_MiniDumpWriteDump>(
-        GetProcAddress(hDbgHelp, "MiniDumpWriteDump"));
-    if (pfnDump) {
+    {
         HANDLE hFile = CreateFileW(
             dumpPath,
             GENERIC_WRITE,
@@ -159,7 +158,6 @@ void WriteMinidump(EXCEPTION_POINTERS* pEx, const wchar_t* dumpPath) {
             CloseHandle(hFile);
         }
     }
-    FreeLibrary(hDbgHelp);
 }
 
 // Stack report builder appending helper (no heap allocations)
@@ -315,6 +313,16 @@ void CrashHandler::Install(const std::filesystem::path& logDirectory) {
     std::copy_n(nativeDump.c_str(), copyLen, g_dumpPathW);
     g_dumpPathW[copyLen] = L'\0';
 
+    // Preload dbghelp.dll and cache MiniDumpWriteDump once during Install() so exception
+    // handling never acquires the PEB loader lock inside CBRUnhandledExceptionFilter (Section 4.2).
+    if (!g_hDbgHelp) {
+        g_hDbgHelp = LoadLibraryExA("dbghelp.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    }
+    if (g_hDbgHelp && !g_pfnMiniDumpWriteDump) {
+        g_pfnMiniDumpWriteDump = reinterpret_cast<PFN_MiniDumpWriteDump>(
+            GetProcAddress(g_hDbgHelp, "MiniDumpWriteDump"));
+    }
+
     g_previousFilter = SetUnhandledExceptionFilter(CBRUnhandledExceptionFilter);
     m_installed = true;
     CBR_LOG_INFO("CrashHandler installed. Unhandled exceptions & crash telemetry will be logged to cbr_crash.log.");
@@ -324,6 +332,12 @@ void CrashHandler::Uninstall() {
     if (!m_installed) return;
     SetUnhandledExceptionFilter(g_previousFilter);
     g_previousFilter = nullptr;
+
+    g_pfnMiniDumpWriteDump = nullptr;
+    if (g_hDbgHelp) {
+        FreeLibrary(g_hDbgHelp);
+        g_hDbgHelp = nullptr;
+    }
 
     if (g_hCrashLogFile != INVALID_HANDLE_VALUE) {
         CloseHandle(g_hCrashLogFile);

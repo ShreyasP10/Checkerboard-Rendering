@@ -79,6 +79,8 @@ static void TestConfigHardening(const fs::path& dir) {
 
     CHECK(ConfigManager::Get().Load(ini));
     const auto& c = ConfigManager::Get().GetConfig();
+    CHECK(c.sharpeningStrength == 0.0f);
+    CHECK(!c.enableCameraMotionFallback);
     CHECK(c.targetWidth == 3840);
     CHECK(c.targetHeight == 2160);
     CHECK(c.enabled);
@@ -113,10 +115,18 @@ static void TestConfigHardening(const fs::path& dir) {
     CHECK(ConfigManager::Get().GetConfig().depthConvention == DepthConvention::Standard);
 
     // Hardened integer parsing (large 64-bit clamp) and quoted comment stripping
-    WriteFile(dir / "hardened.ini", "[General]\nTargetWidth = 9999999999999999\nPreferredApi = \"Vulkan\" ; inline comment\n");
+    WriteFile(dir / "hardened.ini",
+        "[General]\nTargetWidth = 9999999999999999\nPreferredApi = \"Vulkan\" ; inline comment\n"
+        "[Reconstruction]\nSharpeningStrength = 1.75\nEnableCameraMotionFallback = true\n");
     CHECK(ConfigManager::Get().Load(dir / "hardened.ini"));
     CHECK(ConfigManager::Get().GetConfig().targetWidth == 7680); // clamped to kMaxTargetWidth
     CHECK(ConfigManager::Get().GetConfig().preferredApi == GraphicsApi::Vulkan);
+    CHECK(ConfigManager::Get().GetConfig().sharpeningStrength == 1.0f); // clamped to [0.0, 1.0]
+    CHECK(ConfigManager::Get().GetConfig().enableCameraMotionFallback);
+    ConfigManager::Get().Modify([](CBRConfig& cfg) {
+        cfg.sharpeningStrength = 0.0f;
+        cfg.enableCameraMotionFallback = false;
+    });
 }
 
 static void TestConfigMissingFileAndRoundTrip(const fs::path& dir) {
@@ -137,6 +147,8 @@ static void TestConfigMissingFileAndRoundTrip(const fs::path& dir) {
     CHECK(after.samplingStrategy == before.samplingStrategy);
     CHECK(after.depthConvention == before.depthConvention);
     CHECK(after.depthNear == before.depthNear && after.depthFar == before.depthFar);
+    CHECK(after.sharpeningStrength == before.sharpeningStrength);
+    CHECK(after.enableCameraMotionFallback == before.enableCameraMotionFallback);
 
     // Verify thread-safe Modify callback executes and commits successfully
     ConfigManager::Get().Modify([](CBRConfig& cfg) {
@@ -219,6 +231,31 @@ static void TestJitter() {
 
     // Non-aliased output leaves the unjittered source untouched
     for (int i = 0; i < 16; ++i) CHECK(orig[i] == snapshot[i]);
+
+    // Item H-01 regression: repeated per-frame ApplyJitterToProjection + alternating frames must not drift
+    float persistent[16];
+    std::copy(orig, orig + 16, persistent);
+    j.Initialize(3840, 2160);
+    for (uint32_t frame = 0; frame < 200; ++frame) {
+        j.Update(frame);
+        const JitterOffset beforeDup = j.GetJitterDelta();
+        j.ApplyJitterToProjection(persistent, true);
+        // Duplicate Update/Apply in the same frame (repeated OnBeginFrame calls)
+        j.Update(frame);
+        CHECK(std::fabs(j.GetJitterDelta().x - beforeDup.x) < 1e-12f);
+        CHECK(j.IsProjectionJitterApplied(persistent, frame, true));
+        j.ApplyJitterToProjection(persistent, true);
+
+        const float expectedDx = (frame & 1u) ? (2.0f / 3840.0f) : 0.0f;
+        CHECK(std::fabs(persistent[8] - (orig[8] + expectedDx)) < 1e-7f);
+        CHECK(std::fabs(persistent[9] - orig[9]) < 1e-7f);
+    }
+
+    // Engine overwriting the matrix cleanly back to unjittered values must refresh base instead of subtracting stale offset
+    std::copy(orig, orig + 16, persistent);
+    j.Update(2);
+    j.ApplyJitterToProjection(persistent, true);
+    CHECK(std::fabs(persistent[8] - orig[8]) < 1e-7f);
 }
 
 // Geometric simulation of 2x MSAA checkerboard coverage, driven by the REAL JitterManager output.
@@ -427,12 +464,25 @@ static void TestRenderTargets() {
     CHECK(r.GetTotalAllocatedVramBytes() == 78796800u);
     r.Initialize(3840, 2160);
 
+    CHECK(r.GetDimensions().quarterWidth == (3840u >> 1) && r.GetDimensions().quarterHeight == (2160u >> 1));
     CHECK(r.IsTargetInterceptCandidate(3840, 2160, 0));
     CHECK(!r.IsTargetInterceptCandidate(1920, 1080, 0));
 
     CHECK(r.GetCurrentHistoryIndex() == 0 && r.GetPreviousHistoryIndex() == 1);
-    r.SwapHistoryBuffers();
-    CHECK(r.GetCurrentHistoryIndex() == 1 && r.GetPreviousHistoryIndex() == 0);
+    {
+        // Frame 0..2 ping-pong contract matching DispatchVulkan + SwapHistoryBuffers + Step 3 blit (Item C-02):
+        // Before swap: readIdx = GetCurrentHistoryIndex(), writeIdx = 1 - readIdx.
+        // After SwapHistoryBuffers(): GetCurrentHistoryIndex() equals the just-written writeIdx.
+        for (uint32_t frame = 0; frame < 3; ++frame) {
+            const uint32_t activeSetIdx = r.GetCurrentHistoryIndex() & 1u;
+            const uint32_t readIdx = activeSetIdx;
+            const uint32_t writeIdx = 1u - activeSetIdx;
+            CHECK(readIdx != writeIdx);
+            r.SwapHistoryBuffers();
+            const uint32_t justWrittenAfterSwap = r.GetCurrentHistoryIndex() & 1u;
+            CHECK(justWrittenAfterSwap == writeIdx);
+        }
+    }
     r.ResetHistory();
 
     // Vulkan resource lifecycle sanity checks
@@ -441,6 +491,51 @@ static void TestRenderTargets() {
     r.DestroyVulkanResources();
     CHECK(!r.AreVulkanResourcesCreated());
     CHECK(r.GetCurrentHistoryIndex() == 0);
+    CHECK(r.GetVulkanResources().historyColor[0].currentLayout == 0);
+    CHECK(r.GetVulkanResources().historyDepth[0].aspectMask == 1);
+    r.SetVulkanImageLayout(nullptr, 5);
+    CHECK(r.GetVulkanImageLayout(nullptr) == 0);
+
+    // C-01 / C-04 Vulkan attachment & blit safety checks
+    CHECK(RenderTargetManager::IsVulkanDepthFormat(126));  // D32_SFLOAT
+    CHECK(RenderTargetManager::IsVulkanDepthFormat(129));  // D24_UNORM_S8_UINT
+    CHECK(!RenderTargetManager::IsVulkanDepthFormat(97));  // R16G16B16A16_SFLOAT
+    CHECK(RenderTargetManager::IsDepthCopyFormatCompatible(100, 100));
+    CHECK(!RenderTargetManager::IsDepthCopyFormatCompatible(126, 100)); // depth -> color copy disallowed
+
+    r.Initialize(3840, 2160);
+    const VulkanImageMetadata validColor{ 3840, 2160, 97, 2, 0x10 };
+    const VulkanImageMetadata color32bpp{ 3840, 2160, 37, 2, 0x10 };
+    const VulkanImageMetadata singleSampleColor{ 3840, 2160, 97, 1, 0x10 };
+    const VulkanImageMetadata depthMetaDst{ 3840, 2160, 126, 1, 0x20 };
+    const VulkanImageMetadata tooSmallColor{ 960, 540, 97, 2, 0x10 };
+    const VulkanImageMetadata validVel{ 1920, 1080, 97, 1, 0x10 };
+    CHECK(RenderTargetManager::IsColorCopyFormatCompatible(97, 97));
+    CHECK(RenderTargetManager::IsColorCopyFormatCompatible(103, 97));  // 64bpp R32G32_SFLOAT -> RGBA16F
+    CHECK(!RenderTargetManager::IsColorCopyFormatCompatible(37, 97));  // 32bpp RGBA8 -> 64bpp RGBA16F disallowed
+    CHECK(r.CanCopyToQuarterColor(validColor));
+    CHECK(!r.CanCopyToQuarterColor(color32bpp));
+    CHECK(!r.CanCopyToQuarterColor(singleSampleColor));
+    CHECK(!r.CanCopyToQuarterColor(tooSmallColor));
+    CHECK(r.CanCopyToVelocity(validVel));
+    CHECK(!r.CanCopyToVelocity(validColor)); // 2x samples != 1x velocity buffer
+
+    const int fakeImg = 1;
+    CHECK(r.ShouldBlitReconstructionToSceneColor(&fakeImg, false, 3840, 2160));
+    CHECK(r.ShouldBlitReconstructionToSceneColor(&fakeImg, false, 3840, 2160, singleSampleColor));
+    CHECK(!r.ShouldBlitReconstructionToSceneColor(&fakeImg, false, 3840, 2160, validColor));    // 2x MSAA blit dst invalid (C-04)
+    CHECK(!r.ShouldBlitReconstructionToSceneColor(&fakeImg, false, 3840, 2160, depthMetaDst));  // depth dst invalid (C-04)
+    CHECK(!r.ShouldBlitReconstructionToSceneColor(&fakeImg, true, 3840, 2160));                 // never blit swapchain mid-frame (C-04)
+    CHECK(!r.ShouldBlitReconstructionToSceneColor(&fakeImg, false, 1920, 1080));                // never downsample into quarter-res pass
+    CHECK(!r.ShouldBlitReconstructionToSceneColor(nullptr, false, 3840, 2160));
+
+    // DX12 resource lifecycle sanity checks (Item H-02)
+    CHECK(!r.AreDX12ResourcesCreated());
+    CHECK(!r.CreateDX12Resources(nullptr));
+    r.DestroyDX12Resources();
+    CHECK(!r.AreDX12ResourcesCreated());
+    r.SetDX12ResourceState(nullptr, 0x40);
+    CHECK(r.GetDX12ResourceState(nullptr) == 0);
 }
 
 static void TestPushConstantLayout() {
@@ -515,12 +610,63 @@ static void TestReconstructionPass(const fs::path& dir) {
     CHECK(pass.InitializeVulkan(nullptr, nullptr));
     CHECK(pass.IsInitialized());
 
-    // 4. Safe dispatch, barrier transition, and blit with null command buffer
+    // 4. Safe dispatch, barrier transition, copy, and blit with null command buffer
+    pass.ResetLayoutTransitions();
+    pass.EnsureInitialLayoutsTransitioned(nullptr);
     pass.DispatchVulkan(nullptr, 0);
     pass.TransitionImageLayout(nullptr, nullptr, 0, 1, 0, 0, 0, 0);
-    pass.BlitToImage(nullptr, nullptr, nullptr, 1920, 1080, 3840, 2160);
+    pass.CopyImageRegion(nullptr, nullptr, nullptr, 0, 0, 0, 0, 1920, 1080, 1, 2, 5, 2, 5, 1);
+    pass.BlitToImage(nullptr, nullptr, nullptr, 1920, 1080, 3840, 2160, 2, 1, 2);
 
-    // 5. Clean shutdown
+    // 5. Camera UBO layout, matrix inversion & RCAS uniform propagation (Sections 5.4 & 5.6)
+    CHECK(sizeof(CBRCameraUniforms) == 144);
+    pass.ClearCameraMatrices();
+    ConfigManager::Get().Modify([](CBRConfig& c) {
+        c.sharpeningStrength = 0.65f;
+        c.enableCameraMotionFallback = true;
+    });
+    const CBRCameraUniforms uEmpty = pass.BuildCameraUniforms();
+    CHECK(std::fabs(uEmpty.sharpeningStrength - 0.65f) < 1e-6f);
+    CHECK(uEmpty.enableCameraFallback == 1u);
+    CHECK(uEmpty.hasCameraMatrices == 0u);
+
+    const float singularMat[16] = {};
+    float singularOut[16]{};
+    CHECK(!ReconstructionPass::InvertMatrix4x4(singularMat, singularOut));
+
+    // Invertible non-trivial column-major 4x4 projection/view matrix
+    const float matA[16] = {
+        2.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 2.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 0.5f, 1.0f,
+        1.0f, -0.5f, 0.25f, 1.0f
+    };
+    float invA[16]{};
+    CHECK(ReconstructionPass::InvertMatrix4x4(matA, invA));
+    for (int col = 0; col < 4; ++col) {
+        for (int row = 0; row < 4; ++row) {
+            float dot = 0.0f;
+            for (int k = 0; k < 4; ++k) {
+                dot += matA[k * 4 + row] * invA[col * 4 + k];
+            }
+            const float expected = (row == col) ? 1.0f : 0.0f;
+            CHECK(std::fabs(dot - expected) < 1e-5f);
+        }
+    }
+
+    CHECK(pass.SetCameraMatrices(matA));
+    const CBRCameraUniforms uSet = pass.BuildCameraUniforms();
+    CHECK(uSet.hasCameraMatrices == 1u);
+    CHECK(std::fabs(uSet.currViewProjInv[0] - invA[0]) < 1e-6f);
+    CHECK(std::fabs(uSet.prevViewProj[12] - matA[12]) < 1e-6f);
+    pass.ClearCameraMatrices();
+    CHECK(pass.BuildCameraUniforms().hasCameraMatrices == 0u);
+    ConfigManager::Get().Modify([](CBRConfig& c) {
+        c.sharpeningStrength = 0.0f;
+        c.enableCameraMotionFallback = false;
+    });
+
+    // 6. Clean shutdown
     pass.Shutdown();
     CHECK(!pass.IsInitialized());
     CHECK(pass.GetDescriptorSetLayout() == nullptr);

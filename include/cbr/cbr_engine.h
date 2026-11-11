@@ -42,8 +42,9 @@ public:
         return cmdBuffer != nullptr && m_activeCandidateCmdBuffer.load() == cmdBuffer;
     }
 
-    // Scans loaded process modules for known anti-cheat or online multiplayer binaries
+    // Scans loaded process modules and launch command line for known anti-cheat or online multiplayer binaries/flags
     bool CheckAntiCheatModules() const;
+    static bool HasDisallowedCommandLineArgs(const wchar_t* commandLine);
 
     uint32_t    GetCurrentFrameIndex() const { return m_frameIndex.load(); }
     bool        IsEnabled() const { return m_enabled.load(); }
@@ -53,6 +54,7 @@ public:
 
     // Performance metrics
     float GetLastReconstructionDurationMs() const { return m_lastReconDurationMs.load(); }
+    void  SetLastReconstructionDurationMs(float durationMs) { m_lastReconDurationMs.store(durationMs); }
 
     CBRConfig GetCachedFrameConfig() const {
         std::lock_guard<std::mutex> lock(m_frameConfigMutex);

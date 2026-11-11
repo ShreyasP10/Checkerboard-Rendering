@@ -1,9 +1,14 @@
 #include "cbr/hooks.h"
 #include <atomic>
 #include <cstring>
+#include <mutex>
+#include <vector>
 #include <MinHook.h>
 #include "cbr/cbr_engine.h"
+#include "cbr/jitter_manager.h"
 #include "cbr/logger.h"
+#include "cbr/pattern_scanner.h"
+#include "cbr/reconstruction_pass.h"
 #include "cbr/render_target_manager.h"
 
 #if defined(_WIN32)
@@ -18,15 +23,97 @@ namespace {
 typedef long (__stdcall *PFN_D3D12Present)(void* swapChain, unsigned int syncInterval, unsigned int flags);
 typedef long (__stdcall *PFN_D3D12Present1)(void* swapChain, unsigned int syncInterval, unsigned int flags, const void* pPresentParameters);
 typedef long (__stdcall *PFN_D3D12ResizeBuffers)(void* swapChain, unsigned int bufferCount, unsigned int width, unsigned int height, unsigned int newFormat, unsigned int swapChainFlags);
+typedef void (__stdcall *PFN_D3D12ExecuteCommandLists)(void* commandQueue, unsigned int numCommandLists, void* const* ppCommandLists);
+typedef void (__stdcall *PFN_D3D12RSSetViewports)(void* commandList, unsigned int numViewports, const void* pViewports);
+typedef void (__stdcall *PFN_D3D12RSSetScissorRects)(void* commandList, unsigned int numRects, const void* pRects);
+typedef void (__stdcall *PFN_D3D12OMSetRenderTargets)(void* commandList, unsigned int numRTDescriptors, const void* pRTDescriptors, int rtsSingleHandleToRange, const void* pDepthDescriptor);
+typedef void (__stdcall *PFN_D3D12DrawInstanced)(void* commandList, unsigned int vertexCount, unsigned int instanceCount, unsigned int startVertex, unsigned int startInstance);
+typedef void (__stdcall *PFN_D3D12DrawIndexedInstanced)(void* commandList, unsigned int indexCount, unsigned int instanceCount, unsigned int startIndex, int baseVertex, unsigned int startInstance);
 
-PFN_D3D12Present       g_Original_D3D12Present = nullptr;
-PFN_D3D12Present1      g_Original_D3D12Present1 = nullptr;
-PFN_D3D12ResizeBuffers g_Original_D3D12ResizeBuffers = nullptr;
-void*                  g_HookedPresentTarget = nullptr;
-void*                  g_HookedPresent1Target = nullptr;
-void*                  g_HookedResizeBuffersTarget = nullptr;
+PFN_D3D12Present              g_Original_D3D12Present = nullptr;
+PFN_D3D12Present1             g_Original_D3D12Present1 = nullptr;
+PFN_D3D12ResizeBuffers        g_Original_D3D12ResizeBuffers = nullptr;
+PFN_D3D12ExecuteCommandLists  g_Original_D3D12ExecuteCommandLists = nullptr;
+PFN_D3D12RSSetViewports       g_Original_D3D12RSSetViewports = nullptr;
+PFN_D3D12RSSetScissorRects    g_Original_D3D12RSSetScissorRects = nullptr;
+PFN_D3D12OMSetRenderTargets   g_Original_D3D12OMSetRenderTargets = nullptr;
+PFN_D3D12DrawInstanced        g_Original_D3D12DrawInstanced = nullptr;
+PFN_D3D12DrawIndexedInstanced g_Original_D3D12DrawIndexedInstanced = nullptr;
+
+std::mutex         g_dx12HookMutex;
+std::vector<void*> g_HookedDX12Targets;
+std::atomic<void*> g_liveD3D12Device{ nullptr };
 
 constexpr long kHResultFail = static_cast<long>(0x80004005u); // E_FAIL
+
+#if defined(_WIN32)
+struct MinimalD3D12Viewport {
+    float TopLeftX;
+    float TopLeftY;
+    float Width;
+    float Height;
+    float MinDepth;
+    float MaxDepth;
+};
+static_assert(sizeof(MinimalD3D12Viewport) == 24, "D3D12_VIEWPORT size mismatch");
+
+struct MinimalD3D12Rect {
+    int32_t left;
+    int32_t top;
+    int32_t right;
+    int32_t bottom;
+};
+static_assert(sizeof(MinimalD3D12Rect) == 16, "D3D12_RECT size mismatch");
+
+struct DX12CmdListSlot {
+    std::atomic<void*>    cmdList{ nullptr };
+    std::atomic<bool>     viewportDownscaled{ false };
+    std::atomic<uint32_t> drawCount{ 0 };
+};
+
+constexpr size_t kMaxDX12Slots = 64;
+static DX12CmdListSlot g_dx12Slots[kMaxDX12Slots];
+
+inline DX12CmdListSlot* GetOrCreateDX12Slot(void* cmdList) {
+    if (!cmdList) return nullptr;
+    const size_t start = (reinterpret_cast<uintptr_t>(cmdList) >> 4) % kMaxDX12Slots;
+    for (size_t i = 0; i < 8; ++i) {
+        size_t idx = (start + i) % kMaxDX12Slots;
+        if (g_dx12Slots[idx].cmdList.load(std::memory_order_relaxed) == cmdList) {
+            return &g_dx12Slots[idx];
+        }
+    }
+    for (size_t i = 0; i < 8; ++i) {
+        size_t idx = (start + i) % kMaxDX12Slots;
+        void* expected = nullptr;
+        if (g_dx12Slots[idx].cmdList.compare_exchange_strong(expected, cmdList, std::memory_order_acq_rel)) {
+            return &g_dx12Slots[idx];
+        }
+    }
+    return nullptr;
+}
+
+inline DX12CmdListSlot* FindDX12Slot(void* cmdList) {
+    if (!cmdList) return nullptr;
+    const size_t start = (reinterpret_cast<uintptr_t>(cmdList) >> 4) % kMaxDX12Slots;
+    for (size_t i = 0; i < 8; ++i) {
+        size_t idx = (start + i) % kMaxDX12Slots;
+        if (g_dx12Slots[idx].cmdList.load(std::memory_order_relaxed) == cmdList) {
+            return &g_dx12Slots[idx];
+        }
+    }
+    return nullptr;
+}
+
+inline void ReleaseDX12Slot(void* cmdList) {
+    DX12CmdListSlot* slot = FindDX12Slot(cmdList);
+    if (slot) {
+        slot->viewportDownscaled.store(false, std::memory_order_relaxed);
+        slot->drawCount.store(0, std::memory_order_relaxed);
+        slot->cmdList.store(nullptr, std::memory_order_release);
+    }
+}
+#endif
 
 long __stdcall Hooked_D3D12Present(void* swapChain, unsigned int syncInterval, unsigned int flags) {
     if (!g_Original_D3D12Present) {
@@ -141,6 +228,149 @@ inline ULONG ReleaseCom(void* obj) {
     if (!vmt || !vmt[2]) return 0;
     return reinterpret_cast<PFN_Release>(vmt[2])(obj);
 }
+
+void __stdcall Hooked_D3D12ExecuteCommandLists(void* commandQueue, unsigned int numCommandLists, void* const* ppCommandLists) {
+    if (commandQueue && CBREngine::Get().IsEnabled()) {
+        try {
+            // Capture the live ID3D12Device from the game's command queue on first execution (Item H-02)
+            static const GUID kIID_ID3D12Device =
+                { 0x189819f1, 0x1db6, 0x4b57, { 0xbe, 0x54, 0x18, 0x21, 0x33, 0x9b, 0x85, 0xf7 } };
+            void* liveDev = nullptr;
+            typedef HRESULT (__stdcall *PFN_GetDevice)(void*, const GUID*, void**);
+            if (SUCCEEDED(CallVmt<PFN_GetDevice>(commandQueue, 7, &kIID_ID3D12Device, &liveDev)) && liveDev) {
+                void* prevDev = g_liveD3D12Device.load(std::memory_order_acquire);
+                if (prevDev != liveDev || !RenderTargetManager::Get().AreDX12ResourcesCreated()) {
+                    if (g_liveD3D12Device.exchange(liveDev, std::memory_order_acq_rel) != liveDev ||
+                        !RenderTargetManager::Get().AreDX12ResourcesCreated()) {
+                        if (RenderTargetManager::Get().CreateDX12Resources(liveDev)) {
+                            ReconstructionPass::Get().InitializeDX12(liveDev);
+                        }
+                    }
+                }
+                ReleaseCom(liveDev);
+            }
+
+            if (ppCommandLists && numCommandLists > 0) {
+                for (unsigned int i = 0; i < numCommandLists; ++i) {
+                    ReleaseDX12Slot(ppCommandLists[i]);
+                }
+            }
+        } catch (...) {
+        }
+    }
+
+    if (g_Original_D3D12ExecuteCommandLists) {
+        g_Original_D3D12ExecuteCommandLists(commandQueue, numCommandLists, ppCommandLists);
+    }
+}
+
+void __stdcall Hooked_D3D12RSSetViewports(void* commandList, unsigned int numViewports, const void* pViewports) {
+    if (!g_Original_D3D12RSSetViewports) return;
+
+    if (!pViewports || numViewports == 0 || !CBREngine::Get().IsEnabled()) {
+        g_Original_D3D12RSSetViewports(commandList, numViewports, pViewports);
+        return;
+    }
+
+    MinimalD3D12Viewport firstVp{};
+    std::memcpy(&firstVp, pViewports, sizeof(firstVp));
+    const auto dims = RenderTargetManager::Get().GetDimensions();
+    if (numViewports == 1 && RenderTargetManager::Get().IsTargetInterceptCandidate(
+            static_cast<uint32_t>(firstVp.Width),
+            static_cast<uint32_t>(firstVp.Height),
+            0)) {
+        const auto config = CBREngine::Get().GetCachedFrameConfig();
+        const uint32_t currentFrame = CBREngine::Get().GetCurrentFrameIndex();
+        if (config.samplingStrategy == SamplingStrategy::StrategyA && config.jitterDirection != 0) {
+            PatternScanner::UpdateCameraJitter(currentFrame, false);
+        }
+
+        DX12CmdListSlot* slot = GetOrCreateDX12Slot(commandList);
+        if (slot) {
+            slot->viewportDownscaled.store(true, std::memory_order_release);
+        }
+
+        firstVp.Width = static_cast<float>(dims.quarterWidth);
+        firstVp.Height = static_cast<float>(dims.quarterHeight);
+        if (config.samplingStrategy == SamplingStrategy::StrategyA &&
+            config.jitterDirection != 0 &&
+            PatternScanner::GetCameraProjectionMatrix() == nullptr) {
+            firstVp.TopLeftX += JitterManager::Get().GetQuarterViewportShiftX(currentFrame);
+        }
+
+        g_Original_D3D12RSSetViewports(commandList, 1, &firstVp);
+        return;
+    }
+
+    g_Original_D3D12RSSetViewports(commandList, numViewports, pViewports);
+}
+
+void __stdcall Hooked_D3D12RSSetScissorRects(void* commandList, unsigned int numRects, const void* pRects) {
+    if (!g_Original_D3D12RSSetScissorRects) return;
+
+    if (!pRects || numRects == 0 || !CBREngine::Get().IsEnabled()) {
+        g_Original_D3D12RSSetScissorRects(commandList, numRects, pRects);
+        return;
+    }
+
+    MinimalD3D12Rect firstRect{};
+    std::memcpy(&firstRect, pRects, sizeof(firstRect));
+    const uint32_t width = (firstRect.right > firstRect.left) ? static_cast<uint32_t>(firstRect.right - firstRect.left) : 0u;
+    const uint32_t height = (firstRect.bottom > firstRect.top) ? static_cast<uint32_t>(firstRect.bottom - firstRect.top) : 0u;
+    const auto dims = RenderTargetManager::Get().GetDimensions();
+    if (numRects == 1 && RenderTargetManager::Get().IsTargetInterceptCandidate(width, height, 0)) {
+        firstRect.right = firstRect.left + static_cast<int32_t>(dims.quarterWidth);
+        firstRect.bottom = firstRect.top + static_cast<int32_t>(dims.quarterHeight);
+        g_Original_D3D12RSSetScissorRects(commandList, 1, &firstRect);
+        return;
+    }
+
+    g_Original_D3D12RSSetScissorRects(commandList, numRects, pRects);
+}
+
+void __stdcall Hooked_D3D12OMSetRenderTargets(void* commandList, unsigned int numRTDescriptors, const void* pRTDescriptors, int rtsSingleHandleToRange, const void* pDepthDescriptor) {
+    if (CBREngine::Get().IsEnabled() && commandList) {
+        try {
+            // If an intercepted scene pass just finished drawing on this open command list and is now switching targets,
+            // inject CBR compute reconstruction before downstream post-processing / UI targets bind (Item H-02).
+            DX12CmdListSlot* slot = FindDX12Slot(commandList);
+            if (slot && slot->viewportDownscaled.load(std::memory_order_acquire) &&
+                slot->drawCount.load(std::memory_order_acquire) >= 250u) {
+                CBREngine::Get().OnScenePassEnd(commandList);
+                ReleaseDX12Slot(commandList);
+            }
+        } catch (...) {
+        }
+    }
+
+    if (g_Original_D3D12OMSetRenderTargets) {
+        g_Original_D3D12OMSetRenderTargets(commandList, numRTDescriptors, pRTDescriptors, rtsSingleHandleToRange, pDepthDescriptor);
+    }
+}
+
+void __stdcall Hooked_D3D12DrawInstanced(void* commandList, unsigned int vertexCount, unsigned int instanceCount, unsigned int startVertex, unsigned int startInstance) {
+    if (CBREngine::Get().IsEnabled()) {
+        DX12CmdListSlot* slot = FindDX12Slot(commandList);
+        if (slot) {
+            slot->drawCount.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    if (g_Original_D3D12DrawInstanced) {
+        g_Original_D3D12DrawInstanced(commandList, vertexCount, instanceCount, startVertex, startInstance);
+    }
+}
+
+void __stdcall Hooked_D3D12DrawIndexedInstanced(void* commandList, unsigned int indexCount, unsigned int instanceCount, unsigned int startIndex, int baseVertex, unsigned int startInstance) {
+    if (CBREngine::Get().IsEnabled()) {
+        DX12CmdListSlot* slot = FindDX12Slot(commandList);
+        if (slot) {
+            slot->drawCount.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    if (g_Original_D3D12DrawIndexedInstanced) {
+        g_Original_D3D12DrawIndexedInstanced(commandList, indexCount, instanceCount, startIndex, baseVertex, startInstance);
+    }
+}
 #endif
 
 } // namespace
@@ -157,7 +387,6 @@ bool HookManager::InstallDX12Hooks() {
         }
         return false;
     }
-
 
     MH_STATUS mhStatus = MH_OK;
 
@@ -188,11 +417,15 @@ bool HookManager::InstallDX12Hooks() {
         return false;
     }
 
-    static const GUID kIID_ID3D12Device = 
+    static const GUID kIID_ID3D12Device =
         { 0x189819f1, 0x1db6, 0x4b57, { 0xbe, 0x54, 0x18, 0x21, 0x33, 0x9b, 0x85, 0xf7 } };
-    static const GUID kIID_ID3D12CommandQueue = 
+    static const GUID kIID_ID3D12CommandQueue =
         { 0x0ec870a6, 0x5d7e, 0x4c22, { 0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed } };
-    static const GUID kIID_IDXGIFactory1 = 
+    static const GUID kIID_ID3D12CommandAllocator =
+        { 0x6102dee4, 0xaf59, 0x4b09, { 0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24 } };
+    static const GUID kIID_ID3D12GraphicsCommandList =
+        { 0x5b160d0f, 0xac1b, 0x4185, { 0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55 } };
+    static const GUID kIID_IDXGIFactory1 =
         { 0x770aae78, 0xf26f, 0x4dba, { 0xa8, 0x29, 0x25, 0x3c, 0x83, 0xd1, 0xb3, 0x87 } };
 
     void* d3d12Device = nullptr;
@@ -209,6 +442,18 @@ bool HookManager::InstallDX12Hooks() {
     queueDesc.Type = 0; // D3D12_COMMAND_LIST_TYPE_DIRECT
     void* cmdQueue = nullptr;
     hr = CallVmt<PFN_CreateCommandQueue>(d3d12Device, 8, &queueDesc, kIID_ID3D12CommandQueue, &cmdQueue);
+
+    // Create temporary allocator & graphics command list for VMT hooking (Item H-02)
+    typedef HRESULT (__stdcall *PFN_CreateCommandAllocator)(void*, unsigned int, REFIID, void**);
+    typedef HRESULT (__stdcall *PFN_CreateCommandList)(void*, unsigned int, unsigned int, void*, void*, REFIID, void**);
+    void* cmdAllocator = nullptr;
+    void* cmdList = nullptr;
+    if (SUCCEEDED(CallVmt<PFN_CreateCommandAllocator>(d3d12Device, 9, 0u, kIID_ID3D12CommandAllocator, &cmdAllocator)) && cmdAllocator) {
+        if (SUCCEEDED(CallVmt<PFN_CreateCommandList>(d3d12Device, 12, 0u, 0u, cmdAllocator, nullptr, kIID_ID3D12GraphicsCommandList, &cmdList)) && cmdList) {
+            typedef HRESULT (__stdcall *PFN_CloseCmdList)(void*);
+            CallVmt<PFN_CloseCmdList>(cmdList, 9);
+        }
+    }
 
     void* dxgiFactory = nullptr;
     hr = pfnCreateDXGIFactory1(kIID_IDXGIFactory1, &dxgiFactory);
@@ -231,49 +476,52 @@ bool HookManager::InstallDX12Hooks() {
         hr = CallVmt<PFN_CreateSwapChain>(dxgiFactory, 10, cmdQueue, &scDesc, &swapChain);
     }
 
+    auto installVmtHook = [&](void* target, void* detour, void** original, const char* name) -> bool {
+        if (!target) return false;
+        mhStatus = MH_CreateHook(target, detour, original);
+        if (mhStatus == MH_OK || mhStatus == MH_ERROR_ALREADY_CREATED) {
+            MH_EnableHook(target);
+            std::lock_guard<std::mutex> lock(g_dx12HookMutex);
+            g_HookedDX12Targets.push_back(target);
+            CBR_LOG_INFO("MinHook: Successfully detoured %s (at 0x%p).", name, target);
+            return true;
+        }
+        return false;
+    };
+
     bool hooked = false;
     if (SUCCEEDED(hr) && swapChain) {
         void** swapChainVmt = *reinterpret_cast<void***>(swapChain);
-        void* pfnPresent = swapChainVmt[8]; // IDXGISwapChain::Present
-        void* pfnResize = swapChainVmt[13]; // IDXGISwapChain::ResizeBuffers
+        hooked |= installVmtHook(swapChainVmt[8],  reinterpret_cast<LPVOID>(&Hooked_D3D12Present),       reinterpret_cast<LPVOID*>(&g_Original_D3D12Present),       "IDXGISwapChain::Present[8]");
+        hooked |= installVmtHook(swapChainVmt[22], reinterpret_cast<LPVOID>(&Hooked_D3D12Present1),      reinterpret_cast<LPVOID*>(&g_Original_D3D12Present1),      "IDXGISwapChain1::Present1[22]");
+        installVmtHook(swapChainVmt[13],           reinterpret_cast<LPVOID>(&Hooked_D3D12ResizeBuffers), reinterpret_cast<LPVOID*>(&g_Original_D3D12ResizeBuffers), "IDXGISwapChain::ResizeBuffers[13]");
+    }
 
-        if (pfnPresent) {
-            mhStatus = MH_CreateHook(pfnPresent, reinterpret_cast<LPVOID>(&Hooked_D3D12Present), reinterpret_cast<LPVOID*>(&g_Original_D3D12Present));
-            if (mhStatus == MH_OK || mhStatus == MH_ERROR_ALREADY_CREATED) {
-                MH_EnableHook(pfnPresent);
-                g_HookedPresentTarget = pfnPresent;
-                hooked = true;
-                CBR_LOG_INFO("MinHook: Successfully detoured D3D12/DXGI Present (VMT[8] at 0x%p).", pfnPresent);
-            }
+    if (cmdQueue) {
+        void** queueVmt = *reinterpret_cast<void***>(cmdQueue);
+        if (queueVmt) {
+            installVmtHook(queueVmt[10], reinterpret_cast<LPVOID>(&Hooked_D3D12ExecuteCommandLists), reinterpret_cast<LPVOID*>(&g_Original_D3D12ExecuteCommandLists), "ID3D12CommandQueue::ExecuteCommandLists[10]");
         }
+    }
 
-        // VMT index 22 on IDXGISwapChain1: Present1
-        void* pfnPresent1 = swapChainVmt[22];
-        if (pfnPresent1) {
-            mhStatus = MH_CreateHook(pfnPresent1, reinterpret_cast<LPVOID>(&Hooked_D3D12Present1), reinterpret_cast<LPVOID*>(&g_Original_D3D12Present1));
-            if (mhStatus == MH_OK || mhStatus == MH_ERROR_ALREADY_CREATED) {
-                MH_EnableHook(pfnPresent1);
-                g_HookedPresent1Target = pfnPresent1;
-                hooked = true;
-                CBR_LOG_INFO("MinHook: Successfully detoured D3D12/DXGI Present1 (VMT[22] at 0x%p).", pfnPresent1);
-            }
-        }
-
-        if (pfnResize) {
-            mhStatus = MH_CreateHook(pfnResize, reinterpret_cast<LPVOID>(&Hooked_D3D12ResizeBuffers), reinterpret_cast<LPVOID*>(&g_Original_D3D12ResizeBuffers));
-            if (mhStatus == MH_OK || mhStatus == MH_ERROR_ALREADY_CREATED) {
-                MH_EnableHook(pfnResize);
-                g_HookedResizeBuffersTarget = pfnResize;
-                CBR_LOG_INFO("MinHook: Successfully detoured D3D12/DXGI ResizeBuffers (VMT[13] at 0x%p).", pfnResize);
-            }
+    if (cmdList) {
+        void** listVmt = *reinterpret_cast<void***>(cmdList);
+        if (listVmt) {
+            installVmtHook(listVmt[12], reinterpret_cast<LPVOID>(&Hooked_D3D12DrawInstanced),        reinterpret_cast<LPVOID*>(&g_Original_D3D12DrawInstanced),        "ID3D12GraphicsCommandList::DrawInstanced[12]");
+            installVmtHook(listVmt[13], reinterpret_cast<LPVOID>(&Hooked_D3D12DrawIndexedInstanced), reinterpret_cast<LPVOID*>(&g_Original_D3D12DrawIndexedInstanced), "ID3D12GraphicsCommandList::DrawIndexedInstanced[13]");
+            installVmtHook(listVmt[21], reinterpret_cast<LPVOID>(&Hooked_D3D12RSSetViewports),       reinterpret_cast<LPVOID*>(&g_Original_D3D12RSSetViewports),       "ID3D12GraphicsCommandList::RSSetViewports[21]");
+            installVmtHook(listVmt[22], reinterpret_cast<LPVOID>(&Hooked_D3D12RSSetScissorRects),    reinterpret_cast<LPVOID*>(&g_Original_D3D12RSSetScissorRects),    "ID3D12GraphicsCommandList::RSSetScissorRects[22]");
+            installVmtHook(listVmt[46], reinterpret_cast<LPVOID>(&Hooked_D3D12OMSetRenderTargets),   reinterpret_cast<LPVOID*>(&g_Original_D3D12OMSetRenderTargets),   "ID3D12GraphicsCommandList::OMSetRenderTargets[46]");
         }
     }
 
     // Clean up temporary dummy objects
-    if (swapChain)   ReleaseCom(swapChain);
-    if (dxgiFactory) ReleaseCom(dxgiFactory);
-    if (cmdQueue)    ReleaseCom(cmdQueue);
-    if (d3d12Device) ReleaseCom(d3d12Device);
+    if (cmdList)      ReleaseCom(cmdList);
+    if (cmdAllocator) ReleaseCom(cmdAllocator);
+    if (swapChain)    ReleaseCom(swapChain);
+    if (dxgiFactory)  ReleaseCom(dxgiFactory);
+    if (cmdQueue)     ReleaseCom(cmdQueue);
+    if (d3d12Device)  ReleaseCom(d3d12Device);
     if (dummyHwnd) {
         if (!DestroyWindow(dummyHwnd)) {
             CBR_LOG_WARN("HooksDX12: DestroyWindow on dummy window returned error: %lu (Item 92)", GetLastError());
@@ -300,21 +548,14 @@ bool HookManager::InstallDX12Hooks() {
 void HookManager::UninstallDX12Hooks() {
     if (m_dx12Hooked.load()) {
         CBR_LOG_INFO("Restoring original DXGI/DX12 VMT hooks.");
-        if (g_HookedPresentTarget) {
-            MH_DisableHook(g_HookedPresentTarget);
-            MH_RemoveHook(g_HookedPresentTarget);
-            g_HookedPresentTarget = nullptr;
+        std::lock_guard<std::mutex> lock(g_dx12HookMutex);
+        for (void* target : g_HookedDX12Targets) {
+            if (target) {
+                MH_DisableHook(target);
+                MH_RemoveHook(target);
+            }
         }
-        if (g_HookedPresent1Target) {
-            MH_DisableHook(g_HookedPresent1Target);
-            MH_RemoveHook(g_HookedPresent1Target);
-            g_HookedPresent1Target = nullptr;
-        }
-        if (g_HookedResizeBuffersTarget) {
-            MH_DisableHook(g_HookedResizeBuffersTarget);
-            MH_RemoveHook(g_HookedResizeBuffersTarget);
-            g_HookedResizeBuffersTarget = nullptr;
-        }
+        g_HookedDX12Targets.clear();
         m_dx12Hooked.store(false);
     }
 }

@@ -1,11 +1,10 @@
 #version 450 core
-#extension GL_KHR_shader_subgroup_basic : enable
-#extension GL_KHR_shader_subgroup_quad : enable
 
 /**
  * RDR2 Checkerboard Rendering Mod (CBR) - Quad-Based Reconstruction Compute Shader
  * Architecture: 1 Quad (2x2 = 4 pixels) per thread, 8x8x1 workgroup (256 pixels/group).
- * Improves texture cache hit rate through 2x2 quad spatial locality (CHECKERBOARD.md: 1 Quad per Thread).
+ * Evaluates the 2 active quad samples first and shares their cached color/depth registers directly
+ * with the 2 inactive quad pixels (no subgroup extensions required; Item M-07).
  * Target: Vulkan SPIR-V
  * Author & Co-Owner: Shreyas Pawar
  */
@@ -25,6 +24,15 @@ layout(set = 0, binding = 4) uniform sampler2D   u_Velocity;
 layout(set = 0, binding = 5, rgba16f) writeonly uniform image2D u_OutputImage;
 layout(set = 0, binding = 6, r32f) writeonly uniform image2D u_OutputDepth;
 
+layout(std140, set = 0, binding = 7) uniform CBRCameraData {
+    mat4  u_CurrViewProjInv;
+    mat4  u_PrevViewProj;
+    float u_SharpeningStrength;
+    uint  u_EnableCameraFallback;
+    uint  u_HasCameraMatrices;
+    uint  u_CameraReserved;
+} cam;
+
 // =============================================================================
 // Push Constants
 // =============================================================================
@@ -36,7 +44,7 @@ layout(push_constant) uniform CBRConstants {
     float u_HistoryWeight;          // Temporal blend weight (0.90)
     uint  u_DebugView;              // 0=Normal, 1=Mask, 2=Disocclusion, 3=Motion, 4=Raw
     uint  u_EnableColorClamping;    // 1 = True, 0 = False
-    float u_MipLodBias;             // Texture LOD bias (-1.0 per CHECKERBOARD.md)
+    float u_MipLodBias;             // Retained strictly for 80-byte push-constant ABI parity; sampler LOD bias is enforced CPU-side in Hooked_vkCreateSampler (Item M-01)
     uint  u_ColorSpace;             // 0 = YCoCg clamp, 1 = RGB clamp, 2 = ICtCp clamp (HDR10/BT.2100)
     uint  u_EnableSpatialFallback;  // 1 = cross-bilateral fallback
     vec2  u_JitterDelta;            // Subpixel projection jitter delta
@@ -161,27 +169,36 @@ bool InBounds(ivec2 p, ivec2 size) {
     return p.x >= 0 && p.y >= 0 && p.x < size.x && p.y < size.y;
 }
 
-// Reconstructs a single pixel within the quad
-void ResolvePixel(ivec2 pixelCoord, ivec2 targetSize, uint frameParity) {
+struct QuadActiveSample {
+    ivec2 coord;
+    vec3  color;
+    float depth;
+    float linearDepth;
+};
+
+// Reconstructs a single pixel within the quad, sharing active quad registers across inactive pixels (Item M-07)
+void ResolvePixel(
+    ivec2 pixelCoord,
+    ivec2 targetSize,
+    uint frameParity,
+    bool isCurrentSampleActive,
+    vec3 currentColor,
+    float currentDepth,
+    float currentLinear,
+    bool hasQuadCache,
+    QuadActiveSample quadAct0,
+    QuadActiveSample quadAct1)
+{
     if (!InBounds(pixelCoord, targetSize)) return;
 
     vec2 uv = (vec2(pixelCoord) + 0.5) * pc.u_InvTargetResolution;
     const ivec2 kCardinal[4] = ivec2[](ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1));
 
-    CbrSample self = MapPixelToSample(pixelCoord, frameParity);
-    bool isCurrentSampleActive = self.isActive;
-    vec3 currentColor = vec3(0.0);
-    float currentDepth = 0.0;
-    float currentLinear = 0.0;
-
     ivec2 cardinalCoord[4] = ivec2[](ivec2(0), ivec2(0), ivec2(0), ivec2(0));
     float cardinalDepth[4] = float[](0.0, 0.0, 0.0, 0.0);
+    vec3  cardinalColor[4] = vec3[](vec3(0.0), vec3(0.0), vec3(0.0), vec3(0.0));
 
-    if (isCurrentSampleActive) {
-        currentColor = FetchColor(self);
-        currentDepth = FetchDepth(self);
-        currentLinear = LinearizeDepth(currentDepth);
-    } else {
+    if (!isCurrentSampleActive) {
         float sumRaw = 0.0;
         float sumLin = 0.0;
         float validCount = 0.0;
@@ -190,7 +207,20 @@ void ResolvePixel(ivec2 pixelCoord, ivec2 targetSize, uint frameParity) {
             if (!InBounds(c, targetSize)) c = pixelCoord - kCardinal[i];
             if (!InBounds(c, targetSize)) c = pixelCoord;
             cardinalCoord[i] = c;
-            cardinalDepth[i] = FetchDepth(MapPixelToSample(c, frameParity));
+
+            // Reuse active samples already loaded into registers by the owning quad thread (Item M-07 / H-05)
+            if (hasQuadCache && c == quadAct0.coord) {
+                cardinalDepth[i] = quadAct0.depth;
+                cardinalColor[i] = quadAct0.color;
+            } else if (hasQuadCache && c == quadAct1.coord) {
+                cardinalDepth[i] = quadAct1.depth;
+                cardinalColor[i] = quadAct1.color;
+            } else {
+                CbrSample s = MapPixelToSample(c, frameParity);
+                cardinalDepth[i] = FetchDepth(s);
+                cardinalColor[i] = FetchColor(s);
+            }
+
             float raw = cardinalDepth[i];
             float lin = LinearizeDepth(raw);
             if (!isnan(raw) && !isinf(raw) && !isnan(lin) && !isinf(lin)) {
@@ -229,14 +259,33 @@ void ResolvePixel(ivec2 pixelCoord, ivec2 targetSize, uint frameParity) {
         }
     }
 
-    // Sample velocity: adaptively handle quarter-res or full-res velocity buffers (Item C-05)
-    ivec2 velSize = textureSize(u_Velocity, 0);
-    ivec2 velCoord = (velSize.x < targetSize.x) ? (motionCoord >> 1) : motionCoord;
-    velCoord = clamp(velCoord, ivec2(0), max(velSize - ivec2(1), ivec2(0)));
+    // Point-sample quarter-resolution velocity buffer (targetSize >> 1) with clamped coordinates (Item C-05)
+    ivec2 velCoord = clamp(motionCoord >> 1, ivec2(0), max((targetSize >> 1) - ivec2(1), ivec2(0)));
     vec2 velocity = texelFetch(u_Velocity, velCoord, 0).xy;
     velocity = clamp(velocity, vec2(-0.5), vec2(0.5));
     bool velocityBad = isinf(velocity.x) || isnan(velocity.x) || isinf(velocity.y) || isnan(velocity.y)
         || isinf(uv.x) || isnan(uv.x) || isinf(uv.y) || isnan(uv.y);
+    // Camera-only depth unprojection fallback (Section 5.4)
+    bool velZero = dot(velocity, velocity) < 1e-12;
+    if (cam.u_HasCameraMatrices != 0u &&
+        (cam.u_EnableCameraFallback != 0u || velZero || velocityBad)) {
+        vec4 clipPos = vec4(uv * 2.0 - 1.0, currentDepth, 1.0);
+        vec4 worldH = cam.u_CurrViewProjInv * clipPos;
+        if (!isinf(worldH.w) && !isnan(worldH.w) && abs(worldH.w) > 1e-6) {
+            vec4 worldPos = worldH / worldH.w;
+            vec4 prevClip = cam.u_PrevViewProj * worldPos;
+            if (!isinf(prevClip.w) && !isnan(prevClip.w) && abs(prevClip.w) > 1e-6) {
+                vec2 prevUV = (prevClip.xy / prevClip.w) * 0.5 + 0.5;
+                vec2 camVel = clamp(uv - prevUV, vec2(-0.5), vec2(0.5));
+                if (!isinf(camVel.x) && !isnan(camVel.x) && !isinf(camVel.y) && !isnan(camVel.y)) {
+                    velocity = camVel;
+                    velocityBad = isinf(uv.x) || isnan(uv.x) || isinf(uv.y) || isnan(uv.y);
+                }
+            }
+        }
+    }
+    // JitterCompensation (Item M-08): 0.0 when velocity buffer is unjittered or Strategy A viewport shift is active;
+    // set to 1.0 only if velocity vectors encode the projection jitter delta (verify via RenderDoc).
     // Jitter dampener: dampens jitter compensation on zero-velocity passes (transparent particles, fog, smoke)
     // to prevent half-pixel oscillation when alpha-blended particles lack motion vectors.
     float jitterDampener = (dot(velocity, velocity) < 1e-9) ? 0.0 : 1.0;
@@ -279,16 +328,21 @@ void ResolvePixel(ivec2 pixelCoord, ivec2 targetSize, uint frameParity) {
 
         int numNeighbors = isCurrentSampleActive ? 5 : 4;
         const ivec2 kDiagonal[4] = ivec2[](ivec2(-1, -1), ivec2(1, -1), ivec2(-1, 1), ivec2(1, 1));
-        
+
         for (int i = 0; i < numNeighbors; ++i) {
             ivec2 offset = isCurrentSampleActive ? ((i == 0) ? ivec2(0, 0) : kDiagonal[i - 1]) : kCardinal[i];
             ivec2 nc = pixelCoord + offset;
             if (!InBounds(nc, targetSize)) continue;
-            
-            vec3 c = (isCurrentSampleActive && i == 0)
-                ? ToClampSpace(currentColor)
-                : ToClampSpace(FetchColor(MapPixelToSample(nc, frameParity)));
-            
+
+            vec3 c;
+            if (isCurrentSampleActive && i == 0) {
+                c = ToClampSpace(currentColor);
+            } else if (!isCurrentSampleActive) {
+                c = ToClampSpace(cardinalColor[i]);
+            } else {
+                c = ToClampSpace(FetchColor(MapPixelToSample(nc, frameParity)));
+            }
+
             colorMin = min(colorMin, c);
             colorMax = max(colorMax, c);
             m1 += c;
@@ -329,7 +383,7 @@ void ResolvePixel(ivec2 pixelCoord, ivec2 targetSize, uint frameParity) {
             float accumWeight = 0.0;
 
             for (int i = 0; i < 4 && pc.u_EnableSpatialFallback != 0u; ++i) {
-                vec3 sCol = FetchColor(MapPixelToSample(cardinalCoord[i], frameParity));
+                vec3 sCol = cardinalColor[i];
                 float sLin = LinearizeDepth(cardinalDepth[i]);
                 float depthWeight = exp2((-abs(currentLinear - sLin) / (max(currentLinear, 1e-5) * max(pc.u_DepthTolerance, 1e-4))) * 1.4426950408889634);
                 accumColor += sCol * depthWeight;
@@ -341,21 +395,61 @@ void ResolvePixel(ivec2 pixelCoord, ivec2 targetSize, uint frameParity) {
                 finalColor = accumColor / accumWeight;
                 spatialDepth = accumDepth / accumWeight;
             } else {
-                finalColor = isCurrentSampleActive ? currentColor : (
-                    FetchColor(MapPixelToSample(cardinalCoord[0], frameParity)) +
-                    FetchColor(MapPixelToSample(cardinalCoord[1], frameParity)) +
-                    FetchColor(MapPixelToSample(cardinalCoord[2], frameParity)) +
-                    FetchColor(MapPixelToSample(cardinalCoord[3], frameParity))
-                ) * 0.25;
+                finalColor = isCurrentSampleActive ? currentColor : (cardinalColor[0] + cardinalColor[1] + cardinalColor[2] + cardinalColor[3]) * 0.25;
                 spatialDepth = isCurrentSampleActive ? currentDepth : (cardinalDepth[0] + cardinalDepth[1] + cardinalDepth[2] + cardinalDepth[3]) * 0.25;
             }
         }
     }
 
-    if (isnan(finalColor.r) || isinf(finalColor.r) ||
-        isnan(finalColor.g) || isinf(finalColor.g) ||
-        isnan(finalColor.b) || isinf(finalColor.b)) {
-        finalColor = isCurrentSampleActive ? currentColor : FetchColor(MapPixelToSample(cardinalCoord[0], frameParity));
+    // Guard against NaN/Inf pollution in the temporal feedback loop (Item H-05)
+    if (any(isnan(finalColor)) || any(isinf(finalColor))) {
+        vec3 fallback = isCurrentSampleActive ? currentColor : cardinalColor[0];
+        if (any(isnan(fallback)) || any(isinf(fallback))) {
+            fallback = vec3(0.0);
+        }
+        finalColor = fallback;
+    }
+
+    // 5-tap RCAS contrast-adaptive sharpening (Section 5.6; bypassed when 0.0 or debug overlay active)
+    if (cam.u_SharpeningStrength > 0.0 && pc.u_DebugView == 0u) {
+        vec3 rc0 = cardinalColor[0];
+        vec3 rc1 = cardinalColor[1];
+        vec3 rc2 = cardinalColor[2];
+        vec3 rc3 = cardinalColor[3];
+        if (isCurrentSampleActive) {
+            for (int i = 0; i < 4; ++i) {
+                vec3 sc = finalColor;
+                if (!isDisoccluded && pc.u_FrameIndex > 0u) {
+                    vec2 nUV = clamp(historyUV + vec2(kCardinal[i]) * pc.u_InvTargetResolution, minUV, maxUV);
+                    vec4 hc = textureLod(u_HistoryColor, nUV, 0.0);
+                    if (hc.a >= 0.5 && !any(isnan(hc.rgb)) && !any(isinf(hc.rgb))) {
+                        sc = hc.rgb;
+                    }
+                } else {
+                    ivec2 stepAxis = (i < 2) ? ivec2(kCardinal[i].x, 1) : ivec2(1, kCardinal[i].y);
+                    ivec2 diag = pixelCoord + stepAxis;
+                    if (!InBounds(diag, targetSize)) diag = pixelCoord - stepAxis;
+                    if (InBounds(diag, targetSize)) {
+                        vec3 dc = FetchColor(MapPixelToSample(diag, frameParity));
+                        if (!any(isnan(dc)) && !any(isinf(dc))) sc = dc;
+                    }
+                }
+                if (i == 0) rc0 = sc;
+                else if (i == 1) rc1 = sc;
+                else if (i == 2) rc2 = sc;
+                else rc3 = sc;
+            }
+        }
+        vec3 mn4 = min(min(rc0, rc1), min(rc2, rc3));
+        vec3 mx4 = max(max(rc0, rc1), max(rc2, rc3));
+        vec3 mn5 = min(mn4, finalColor);
+        vec3 mx5 = max(mx4, finalColor);
+        vec3 amp = sqrt(clamp(min(max(mn5, vec3(0.0)), max(mx5 - mn5, vec3(0.0))) / max(mx5, vec3(1e-5)), vec3(0.0), vec3(1.0)));
+        float w = max(-0.1875 * clamp(cam.u_SharpeningStrength, 0.0, 1.0) * min(amp.r, min(amp.g, amp.b)), -0.1875);
+        vec3 sharpened = max((finalColor + w * (rc0 + rc1 + rc2 + rc3)) / max(1.0 + 4.0 * w, 1e-4), vec3(0.0));
+        if (!any(isnan(sharpened)) && !any(isinf(sharpened))) {
+            finalColor = sharpened;
+        }
     }
 
     // Debug visualization modes
@@ -369,19 +463,9 @@ void ResolvePixel(ivec2 pixelCoord, ivec2 targetSize, uint frameParity) {
         float speed = clamp(length(normVel), 0.0, 1.0);
         finalColor = vec3(clamp(normVel * 0.5 + 0.5, 0.0, 1.0), speed);
     } else if (pc.u_DebugView == 4u) {
-        finalColor = isCurrentSampleActive ? currentColor : (
-            FetchColor(MapPixelToSample(cardinalCoord[0], frameParity)) +
-            FetchColor(MapPixelToSample(cardinalCoord[1], frameParity)) +
-            FetchColor(MapPixelToSample(cardinalCoord[2], frameParity)) +
-            FetchColor(MapPixelToSample(cardinalCoord[3], frameParity))
-        ) * 0.25;
+        finalColor = isCurrentSampleActive ? currentColor : (cardinalColor[0] + cardinalColor[1] + cardinalColor[2] + cardinalColor[3]) * 0.25;
     } else if (pc.u_DebugView == 5u) {
-        finalColor = isCurrentSampleActive ? currentColor : (
-            FetchColor(MapPixelToSample(cardinalCoord[0], frameParity)) +
-            FetchColor(MapPixelToSample(cardinalCoord[1], frameParity)) +
-            FetchColor(MapPixelToSample(cardinalCoord[2], frameParity)) +
-            FetchColor(MapPixelToSample(cardinalCoord[3], frameParity))
-        ) * 0.25;
+        finalColor = isCurrentSampleActive ? currentColor : (cardinalColor[0] + cardinalColor[1] + cardinalColor[2] + cardinalColor[3]) * 0.25;
     }
 
     imageStore(u_OutputImage, pixelCoord, vec4(finalColor, 1.0));
@@ -399,13 +483,53 @@ void ResolvePixel(ivec2 pixelCoord, ivec2 targetSize, uint frameParity) {
 }
 
 void main() {
-    // Each thread processes a 2x2 target pixel quad (4 pixels per thread)
+    // Each thread processes a 2x2 target pixel quad (4 pixels per thread).
+    // Evaluate the 2 active pixels first and share their registers with the 2 inactive pixels (Item M-07).
     ivec2 baseCoord = ivec2(gl_GlobalInvocationID.xy) * 2;
     ivec2 targetSize = ivec2(pc.u_TargetResolution);
     uint frameParity = pc.u_FrameIndex & 1u;
 
-    ResolvePixel(baseCoord + ivec2(0, 0), targetSize, frameParity);
-    ResolvePixel(baseCoord + ivec2(1, 0), targetSize, frameParity);
-    ResolvePixel(baseCoord + ivec2(0, 1), targetSize, frameParity);
-    ResolvePixel(baseCoord + ivec2(1, 1), targetSize, frameParity);
+    ivec2 act0Coord   = (frameParity == 0u) ? (baseCoord + ivec2(0, 0)) : (baseCoord + ivec2(1, 0));
+    ivec2 act1Coord   = (frameParity == 0u) ? (baseCoord + ivec2(1, 1)) : (baseCoord + ivec2(0, 1));
+    ivec2 inact0Coord = (frameParity == 0u) ? (baseCoord + ivec2(1, 0)) : (baseCoord + ivec2(0, 0));
+    ivec2 inact1Coord = (frameParity == 0u) ? (baseCoord + ivec2(0, 1)) : (baseCoord + ivec2(1, 1));
+
+    QuadActiveSample act0;
+    act0.coord = ivec2(-1);
+    act0.color = vec3(0.0);
+    act0.depth = 0.0;
+    act0.linearDepth = 0.0;
+
+    QuadActiveSample act1 = act0;
+
+    if (InBounds(act0Coord, targetSize)) {
+        CbrSample s0 = MapPixelToSample(act0Coord, frameParity);
+        act0.coord = act0Coord;
+        act0.color = FetchColor(s0);
+        if (any(isnan(act0.color)) || any(isinf(act0.color))) {
+            act0.color = vec3(0.0);
+        }
+        act0.depth = FetchDepth(s0);
+        act0.linearDepth = LinearizeDepth(act0.depth);
+        ResolvePixel(act0Coord, targetSize, frameParity, true, act0.color, act0.depth, act0.linearDepth, false, act0, act1);
+    }
+
+    if (InBounds(act1Coord, targetSize)) {
+        CbrSample s1 = MapPixelToSample(act1Coord, frameParity);
+        act1.coord = act1Coord;
+        act1.color = FetchColor(s1);
+        if (any(isnan(act1.color)) || any(isinf(act1.color))) {
+            act1.color = vec3(0.0);
+        }
+        act1.depth = FetchDepth(s1);
+        act1.linearDepth = LinearizeDepth(act1.depth);
+        ResolvePixel(act1Coord, targetSize, frameParity, true, act1.color, act1.depth, act1.linearDepth, false, act0, act1);
+    }
+
+    if (InBounds(inact0Coord, targetSize)) {
+        ResolvePixel(inact0Coord, targetSize, frameParity, false, vec3(0.0), 0.0, 0.0, true, act0, act1);
+    }
+    if (InBounds(inact1Coord, targetSize)) {
+        ResolvePixel(inact1Coord, targetSize, frameParity, false, vec3(0.0), 0.0, 0.0, true, act0, act1);
+    }
 }

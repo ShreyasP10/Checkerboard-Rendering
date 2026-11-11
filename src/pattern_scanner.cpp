@@ -351,16 +351,37 @@ const uint8_t* PatternScanner::ScanModule(const char* moduleName, const char* si
             if (sec.Characteristics & (IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_CNT_CODE)) {
                 const auto* secBase = reinterpret_cast<const uint8_t*>(hMod) + sec.VirtualAddress;
                 const size_t secSize = sec.Misc.VirtualSize > 0 ? sec.Misc.VirtualSize : sec.SizeOfRawData;
+                const auto* const secEnd = secBase + secSize;
+                const uint8_t* cursor = secBase;
+                constexpr DWORD kReadableProtectMask =
+                    PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                    PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
 
-                MEMORY_BASIC_INFORMATION secMbi{};
-                if (!VirtualQuery(secBase, &secMbi, sizeof(secMbi)) || secMbi.State != MEM_COMMIT ||
-                    (secMbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) {
-                    continue;
-                }
+                while (cursor < secEnd) {
+                    MEMORY_BASIC_INFORMATION regMbi{};
+                    if (VirtualQuery(cursor, &regMbi, sizeof(regMbi)) != sizeof(regMbi) ||
+                        regMbi.RegionSize == 0) {
+                        break;
+                    }
+                    const auto* regBase = reinterpret_cast<const uint8_t*>(regMbi.BaseAddress);
+                    const auto* regEnd = regBase + regMbi.RegionSize;
+                    if (regEnd <= cursor) {
+                        break;
+                    }
+                    const auto* scanEnd = (regEnd < secEnd) ? regEnd : secEnd;
+                    const size_t scanLen = static_cast<size_t>(scanEnd - cursor);
 
-                const uint8_t* found = FindPattern(secBase, secSize, signature, mask);
-                if (found) {
-                    return found;
+                    const bool isCommitted = (regMbi.State == MEM_COMMIT);
+                    const bool isForbidden = (regMbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0;
+                    const bool isReadable  = (regMbi.Protect & kReadableProtectMask) != 0;
+
+                    if (isCommitted && !isForbidden && isReadable && scanLen > 0) {
+                        const uint8_t* found = FindPattern(cursor, scanLen, signature, mask);
+                        if (found) {
+                            return found;
+                        }
+                    }
+                    cursor = scanEnd;
                 }
             }
         }
@@ -428,7 +449,7 @@ float* PatternScanner::GetCameraProjectionMatrix() {
     return g_cachedCameraMatrix.load(std::memory_order_acquire);
 }
 
-bool PatternScanner::UpdateCameraJitter(uint32_t /*frameIndex*/, bool isVulkan) {
+bool PatternScanner::UpdateCameraJitter(uint32_t frameIndex, bool isVulkan) {
     float* cameraMatrix = g_cachedCameraMatrix.load(std::memory_order_acquire);
     if (!cameraMatrix) {
         if (!InitializeCameraScanner()) {
@@ -446,8 +467,18 @@ bool PatternScanner::UpdateCameraJitter(uint32_t /*frameIndex*/, bool isVulkan) 
             CBR_LOG_WARN("Camera projection matrix memory unreadable or not committed; falling back to Viewport Redirection.");
             return false;
         }
+        const uintptr_t matrixAddr = reinterpret_cast<uintptr_t>(cameraMatrix);
+        const uintptr_t regionEnd = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+        if (regionEnd < matrixAddr || (regionEnd - matrixAddr) < (16 * sizeof(float))) {
+            g_cachedCameraMatrix.store(nullptr, std::memory_order_release);
+            CBR_LOG_WARN("Camera projection matrix buffer smaller than 4x4 float matrix; falling back to Viewport Redirection.");
+            return false;
+        }
 #if defined(_MSC_VER)
         __try {
+            if (JitterManager::Get().IsProjectionJitterApplied(cameraMatrix, frameIndex, isVulkan)) {
+                return true;
+            }
             JitterManager::Get().ApplyJitterToProjection(cameraMatrix, isVulkan);
             return true;
         } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -457,6 +488,9 @@ bool PatternScanner::UpdateCameraJitter(uint32_t /*frameIndex*/, bool isVulkan) 
         }
 #else
         try {
+            if (JitterManager::Get().IsProjectionJitterApplied(cameraMatrix, frameIndex, isVulkan)) {
+                return true;
+            }
             JitterManager::Get().ApplyJitterToProjection(cameraMatrix, isVulkan);
             return true;
         } catch (...) {

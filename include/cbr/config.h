@@ -69,6 +69,10 @@ struct CBRConfig {
     DepthConvention depthConvention{ DepthConvention::Reversed };
     float           depthNear{ 0.1f };
     float           depthFar{ 0.0f }; // 0.0 = infinite far plane (Reversed only)
+    // 5-tap RCAS contrast-adaptive sharpening strength (0.0 = disabled, 1.0 = max).
+    float           sharpeningStrength{ 0.0f };
+    // Camera-only depth unprojection fallback when sampled velocity is zeroed/unbound.
+    bool            enableCameraMotionFallback{ false };
 
     // Jitter
     JitterPattern jitterPattern{ JitterPattern::Checkerboard };

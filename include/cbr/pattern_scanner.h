@@ -34,6 +34,7 @@ public:
     // Attempts to locate and cache the RAGE camera projection matrix pointer in RDR2
     static bool InitializeCameraScanner();
     static float* GetCameraProjectionMatrix();
+    // Idempotent per frame: applies current frame's projection jitter without duplicate accumulation.
     static bool UpdateCameraJitter(uint32_t frameIndex, bool isVulkan);
 #else
     static float* GetCameraProjectionMatrix() { return nullptr; }

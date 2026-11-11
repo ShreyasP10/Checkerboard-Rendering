@@ -1,5 +1,6 @@
 #include "cbr/ui_overlay.h"
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include "cbr/config.h"
 #include "cbr/cbr_engine.h"
@@ -19,6 +20,47 @@
 
 namespace cbr {
 
+namespace {
+
+void DefaultTelemetryHudCallback(const OverlayMetrics& metrics) {
+    static std::atomic<uint64_t> s_lastStampNs{ 0 };
+    static std::atomic<uint32_t> s_lastOutputFrame{ ~0u };
+    static std::atomic<double>   s_smoothedFrameMs{ 16.667 };
+
+    const auto nowNs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+    const uint64_t prevNs = s_lastStampNs.exchange(nowNs, std::memory_order_acq_rel);
+    if (prevNs != 0u && nowNs > prevNs) {
+        const double instMs = static_cast<double>(nowNs - prevNs) * 1e-6;
+        if (instMs > 0.05 && instMs < 2000.0) {
+            const double prevMs = s_smoothedFrameMs.load(std::memory_order_relaxed);
+            s_smoothedFrameMs.store(prevMs * 0.9 + instMs * 0.1, std::memory_order_relaxed);
+        }
+    }
+
+    const uint32_t lastFrame = s_lastOutputFrame.load(std::memory_order_relaxed);
+    if (lastFrame == ~0u || (metrics.currentFrame >= lastFrame && metrics.currentFrame - lastFrame >= 60u)) {
+        s_lastOutputFrame.store(metrics.currentFrame, std::memory_order_relaxed);
+        const double frameMs = s_smoothedFrameMs.load(std::memory_order_relaxed);
+        const double fps = (frameMs > 0.01) ? (1000.0 / frameMs) : 0.0;
+        const std::string text = UIOverlay::Get().GetFormattedTelemetry();
+#if defined(_WIN32)
+        char perfLine[160];
+        std::snprintf(perfLine, sizeof(perfLine),
+                      "FrameTime: %.2f ms (%.1f FPS) | Recon: %.3f ms | JitterPhase: %u\n",
+                      frameMs, fps, static_cast<double>(metrics.lastReconDurationMs), metrics.jitterPhase);
+        OutputDebugStringA(perfLine);
+        OutputDebugStringA(text.c_str());
+#endif
+        CBR_LOG_INFO("HUD OSD (%.1f FPS / %.2f ms, Recon %.3f ms, Phase %u):\n%s",
+                     fps, frameMs, static_cast<double>(metrics.lastReconDurationMs),
+                     metrics.jitterPhase, text.c_str());
+    }
+}
+
+} // namespace
+
 UIOverlay& UIOverlay::Get() {
     static UIOverlay instance;
     return instance;
@@ -29,6 +71,9 @@ void UIOverlay::Initialize() {
     const bool show = ConfigManager::Get().GetConfig().showOverlay;
     m_visible.store(show, std::memory_order_release);
     m_lastHotkeyDown.store(false, std::memory_order_relaxed);
+    if (m_hudCallback.load(std::memory_order_acquire) == nullptr) {
+        RegisterHudRenderCallback(&DefaultTelemetryHudCallback);
+    }
     CBR_LOG_INFO("UIOverlay initialized (Visible: %s)", show ? "true" : "false");
 }
 
@@ -96,6 +141,8 @@ OverlayMetrics UIOverlay::GetCurrentMetrics() const {
     metrics.isHooked = (api == GraphicsApi::Vulkan)
         ? HookManager::Get().IsVulkanHooked()
         : HookManager::Get().IsDX12Hooked();
+    metrics.lastReconDurationMs = CBREngine::Get().GetLastReconstructionDurationMs();
+    metrics.jitterPhase = metrics.currentFrame & 1u;
 
     return metrics;
 }
@@ -162,11 +209,12 @@ void UIOverlay::RegisterHudRenderCallback(HudRenderCallback callback) {
 std::string UIOverlay::GetFormattedTelemetry() const {
     const auto m = GetCurrentMetrics();
     const auto& config = ConfigManager::Get().GetConfig();
-    char buf[512];
+    char buf[576];
     std::snprintf(buf, sizeof(buf),
                   "=== RDR2 CBR Telemetry Overlay ===\n"
                   "Status:          %s\n"
-                  "Frame:           %u\n"
+                  "Frame:           %u (Jitter Phase: %u)\n"
+                  "Recon Duration:  %.3f ms\n"
                   "Resolution:      %ux%u (Quarter: %ux%u)\n"
                   "VRAM Allocated:  %.2f MiB\n"
                   "API Hooked:      %s\n"
@@ -176,7 +224,8 @@ std::string UIOverlay::GetFormattedTelemetry() const {
                   "Mip LOD Bias:    %.2f\n"
                   "Color Space:     %s\n",
                   m.cbrEnabled ? "ACTIVE (Checkerboard 2x MSAA)" : "BYPASS",
-                  m.currentFrame,
+                  m.currentFrame, m.jitterPhase,
+                  static_cast<double>(m.lastReconDurationMs),
                   m.targetWidth, m.targetHeight, m.quarterWidth, m.quarterHeight,
                   m.vramFootprintMiB,
                   m.isHooked ? "YES" : "NO",

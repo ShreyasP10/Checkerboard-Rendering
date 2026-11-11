@@ -9,6 +9,8 @@
 #include "cbr/crash_handler.h"
 #include "cbr/pattern_scanner.h"
 #include <cctype>
+#include <chrono>
+#include <cwchar>
 #include <string>
 
 #if defined(_WIN32)
@@ -98,6 +100,9 @@ bool CBREngine::Initialize() {
         UIOverlay::Get().Initialize();
 
         // 5. Prepare the reconstruction pass for the active API
+        if (!baseDir.empty()) {
+            ReconstructionPass::Get().SetShaderDirectory(baseDir / "shaders");
+        }
         HookManager::Get().Initialize();
         if (api == GraphicsApi::Vulkan) {
             ReconstructionPass::Get().InitializeVulkan(nullptr, nullptr);
@@ -216,10 +221,20 @@ void CBREngine::OnScenePassEnd(void* cmdBufferOrContext) {
 
     // Mid-frame dispatch: reconstruct immediately when the quarter-resolution 2x MSAA
     // geometry pass finishes, before post-processing and UI are composited.
+    const auto dispatchStart = std::chrono::steady_clock::now();
     if (m_activeApi.load() == GraphicsApi::Vulkan) {
         ReconstructionPass::Get().DispatchVulkan(cmdBufferOrContext, currentFrame);
     } else {
         ReconstructionPass::Get().DispatchDX12(cmdBufferOrContext, currentFrame);
+    }
+    const auto dispatchEnd = std::chrono::steady_clock::now();
+
+    const float passDurationMs = ReconstructionPass::Get().GetLastDispatchDurationMs();
+    if (passDurationMs > 0.0f) {
+        m_lastReconDurationMs.store(passDurationMs, std::memory_order_release);
+    } else {
+        const float cpuElapsedMs = std::chrono::duration<float, std::milli>(dispatchEnd - dispatchStart).count();
+        m_lastReconDurationMs.store(cpuElapsedMs > 0.001f ? cpuElapsedMs : 0.001f, std::memory_order_release);
     }
 
     // Swap history buffers (ping-pong double buffer)
@@ -280,8 +295,57 @@ void CBREngine::OnSwapchainRecreated(uint32_t width, uint32_t height) {
     }
 }
 
+bool CBREngine::HasDisallowedCommandLineArgs(const wchar_t* commandLine) {
+    if (!commandLine) return false;
+
+    std::wstring lower;
+    for (const wchar_t* p = commandLine; *p != L'\0'; ++p) {
+        wchar_t ch = *p;
+        if (ch >= L'A' && ch <= L'Z') {
+            ch = static_cast<wchar_t>(ch + (L'a' - L'A'));
+        }
+        lower.push_back(ch);
+    }
+
+    static constexpr const wchar_t* kOnlineFlags[] = {
+        L"-rdo",
+        L"-sconlineonly",
+        L"-multiplayer"
+    };
+
+    auto isArgBoundaryLeft = [&](size_t pos) -> bool {
+        if (pos == 0) return true;
+        const wchar_t prev = lower[pos - 1];
+        return prev == L' ' || prev == L'\t' || prev == L'\r' || prev == L'\n' ||
+               prev == L'"' || prev == L'\'';
+    };
+    auto isArgBoundaryRight = [&](size_t pos) -> bool {
+        if (pos >= lower.size()) return true;
+        const wchar_t next = lower[pos];
+        return next == L' ' || next == L'\t' || next == L'\r' || next == L'\n' ||
+               next == L'"' || next == L'\'' || next == L'=' || next == L':';
+    };
+
+    for (const wchar_t* flag : kOnlineFlags) {
+        const size_t flagLen = std::wcslen(flag);
+        size_t pos = lower.find(flag);
+        while (pos != std::wstring::npos) {
+            if (isArgBoundaryLeft(pos) && isArgBoundaryRight(pos + flagLen)) {
+                return true;
+            }
+            pos = lower.find(flag, pos + 1);
+        }
+    }
+    return false;
+}
+
 bool CBREngine::CheckAntiCheatModules() const {
 #if defined(_WIN32)
+    if (HasDisallowedCommandLineArgs(GetCommandLineW())) {
+        CBR_LOG_ERROR("CRITICAL: Detected online / multiplayer launch argument (-rdo / -scOnlineOnly / -Multiplayer) in command line! Aborting CBREngine initialization.");
+        return true;
+    }
+
     static const char* const kKnownAntiCheatModules[] = {
         "BEClient_x64.dll",
         "BEClient.dll",

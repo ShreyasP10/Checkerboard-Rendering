@@ -203,6 +203,9 @@ if(CBR_BUILD_TESTS)
     )
     add_executable(cbr_tests tests/test_core.cpp ${CBR_TEST_CORE_SOURCES})
     target_include_directories(cbr_tests PRIVATE ${CBR_INCLUDE_DIR})
+    if(UNIX)
+        target_link_libraries(cbr_tests PRIVATE ${CMAKE_DL_LIBS})
+    endif()
     add_test(NAME cbr_core COMMAND cbr_tests)
 
     # Engine tests use fake hook installers (the real ones are Windows-only), one mode per process
@@ -214,8 +217,26 @@ if(CBR_BUILD_TESTS)
         ${CBR_SOURCE_DIR}/ui_overlay.cpp
     )
     target_include_directories(cbr_engine_tests PRIVATE ${CBR_INCLUDE_DIR})
+    if(UNIX)
+        target_link_libraries(cbr_engine_tests PRIVATE ${CMAKE_DL_LIBS})
+    endif()
     add_test(NAME cbr_engine      COMMAND cbr_engine_tests)
     add_test(NAME cbr_engine_auto COMMAND cbr_engine_tests auto)
+
+    # Headless Vulkan compute reconstruction test (runs on Lavapipe in CI or any host with Vulkan ICD)
+    add_executable(cbr_vulkan_headless tests/test_vulkan_headless.cpp ${CBR_TEST_CORE_SOURCES})
+    target_include_directories(cbr_vulkan_headless PRIVATE ${CBR_INCLUDE_DIR})
+    if(UNIX)
+        target_link_libraries(cbr_vulkan_headless PRIVATE ${CMAKE_DL_LIBS})
+    endif()
+    if(CBR_COMPILED_SHADERS)
+        add_dependencies(cbr_vulkan_headless cbr_shaders)
+    endif()
+    target_compile_definitions(cbr_vulkan_headless PRIVATE
+        CBR_DEFAULT_SHADER_DIR="${CMAKE_CURRENT_BINARY_DIR}/shaders/$<CONFIG>"
+        CBR_SOURCE_SHADER_SPV_DIR="${CMAKE_CURRENT_SOURCE_DIR}/shaders/spv"
+    )
+    add_test(NAME cbr_vulkan_headless COMMAND cbr_vulkan_headless)
 
     # Equivalence verification between C++ checkerboard mapping and compute shaders
     find_package(Python3 COMPONENTS Interpreter QUIET)

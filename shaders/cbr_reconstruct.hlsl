@@ -41,7 +41,7 @@ cbuffer CBRConstants : register(b0)
     float  g_HistoryWeight;          // Temporal blend weight (0.90f)
     uint   g_DebugView;              // 0=Normal, 1=Mask, 2=Disocclusion, 3=Motion, 4=Raw
     uint   g_EnableColorClamping;    // 1 = True, 0 = False
-    float  g_MipLodBias;             // Texture LOD bias (-0.5f)
+    float  g_MipLodBias;             // Retained strictly for 80-byte cbuffer ABI parity; sampler LOD bias is enforced CPU-side in Hooked_vkCreateSampler (Item M-01)
     uint   g_ColorSpace;             // 0 = YCoCg clamp, 1 = RGB clamp, 2 = ICtCp clamp (HDR10/BT.2100)
     uint   g_EnableSpatialFallback;  // 1 = cross-bilateral fallback, 0 = raw current sample
     float2 g_JitterDelta;            // subpixel projection jitter delta (jc - jp)
@@ -51,6 +51,17 @@ cbuffer CBRConstants : register(b0)
     uint   g_DepthMode;             // 0 = Standard (0 near .. 1 far), 1 = Reversed (1 near .. 0 far)
     float  g_DepthNear;             // camera near plane
     float  g_DepthFar;              // camera far plane (0 = infinite, Reversed only)
+};
+
+// Camera matrices & post-resolve controls (16-byte aligned; preserves 80-byte b0 root constants)
+cbuffer CBRCameraData : register(b1)
+{
+    column_major float4x4 g_CurrViewProjInv;
+    column_major float4x4 g_PrevViewProj;
+    float  g_SharpeningStrength;
+    uint   g_EnableCameraFallback;
+    uint   g_HasCameraMatrices;
+    uint   g_CameraReserved;
 };
 
 // =============================================================================
@@ -218,9 +229,13 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     // The 4 cardinal neighbours of a reconstructed pixel are always natively shaded (mirrored at borders).
     int2 cardinalCoord[4] = { int2(0, 0), int2(0, 0), int2(0, 0), int2(0, 0) };
     float cardinalDepth[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    float3 cardinalColor[4] = { float3(0.0f, 0.0f, 0.0f), float3(0.0f, 0.0f, 0.0f), float3(0.0f, 0.0f, 0.0f), float3(0.0f, 0.0f, 0.0f) };
 
     if (isCurrentSampleActive) {
         currentColor = FetchColor(self);
+        if (any(isnan(currentColor)) || any(isinf(currentColor))) {
+            currentColor = float3(0.0f, 0.0f, 0.0f);
+        }
         currentDepth = FetchDepth(self);
         currentLinear = LinearizeDepth(currentDepth);
     } else {
@@ -237,7 +252,9 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
                 c = pixelCoord;
             }
             cardinalCoord[i] = c;
-            cardinalDepth[i] = FetchDepth(MapPixelToSample(c, frameParity));
+            CbrSample cs = MapPixelToSample(c, frameParity);
+            cardinalDepth[i] = FetchDepth(cs);
+            cardinalColor[i] = FetchColor(cs);
             float raw = cardinalDepth[i];
             float lin = LinearizeDepth(raw);
             if (!isnan(raw) && !isinf(raw) && !isnan(lin) && !isinf(lin)) {
@@ -288,15 +305,33 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
         }
     }
 
-    // Sample velocity: adaptively handle quarter-res or full-res velocity buffers (Item C-05)
-    uint velWidth = 0, velHeight = 0, numLevels = 0;
-    g_Velocity.GetDimensions(0, velWidth, velHeight, numLevels);
-    int2 velCoord = ((int)velWidth < (int)g_TargetResolution.x) ? (motionCoord >> 1) : motionCoord;
-    velCoord = clamp(velCoord, int2(0, 0), max(int2((int)velWidth - 1, (int)velHeight - 1), int2(0, 0)));
+    // Sample quarter-resolution velocity buffer (targetSize >> 1) with clamped coordinates (Item C-05)
+    int2 velCoord = clamp(motionCoord >> 1, int2(0, 0), max((targetSize >> 1) - int2(1, 1), int2(0, 0)));
     float2 velocity = g_Velocity.Load(int3(velCoord, 0)).xy;
     velocity = clamp(velocity, float2(-0.5f, -0.5f), float2(0.5f, 0.5f));
     bool velocityBad = isinf(velocity.x) || isnan(velocity.x) || isinf(velocity.y) || isnan(velocity.y)
         || isinf(uv.x) || isnan(uv.x) || isinf(uv.y) || isnan(uv.y);
+    // Camera-only depth unprojection fallback (Section 5.4) when velocity is zeroed/unbound or fallback is active
+    bool velZero = dot(velocity, velocity) < 1e-12f;
+    if (g_HasCameraMatrices != 0u &&
+        (g_EnableCameraFallback != 0u || velZero || velocityBad)) {
+        float4 clipPos = float4(uv * 2.0f - 1.0f, currentDepth, 1.0f);
+        float4 worldH = mul(g_CurrViewProjInv, clipPos);
+        if (!isinf(worldH.w) && !isnan(worldH.w) && abs(worldH.w) > 1e-6f) {
+            float4 worldPos = worldH / worldH.w;
+            float4 prevClip = mul(g_PrevViewProj, worldPos);
+            if (!isinf(prevClip.w) && !isnan(prevClip.w) && abs(prevClip.w) > 1e-6f) {
+                float2 prevUV = (prevClip.xy / prevClip.w) * 0.5f + 0.5f;
+                float2 camVel = clamp(uv - prevUV, float2(-0.5f, -0.5f), float2(0.5f, 0.5f));
+                if (!isinf(camVel.x) && !isnan(camVel.x) && !isinf(camVel.y) && !isnan(camVel.y)) {
+                    velocity = camVel;
+                    velocityBad = isinf(uv.x) || isnan(uv.x) || isinf(uv.y) || isnan(uv.y);
+                }
+            }
+        }
+    }
+    // JitterCompensation (Item M-08): 0.0 when velocity buffer is unjittered or Strategy A viewport shift is active;
+    // set to 1.0 only if velocity vectors encode the projection jitter delta (verify via RenderDoc).
     // Jitter dampener: dampens jitter compensation on zero-velocity passes (transparent particles, fog, smoke)
     // to prevent half-pixel oscillation when alpha-blended particles lack motion vectors.
     float jitterDampener = (dot(velocity, velocity) < 1e-9f) ? 0.0f : 1.0f;
@@ -318,7 +353,9 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     if (historyUVBad || g_FrameIndex == 0u || historyUV.x < 0.0f || historyUV.x > 1.0f || historyUV.y < 0.0f || historyUV.y > 1.0f) {
         isDisoccluded = true; // First frame, bad velocity/UV, or sample moved outside screen space
     } else {
-        previousDepth = g_HistoryDepth.SampleLevel(g_PointClampSampler, historyUV, 0.0f).r;
+        // Exact integer texel load: matches GLSL texelFetch(u_HistoryDepth, historyCoord, 0).r without UV rounding (Item M-02)
+        int2 historyCoord = clamp(int2(historyUV * g_TargetResolution), int2(0, 0), targetSize - int2(1, 1));
+        previousDepth = g_HistoryDepth.Load(int3(historyCoord, 0)).r;
         float prevLin = LinearizeDepth(previousDepth);
         bool depthBad = isinf(currentLinear) || isnan(currentLinear) || isinf(prevLin) || isnan(prevLin);
         depthDelta = depthBad ? 10.0f : abs(currentLinear - prevLin) / max(currentLinear, 1e-5f);
@@ -365,6 +402,8 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
             float3 c;
             if (isCurrentSampleActive && i == 0) {
                 c = ToClampSpace(currentColor);
+            } else if (!isCurrentSampleActive) {
+                c = ToClampSpace(cardinalColor[i]);
             } else {
                 c = ToClampSpace(FetchColor(MapPixelToSample(nc, frameParity)));
             }
@@ -416,7 +455,7 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
             float accumWeight = 0.0f;
 
             for (int i = 0; i < 4 && g_EnableSpatialFallback != 0u; ++i) {
-                float3 sCol = FetchColor(MapPixelToSample(cardinalCoord[i], frameParity));
+                float3 sCol = cardinalColor[i];
                 float sLin = LinearizeDepth(cardinalDepth[i]);
 
                 // Relative linear-depth weighting: scale-invariant, independent of the depth convention
@@ -433,19 +472,63 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
                 spatialDepth = accumDepth / accumWeight;
             } else {
                 finalColor = isCurrentSampleActive ? currentColor : (
-                    FetchColor(MapPixelToSample(cardinalCoord[0], frameParity)) +
-                    FetchColor(MapPixelToSample(cardinalCoord[1], frameParity)) +
-                    FetchColor(MapPixelToSample(cardinalCoord[2], frameParity)) +
-                    FetchColor(MapPixelToSample(cardinalCoord[3], frameParity))
+                    cardinalColor[0] + cardinalColor[1] + cardinalColor[2] + cardinalColor[3]
                 ) * 0.25f;
                 spatialDepth = isCurrentSampleActive ? currentDepth : (cardinalDepth[0] + cardinalDepth[1] + cardinalDepth[2] + cardinalDepth[3]) * 0.25f;
             }
         }
     }
 
-    // Guard against NaN/Inf pollution in the temporal feedback loop
+    // Guard against NaN/Inf pollution in the temporal feedback loop (Item H-05)
     if (any(isnan(finalColor)) || any(isinf(finalColor))) {
-        finalColor = isCurrentSampleActive ? currentColor : FetchColor(MapPixelToSample(cardinalCoord[0], frameParity));
+        float3 fallback = isCurrentSampleActive ? currentColor : cardinalColor[0];
+        if (any(isnan(fallback)) || any(isinf(fallback))) {
+            fallback = float3(0.0f, 0.0f, 0.0f);
+        }
+        finalColor = fallback;
+    }
+
+    // 5-tap RCAS contrast-adaptive sharpening (Section 5.6; bypassed when 0.0 or debug overlay active)
+    if (g_SharpeningStrength > 0.0f && g_DebugView == 0u) {
+        float3 rc0 = cardinalColor[0];
+        float3 rc1 = cardinalColor[1];
+        float3 rc2 = cardinalColor[2];
+        float3 rc3 = cardinalColor[3];
+        if (isCurrentSampleActive) {
+            for (int i = 0; i < 4; ++i) {
+                float3 sc = finalColor;
+                if (!isDisoccluded && g_FrameIndex > 0u) {
+                    float2 nUV = clamp(historyUV + float2(kCardinal[i]) * g_InvTargetResolution, minUV, maxUV);
+                    float4 hc = g_HistoryColor.SampleLevel(g_LinearClampSampler, nUV, 0.0f);
+                    if (hc.a >= 0.5f && !any(isnan(hc.rgb)) && !any(isinf(hc.rgb))) {
+                        sc = hc.rgb;
+                    }
+                } else {
+                    int2 stepAxis = (i < 2) ? int2(kCardinal[i].x, 1) : int2(1, kCardinal[i].y);
+                    int2 diag = pixelCoord + stepAxis;
+                    if (!InBounds(diag, targetSize)) diag = pixelCoord - stepAxis;
+                    if (InBounds(diag, targetSize)) {
+                        float3 dc = FetchColor(MapPixelToSample(diag, frameParity));
+                        if (!any(isnan(dc)) && !any(isinf(dc))) sc = dc;
+                    }
+                }
+                if (i == 0) rc0 = sc;
+                else if (i == 1) rc1 = sc;
+                else if (i == 2) rc2 = sc;
+                else rc3 = sc;
+            }
+        }
+        float3 mn4 = min(min(rc0, rc1), min(rc2, rc3));
+        float3 mx4 = max(max(rc0, rc1), max(rc2, rc3));
+        float3 mn5 = min(mn4, finalColor);
+        float3 mx5 = max(mx4, finalColor);
+        float3 amp = sqrt(clamp(min(max(mn5, float3(0.0f, 0.0f, 0.0f)), max(mx5 - mn5, float3(0.0f, 0.0f, 0.0f))) / max(mx5, float3(1e-5f, 1e-5f, 1e-5f)),
+                                float3(0.0f, 0.0f, 0.0f), float3(1.0f, 1.0f, 1.0f)));
+        float w = max(-0.1875f * clamp(g_SharpeningStrength, 0.0f, 1.0f) * min(amp.r, min(amp.g, amp.b)), -0.1875f);
+        float3 sharpened = max((finalColor + w * (rc0 + rc1 + rc2 + rc3)) / max(1.0f + 4.0f * w, 1e-4f), float3(0.0f, 0.0f, 0.0f));
+        if (!any(isnan(sharpened)) && !any(isinf(sharpened))) {
+            finalColor = sharpened;
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -466,19 +549,13 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     } else if (g_DebugView == 4u) {
         // Quarter-resolution raw colour without directional bias
         finalColor = isCurrentSampleActive ? currentColor : (
-            FetchColor(MapPixelToSample(cardinalCoord[0], frameParity)) +
-            FetchColor(MapPixelToSample(cardinalCoord[1], frameParity)) +
-            FetchColor(MapPixelToSample(cardinalCoord[2], frameParity)) +
-            FetchColor(MapPixelToSample(cardinalCoord[3], frameParity))
+            cardinalColor[0] + cardinalColor[1] + cardinalColor[2] + cardinalColor[3]
         ) * 0.25f;
     } else if (g_DebugView == 5u) {
         // Spatial baseline resolve: average of 4 cardinal samples for reconstructed pixels
         // (direct visual A/B baseline comparison against temporal CBR, matching reference Space toggle)
         finalColor = isCurrentSampleActive ? currentColor : (
-            FetchColor(MapPixelToSample(cardinalCoord[0], frameParity)) +
-            FetchColor(MapPixelToSample(cardinalCoord[1], frameParity)) +
-            FetchColor(MapPixelToSample(cardinalCoord[2], frameParity)) +
-            FetchColor(MapPixelToSample(cardinalCoord[3], frameParity))
+            cardinalColor[0] + cardinalColor[1] + cardinalColor[2] + cardinalColor[3]
         ) * 0.25f;
     }
 

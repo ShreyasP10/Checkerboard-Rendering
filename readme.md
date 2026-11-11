@@ -30,8 +30,8 @@ A community-driven native ASI graphics modification implementing **Checkerboard 
 </p>
 
 > **🚀 Project Status: Active Graphics Interception & Pipeline Execution Phase**  
-> The mod runs active **MinHook** detours across the **Vulkan** pipeline (`vkQueuePresentKHR`, `vkCreateSwapchainKHR`, `vkCreateFramebuffer`, `vkCreateImageView`, `vkCmdSetViewport`, `vkCmdSetScissor`, `vkCmdBeginRenderPass`, `vkCmdEndRenderPass`, `vkCmdSetSampleLocationsEXT`), capturing rendered geometry into quarter-res 2× MSAA buffers, managing ping-pong history descriptor sets (`historyColorViewA`/`B`) with pre-dispatch barrier transitions, executing `cbr_reconstruct.spv` mid-frame on `vkCmdEndRenderPass`, and blitting the reconstructed output back into the HDR scene attachment without overwriting UI/HUD overlays. It also includes mutual-exclusive Strategy A / Strategy B sampling, an AVX2 SIMD camera AOB scanner, HDR10 `ICtCp` / `YCoCg` / `RGB` color spaces, and `F11` / `Insert` HUD telemetry controls.  
-> *Note on parity:* DirectX 12 hooks (`hooks_dx12.cpp`) currently intercept DXGI `Present`, `Present1`, and `ResizeBuffers` alongside VMT compute-dispatch plumbing, while live DX12 scene attachment capture remains in active development; Vulkan (`PreferredApi = Vulkan`) is the primary active backend. Pre-built binaries are available on [GitHub Releases](https://github.com/ShreyasP10/Checkerboard-Rendering/releases).
+> The mod runs active **MinHook** detours across the **Vulkan** pipeline (`vkQueuePresentKHR`, `vkCreateSwapchainKHR`, `vkAcquireNextImageKHR`, `vkAcquireNextImage2KHR`, `vkCreateFramebuffer`, `vkCreateImageView`, `vkCreateRenderPass`/`2`, `vkEnumeratePhysicalDevices`, `vkCreateSampler`, `vkCmdSetViewport`, `vkCmdSetScissor`, `vkCmdBeginRenderPass`, `vkCmdEndRenderPass`, `vkCmdSetSampleLocationsEXT`), capturing rendered geometry into quarter-res 2× MSAA buffers, managing ping-pong history descriptor sets (`historyColorViewA`/`B`) + `binding = 7` camera UBO with pre-dispatch layout barriers, executing `cbr_reconstruct.spv` mid-frame on `vkCmdEndRenderPass`, and blitting the reconstructed output into the intermediate full-res scene color target without overwriting UI/HUD overlays. It also includes mutual-exclusive Strategy A / Strategy B sampling, selective `-1.0` `MipLodBias` on anisotropic mipmapped samplers, multi-region `VirtualQuery` AVX2 AOB scanning, optional camera-only depth unprojection fallback & 5-tap RCAS sharpening (`SharpeningStrength = 0.0` default), online CLI argument safety (`-rdo`, `-scOnlineOnly`, `-Multiplayer`), loader-lock-safe preloaded `dbghelp.dll` minidumps, and `F11` / `Insert` telemetry OSD controls.  
+> *Note on parity:* DirectX 12 (`hooks_dx12.cpp`, `render_target_manager.cpp`, `reconstruction_pass.cpp`) implements DXGI swapchain + `ID3D12CommandQueue`/`ID3D12GraphicsCommandList` VMT detours, committed resources, descriptor heaps, root signature, compute PSO, and `DispatchDX12` barrier submission, while live RDR2 DX12 scene attachment capture & visual Dear ImGui swapchain rendering remain pending in-game validation; Vulkan (`PreferredApi = Vulkan`) is the primary active backend. Pre-built binaries are available on [GitHub Releases](https://github.com/ShreyasP10/Checkerboard-Rendering/releases).
 
 ---
 
@@ -121,29 +121,29 @@ Reconstruct: Current Active Pixels  <─── Unpack exact MSAA Sample 0 / Samp
 Output:      Full 3840×2160 Frame   ───> Blitted back to Game Scene HDR Attachment pre-UI
 ```
 
-1. **Target Interception & Dynamic Redirection:** Intercepts `vkCreateFramebuffer`, `vkCreateImageView`, `vkCmdSetViewport`, `vkCmdSetScissor`, and `vkCmdBeginRenderPass` to redirect full-resolution geometry passes to quarter-resolution (e.g., 1920×1080 for 4K, 960×540 for 1080p) 2× MSAA targets while keeping HUD/UI passes at native output resolution.
+1. **Target Interception & Dynamic Redirection:** Intercepts `vkCreateRenderPass`/`2`, `vkCreateFramebuffer`, `vkCreateImageView`, `vkAcquireNextImageKHR`/`2KHR`, `vkCmdSetViewport`, `vkCmdSetScissor`, and `vkCmdBeginRenderPass` (gated by attachment inspection + `draws >= 250`) to redirect full-resolution geometry passes to quarter-resolution (e.g., 1920×1080 for 4K, 960×540 for 1080p) 2× MSAA targets while keeping HUD/UI passes at native output resolution.
 2. **Mutual-Exclusive Subpixel Sampling (`StrategyA` vs. `StrategyB`):**
-   - **`StrategyA` (Viewport Shift / Projection Jitter):** Shifts the viewport / camera projection horizontally by a complementary subpixel offset on odd frames, scanned dynamically in `RDR2.exe` memory via the AVX2 SIMD AOB scanner (`pattern_scanner.cpp`) with non-accumulating previous-offset removal.
+   - **`StrategyA` (Viewport Shift / Projection Jitter):** Shifts the viewport / camera projection horizontally by a complementary subpixel offset on odd frames, scanned dynamically across readable committed regions of `RDR2.exe` via the AVX2 SIMD AOB scanner (`pattern_scanner.cpp`) with non-accumulating tracked-base / previous-offset jitter handling.
    - **`StrategyB` (`VK_EXT_sample_locations`):** Alternates hardware 2× MSAA programmable sample coordinates (`(0.75, 0.25) / (0.25, 0.75)` on even frames, mirrored on odd frames) while keeping the viewport stationary.
-3. **MIP LOD Bias (`-1.0`):** Applies a `-1.0` texture LOD bias (`kMipLodBias`, matching `CHECKERBOARD.md` / El Mansouri 2016) to compensate for 2× wider texture gradients at quarter resolution so surfaces retain full-res Nyquist sharpness.
-4. **Mid-Frame Compute Reconstruction & Scene Blit:** At `vkCmdEndRenderPass` (prior to UI/HUD compositing), copies scene attachments into quarter-res buffers, transitions all 7 ping-pong images safely out of `UNDEFINED`, binds the alternating `VkDescriptorSet`, runs `cbr_reconstruct.spv` (or quad-subgroup `cbr_reconstruct_quad.comp` / HLSL `cbr_reconstruct.hlsl`) with linearized depth disocclusion, `YCoCg`/`RGB`/`ICtCp` variance clipping (`gamma = 1.25`), and cross-bilateral fallback, then blits the reconstructed frame back to the game's HDR scene attachment.
+3. **Selective MIP LOD Bias (`-1.0`):** Applies the default `-1.0` `MipLodBias` selectively inside `Hooked_vkCreateSampler` ONLY to mipmapped anisotropic scene samplers (`maxLod > 1.0f && anisotropyEnable == VK_TRUE`), compensating for 2× wider texture gradients at quarter resolution without distorting UI/LUT samplers.
+4. **Mid-Frame Compute Reconstruction & Scene Blit:** At `vkCmdEndRenderPass` (prior to UI/HUD compositing), copies scene attachments into quarter-res buffers, transitions all 7 ping-pong images safely out of `UNDEFINED`, binds the alternating `VkDescriptorSet` + `binding = 7` camera UBO, runs `cbr_reconstruct.spv` (or quad-per-thread `cbr_reconstruct_quad.comp`, which evaluates both active 2×2 quad pixels first and shares their samples in thread-local registers without requiring `GL_KHR_shader_subgroup_quad` cross-lane intrinsics, or HLSL `cbr_reconstruct.hlsl`) with linearized depth disocclusion, optional camera-only depth unprojection fallback, NaN/Inf sanitization, `YCoCg`/`RGB`/`ICtCp` variance clipping (`gamma = 1.25`), cross-bilateral fallback, and optional 5-tap RCAS sharpening (`SharpeningStrength`, default `0.0`), then blits the reconstructed frame into the game's intermediate full-resolution scene color attachment (falling back to pre-present blit only if no intermediate scene target is tracked).
 
 ---
 
 ## Key Features
 
 - [x] **Engineering Specifications & Hardware Guides:** Complete PRD, SRD, SRS, TRD, DEV_PLAN, RISK_REGISTER, Intel 2018 CBR reference analysis, AMD Vega 7 optimization guide, Vulkan hooking guide, and live test report (`docs/IN_GAME_TEST_REPORT_v1491.md`).
-- [x] **Multi-Backend Reconstruction Shaders:** GLSL (`cbr_reconstruct.comp`), subgroup-quad accelerated GLSL (`cbr_reconstruct_quad.comp`, `GL_KHR_shader_subgroup_quad`), spatial baseline fallback (`cbr_resolve_simple.comp`), and DirectX 12 HLSL SM 6.0 (`cbr_reconstruct.hlsl`) verified for 100% coordinate-mapping equivalence across 36,864 combinations.
-- [x] **Temporal Reprojection & Adaptive Velocity:** Reads motion vectors with automatic quarter-resolution velocity coordinate downshifting (`>> 1`), optional 3×3 closest-depth motion dilation, NaN/Inf sanitization, and full-resolution history-depth output (`u_OutputDepth` / `g_OutputDepth`).
+- [x] **Multi-Backend Reconstruction Shaders:** GLSL (`cbr_reconstruct.comp`), 2×2 quad-per-thread GLSL (`cbr_reconstruct_quad.comp`, sharing active samples in thread-local registers without requiring subgroup extensions), spatial baseline fallback (`cbr_resolve_simple.comp`), and DirectX 12 HLSL (`cbr_reconstruct.hlsl`) verified for 100% coordinate-mapping equivalence across 36,864 combinations.
+- [x] **Temporal Reprojection, Velocity Fallback & 5-Tap RCAS:** Reads motion vectors with automatic quarter-resolution coordinate downshifting (`>> 1` clamp), optional 3×3 closest-depth motion dilation, camera-only depth unprojection fallback (`u_CurrViewProjInv` / `u_PrevViewProj` via `binding = 7` / `register(b1)`), NaN/Inf sanitization on active/fallback paths, full-resolution history-depth output (`u_OutputDepth` / `g_OutputDepth`), and optional fused 5-tap RCAS sharpening (`SharpeningStrength`, default `0.0`).
 - [x] **Depth Convention & Disocclusion Defense:** Supports both RDR2 Reversed-Z (`DepthFar = 0.0` infinite far plane) and Standard linear depth unprojection (`depth_convention.h`) with cardinal cross-bilateral fallback on disocclusion.
 - [x] **Three Color-Space Clamping Modes (`gamma = 1.25`):** Unconditional 3×3 neighborhood variance clipping selectable between **YCoCg** (`0`), **RGB** (`1`), and **HDR10 / BT.2100 ICtCp** (`2`) to eliminate ghosting and pattern shimmer on static and dynamic scenes.
-- [x] **Live Vulkan MinHook Pipeline:** Active detours on `vkQueuePresentKHR`, `vkCreateSwapchainKHR`, `vkCreateFramebuffer`, `vkCreateImageView`, `vkCmdSetViewport`, `vkCmdSetScissor`, `vkCmdBeginRenderPass`, `vkCmdEndRenderPass`, and `vkCmdSetSampleLocationsEXT` with ping-pong descriptor sets and scene HDR attachment copy/blit.
-- [x] **AVX2 SIMD Camera AOB Scanner:** Runtime CPUID-dispatched `_mm256_cmpeq_epi8` pattern scanner with scalar fallback, IDA-style wildcard parser, RIP-relative address resolution, and SEH memory bounds protection.
-- [x] **Interactive HUD API & Telemetry (`F11` / `Insert`):** Foreground-PID-gated hotkey toggling, live parameter setters (`SetHistoryWeight`, `SetDepthTolerance`, `SetMipLodBias`, `SetDebugView`, `SetColorSpace`, etc.), formatted OSD telemetry string output (`GetFormattedTelemetry()`), and a pluggable `HudRenderCallback` hook for Dear ImGui renderers.
+- [x] **Live Vulkan MinHook Pipeline:** Active scoped detours on `vkQueuePresentKHR`, `vkCreateSwapchainKHR`, `vkAcquireNextImageKHR`, `vkAcquireNextImage2KHR`, `vkCreateRenderPass`/`2`, `vkEnumeratePhysicalDevices`, `vkCreateSampler` (filtered anisotropic LOD bias), `vkCreateFramebuffer`, `vkCreateImageView`, `vkCmdSetViewport`, `vkCmdSetScissor`, `vkCmdBeginRenderPass`, `vkCmdEndRenderPass`, and `vkCmdSetSampleLocationsEXT` with ping-pong descriptor sets, GPU `VkQueryPool` timing, and intermediate scene color composite.
+- [x] **DirectX 12 Runtime Parity Plumbing (`hooks_dx12.cpp`, `render_target_manager.cpp`, `reconstruction_pass.cpp`):** DXGI + `ID3D12CommandQueue::ExecuteCommandLists` and `ID3D12GraphicsCommandList` VMT hooks, `CreateCommittedResource` + `CBV_SRV_UAV` / `SAMPLER` descriptor heaps, root signature + PSO compilation, and `DispatchDX12` barrier/compute submission.
+- [x] **AVX2 SIMD Camera AOB Scanner:** Runtime CPUID AVX2 detection (`_mm256_cmpeq_epi8`) with scalar fallback, IDA wildcard parsing, RIP-relative resolution, SEH bounds protection, and region-by-region `VirtualQuery` traversal across `.text` sub-regions.
+- [x] **Interactive HUD API & Telemetry (`F11` / `Insert`):** Foreground-PID-gated hotkey toggling, live parameter setters (`SetHistoryWeight`, `SetDepthTolerance`, `SetMipLodBias`, `SetDebugView`, `SetColorSpace`, etc.), built-in default `DefaultTelemetryHudCallback` logging/debug OSD output (`GetFormattedTelemetry()`, FPS, and reconstruction duration), and pluggable `HudRenderCallback`.
 - [x] **Multi-Mode Debug Visualizer (`DebugView = 0..5`):** Reconstructed Output (`0`), Checkerboard Parity Mask (`1`), Disocclusion Heatmap (`2`), Motion Vector Field (`3`), Quarter-Res Raw (`4`), and Spatial Baseline (`5`).
-- [x] **Hardened Runtime, Logging & CI:** Bounded `cbr.ini` parser, thread-safe lock-minimized async logger (`cbr.log`), Windows SEH minidump `CrashHandler`, centralized limits (`include/cbr/limits.h`), CTest C++ unit suites (`cbr_tests`, `cbr_engine_tests`), and automated GitHub Actions release builds.
-- [ ] **DirectX 12 Live Scene Capture Parity:** DXGI `Present`, `Present1`, and `ResizeBuffers` detours and VMT compute dispatch plumbing are implemented; live D3D12 command-list scene attachment extraction (`ExecuteCommandLists` / resource tracking) remains in progress.
-- [ ] **In-Game Dear ImGui Overlay Rendering & Multi-Patch AOB Sweep:** Built-in HUD telemetry OSD and callback registration work today; live Dear ImGui swapchain draw backend and broad RAGE patch signature validation remain open.
+- [x] **Hardened Runtime, Safety Gates & CI:** Bounded `cbr.ini` parser, online launch-argument anti-cheat gate (`-rdo`, `-scOnlineOnly`, `-Multiplayer`), loader-lock-safe preloaded `dbghelp.dll` minidump `CrashHandler`, centralized limits (`include/cbr/limits.h`), CTest C++ unit suites (`cbr_tests`, `cbr_engine_tests`), headless Vulkan Lavapipe compute test (`cbr_vulkan_headless`), and automated GitHub Actions release builds.
+- [ ] **Live In-Game RDR2 DX12 Attachment Capture & Visual ImGui Draw Backend:** D3D12 VMT hooks and compute dispatch plumbing are implemented cleanly in source, while live in-game RAGE DX12 resource-binding validation, full visual Dear ImGui swapchain draw rendering, and multi-patch ViewProj AOB signatures remain open for live game testing.
 
 ---
 
@@ -154,7 +154,7 @@ Checkerboard-Rendering/
 ├── CMakeLists.txt                   # CMake build script for rdr2-cbr.asi & test targets
 ├── cbr.ini                          # Default runtime configuration
 ├── CHECKERBOARD.md                  # Foundational checkerboard rendering paper notes & math
-├── CODEBASE.md                      # Single-file synchronized snapshot (57 tracked files)
+├── CODEBASE.md                      # Single-file synchronized codebase reference snapshot
 ├── CONTRIBUTING.md                  # Contribution guidelines & C++20/GLSL/HLSL standards
 ├── LICENSE                          # MIT License
 ├── nextImplementationPhase.md       # Master roadmap for Phase 2 runtime interception
@@ -194,28 +194,29 @@ Checkerboard-Rendering/
 │
 ├── src/                             # C++20 implementation modules (13 files)
 │   ├── main.cpp                     # DllMain (pinned module), CBRInitThread & CBR_PluginInit
-│   ├── cbr_engine.cpp               # Anti-cheat guard, hook retry, push constants & parity
+│   ├── cbr_engine.cpp               # Anti-cheat/CLI gate, hook retry, push constants & parity
 │   ├── config.cpp                   # Bounded INI parser/serializer with validation
-│   ├── crash_handler.cpp            # Minidump & crash diagnostics
+│   ├── crash_handler.cpp            # Loader-lock-safe preloaded dbghelp.dll minidump telemetry
 │   ├── hooks.cpp                    # HookManager lifecycle & API routing
-│   ├── hooks_vulkan.cpp             # Vulkan detours, attachment copy & mid-frame compute trigger
-│   ├── hooks_dx12.cpp               # DXGI/D3D12 dummy-swapchain Present/ResizeBuffers detours
-│   ├── jitter_manager.cpp           # Subpixel projection jitter & delta calculation
+│   ├── hooks_vulkan.cpp             # Scoped Vulkan detours, attachment copy & mid-frame compute trigger
+│   ├── hooks_dx12.cpp               # DXGI + ID3D12CommandQueue/GraphicsCommandList VMT detours
+│   ├── jitter_manager.cpp           # Non-accumulating Strategy A/B projection & sample jitter
 │   ├── logger.cpp                   # Bounded lock-free/queued asynchronous file writer
-│   ├── pattern_scanner.cpp          # AVX2 + scalar IDA pattern scanner & RIP-relative solver
-│   ├── reconstruction_pass.cpp      # Vulkan compute pipeline & D3D12 VMT dispatch implementation
-│   ├── render_target_manager.cpp    # VRAM footprint math & VkImage/VkSampler allocation
-│   └── ui_overlay.cpp               # Hotkey gating, live tuning setters & OSD formatting
+│   ├── pattern_scanner.cpp          # AVX2 + scalar IDA pattern scanner (multi-region VirtualQuery)
+│   ├── reconstruction_pass.cpp      # Vulkan + D3D12 compute pipeline, UBO/CBV & dispatch
+│   ├── render_target_manager.cpp    # VRAM footprint math & VkImage / ID3D12Resource allocation
+│   └── ui_overlay.cpp               # Hotkey gating, live tuning setters & DefaultTelemetryHudCallback
 │
 ├── shaders/                         # GPU compute shaders (4 files)
 │   ├── cbr_reconstruct.comp         # Vulkan GLSL compute shader (16×16 Wave32/Wave64)
-│   ├── cbr_reconstruct_quad.comp    # Quad-subgroup GLSL compute shader (8×8, 2×2 quad/thread)
-│   ├── cbr_reconstruct.hlsl         # DirectX 12 HLSL SM 6.0 compute shader
+│   ├── cbr_reconstruct_quad.comp    # Quad-per-thread GLSL shader (8×8, register-shared active samples)
+│   ├── cbr_reconstruct.hlsl         # DirectX 12 HLSL compute shader (SM 5.1 / SM 6.0)
 │   └── cbr_resolve_simple.comp      # Spatial-only fallback resolve shader
 │
-└── tests/                           # Portable unit & mathematical equivalence tests
-    ├── test_core.cpp                # Config, logger, jitter, push constants, depth & scanner tests
-    ├── test_engine.cpp              # Hook retry, once-per-frame guard, parity & HUD tests
+└── tests/                           # Portable unit, shader & headless GPU compute tests
+    ├── test_core.cpp                # Config, logger, jitter, push constants, camera UBO, depth & scanner tests
+    ├── test_engine.cpp              # Hook retry, once-per-frame guard, CLI safety gate, parity & HUD tests
+    ├── test_vulkan_headless.cpp     # Headless Vulkan compute dispatch & Frame 0/1 readback test (Lavapipe CI)
     └── check_shader_mapping.py      # 36,864-combination proof of 4-quadrant MSAA coverage
 ```
 
@@ -230,7 +231,7 @@ Every architectural decision, hardware profile, and audit finding is documented 
 |---|---|
 | Architectural overview & verification summary | [`REPORT.md`](REPORT.md) |
 | Foundational CBR theory, 2× MSAA grids & `-1.0` LOD bias | [`CHECKERBOARD.md`](CHECKERBOARD.md) |
-| Synchronized single-file snapshot of all 57 repo files | [`CODEBASE.md`](CODEBASE.md) |
+| Synchronized single-file codebase snapshot | [`CODEBASE.md`](CODEBASE.md) |
 | Phase 2 runtime detours & swapchain integration plan | [`nextImplementationPhase.md`](nextImplementationPhase.md) · [`docs/nextImplementationPhase.md`](docs/nextImplementationPhase.md) |
 | Live test report on RDR2 `1.0.1491.50` (GTX 1070 Ti + LML) | [`docs/IN_GAME_TEST_REPORT_v1491.md`](docs/IN_GAME_TEST_REPORT_v1491.md) |
 | Vulkan loader detours, image barriers & compute pass guide | [`docs/VULKAN_HOOKING_GUIDE.md`](docs/VULKAN_HOOKING_GUIDE.md) |
@@ -258,7 +259,7 @@ Depth values are converted to view-space linear depth (`depth_convention.h`, sup
 
 $$\Delta Z = \frac{|Z_{\text{curr}} - Z_{\text{prev}}|}{\max(Z_{\text{curr}}, 10^{-5})} > \text{DepthTolerance}$$
 
-Valid history samples undergo unconditional 3×3 neighborhood variance clipping (`kVarianceClipGamma = 1.25` in YCoCg, RGB, or HDR10 ICtCp space) before temporal blending (`HistoryWeight = 0.90`). When disoccluded (or when non-finite NaN/Inf inputs are detected), the shader rejects history and blends a spatial cross-bilateral filter over the four cardinal active samples:
+Valid history samples undergo unconditional 3×3 neighborhood variance clipping (`kVarianceClipGamma = 1.25` in YCoCg, RGB, or HDR10 ICtCp space) before temporal blending (`HistoryWeight = 0.90`), followed optionally by a 5-tap RCAS contrast-adaptive sharpening pass (`SharpeningStrength`, default `0.0`). When velocity is zeroed/unbound and camera matrices are supplied (`binding = 7` / `register(b1)`), a camera-only depth unprojection fallback computes rigid motion via `u_CurrViewProjInv` and `u_PrevViewProj`. When disoccluded (or when non-finite NaN/Inf inputs are detected), the shader rejects history and blends a spatial cross-bilateral filter over the four cardinal active samples:
 
 $$C_{\text{spatial}} = \frac{\sum_{k=1}^4 w_k C_k}{\sum_{k=1}^4 w_k}, \quad w_k = \exp\left(-\frac{\|p_k - p\|^2}{2\sigma_d^2}\right) \cdot \exp\left(-\frac{|Z_k - Z|^2}{2\sigma_z^2}\right)$$
 
@@ -351,7 +352,7 @@ TargetWidth = 3840           ; Output width (e.g., 3840 for 4K, 2560 for 1440p, 
 TargetHeight = 2160          ; Output height (e.g., 2160 for 4K, 1440 for 1440p, 1080 for 1080p)
 PreferredApi = Vulkan        ; "Vulkan" (primary active backend), "D3D12", or "Auto"
 SamplingStrategy = StrategyA ; "StrategyA" (0.5px viewport/projection jitter) or "StrategyB" (VK_EXT_sample_locations)
-MipLodBias = -1.0            ; Compensates for 2x texture derivatives in quarter-res 2x MSAA
+MipLodBias = -1.0            ; Applied selectively to anisotropic mipmapped scene samplers (maxLod > 1.0 && anisotropy)
 
 [Reconstruction]
 DepthTolerance = 0.010       ; Linearized relative depth disocclusion sensitivity
@@ -363,6 +364,8 @@ EnableMotionDilation = true  ; 3x3 closest-depth motion vector dilation over act
 DepthConvention = Reversed   ; "Reversed" (RDR2 default: 1 near .. 0 far) or "Standard"
 DepthNear = 0.1              ; Camera near plane in metres
 DepthFar = 0.0               ; Camera far plane in metres (0.0 = infinite far plane for Reversed)
+SharpeningStrength = 0.0     ; Optional 5-tap RCAS sharpening strength (0.0..1.0; default 0.0 = disabled)
+EnableCameraMotionFallback = false ; Force camera depth unprojection motion fallback when matrices are bound
 
 [Jitter]
 JitterPattern = Checkerboard ; 2-phase complementary grid ("Halton" warns & falls back to Checkerboard)
@@ -470,6 +473,8 @@ EnableMotionDilation = true
 DepthConvention = Reversed
 DepthNear = 0.1
 DepthFar = 0.0
+SharpeningStrength = 0.0
+EnableCameraMotionFallback = false
 
 [Jitter]
 JitterPattern = Checkerboard
@@ -489,24 +494,25 @@ LogLevel = Info
 
 ## Testing
 
-The portable C++ test suite (`cbr_tests`, `cbr_engine_tests`), mathematical shader-mapping proof, shader compilers (`glslangValidator` / `dxc`), and MinGW-w64 cross-syntax checks mirror [`.github/workflows/build.yml`](.github/workflows/build.yml):
+The portable C++ test suite (`cbr_tests`, `cbr_engine_tests`), headless Vulkan compute reconstruction test (`cbr_vulkan_headless`, executed against Mesa Lavapipe in CI), mathematical shader-mapping proof, shader compilers (`glslangValidator` / `dxc`), and MinGW-w64 cross-syntax checks mirror [`.github/workflows/build.yml`](.github/workflows/build.yml):
 
 ```bash
-# Configure & run portable unit tests (config, logger, jitter, push constants, depth, engine guards)
+# Validate GLSL compute shaders & HLSL compute shader into shaders/spv/
+mkdir -p shaders/spv
+glslangValidator -V shaders/cbr_reconstruct.comp -o shaders/spv/cbr_reconstruct.spv
+glslangValidator -V shaders/cbr_reconstruct_quad.comp -o shaders/spv/cbr_reconstruct_quad.spv
+glslangValidator -V shaders/cbr_resolve_simple.comp -o shaders/spv/cbr_resolve_simple.spv
+glslangValidator -D -e CSMain -S comp -V shaders/cbr_reconstruct.hlsl -o shaders/spv/cbr_reconstruct_hlsl.spv
+# When Microsoft DXC is installed:
+dxc -T cs_6_0 -E CSMain shaders/cbr_reconstruct.hlsl -Fo shaders/spv/cbr_reconstruct.dxil
+
+# Configure & run unit tests + headless Vulkan compute test (requires Vulkan ICD / mesa-vulkan-drivers)
 cmake -S . -B build-tests -DCBR_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release
-cmake --build build-tests --target cbr_tests cbr_engine_tests
-ctest --test-dir build-tests --output-on-failure
+cmake --build build-tests --target cbr_tests cbr_engine_tests cbr_vulkan_headless
+ctest --test-dir build-tests --output-on-failure -V
 
 # Verify 4-quadrant MSAA coverage equivalence across all 36,864 parity/shift/resolution cases
 python3 tests/check_shader_mapping.py
-
-# Validate GLSL compute shaders & HLSL compute shader
-glslangValidator -V shaders/cbr_reconstruct.comp -o /tmp/cbr_reconstruct.spv
-glslangValidator -V shaders/cbr_reconstruct_quad.comp -o /tmp/cbr_reconstruct_quad.spv
-glslangValidator -V shaders/cbr_resolve_simple.comp -o /tmp/cbr_resolve_simple.spv
-glslangValidator -D -e CSMain -S comp -V shaders/cbr_reconstruct.hlsl -o /tmp/cbr_reconstruct_hlsl.spv
-# When Microsoft DXC is installed:
-dxc -T cs_6_0 -E CSMain shaders/cbr_reconstruct.hlsl -Fo /tmp/cbr_reconstruct.dxil
 ```
 
 ```bash
@@ -522,12 +528,10 @@ done
 ## Changelog / Recent Updates
 
 ### Current (`feature/cbr-pipeline`)
-* **Runtime Pipeline Blocker Fixes (`bcfe6a1` — C-01–C-05, H-01, H-02, H-04):**
-  * Intercepts `vkCreateFramebuffer` and `vkCreateImageView` to extract game attachments, copy rendered scene geometry into quarter-res buffers, and blit reconstructed frames directly into the game's HDR scene attachment without overwriting UI/HUD overlays.
-  * Configures alternating ping-pong descriptor sets (`historyColorViewA`/`B`), initializes all 7 CBR images out of `UNDEFINED` before first dispatch, and inserts per-frame pre-dispatch layout barriers.
-  * Adaptively downshifts velocity texture coordinates (`>> 1`) when velocity buffers are quarter-resolution.
-  * Tracks and removes prior jitter offsets inside `JitterManager::ApplyJitterToProjection` to eliminate camera drift.
-  * Implements D3D12 compute dispatch plumbing via VMT command-list bindings and built-in formatted telemetry OSD fallback for `F11` / `Insert`.
+* **Phases 1–7 Pipeline Completion, Security Hardening & Headless Vulkan Verification:**
+  * Shaders (`C-05`, `H-05`, `M-01`, `M-02`, `M-07`, `M-08`, Sections 5.4 & 5.6): Quarter-res velocity coordinate downshift (`>> 1`), double-guarded NaN/Inf sanitization, HLSL `g_HistoryDepth.Load` + `cardinalColor[4]` caching, thread-local 2×2 quad register sharing (`cbr_reconstruct_quad.comp` without subgroup extensions), `binding = 7` / `register(b1)` camera-only depth unprojection fallback, and optional 5-tap RCAS sharpening (`SharpeningStrength`, default `0.0`).
+  * Vulkan & DX12 Runtime (`C-01..C-04`, `H-02`, `H-03`, `H-06`, `M-03..M-05`): Framebuffer/render-pass attachment inspection (`draws >= 250`), `vkAcquireNextImage2KHR` tracking, ping-pong descriptor sets (`historyColorViewA`/`B`), tracked-layout pre-dispatch & zero-copy barriers, intermediate scene color blit without overwriting UI/HUD overlays, `VkQueryPool` GPU duration timing, selective anisotropic `MipLodBias`, scoped hook teardown, and full D3D12 command queue/list VMT hooks + committed resource/PSO dispatch.
+  * Hardening, Overlay & CI (`H-01`, `H-04`, Sections 4.1–4.3, 5.10, 7): Non-accumulating tracked projection jitter cache, online CLI launch-argument safety gate (`-rdo`, `-scOnlineOnly`, `-Multiplayer`), preloaded `dbghelp.dll` minidump resolution in `CrashHandler::Install()`, region-by-region `VirtualQuery` in `PatternScanner::ScanModule`, built-in `DefaultTelemetryHudCallback`, hardened `check_shader_mapping.py`, and headless Vulkan Lavapipe compute test (`tests/test_vulkan_headless.cpp`) in CMake and GitHub Actions CI.
 * **Architecture Features (`bb85392`):**
   * **AVX2 SIMD Pattern Scanner:** Runtime CPUID AVX2 detection (`_mm256_cmpeq_epi8` 32-byte scanning) with scalar fallback in `pattern_scanner.cpp`.
   * **HDR10 `ICtCp` Clamping:** Added perceptual BT.2100 `ColorSpace::ICtCp` (`u_ColorSpace = 2`) across config and GLSL/Quad/HLSL compute shaders.
