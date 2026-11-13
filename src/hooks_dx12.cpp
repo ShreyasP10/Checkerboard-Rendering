@@ -29,6 +29,10 @@ typedef void (__stdcall *PFN_D3D12RSSetScissorRects)(void* commandList, unsigned
 typedef void (__stdcall *PFN_D3D12OMSetRenderTargets)(void* commandList, unsigned int numRTDescriptors, const void* pRTDescriptors, int rtsSingleHandleToRange, const void* pDepthDescriptor);
 typedef void (__stdcall *PFN_D3D12DrawInstanced)(void* commandList, unsigned int vertexCount, unsigned int instanceCount, unsigned int startVertex, unsigned int startInstance);
 typedef void (__stdcall *PFN_D3D12DrawIndexedInstanced)(void* commandList, unsigned int indexCount, unsigned int instanceCount, unsigned int startIndex, int baseVertex, unsigned int startInstance);
+typedef void (__stdcall *PFN_D3D12SetPipelineState)(void* commandList, void* pPipelineState);
+typedef void (__stdcall *PFN_D3D12SetDescriptorHeaps)(void* commandList, unsigned int numDescriptorHeaps, void* const* ppDescriptorHeaps);
+typedef void (__stdcall *PFN_D3D12SetComputeRootSignature)(void* commandList, void* pRootSignature);
+typedef void (__stdcall *PFN_D3D12SetGraphicsRootSignature)(void* commandList, void* pRootSignature);
 
 PFN_D3D12Present              g_Original_D3D12Present = nullptr;
 PFN_D3D12Present1             g_Original_D3D12Present1 = nullptr;
@@ -39,6 +43,10 @@ PFN_D3D12RSSetScissorRects    g_Original_D3D12RSSetScissorRects = nullptr;
 PFN_D3D12OMSetRenderTargets   g_Original_D3D12OMSetRenderTargets = nullptr;
 PFN_D3D12DrawInstanced        g_Original_D3D12DrawInstanced = nullptr;
 PFN_D3D12DrawIndexedInstanced g_Original_D3D12DrawIndexedInstanced = nullptr;
+PFN_D3D12SetPipelineState    g_Original_D3D12SetPipelineState = nullptr;
+PFN_D3D12SetDescriptorHeaps  g_Original_D3D12SetDescriptorHeaps = nullptr;
+PFN_D3D12SetComputeRootSignature g_Original_D3D12SetComputeRootSignature = nullptr;
+PFN_D3D12SetGraphicsRootSignature g_Original_D3D12SetGraphicsRootSignature = nullptr;
 
 std::mutex         g_dx12HookMutex;
 std::vector<void*> g_HookedDX12Targets;
@@ -69,6 +77,12 @@ struct DX12CmdListSlot {
     std::atomic<void*>    cmdList{ nullptr };
     std::atomic<bool>     viewportDownscaled{ false };
     std::atomic<uint32_t> drawCount{ 0 };
+    std::atomic<void*>    lastPipelineState{ nullptr };
+    std::atomic<void*>    lastGraphicsRootSig{ nullptr };
+    std::atomic<void*>    lastComputeRootSig{ nullptr };
+    std::mutex            heapMutex;
+    uint32_t              lastNumDescriptorHeaps{ 0 };
+    void*                 lastDescriptorHeaps[8]{ nullptr };
 };
 
 constexpr size_t kMaxDX12Slots = 64;
@@ -87,6 +101,16 @@ inline DX12CmdListSlot* GetOrCreateDX12Slot(void* cmdList) {
         size_t idx = (start + i) % kMaxDX12Slots;
         void* expected = nullptr;
         if (g_dx12Slots[idx].cmdList.compare_exchange_strong(expected, cmdList, std::memory_order_acq_rel)) {
+            g_dx12Slots[idx].viewportDownscaled.store(false, std::memory_order_relaxed);
+            g_dx12Slots[idx].drawCount.store(0, std::memory_order_relaxed);
+            g_dx12Slots[idx].lastPipelineState.store(nullptr, std::memory_order_relaxed);
+            g_dx12Slots[idx].lastGraphicsRootSig.store(nullptr, std::memory_order_relaxed);
+            g_dx12Slots[idx].lastComputeRootSig.store(nullptr, std::memory_order_relaxed);
+            {
+                std::lock_guard<std::mutex> lock(g_dx12Slots[idx].heapMutex);
+                g_dx12Slots[idx].lastNumDescriptorHeaps = 0;
+                for (size_t j = 0; j < 8; ++j) g_dx12Slots[idx].lastDescriptorHeaps[j] = nullptr;
+            }
             return &g_dx12Slots[idx];
         }
     }
@@ -110,6 +134,14 @@ inline void ReleaseDX12Slot(void* cmdList) {
     if (slot) {
         slot->viewportDownscaled.store(false, std::memory_order_relaxed);
         slot->drawCount.store(0, std::memory_order_relaxed);
+        slot->lastPipelineState.store(nullptr, std::memory_order_relaxed);
+        slot->lastGraphicsRootSig.store(nullptr, std::memory_order_relaxed);
+        slot->lastComputeRootSig.store(nullptr, std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lock(slot->heapMutex);
+            slot->lastNumDescriptorHeaps = 0;
+            for (size_t i = 0; i < 8; ++i) slot->lastDescriptorHeaps[i] = nullptr;
+        }
         slot->cmdList.store(nullptr, std::memory_order_release);
     }
 }
@@ -328,6 +360,59 @@ void __stdcall Hooked_D3D12RSSetScissorRects(void* commandList, unsigned int num
     g_Original_D3D12RSSetScissorRects(commandList, numRects, pRects);
 }
 
+void __stdcall Hooked_D3D12SetPipelineState(void* commandList, void* pPipelineState) {
+    if (CBREngine::Get().IsEnabled() && commandList) {
+        DX12CmdListSlot* slot = GetOrCreateDX12Slot(commandList);
+        if (slot) {
+            slot->lastPipelineState.store(pPipelineState, std::memory_order_release);
+        }
+    }
+    if (g_Original_D3D12SetPipelineState) {
+        g_Original_D3D12SetPipelineState(commandList, pPipelineState);
+    }
+}
+
+void __stdcall Hooked_D3D12SetDescriptorHeaps(void* commandList, unsigned int numDescriptorHeaps, void* const* ppDescriptorHeaps) {
+    if (CBREngine::Get().IsEnabled() && commandList) {
+        DX12CmdListSlot* slot = GetOrCreateDX12Slot(commandList);
+        if (slot) {
+            std::lock_guard<std::mutex> lock(slot->heapMutex);
+            const uint32_t count = (numDescriptorHeaps > 8u) ? 8u : numDescriptorHeaps;
+            slot->lastNumDescriptorHeaps = count;
+            for (uint32_t i = 0; i < count; ++i) {
+                slot->lastDescriptorHeaps[i] = ppDescriptorHeaps ? ppDescriptorHeaps[i] : nullptr;
+            }
+        }
+    }
+    if (g_Original_D3D12SetDescriptorHeaps) {
+        g_Original_D3D12SetDescriptorHeaps(commandList, numDescriptorHeaps, ppDescriptorHeaps);
+    }
+}
+
+void __stdcall Hooked_D3D12SetComputeRootSignature(void* commandList, void* pRootSignature) {
+    if (CBREngine::Get().IsEnabled() && commandList) {
+        DX12CmdListSlot* slot = GetOrCreateDX12Slot(commandList);
+        if (slot) {
+            slot->lastComputeRootSig.store(pRootSignature, std::memory_order_release);
+        }
+    }
+    if (g_Original_D3D12SetComputeRootSignature) {
+        g_Original_D3D12SetComputeRootSignature(commandList, pRootSignature);
+    }
+}
+
+void __stdcall Hooked_D3D12SetGraphicsRootSignature(void* commandList, void* pRootSignature) {
+    if (CBREngine::Get().IsEnabled() && commandList) {
+        DX12CmdListSlot* slot = GetOrCreateDX12Slot(commandList);
+        if (slot) {
+            slot->lastGraphicsRootSig.store(pRootSignature, std::memory_order_release);
+        }
+    }
+    if (g_Original_D3D12SetGraphicsRootSignature) {
+        g_Original_D3D12SetGraphicsRootSignature(commandList, pRootSignature);
+    }
+}
+
 void __stdcall Hooked_D3D12OMSetRenderTargets(void* commandList, unsigned int numRTDescriptors, const void* pRTDescriptors, int rtsSingleHandleToRange, const void* pDepthDescriptor) {
     if (CBREngine::Get().IsEnabled() && commandList) {
         try {
@@ -336,13 +421,30 @@ void __stdcall Hooked_D3D12OMSetRenderTargets(void* commandList, unsigned int nu
             DX12CmdListSlot* slot = FindDX12Slot(commandList);
             if (slot && slot->viewportDownscaled.load(std::memory_order_acquire) &&
                 slot->drawCount.load(std::memory_order_acquire) >= 250u) {
-                // NOTE (C-03): Dispatching compute reconstruction mid-command-list on the game's open
-                // graphics command list clobbers active descriptor heaps and pipeline state (SetDescriptorHeaps /
-                // SetComputeRootSignature / SetPipelineState). Bypassed until dedicated command list isolation is added.
-                static std::atomic<bool> s_warnedDx12State{ false };
-                if (!s_warnedDx12State.exchange(true)) {
-                    CBR_LOG_WARN("D3D12 mid-command-list dispatch bypassed to prevent descriptor heap / PSO state corruption (Item C-03).");
+                
+                // Dispatch CBR compute reconstruction
+                CBREngine::Get().OnScenePassEnd(commandList);
+
+                // Restore game's active graphics/compute pipeline state and descriptor heaps (Item C-03)
+                if (g_Original_D3D12SetDescriptorHeaps) {
+                    std::lock_guard<std::mutex> lock(slot->heapMutex);
+                    if (slot->lastNumDescriptorHeaps > 0) {
+                        g_Original_D3D12SetDescriptorHeaps(commandList, slot->lastNumDescriptorHeaps, slot->lastDescriptorHeaps);
+                    }
                 }
+                void* pso = slot->lastPipelineState.load(std::memory_order_acquire);
+                if (pso && g_Original_D3D12SetPipelineState) {
+                    g_Original_D3D12SetPipelineState(commandList, pso);
+                }
+                void* gfxSig = slot->lastGraphicsRootSig.load(std::memory_order_acquire);
+                if (gfxSig && g_Original_D3D12SetGraphicsRootSignature) {
+                    g_Original_D3D12SetGraphicsRootSignature(commandList, gfxSig);
+                }
+                void* compSig = slot->lastComputeRootSig.load(std::memory_order_acquire);
+                if (compSig && g_Original_D3D12SetComputeRootSignature) {
+                    g_Original_D3D12SetComputeRootSignature(commandList, compSig);
+                }
+
                 ReleaseDX12Slot(commandList);
             }
         } catch (...) {
@@ -517,6 +619,10 @@ bool HookManager::InstallDX12Hooks() {
             installVmtHook(listVmt[13], reinterpret_cast<LPVOID>(&Hooked_D3D12DrawIndexedInstanced), reinterpret_cast<LPVOID*>(&g_Original_D3D12DrawIndexedInstanced), "ID3D12GraphicsCommandList::DrawIndexedInstanced[13]");
             installVmtHook(listVmt[21], reinterpret_cast<LPVOID>(&Hooked_D3D12RSSetViewports),       reinterpret_cast<LPVOID*>(&g_Original_D3D12RSSetViewports),       "ID3D12GraphicsCommandList::RSSetViewports[21]");
             installVmtHook(listVmt[22], reinterpret_cast<LPVOID>(&Hooked_D3D12RSSetScissorRects),    reinterpret_cast<LPVOID*>(&g_Original_D3D12RSSetScissorRects),    "ID3D12GraphicsCommandList::RSSetScissorRects[22]");
+            installVmtHook(listVmt[25], reinterpret_cast<LPVOID>(&Hooked_D3D12SetPipelineState),    reinterpret_cast<LPVOID*>(&g_Original_D3D12SetPipelineState),    "ID3D12GraphicsCommandList::SetPipelineState[25]");
+            installVmtHook(listVmt[28], reinterpret_cast<LPVOID>(&Hooked_D3D12SetDescriptorHeaps),  reinterpret_cast<LPVOID*>(&g_Original_D3D12SetDescriptorHeaps),  "ID3D12GraphicsCommandList::SetDescriptorHeaps[28]");
+            installVmtHook(listVmt[29], reinterpret_cast<LPVOID>(&Hooked_D3D12SetComputeRootSignature), reinterpret_cast<LPVOID*>(&g_Original_D3D12SetComputeRootSignature), "ID3D12GraphicsCommandList::SetComputeRootSignature[29]");
+            installVmtHook(listVmt[30], reinterpret_cast<LPVOID>(&Hooked_D3D12SetGraphicsRootSignature), reinterpret_cast<LPVOID*>(&g_Original_D3D12SetGraphicsRootSignature), "ID3D12GraphicsCommandList::SetGraphicsRootSignature[30]");
             installVmtHook(listVmt[46], reinterpret_cast<LPVOID>(&Hooked_D3D12OMSetRenderTargets),   reinterpret_cast<LPVOID*>(&g_Original_D3D12OMSetRenderTargets),   "ID3D12GraphicsCommandList::OMSetRenderTargets[46]");
         }
     }
@@ -563,6 +669,10 @@ void HookManager::UninstallDX12Hooks() {
         }
         g_HookedDX12Targets.clear();
         m_dx12Hooked.store(false);
+        g_Original_D3D12SetPipelineState = nullptr;
+        g_Original_D3D12SetDescriptorHeaps = nullptr;
+        g_Original_D3D12SetComputeRootSignature = nullptr;
+        g_Original_D3D12SetGraphicsRootSignature = nullptr;
     }
 }
 

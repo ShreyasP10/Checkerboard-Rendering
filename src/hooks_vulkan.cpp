@@ -80,6 +80,7 @@ typedef void  (*PFN_vkDestroyRenderPass)(void* device, void* renderPass, const v
 typedef int   (*PFN_vkEnumeratePhysicalDevices)(void* instance, uint32_t* pPhysicalDeviceCount, void** pPhysicalDevices);
 typedef void  (*PFN_vkGetPhysicalDeviceProperties)(void* physicalDevice, void* pProperties);
 typedef void  (*PFN_vkGetPhysicalDeviceMemoryProperties)(void* physicalDevice, void* pMemoryProperties);
+typedef void  (*PFN_vkCmdResolveImage)(void* commandBuffer, void* srcImage, uint32_t srcImageLayout, void* dstImage, uint32_t dstImageLayout, uint32_t regionCount, const void* pRegions);
 
 PFN_vkGetDeviceProcAddr                     g_Original_vkGetDeviceProcAddr = nullptr;
 PFN_vkGetInstanceProcAddr                   g_Original_vkGetInstanceProcAddr = nullptr;
@@ -111,6 +112,8 @@ PFN_vkDestroyRenderPass                     g_Original_vkDestroyRenderPass = nul
 PFN_vkEnumeratePhysicalDevices              g_Original_vkEnumeratePhysicalDevices = nullptr;
 PFN_vkGetPhysicalDeviceProperties           g_Original_vkGetPhysicalDeviceProperties = nullptr;
 PFN_vkGetPhysicalDeviceMemoryProperties     g_Original_vkGetPhysicalDeviceMemoryProperties = nullptr;
+PFN_vkCmdResolveImage                       g_Original_vkCmdResolveImage = nullptr;
+static std::atomic<void*>                   g_pendingResolveColorImage{ nullptr };
 
 std::mutex         g_vkHookMutex;
 std::vector<void*> g_HookedVulkanTargets;
@@ -143,6 +146,7 @@ void  Hooked_vkDestroyRenderPass(void* device, void* renderPass, const void* pAl
 int   Hooked_vkEnumeratePhysicalDevices(void* instance, uint32_t* pPhysicalDeviceCount, void** pPhysicalDevices);
 void  Hooked_vkGetPhysicalDeviceProperties(void* physicalDevice, void* pProperties);
 void  Hooked_vkGetPhysicalDeviceMemoryProperties(void* physicalDevice, void* pMemoryProperties);
+void  Hooked_vkCmdResolveImage(void* commandBuffer, void* srcImage, uint32_t srcImageLayout, void* dstImage, uint32_t dstImageLayout, uint32_t regionCount, const void* pRegions);
 
 // VK_ERROR_INITIALIZATION_FAILED: returned if a hook is ever invoked without a valid trampoline,
 // so the failure is visible to the caller instead of silently dropping frames / swapchains.
@@ -725,6 +729,8 @@ int Hooked_vkQueuePresentKHR(void* queue, const void* pPresentInfo) {
     if (!g_Original_vkQueuePresentKHR) {
         return kVkErrorInitializationFailed;
     }
+
+    g_pendingResolveColorImage.store(nullptr, std::memory_order_relaxed);
 
     void* presentTarget = queue;
     if (pPresentInfo) {
@@ -1524,6 +1530,7 @@ void Hooked_vkCmdEndRenderPass(void* commandBuffer) {
                     const bool blitSafe = rtm.ShouldBlitReconstructionToSceneColor(
                         blitDst, IsSwapchainImage(blitDst), rw, rh, blitDstMeta);
                     if (blitSafe) {
+                        g_pendingResolveColorImage.store(nullptr, std::memory_order_release);
                         // DispatchVulkan writes historyColor[1 - activeSetIdx] and OnScenePassEnd() then swaps ping-pong state,
                         // so GetCurrentHistoryIndex() here is the just-written reconstructed history buffer (Item C-02).
                         const uint32_t justWrittenIdx = rtm.GetCurrentHistoryIndex() & 1u;
@@ -1539,12 +1546,52 @@ void Hooked_vkCmdEndRenderPass(void* commandBuffer) {
                             blitSrcLayout,
                             blitDstLayout
                         );
+                    } else if (gameColorImage && !gameResolveColorImage) {
+                        // Game rendered 2x MSAA without inline resolve attachment; arm vkCmdResolveImage to intercept (Item C-02)
+                        g_pendingResolveColorImage.store(gameColorImage, std::memory_order_release);
                     }
                 }
             }
         } catch (...) {
         }
     }
+}
+
+void Hooked_vkCmdResolveImage(void* commandBuffer, void* srcImage, uint32_t srcImageLayout, void* dstImage, uint32_t dstImageLayout, uint32_t regionCount, const void* pRegions) {
+    if (!g_Original_vkCmdResolveImage) return;
+
+    if (CBREngine::Get().IsEnabled() && srcImage) {
+        void* pending = g_pendingResolveColorImage.load(std::memory_order_acquire);
+        if (pending && srcImage == pending) {
+            g_pendingResolveColorImage.store(nullptr, std::memory_order_release);
+            auto& rtm = RenderTargetManager::Get();
+            if (rtm.AreVulkanResourcesCreated()) {
+                const auto& res = rtm.GetVulkanResources();
+                const auto dims = rtm.GetDimensions();
+                const uint32_t justWrittenIdx = rtm.GetCurrentHistoryIndex() & 1u;
+                void* blitSource = res.historyColor[justWrittenIdx].image ? res.historyColor[justWrittenIdx].image : res.outputColor.image;
+                if (blitSource && dstImage) {
+                    const uint32_t blitSrcLayout = rtm.GetVulkanImageLayout(blitSource);
+                    const VulkanImageMetadata dstMeta = LookupImageMetadata(dstImage);
+                    const uint32_t dstW = (dstMeta.width > 0) ? dstMeta.width : dims.fullWidth;
+                    const uint32_t dstH = (dstMeta.height > 0) ? dstMeta.height : dims.fullHeight;
+                    ReconstructionPass::BlitToImage(
+                        commandBuffer,
+                        blitSource,
+                        dstImage,
+                        dims.fullWidth, dims.fullHeight,
+                        dstW, dstH,
+                        dstImageLayout,
+                        blitSrcLayout,
+                        dstImageLayout
+                    );
+                    return;
+                }
+            }
+        }
+    }
+
+    g_Original_vkCmdResolveImage(commandBuffer, srcImage, srcImageLayout, dstImage, dstImageLayout, regionCount, pRegions);
 }
 
 void Hooked_vkCmdSetSampleLocationsEXT(void* commandBuffer, const MinimalVkSampleLocationsInfoEXT* pSampleLocationsInfo) {
@@ -1601,6 +1648,7 @@ inline const VkHookEntry* GetDeviceVkHooks(size_t& outCount) {
         { "vkCmdSetScissor",            reinterpret_cast<void*>(&Hooked_vkCmdSetScissor),            reinterpret_cast<void**>(&g_Original_vkCmdSetScissor),            true  },
         { "vkCmdBeginRenderPass",       reinterpret_cast<void*>(&Hooked_vkCmdBeginRenderPass),       reinterpret_cast<void**>(&g_Original_vkCmdBeginRenderPass),       true  },
         { "vkCmdEndRenderPass",         reinterpret_cast<void*>(&Hooked_vkCmdEndRenderPass),         reinterpret_cast<void**>(&g_Original_vkCmdEndRenderPass),         true  },
+        { "vkCmdResolveImage",          reinterpret_cast<void*>(&Hooked_vkCmdResolveImage),          reinterpret_cast<void**>(&g_Original_vkCmdResolveImage),          false },
         { "vkCmdDraw",                  reinterpret_cast<void*>(&Hooked_vkCmdDraw),                  reinterpret_cast<void**>(&g_Original_vkCmdDraw),                  true  },
         { "vkCmdDrawIndexed",           reinterpret_cast<void*>(&Hooked_vkCmdDrawIndexed),           reinterpret_cast<void**>(&g_Original_vkCmdDrawIndexed),           true  },
         { "vkCmdSetSampleLocationsEXT", reinterpret_cast<void*>(&Hooked_vkCmdSetSampleLocationsEXT), reinterpret_cast<void**>(&g_Original_vkCmdSetSampleLocationsEXT), false },
@@ -1777,6 +1825,8 @@ void HookManager::UninstallVulkanHooks() {
         }
         g_HookedVulkanTargets.clear();
         m_vulkanHooked.store(false);
+        g_Original_vkCmdResolveImage = nullptr;
+        g_pendingResolveColorImage.store(nullptr, std::memory_order_release);
     }
 }
 
