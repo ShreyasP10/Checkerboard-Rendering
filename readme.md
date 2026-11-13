@@ -398,7 +398,8 @@ LogLevel = Info              ; Debug, Info, Warning, Error
 3. **Anti-Aliasing & Resolution Scaling (Critical!):**
    - **Resolution Scale:** **Off / 1.0×** (*Must stay 1.0× so quarter-res parity maps 1:1 to output pixels*).
    - **TAA:** **Medium** or **High** (ensures motion vector buffers remain active for temporal reprojection).
-   - **FXAA / MSAA:** **Off** (CBR allocates and manages its own dedicated quarter-resolution 2× MSAA target).
+   - **MSAA:** **2×** (**Required!** In-game MSAA must be set to **2×** so that the scene geometry color and depth attachments render with 2× MSAA / `VK_SAMPLE_COUNT_2_BIT`. `CanCopyToQuarterColor` and `CanCopyToQuarterDepth` enforce 2× MSAA matching `quarterColor` and `quarterDepth`. If MSAA is set to Off (1×), the C-01 safety gate safely fails open and preserves the native image without black-screening, but CBR compute reconstruction will not trigger).
+   - **FXAA:** **Off** (recommended Off to prevent post-filtering blurring).
 4. **Quality Baseline (4K on 8 GB Pascal GPUs):**
    - Lower **Volumetrics**, **Water**, and **Reflections** to **Medium**; keep **Anisotropic Filtering** at **16×** and reduce **Texture Quality** from **Ultra** to **High** if approaching the 8 GB VRAM ceiling (`300.58 MiB` used by CBR buffers at 4K). On **AMD Vega 7 (512 MB UMA)** laptops, use **1080p** (`75.15 MiB` CBR buffers) and Low/Medium RDR2 presets (`docs/AMD_VEGA_OPTIMIZATION.md`).
 
