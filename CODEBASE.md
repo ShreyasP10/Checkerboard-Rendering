@@ -12132,7 +12132,7 @@ static void TestLoggerBufferingAndLevel(const fs::path& dir) {
 }
 
 static void TestJitter() {
-    ConfigManager::Get().Modify([](CBRConfig& c) { c.jitterScale = 1.0f; c.jitterDirection = 1; });
+    ConfigManager::Get().Modify([](CBRConfig& c) { c = CBRConfig{}; });
     auto& j = JitterManager::Get();
     j.Initialize(3840, 2160);
 
