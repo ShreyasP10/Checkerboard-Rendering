@@ -6873,13 +6873,6 @@ union MinimalVkClearColorValue {
     uint32_t uint32[4];
 };
 
-typedef void (*PFN_vkCmdClearColorImage)(void* commandBuffer,
-                                         void* image,
-                                         uint32_t imageLayout,
-                                         const MinimalVkClearColorValue* pColor,
-                                         uint32_t rangeCount,
-                                         const MinimalVkImageSubresourceRange* pRanges);
-
 // Minimal Vulkan QueryPool types for GPU reconstruction timing (Item M-05)
 constexpr uint32_t kVkStructureTypeQueryPoolCreateInfo = 11;
 constexpr uint32_t kVkQueryTypeTimestamp = 2;
@@ -8385,7 +8378,7 @@ void ReconstructionPass::EnsureInitialLayoutsTransitioned(void* vkCommandBuffer)
     if (!pfnCmdClearColorImage) {
         void* vulkanModule = GetVulkanLoaderModule();
         if (vulkanModule) {
-            pfnCmdClearColorImage = reinterpret_cast<PFN_vkCmdClearColorImage>(GetVulkanLoaderSymbol(vulkanModule, "vkCmdClearColorImage"));
+            pfnCmdClearColorImage = reinterpret_cast<PFN_CmdClearColorImage>(GetVulkanLoaderSymbol(vulkanModule, "vkCmdClearColorImage"));
             m_pfnCmdClearColorImage = pfnCmdClearColorImage;
         }
     }
