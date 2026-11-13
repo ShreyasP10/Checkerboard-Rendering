@@ -502,11 +502,17 @@ static void TestRenderTargets() {
     CHECK(!RenderTargetManager::IsVulkanDepthFormat(97));  // R16G16B16A16_SFLOAT
     CHECK(RenderTargetManager::IsDepthCopyFormatCompatible(100, 100));
     CHECK(!RenderTargetManager::IsDepthCopyFormatCompatible(126, 100)); // depth -> color copy disallowed
+    CHECK(RenderTargetManager::IsDepthCopyFormatCompatible(126, 126));  // D32_SFLOAT -> D32_SFLOAT allowed
+    CHECK(RenderTargetManager::IsDepthCopyFormatCompatible(130, 126));  // D32_SFLOAT_S8_UINT -> D32_SFLOAT allowed
+    CHECK(!RenderTargetManager::IsDepthCopyFormatCompatible(124, 126)); // D16_UNORM -> D32_SFLOAT disallowed (16bpp vs 32bpp)
 
     r.Initialize(3840, 2160);
     const VulkanImageMetadata validColor{ 3840, 2160, 97, 2, 0x10 };
     const VulkanImageMetadata color32bpp{ 3840, 2160, 37, 2, 0x10 };
     const VulkanImageMetadata singleSampleColor{ 3840, 2160, 97, 1, 0x10 };
+    const VulkanImageMetadata validDepth{ 3840, 2160, 126, 2, 0x20 };
+    const VulkanImageMetadata depthColorMismatch{ 3840, 2160, 100, 2, 0x10 };
+    const VulkanImageMetadata singleSampleDepth{ 3840, 2160, 126, 1, 0x20 };
     const VulkanImageMetadata depthMetaDst{ 3840, 2160, 126, 1, 0x20 };
     const VulkanImageMetadata tooSmallColor{ 960, 540, 97, 2, 0x10 };
     const VulkanImageMetadata validVel{ 1920, 1080, 97, 1, 0x10 };
@@ -517,6 +523,9 @@ static void TestRenderTargets() {
     CHECK(!r.CanCopyToQuarterColor(color32bpp));
     CHECK(!r.CanCopyToQuarterColor(singleSampleColor));
     CHECK(!r.CanCopyToQuarterColor(tooSmallColor));
+    CHECK(r.CanCopyToQuarterDepth(validDepth));
+    CHECK(!r.CanCopyToQuarterDepth(depthColorMismatch));
+    CHECK(!r.CanCopyToQuarterDepth(singleSampleDepth));
     CHECK(r.CanCopyToVelocity(validVel));
     CHECK(!r.CanCopyToVelocity(validColor)); // 2x samples != 1x velocity buffer
 

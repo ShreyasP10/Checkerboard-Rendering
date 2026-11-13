@@ -35,6 +35,8 @@ constexpr uint32_t kVkImageViewType2D                     = 1;
 constexpr uint32_t kVkFormatR16G16B16A16Sfloat            = 97;
 // VK_FORMAT_R32_SFLOAT = 100
 constexpr uint32_t kVkFormatR32Sfloat                     = 100;
+// VK_FORMAT_D32_SFLOAT = 126
+constexpr uint32_t kVkFormatD32Sfloat                     = 126;
 
 constexpr uint32_t kVkImageTilingOptimal                  = 0;
 constexpr uint32_t kVkSharingModeExclusive                = 0;
@@ -47,6 +49,7 @@ constexpr uint32_t kVkImageUsageTransferDstBit            = 0x00000002;
 constexpr uint32_t kVkImageUsageSampledBit                = 0x00000004;
 constexpr uint32_t kVkImageUsageStorageBit                = 0x00000008;
 constexpr uint32_t kVkImageUsageColorAttachmentBit        = 0x00000010;
+constexpr uint32_t kVkImageUsageDepthStencilAttachmentBit = 0x00000020;
 
 constexpr uint32_t kVkImageAspectColorBit                 = 0x00000001;
 constexpr uint32_t kVkImageAspectDepthBit                 = 0x00000002;
@@ -496,6 +499,8 @@ bool RenderTargetManager::CreateVulkanResources(void* vkDevice, void* vkPhysical
     // 2x MSAA sampled inputs must NOT carry STORAGE_BIT (VUID-VkImageCreateInfo-samples-02258).
     constexpr uint32_t msaaInputUsage = kVkImageUsageSampledBit | kVkImageUsageTransferSrcBit |
                                         kVkImageUsageTransferDstBit | kVkImageUsageColorAttachmentBit;
+    constexpr uint32_t msaaDepthUsage = kVkImageUsageSampledBit | kVkImageUsageTransferSrcBit |
+                                        kVkImageUsageTransferDstBit | kVkImageUsageDepthStencilAttachmentBit;
     constexpr uint32_t colorUsage = kVkImageUsageSampledBit | kVkImageUsageStorageBit |
                                     kVkImageUsageTransferSrcBit | kVkImageUsageTransferDstBit;
     constexpr uint32_t depthUsage = kVkImageUsageSampledBit | kVkImageUsageStorageBit |
@@ -508,8 +513,8 @@ bool RenderTargetManager::CreateVulkanResources(void* vkDevice, void* vkPhysical
         CBR_LOG_ERROR("Failed to allocate device-local QuarterColor buffer (2x MSAA)");
         return false;
     }
-    if (!createTexture(dims.quarterWidth, dims.quarterHeight, kVkFormatR32Sfloat,
-                       msaaInputUsage, kVkImageAspectColorBit, m_vkResources.quarterDepth, kVkSampleCount2Bit)) {
+    if (!createTexture(dims.quarterWidth, dims.quarterHeight, kVkFormatD32Sfloat,
+                       msaaDepthUsage, kVkImageAspectDepthBit, m_vkResources.quarterDepth, kVkSampleCount2Bit)) {
         CBR_LOG_ERROR("Failed to allocate device-local QuarterDepth buffer (2x MSAA)");
         return false;
     }
@@ -987,12 +992,20 @@ bool RenderTargetManager::IsVulkanDepthFormat(int32_t format) {
 bool RenderTargetManager::IsDepthCopyFormatCompatible(uint32_t srcFormat, uint32_t dstFormat) {
     if (srcFormat == 0u || dstFormat == 0u) return false;
     if (srcFormat == dstFormat) return true;
+    const bool srcIsDepth = IsVulkanDepthFormat(static_cast<int32_t>(srcFormat));
+    const bool dstIsDepth = IsVulkanDepthFormat(static_cast<int32_t>(dstFormat));
     // Direct vkCmdCopyImage cannot cross depth/color aspect classes (e.g. D24/D32 -> R32_SFLOAT).
-    // Allow 32-bit color <-> R32_SFLOAT (100) only when neither is a depth/stencil format.
-    if (IsVulkanDepthFormat(static_cast<int32_t>(srcFormat)) ||
-        IsVulkanDepthFormat(static_cast<int32_t>(dstFormat))) {
+    if (srcIsDepth != dstIsDepth) {
         return false;
     }
+    if (srcIsDepth && dstIsDepth) {
+        // Allow size-compatible 32-bit depth formats (D32_SFLOAT = 126 and D32_SFLOAT_S8_UINT = 130)
+        auto is32BitDepth = [](uint32_t f) {
+            return f == 126u /* D32_SFLOAT */ || f == 130u /* D32_SFLOAT_S8_UINT */;
+        };
+        return is32BitDepth(srcFormat) && is32BitDepth(dstFormat);
+    }
+    // Allow 32-bit color <-> R32_SFLOAT (100) only when neither is a depth/stencil format.
     auto is32BitSingleComponentColor = [](uint32_t f) {
         return f == 98u /* R32_UINT */ || f == 99u /* R32_SINT */ || f == 100u /* R32_SFLOAT */;
     };
@@ -1047,7 +1060,7 @@ bool RenderTargetManager::CanCopyToQuarterDepth(const VulkanImageMetadata& srcMe
     if (srcMeta.samples != 0u && srcMeta.samples != dims.msaaSamples) {
         return false;
     }
-    if (srcMeta.format != 0u && !IsDepthCopyFormatCompatible(srcMeta.format, kVkFormatR32Sfloat)) {
+    if (srcMeta.format != 0u && !IsDepthCopyFormatCompatible(srcMeta.format, kVkFormatD32Sfloat)) {
         return false;
     }
     return true;

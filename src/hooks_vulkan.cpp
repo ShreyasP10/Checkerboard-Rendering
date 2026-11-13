@@ -1238,6 +1238,10 @@ void Hooked_vkCmdBeginRenderPass(void* commandBuffer, const void* pRenderPassBeg
                 if (config.samplingStrategy == SamplingStrategy::StrategyA && config.jitterDirection != 0) {
                     PatternScanner::UpdateCameraJitter(CBREngine::Get().GetCurrentFrameIndex(), true);
                 }
+                float* camProj = PatternScanner::GetCameraProjectionMatrix();
+                if (camProj) {
+                    ReconstructionPass::Get().SetCameraMatrices(camProj, nullptr);
+                }
             }
 
             // Support VK_KHR_imageless_framebuffer / Vulkan 1.2 VkRenderPassAttachmentBeginInfo in pNext chain (Item C-01)
@@ -1422,6 +1426,8 @@ void Hooked_vkCmdEndRenderPass(void* commandBuffer) {
                     const auto dims = rtm.GetDimensions();
 
                     // Step 1: Copy compatible offscreen scene geometry attachments into quarterColor, quarterDepth, and velocity (Item C-01)
+                    bool copiedColor = false;
+                    bool copiedDepth = false;
                     if (gameColorImage) {
                         const VulkanImageMetadata colorMeta = LookupImageMetadata(gameColorImage);
                         if (rtm.CanCopyToQuarterColor(colorMeta)) {
@@ -1437,6 +1443,7 @@ void Hooked_vkCmdEndRenderPass(void* commandBuffer) {
                                 5 /* SHADER_READ_ONLY_OPTIMAL */,
                                 res.quarterColor.aspectMask
                             );
+                            copiedColor = true;
                         } else {
                             static std::atomic<bool> s_warnedColorCopy{ false };
                             if (!s_warnedColorCopy.exchange(true)) {
@@ -1448,22 +1455,26 @@ void Hooked_vkCmdEndRenderPass(void* commandBuffer) {
                     if (gameDepthImage) {
                         const VulkanImageMetadata depthMeta = LookupImageMetadata(gameDepthImage);
                         if (rtm.CanCopyToQuarterDepth(depthMeta)) {
+                            // Enforce aspectMask matches 2u (DEPTH_BIT) so D32_SFLOAT_S8_UINT depth aspect is isolated (VUID-VkImageCopy-aspectMask-00142)
+                            const uint32_t srcDepthAspect = (depthAspect & 2u) ? 2u : depthAspect;
+                            const uint32_t dstDepthAspect = (res.quarterDepth.aspectMask & 2u) ? 2u : res.quarterDepth.aspectMask;
                             ReconstructionPass::CopyImageRegion(
                                 commandBuffer,
                                 gameDepthImage, res.quarterDepth.image,
                                 0, 0, 0, 0,
                                 dims.quarterWidth, dims.quarterHeight,
-                                depthAspect,
+                                srcDepthAspect,
                                 depthFinalLayout,
                                 rtm.GetVulkanImageLayout(res.quarterDepth.image),
                                 depthFinalLayout,
                                 5 /* SHADER_READ_ONLY_OPTIMAL */,
-                                res.quarterDepth.aspectMask
+                                dstDepthAspect
                             );
+                            copiedDepth = true;
                         } else {
                             static std::atomic<bool> s_warnedDepthCopy{ false };
                             if (!s_warnedDepthCopy.exchange(true)) {
-                                CBR_LOG_WARN("vkCmdCopyImage skipped for scene depth (format=%u, samples=%u): direct depth->R32_SFLOAT copy unsupported.",
+                                CBR_LOG_WARN("vkCmdCopyImage skipped for scene depth (format=%u, samples=%u): incompatible with 2x MSAA D32_SFLOAT quarterDepth.",
                                              depthMeta.format, depthMeta.samples);
                             }
                         }
@@ -1490,6 +1501,16 @@ void Hooked_vkCmdEndRenderPass(void* commandBuffer) {
                                              velMeta.width, velMeta.height, velMeta.samples);
                             }
                         }
+                    }
+
+                    // Strict C-01 gate: abort dispatch & blit if essential attachments were not captured
+                    if (!copiedColor || !copiedDepth) {
+                        static std::atomic<bool> s_warnedSkipPass{ false };
+                        if (!s_warnedSkipPass.exchange(true)) {
+                            CBR_LOG_WARN("Skipping CBR reconstruction & blit: required attachments not copied (copiedColor=%d, copiedDepth=%d). Preserving native rendering.",
+                                         copiedColor ? 1 : 0, copiedDepth ? 1 : 0);
+                        }
+                        return;
                     }
 
                     // Step 2: Transition layouts and execute CBR reconstruction compute dispatch

@@ -191,6 +191,10 @@ void CBREngine::OnBeginFrame() {
     if (config.samplingStrategy == SamplingStrategy::StrategyA && config.jitterDirection != 0) {
         PatternScanner::UpdateCameraJitter(currentFrame, m_activeApi.load() == GraphicsApi::Vulkan);
     }
+    float* camProj = PatternScanner::GetCameraProjectionMatrix();
+    if (camProj) {
+        ReconstructionPass::Get().SetCameraMatrices(camProj, nullptr);
+    }
 #endif
 }
 
@@ -287,10 +291,12 @@ void CBREngine::OnSwapchainRecreated(uint32_t width, uint32_t height) {
         height = evenH;
         RenderTargetManager::Get().Initialize(width, height);
         JitterManager::Get().Initialize(width, height);
+        ReconstructionPass::Get().ClearCameraMatrices();
         CBR_LOG_INFO("Swapchain recreated with new resolution %ux%u: frame parity and history reset.", width, height);
         OnBeginFrame();
     } else {
         RenderTargetManager::Get().ResetHistory();
+        ReconstructionPass::Get().ClearCameraMatrices();
         CBR_LOG_INFO("Swapchain recreated: frame parity and history reset.");
     }
 }

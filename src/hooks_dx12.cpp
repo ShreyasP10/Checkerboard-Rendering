@@ -336,7 +336,13 @@ void __stdcall Hooked_D3D12OMSetRenderTargets(void* commandList, unsigned int nu
             DX12CmdListSlot* slot = FindDX12Slot(commandList);
             if (slot && slot->viewportDownscaled.load(std::memory_order_acquire) &&
                 slot->drawCount.load(std::memory_order_acquire) >= 250u) {
-                CBREngine::Get().OnScenePassEnd(commandList);
+                // NOTE (C-03): Dispatching compute reconstruction mid-command-list on the game's open
+                // graphics command list clobbers active descriptor heaps and pipeline state (SetDescriptorHeaps /
+                // SetComputeRootSignature / SetPipelineState). Bypassed until dedicated command list isolation is added.
+                static std::atomic<bool> s_warnedDx12State{ false };
+                if (!s_warnedDx12State.exchange(true)) {
+                    CBR_LOG_WARN("D3D12 mid-command-list dispatch bypassed to prevent descriptor heap / PSO state corruption (Item C-03).");
+                }
                 ReleaseDX12Slot(commandList);
             }
         } catch (...) {

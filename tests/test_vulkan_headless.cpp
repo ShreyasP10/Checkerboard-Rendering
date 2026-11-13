@@ -51,6 +51,7 @@ constexpr uint32_t kVkMemoryPropertyHostVisibleCoherentBits = 0x00000006;
 
 constexpr uint32_t kVkFormatR16G16B16A16Sfloat = 97;
 constexpr uint32_t kVkFormatR32Sfloat = 100;
+constexpr uint32_t kVkFormatD32Sfloat = 126;
 constexpr uint32_t kVkSampleCount2Bit = 0x00000002;
 constexpr uint32_t kVkAttachmentLoadOpClear = 1;
 constexpr uint32_t kVkAttachmentStoreOpStore = 0;
@@ -59,6 +60,7 @@ constexpr uint32_t kVkAttachmentStoreOpDontCare = 1;
 constexpr uint32_t kVkPipelineBindPointGraphics = 0;
 constexpr uint32_t kVkImageLayoutUndefined = 0;
 constexpr uint32_t kVkImageLayoutColorAttachmentOptimal = 2;
+constexpr uint32_t kVkImageLayoutDepthStencilAttachmentOptimal = 3;
 constexpr uint32_t kVkImageLayoutShaderReadOnlyOptimal = 5;
 constexpr uint32_t kVkImageLayoutTransferSrcOptimal = 6;
 constexpr uint32_t kVkImageLayoutTransferDstOptimal = 7;
@@ -691,7 +693,7 @@ int main() {
     rpAtts[0].initialLayout = kVkImageLayoutUndefined;
     rpAtts[0].finalLayout = kVkImageLayoutShaderReadOnlyOptimal;
 
-    rpAtts[1].format = kVkFormatR32Sfloat;
+    rpAtts[1].format = kVkFormatD32Sfloat;
     rpAtts[1].samples = kVkSampleCount2Bit;
     rpAtts[1].loadOp = kVkAttachmentLoadOpClear;
     rpAtts[1].storeOp = kVkAttachmentStoreOpStore;
@@ -700,14 +702,14 @@ int main() {
     rpAtts[1].initialLayout = kVkImageLayoutUndefined;
     rpAtts[1].finalLayout = kVkImageLayoutShaderReadOnlyOptimal;
 
-    VkAttachmentReferenceMin colorRefs[2]{};
-    colorRefs[0] = { 0, kVkImageLayoutColorAttachmentOptimal };
-    colorRefs[1] = { 1, kVkImageLayoutColorAttachmentOptimal };
+    VkAttachmentReferenceMin colorRef = { 0, kVkImageLayoutColorAttachmentOptimal };
+    VkAttachmentReferenceMin depthRef = { 1, kVkImageLayoutDepthStencilAttachmentOptimal };
 
     VkSubpassDescriptionMin subpass{};
     subpass.pipelineBindPoint = kVkPipelineBindPointGraphics;
-    subpass.colorAttachmentCount = 2;
-    subpass.pColorAttachments = colorRefs;
+    subpass.colorAttachmentCount = 1;
+    subpass.pColorAttachments = &colorRef;
+    subpass.pDepthStencilAttachment = &depthRef;
 
     VkRenderPassCreateInfoMin rpInfo{};
     rpInfo.sType = kVkStructureTypeRenderPassCreateInfo;
@@ -785,7 +787,7 @@ int main() {
         // Tile A = (0.75, 0.25, 0.50), Tile B = (0.25, 0.75, 0.50); quarterDepth = 0.50
         VkClearValueMin rpClears[2]{};
         rpClears[0].color = { { 0.75f, 0.25f, 0.50f, 1.0f } };
-        rpClears[1].color = { { 0.50f, 0.0f, 0.0f, 0.0f } };
+        rpClears[1].depthStencil = { 0.50f, 0u };
 
         VkRenderPassBeginInfoMin rpBegin{};
         rpBegin.sType = kVkStructureTypeRenderPassBeginInfo;
