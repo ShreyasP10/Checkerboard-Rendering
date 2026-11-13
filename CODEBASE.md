@@ -2096,6 +2096,10 @@ void CBREngine::OnBeginFrame() {
     if (config.samplingStrategy == SamplingStrategy::StrategyA && config.jitterDirection != 0) {
         PatternScanner::UpdateCameraJitter(currentFrame, m_activeApi.load() == GraphicsApi::Vulkan);
     }
+    float* camProj = PatternScanner::GetCameraProjectionMatrix();
+    if (camProj) {
+        ReconstructionPass::Get().SetCameraMatrices(camProj, nullptr);
+    }
 #endif
 }
 
@@ -2192,10 +2196,12 @@ void CBREngine::OnSwapchainRecreated(uint32_t width, uint32_t height) {
         height = evenH;
         RenderTargetManager::Get().Initialize(width, height);
         JitterManager::Get().Initialize(width, height);
+        ReconstructionPass::Get().ClearCameraMatrices();
         CBR_LOG_INFO("Swapchain recreated with new resolution %ux%u: frame parity and history reset.", width, height);
         OnBeginFrame();
     } else {
         RenderTargetManager::Get().ResetHistory();
+        ReconstructionPass::Get().ClearCameraMatrices();
         CBR_LOG_INFO("Swapchain recreated: frame parity and history reset.");
     }
 }
@@ -4386,6 +4392,10 @@ void Hooked_vkCmdBeginRenderPass(void* commandBuffer, const void* pRenderPassBeg
                 if (config.samplingStrategy == SamplingStrategy::StrategyA && config.jitterDirection != 0) {
                     PatternScanner::UpdateCameraJitter(CBREngine::Get().GetCurrentFrameIndex(), true);
                 }
+                float* camProj = PatternScanner::GetCameraProjectionMatrix();
+                if (camProj) {
+                    ReconstructionPass::Get().SetCameraMatrices(camProj, nullptr);
+                }
             }
 
             // Support VK_KHR_imageless_framebuffer / Vulkan 1.2 VkRenderPassAttachmentBeginInfo in pNext chain (Item C-01)
@@ -4570,6 +4580,8 @@ void Hooked_vkCmdEndRenderPass(void* commandBuffer) {
                     const auto dims = rtm.GetDimensions();
 
                     // Step 1: Copy compatible offscreen scene geometry attachments into quarterColor, quarterDepth, and velocity (Item C-01)
+                    bool copiedColor = false;
+                    bool copiedDepth = false;
                     if (gameColorImage) {
                         const VulkanImageMetadata colorMeta = LookupImageMetadata(gameColorImage);
                         if (rtm.CanCopyToQuarterColor(colorMeta)) {
@@ -4585,6 +4597,7 @@ void Hooked_vkCmdEndRenderPass(void* commandBuffer) {
                                 5 /* SHADER_READ_ONLY_OPTIMAL */,
                                 res.quarterColor.aspectMask
                             );
+                            copiedColor = true;
                         } else {
                             static std::atomic<bool> s_warnedColorCopy{ false };
                             if (!s_warnedColorCopy.exchange(true)) {
@@ -4596,22 +4609,26 @@ void Hooked_vkCmdEndRenderPass(void* commandBuffer) {
                     if (gameDepthImage) {
                         const VulkanImageMetadata depthMeta = LookupImageMetadata(gameDepthImage);
                         if (rtm.CanCopyToQuarterDepth(depthMeta)) {
+                            // Enforce aspectMask matches 2u (DEPTH_BIT) so D32_SFLOAT_S8_UINT depth aspect is isolated (VUID-VkImageCopy-aspectMask-00142)
+                            const uint32_t srcDepthAspect = (depthAspect & 2u) ? 2u : depthAspect;
+                            const uint32_t dstDepthAspect = (res.quarterDepth.aspectMask & 2u) ? 2u : res.quarterDepth.aspectMask;
                             ReconstructionPass::CopyImageRegion(
                                 commandBuffer,
                                 gameDepthImage, res.quarterDepth.image,
                                 0, 0, 0, 0,
                                 dims.quarterWidth, dims.quarterHeight,
-                                depthAspect,
+                                srcDepthAspect,
                                 depthFinalLayout,
                                 rtm.GetVulkanImageLayout(res.quarterDepth.image),
                                 depthFinalLayout,
                                 5 /* SHADER_READ_ONLY_OPTIMAL */,
-                                res.quarterDepth.aspectMask
+                                dstDepthAspect
                             );
+                            copiedDepth = true;
                         } else {
                             static std::atomic<bool> s_warnedDepthCopy{ false };
                             if (!s_warnedDepthCopy.exchange(true)) {
-                                CBR_LOG_WARN("vkCmdCopyImage skipped for scene depth (format=%u, samples=%u): direct depth->R32_SFLOAT copy unsupported.",
+                                CBR_LOG_WARN("vkCmdCopyImage skipped for scene depth (format=%u, samples=%u): incompatible with 2x MSAA D32_SFLOAT quarterDepth.",
                                              depthMeta.format, depthMeta.samples);
                             }
                         }
@@ -4638,6 +4655,16 @@ void Hooked_vkCmdEndRenderPass(void* commandBuffer) {
                                              velMeta.width, velMeta.height, velMeta.samples);
                             }
                         }
+                    }
+
+                    // Strict C-01 gate: abort dispatch & blit if essential attachments were not captured
+                    if (!copiedColor || !copiedDepth) {
+                        static std::atomic<bool> s_warnedSkipPass{ false };
+                        if (!s_warnedSkipPass.exchange(true)) {
+                            CBR_LOG_WARN("Skipping CBR reconstruction & blit: required attachments not copied (copiedColor=%d, copiedDepth=%d). Preserving native rendering.",
+                                         copiedColor ? 1 : 0, copiedDepth ? 1 : 0);
+                        }
+                        return;
                     }
 
                     // Step 2: Transition layouts and execute CBR reconstruction compute dispatch
@@ -5251,7 +5278,13 @@ void __stdcall Hooked_D3D12OMSetRenderTargets(void* commandList, unsigned int nu
             DX12CmdListSlot* slot = FindDX12Slot(commandList);
             if (slot && slot->viewportDownscaled.load(std::memory_order_acquire) &&
                 slot->drawCount.load(std::memory_order_acquire) >= 250u) {
-                CBREngine::Get().OnScenePassEnd(commandList);
+                // NOTE (C-03): Dispatching compute reconstruction mid-command-list on the game's open
+                // graphics command list clobbers active descriptor heaps and pipeline state (SetDescriptorHeaps /
+                // SetComputeRootSignature / SetPipelineState). Bypassed until dedicated command list isolation is added.
+                static std::atomic<bool> s_warnedDx12State{ false };
+                if (!s_warnedDx12State.exchange(true)) {
+                    CBR_LOG_WARN("D3D12 mid-command-list dispatch bypassed to prevent descriptor heap / PSO state corruption (Item C-03).");
+                }
                 ReleaseDX12Slot(commandList);
             }
         } catch (...) {
@@ -8805,6 +8838,8 @@ constexpr uint32_t kVkImageViewType2D                     = 1;
 constexpr uint32_t kVkFormatR16G16B16A16Sfloat            = 97;
 // VK_FORMAT_R32_SFLOAT = 100
 constexpr uint32_t kVkFormatR32Sfloat                     = 100;
+// VK_FORMAT_D32_SFLOAT = 126
+constexpr uint32_t kVkFormatD32Sfloat                     = 126;
 
 constexpr uint32_t kVkImageTilingOptimal                  = 0;
 constexpr uint32_t kVkSharingModeExclusive                = 0;
@@ -8817,6 +8852,7 @@ constexpr uint32_t kVkImageUsageTransferDstBit            = 0x00000002;
 constexpr uint32_t kVkImageUsageSampledBit                = 0x00000004;
 constexpr uint32_t kVkImageUsageStorageBit                = 0x00000008;
 constexpr uint32_t kVkImageUsageColorAttachmentBit        = 0x00000010;
+constexpr uint32_t kVkImageUsageDepthStencilAttachmentBit = 0x00000020;
 
 constexpr uint32_t kVkImageAspectColorBit                 = 0x00000001;
 constexpr uint32_t kVkImageAspectDepthBit                 = 0x00000002;
@@ -9266,6 +9302,8 @@ bool RenderTargetManager::CreateVulkanResources(void* vkDevice, void* vkPhysical
     // 2x MSAA sampled inputs must NOT carry STORAGE_BIT (VUID-VkImageCreateInfo-samples-02258).
     constexpr uint32_t msaaInputUsage = kVkImageUsageSampledBit | kVkImageUsageTransferSrcBit |
                                         kVkImageUsageTransferDstBit | kVkImageUsageColorAttachmentBit;
+    constexpr uint32_t msaaDepthUsage = kVkImageUsageSampledBit | kVkImageUsageTransferSrcBit |
+                                        kVkImageUsageTransferDstBit | kVkImageUsageDepthStencilAttachmentBit;
     constexpr uint32_t colorUsage = kVkImageUsageSampledBit | kVkImageUsageStorageBit |
                                     kVkImageUsageTransferSrcBit | kVkImageUsageTransferDstBit;
     constexpr uint32_t depthUsage = kVkImageUsageSampledBit | kVkImageUsageStorageBit |
@@ -9278,8 +9316,8 @@ bool RenderTargetManager::CreateVulkanResources(void* vkDevice, void* vkPhysical
         CBR_LOG_ERROR("Failed to allocate device-local QuarterColor buffer (2x MSAA)");
         return false;
     }
-    if (!createTexture(dims.quarterWidth, dims.quarterHeight, kVkFormatR32Sfloat,
-                       msaaInputUsage, kVkImageAspectColorBit, m_vkResources.quarterDepth, kVkSampleCount2Bit)) {
+    if (!createTexture(dims.quarterWidth, dims.quarterHeight, kVkFormatD32Sfloat,
+                       msaaDepthUsage, kVkImageAspectDepthBit, m_vkResources.quarterDepth, kVkSampleCount2Bit)) {
         CBR_LOG_ERROR("Failed to allocate device-local QuarterDepth buffer (2x MSAA)");
         return false;
     }
@@ -9757,12 +9795,20 @@ bool RenderTargetManager::IsVulkanDepthFormat(int32_t format) {
 bool RenderTargetManager::IsDepthCopyFormatCompatible(uint32_t srcFormat, uint32_t dstFormat) {
     if (srcFormat == 0u || dstFormat == 0u) return false;
     if (srcFormat == dstFormat) return true;
+    const bool srcIsDepth = IsVulkanDepthFormat(static_cast<int32_t>(srcFormat));
+    const bool dstIsDepth = IsVulkanDepthFormat(static_cast<int32_t>(dstFormat));
     // Direct vkCmdCopyImage cannot cross depth/color aspect classes (e.g. D24/D32 -> R32_SFLOAT).
-    // Allow 32-bit color <-> R32_SFLOAT (100) only when neither is a depth/stencil format.
-    if (IsVulkanDepthFormat(static_cast<int32_t>(srcFormat)) ||
-        IsVulkanDepthFormat(static_cast<int32_t>(dstFormat))) {
+    if (srcIsDepth != dstIsDepth) {
         return false;
     }
+    if (srcIsDepth && dstIsDepth) {
+        // Allow size-compatible 32-bit depth formats (D32_SFLOAT = 126 and D32_SFLOAT_S8_UINT = 130)
+        auto is32BitDepth = [](uint32_t f) {
+            return f == 126u /* D32_SFLOAT */ || f == 130u /* D32_SFLOAT_S8_UINT */;
+        };
+        return is32BitDepth(srcFormat) && is32BitDepth(dstFormat);
+    }
+    // Allow 32-bit color <-> R32_SFLOAT (100) only when neither is a depth/stencil format.
     auto is32BitSingleComponentColor = [](uint32_t f) {
         return f == 98u /* R32_UINT */ || f == 99u /* R32_SINT */ || f == 100u /* R32_SFLOAT */;
     };
@@ -9817,7 +9863,7 @@ bool RenderTargetManager::CanCopyToQuarterDepth(const VulkanImageMetadata& srcMe
     if (srcMeta.samples != 0u && srcMeta.samples != dims.msaaSamples) {
         return false;
     }
-    if (srcMeta.format != 0u && !IsDepthCopyFormatCompatible(srcMeta.format, kVkFormatR32Sfloat)) {
+    if (srcMeta.format != 0u && !IsDepthCopyFormatCompatible(srcMeta.format, kVkFormatD32Sfloat)) {
         return false;
     }
     return true;
@@ -12419,11 +12465,17 @@ static void TestRenderTargets() {
     CHECK(!RenderTargetManager::IsVulkanDepthFormat(97));  // R16G16B16A16_SFLOAT
     CHECK(RenderTargetManager::IsDepthCopyFormatCompatible(100, 100));
     CHECK(!RenderTargetManager::IsDepthCopyFormatCompatible(126, 100)); // depth -> color copy disallowed
+    CHECK(RenderTargetManager::IsDepthCopyFormatCompatible(126, 126));  // D32_SFLOAT -> D32_SFLOAT allowed
+    CHECK(RenderTargetManager::IsDepthCopyFormatCompatible(130, 126));  // D32_SFLOAT_S8_UINT -> D32_SFLOAT allowed
+    CHECK(!RenderTargetManager::IsDepthCopyFormatCompatible(124, 126)); // D16_UNORM -> D32_SFLOAT disallowed (16bpp vs 32bpp)
 
     r.Initialize(3840, 2160);
     const VulkanImageMetadata validColor{ 3840, 2160, 97, 2, 0x10 };
     const VulkanImageMetadata color32bpp{ 3840, 2160, 37, 2, 0x10 };
     const VulkanImageMetadata singleSampleColor{ 3840, 2160, 97, 1, 0x10 };
+    const VulkanImageMetadata validDepth{ 3840, 2160, 126, 2, 0x20 };
+    const VulkanImageMetadata depthColorMismatch{ 3840, 2160, 100, 2, 0x10 };
+    const VulkanImageMetadata singleSampleDepth{ 3840, 2160, 126, 1, 0x20 };
     const VulkanImageMetadata depthMetaDst{ 3840, 2160, 126, 1, 0x20 };
     const VulkanImageMetadata tooSmallColor{ 960, 540, 97, 2, 0x10 };
     const VulkanImageMetadata validVel{ 1920, 1080, 97, 1, 0x10 };
@@ -12434,6 +12486,9 @@ static void TestRenderTargets() {
     CHECK(!r.CanCopyToQuarterColor(color32bpp));
     CHECK(!r.CanCopyToQuarterColor(singleSampleColor));
     CHECK(!r.CanCopyToQuarterColor(tooSmallColor));
+    CHECK(r.CanCopyToQuarterDepth(validDepth));
+    CHECK(!r.CanCopyToQuarterDepth(depthColorMismatch));
+    CHECK(!r.CanCopyToQuarterDepth(singleSampleDepth));
     CHECK(r.CanCopyToVelocity(validVel));
     CHECK(!r.CanCopyToVelocity(validColor)); // 2x samples != 1x velocity buffer
 
@@ -12963,6 +13018,7 @@ constexpr uint32_t kVkMemoryPropertyHostVisibleCoherentBits = 0x00000006;
 
 constexpr uint32_t kVkFormatR16G16B16A16Sfloat = 97;
 constexpr uint32_t kVkFormatR32Sfloat = 100;
+constexpr uint32_t kVkFormatD32Sfloat = 126;
 constexpr uint32_t kVkSampleCount2Bit = 0x00000002;
 constexpr uint32_t kVkAttachmentLoadOpClear = 1;
 constexpr uint32_t kVkAttachmentStoreOpStore = 0;
@@ -12971,6 +13027,7 @@ constexpr uint32_t kVkAttachmentStoreOpDontCare = 1;
 constexpr uint32_t kVkPipelineBindPointGraphics = 0;
 constexpr uint32_t kVkImageLayoutUndefined = 0;
 constexpr uint32_t kVkImageLayoutColorAttachmentOptimal = 2;
+constexpr uint32_t kVkImageLayoutDepthStencilAttachmentOptimal = 3;
 constexpr uint32_t kVkImageLayoutShaderReadOnlyOptimal = 5;
 constexpr uint32_t kVkImageLayoutTransferSrcOptimal = 6;
 constexpr uint32_t kVkImageLayoutTransferDstOptimal = 7;
@@ -13603,7 +13660,7 @@ int main() {
     rpAtts[0].initialLayout = kVkImageLayoutUndefined;
     rpAtts[0].finalLayout = kVkImageLayoutShaderReadOnlyOptimal;
 
-    rpAtts[1].format = kVkFormatR32Sfloat;
+    rpAtts[1].format = kVkFormatD32Sfloat;
     rpAtts[1].samples = kVkSampleCount2Bit;
     rpAtts[1].loadOp = kVkAttachmentLoadOpClear;
     rpAtts[1].storeOp = kVkAttachmentStoreOpStore;
@@ -13612,14 +13669,14 @@ int main() {
     rpAtts[1].initialLayout = kVkImageLayoutUndefined;
     rpAtts[1].finalLayout = kVkImageLayoutShaderReadOnlyOptimal;
 
-    VkAttachmentReferenceMin colorRefs[2]{};
-    colorRefs[0] = { 0, kVkImageLayoutColorAttachmentOptimal };
-    colorRefs[1] = { 1, kVkImageLayoutColorAttachmentOptimal };
+    VkAttachmentReferenceMin colorRef = { 0, kVkImageLayoutColorAttachmentOptimal };
+    VkAttachmentReferenceMin depthRef = { 1, kVkImageLayoutDepthStencilAttachmentOptimal };
 
     VkSubpassDescriptionMin subpass{};
     subpass.pipelineBindPoint = kVkPipelineBindPointGraphics;
-    subpass.colorAttachmentCount = 2;
-    subpass.pColorAttachments = colorRefs;
+    subpass.colorAttachmentCount = 1;
+    subpass.pColorAttachments = &colorRef;
+    subpass.pDepthStencilAttachment = &depthRef;
 
     VkRenderPassCreateInfoMin rpInfo{};
     rpInfo.sType = kVkStructureTypeRenderPassCreateInfo;
@@ -13697,7 +13754,7 @@ int main() {
         // Tile A = (0.75, 0.25, 0.50), Tile B = (0.25, 0.75, 0.50); quarterDepth = 0.50
         VkClearValueMin rpClears[2]{};
         rpClears[0].color = { { 0.75f, 0.25f, 0.50f, 1.0f } };
-        rpClears[1].color = { { 0.50f, 0.0f, 0.0f, 0.0f } };
+        rpClears[1].depthStencil = { 0.50f, 0u };
 
         VkRenderPassBeginInfoMin rpBegin{};
         rpBegin.sType = kVkStructureTypeRenderPassBeginInfo;
