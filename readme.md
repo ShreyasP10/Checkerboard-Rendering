@@ -52,6 +52,7 @@ Pre-built binaries and complete packages are published via CI on [GitHub Release
 1. **Download:** Grab [`rdr2-cbr-v0.1.0-alpha.zip`](https://github.com/ShreyasP10/Checkerboard-Rendering/releases/download/v0.1.0-alpha/rdr2-cbr-v0.1.0-alpha.zip) from the table above (and verify against `SHA256SUMS.txt`).
 2. **Install ASI Loader:** Place `dinput8.dll` from the official [Script Hook RDR2](https://www.dev-c.com/rdr2/scripthookrdr2/) release into your main RDR2 directory (where `RDR2.exe` lives).
 3. **Deploy & Launch:** Extract `rdr2-cbr.asi`, `cbr.ini`, and the `shaders/` directory next to `RDR2.exe`, confirm `Graphics API = Vulkan` in RDR2 settings, and launch **Story Mode**.
+   *(Recommended optimization: Ensure `<asyncComputeEnabled value="false" />` in `Documents\Rockstar Games\Red Dead Redemption 2\Settings\system.xml` on Pascal GPUs and when using CBR to avoid cross-queue hazards on shared attachments).*
 
 ---
 
@@ -231,6 +232,7 @@ Every architectural decision, hardware profile, and audit finding is documented 
 |---|---|
 | Architectural overview & verification summary | [`REPORT.md`](REPORT.md) |
 | Foundational CBR theory, 2× MSAA grids & `-1.0` LOD bias | [`CHECKERBOARD.md`](CHECKERBOARD.md) |
+| RDR2 Hardware Analysis, Requirements & APU Benchmarks | [`HARDWARE.md`](HARDWARE.md) |
 | Synchronized single-file codebase snapshot | [`CODEBASE.md`](CODEBASE.md) |
 | Phase 2 runtime detours & swapchain integration plan | [`nextImplementationPhase.md`](nextImplementationPhase.md) · [`docs/nextImplementationPhase.md`](docs/nextImplementationPhase.md) |
 | Live test report on RDR2 `1.0.1491.50` (GTX 1070 Ti + LML) | [`docs/IN_GAME_TEST_REPORT_v1491.md`](docs/IN_GAME_TEST_REPORT_v1491.md) |

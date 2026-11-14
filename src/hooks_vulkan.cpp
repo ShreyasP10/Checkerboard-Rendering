@@ -1416,8 +1416,13 @@ void Hooked_vkCmdEndRenderPass(void* commandBuffer) {
                 colorIsSwapchain = slot->colorIsSwapchain.load(std::memory_order_acquire);
                 rpCandidate = slot->rpCandidateGeometryPass.load(std::memory_order_acquire);
 
-                // Gate on HDR+depth RenderPass candidate (when tracked) AND >= 250 draws to ignore early shadow/depth pre-passes (Item H-03)
-                isScenePass = (downscaled || matching) && rpCandidate && (draws >= 250u) && !colorIsSwapchain;
+                // Gate on HDR+depth RenderPass candidate (when tracked) AND >= 250 draws to ignore early shadow/depth pre-passes (Item H-03).
+                // Gotcha 10: Require strictly that render dimensions match the main scene target resolution (or quarter downscaled)
+                // so secondary planar mirror reflections (512x512 / 1024x1024) and cubemap passes never corrupt the main camera history.
+                const auto sceneDims = RenderTargetManager::Get().GetDimensions();
+                const bool extentMatchesMainScene = (rw == sceneDims.fullWidth && rh == sceneDims.fullHeight) ||
+                                                    (downscaled && (rw == sceneDims.quarterWidth && rh == sceneDims.quarterHeight));
+                isScenePass = (downscaled || matching) && extentMatchesMainScene && rpCandidate && (draws >= 250u) && !colorIsSwapchain;
 
                 // Release slot back to pool
                 slot->hasMatchingExtent.store(false, std::memory_order_relaxed);
@@ -1477,18 +1482,31 @@ void Hooked_vkCmdEndRenderPass(void* commandBuffer) {
                     if (gameColorImage) {
                         const VulkanImageMetadata colorMeta = LookupImageMetadata(gameColorImage);
                         if (rtm.CanCopyToQuarterColor(colorMeta)) {
-                            ReconstructionPass::CopyImageRegion(
-                                commandBuffer,
-                                gameColorImage, res.quarterColor.image,
-                                0, 0, 0, 0,
-                                dims.quarterWidth, dims.quarterHeight,
-                                colorAspect,
-                                colorFinalLayout,
-                                rtm.GetVulkanImageLayout(res.quarterColor.image),
-                                colorFinalLayout,
-                                5 /* SHADER_READ_ONLY_OPTIMAL */,
-                                res.quarterColor.aspectMask
-                            );
+                            if (colorMeta.format == 122u /* B10G11R11 */ && dims.msaaSamples == 1u) {
+                                // Format 122 requires vkCmdBlitImage for 32-bit -> 64-bit format conversion (Item 7)
+                                ReconstructionPass::BlitToImage(
+                                    commandBuffer,
+                                    gameColorImage, res.quarterColor.image,
+                                    dims.quarterWidth, dims.quarterHeight,
+                                    dims.quarterWidth, dims.quarterHeight,
+                                    colorAspect, res.quarterColor.aspectMask,
+                                    colorFinalLayout, rtm.GetVulkanImageLayout(res.quarterColor.image),
+                                    colorFinalLayout, 5 /* SHADER_READ_ONLY_OPTIMAL */
+                                );
+                            } else {
+                                ReconstructionPass::CopyImageRegion(
+                                    commandBuffer,
+                                    gameColorImage, res.quarterColor.image,
+                                    0, 0, 0, 0,
+                                    dims.quarterWidth, dims.quarterHeight,
+                                    colorAspect,
+                                    colorFinalLayout,
+                                    rtm.GetVulkanImageLayout(res.quarterColor.image),
+                                    colorFinalLayout,
+                                    5 /* SHADER_READ_ONLY_OPTIMAL */,
+                                    res.quarterColor.aspectMask
+                                );
+                            }
                             copiedColor = true;
                         } else {
                             static std::atomic<bool> s_warnedColorCopy{ false };
@@ -1658,9 +1676,15 @@ int Hooked_vkCreateSampler(void* device, const MinimalVkSamplerCreateInfo* pCrea
         return -1; // VK_ERROR_INITIALIZATION_FAILED
     }
     const auto& config = ConfigManager::Get().GetConfig();
-    // Apply mipLodBias selectively only to mipmapped anisotropic scene material samplers (Item M-03)
+    // Apply mipLodBias selectively only to mipmapped anisotropic scene material samplers (Item M-03 & Gotcha 9).
+    // Tiling geometry samplers use VK_SAMPLER_ADDRESS_MODE_REPEAT (0), whereas IBL cubemaps, LUTs, and screen-space
+    // mip chains use VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE (2).
+    constexpr int32_t kVkSamplerAddressModeRepeat = 0;
     if (pCreateInfo && config.mipLodBias != 0.0f &&
-        pCreateInfo->maxLod > 1.0f && pCreateInfo->anisotropyEnable == 1u) {
+        pCreateInfo->maxLod > 1.0f &&
+        pCreateInfo->anisotropyEnable == 1u &&
+        pCreateInfo->addressModeU == kVkSamplerAddressModeRepeat &&
+        pCreateInfo->addressModeV == kVkSamplerAddressModeRepeat) {
         MinimalVkSamplerCreateInfo modifiedInfo = *pCreateInfo;
         modifiedInfo.mipLodBias += config.mipLodBias;
         return g_Original_vkCreateSampler(device, &modifiedInfo, pAllocator, pSampler);

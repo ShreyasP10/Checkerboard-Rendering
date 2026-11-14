@@ -563,14 +563,17 @@ static void TestRenderTargets() {
     CHECK(!r.CanCopyToQuarterDepth(singleSampleDepth));
 
     // Verify 1x ASO single-sample copies when msaaSamples == 1
+    const VulkanImageMetadata b10g11r11SingleSample{ 3840, 2160, 122, 1, 0x10 };
     ConfigManager::Get().Modify([](CBRConfig& cfg) { cfg.msaaSamples = 1; });
     r.Initialize(3840, 2160);
     CHECK(r.CanCopyToQuarterColor(singleSampleColor));
+    CHECK(r.CanCopyToQuarterColor(b10g11r11SingleSample)); // Format 122 allowed in 1x APU mode (Item 7)
     CHECK(!r.CanCopyToQuarterColor(validColor)); // 2x rejected in 1x mode
     CHECK(r.CanCopyToQuarterDepth(singleSampleDepth));
     CHECK(!r.CanCopyToQuarterDepth(validDepth)); // 2x rejected in 1x mode
     ConfigManager::Get().Modify([](CBRConfig& cfg) { cfg.msaaSamples = 2; });
     r.Initialize(3840, 2160);
+    CHECK(!r.CanCopyToQuarterColor(b10g11r11SingleSample)); // Format 122 rejected in 2x mode
     CHECK(r.CanCopyToVelocity(validVel));
     CHECK(!r.CanCopyToVelocity(validColor)); // 2x samples != 1x velocity buffer
 

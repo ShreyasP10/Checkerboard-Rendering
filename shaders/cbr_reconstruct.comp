@@ -450,8 +450,9 @@ void main() {
 
     if (isCurrentSampleActive) {
         if (!isDisoccluded && historyColor.a > 0.0) {
-            // Blend with history for temporal stability
-            finalColor = mix(currentColor, historyColor.rgb, pc.u_HistoryWeight);
+            // Blend with history for temporal stability (damp static pause / weapon-wheel shimmer with higher weight, Gotcha 15)
+            float effectiveWeight = isStatic ? max(pc.u_HistoryWeight, 0.96) : pc.u_HistoryWeight;
+            finalColor = mix(currentColor, historyColor.rgb, effectiveWeight);
         } else {
             finalColor = currentColor;
         }

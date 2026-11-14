@@ -370,7 +370,8 @@ void ResolvePixel(
 
     if (isCurrentSampleActive) {
         if (!isDisoccluded && historyColor.a > 0.0) {
-            finalColor = mix(currentColor, historyColor.rgb, pc.u_HistoryWeight);
+            float effectiveWeight = isStatic ? max(pc.u_HistoryWeight, 0.96) : pc.u_HistoryWeight;
+            finalColor = mix(currentColor, historyColor.rgb, effectiveWeight);
         } else {
             finalColor = currentColor;
         }

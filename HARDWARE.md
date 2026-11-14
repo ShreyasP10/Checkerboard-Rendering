@@ -300,6 +300,7 @@ Open RDR2's in-game **Settings $\rightarrow$ Graphics** (or edit `Documents\Rock
 
 * **Advanced Graphics:** Unlocked
 * **Graphics API:** **Vulkan** (*Crucial: Do not use DirectX 12; Vulkan provides better frame pacing on AMD APUs*)
+* **Async Compute (`asyncComputeEnabled` in `system.xml`):** **False** (*Crucial: Prevents cross-queue family hazards on shared scene attachments*)
 * **Resolution:** Set to match your `cbr.ini` `TargetWidth` and `TargetHeight` (`1280x720` or `1920x1080`)
 * **Refresh Rate:** 60 Hz
 * **V-Sync:** Off (use AMD FreeSync if external monitor supports it)

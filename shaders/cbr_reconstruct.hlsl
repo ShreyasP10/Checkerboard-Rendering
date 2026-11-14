@@ -439,8 +439,9 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
 
     if (isCurrentSampleActive) {
         if (!isDisoccluded && historyColor.a > 0.0f) {
-            // Blend with history for temporal stability
-            finalColor = lerp(currentColor, historyColor.rgb, g_HistoryWeight);
+            // Blend with history for temporal stability (damp static pause / weapon-wheel shimmer with higher weight, Gotcha 15)
+            float effectiveWeight = isStatic ? max(g_HistoryWeight, 0.96f) : g_HistoryWeight;
+            finalColor = lerp(currentColor, historyColor.rgb, effectiveWeight);
         } else {
             finalColor = currentColor;
         }

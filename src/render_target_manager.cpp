@@ -1045,8 +1045,15 @@ bool RenderTargetManager::CanCopyToQuarterColor(const VulkanImageMetadata& srcMe
     if (srcMeta.samples != 0u && srcMeta.samples != dims.msaaSamples) {
         return false;
     }
-    // Verify 64bpp texel compatibility with kVkFormatR16G16B16A16Sfloat when format is known (Item C-01).
-    if (srcMeta.format != 0u && !IsColorCopyFormatCompatible(srcMeta.format, kVkFormatR16G16B16A16Sfloat)) {
+    // Verify format compatibility: either 64bpp copy-compatible (Item C-01) or B10G11R11 (122)
+    // which is converted via vkCmdBlitImage in 1x APU mode (Item 7).
+    if (srcMeta.format != 0u) {
+        if (IsColorCopyFormatCompatible(srcMeta.format, kVkFormatR16G16B16A16Sfloat)) {
+            return true;
+        }
+        if (srcMeta.format == 122u /* B10G11R11_UFLOAT_PACK32 */ && dims.msaaSamples == 1u) {
+            return true;
+        }
         return false;
     }
     return true;
