@@ -1,4 +1,5 @@
 #include "cbr/render_target_manager.h"
+#include "cbr/config.h"
 #include "cbr/logger.h"
 #include <cstring>
 

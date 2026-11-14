@@ -9084,6 +9084,7 @@ void ReconstructionPass::DispatchDX12(void* d3d12GraphicsCommandList, uint32_t f
 ### `src/render_target_manager.cpp`
 ```cpp
 #include "cbr/render_target_manager.h"
+#include "cbr/config.h"
 #include "cbr/logger.h"
 #include <cstring>
 
