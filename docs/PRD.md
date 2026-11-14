@@ -75,7 +75,7 @@ This mod targets Pascal-era and mid-range PC hardware—specifically the **NVIDI
 - Automated camera projection matrix scanning via AOB pattern scanner with RIP-relative address calculation and SEH memory protection.
 - Compute shader-based temporal reconstruction with linearized depth disocclusion testing, unconditional variance color clipping ($\mu \pm 1.25\sigma$), and quad-based acceleration (`cbr_reconstruct_quad.comp`).
 - 6 full-fidelity diagnostic and visualization modes (Normal, Mask, Disocclusion Heatmap, Motion Vectors, Raw Quarter-Resolution, Spatial Baseline Resolve).
-- Vulkan 7-binding descriptor set layout, dynamic descriptor pool allocation, and pipeline barrier memory synchronization.
+- Vulkan 8-binding descriptor set layout (bindings 0–6 for images/storage, binding 7 for camera UBO), dynamic descriptor pool allocation, and pipeline barrier memory synchronization.
 - Texture MIP LOD bias injection (-1.0f bias) to preserve fine texture details.
 - Centralized limits and boundaries in `include/cbr/limits.h`.
 - Automated CI build pipeline distributing pre-compiled SPIR-V shaders and release binaries via GitHub Releases.

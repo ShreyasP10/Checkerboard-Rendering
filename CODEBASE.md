@@ -15275,7 +15275,7 @@ The plugin intercepts the presentation layer and command recording passes of the
 * **PatternScanner:** IDA-style wildcard AOB scanner with RIP-relative resolution and SEH memory protection to automatically discover camera projection matrices.
 * **RenderTargetManager:** Manages Vulkan/DX12 VRAM allocations (~300.59 MiB for 4K CBR).
 * **ReconstructionPass:** 
-  - Manages internal `VkDescriptorPool` and 7-binding `VkDescriptorSet` (MSAA color/depth, history color/depth, velocity, output storage).
+  - Manages internal `VkDescriptorPool` and 8-binding `VkDescriptorSet` (bindings 0–6 for MSAA color/depth, history color/depth, velocity, and output storage; binding 7 for `CBRCameraData` UBO).
   - Synchronizes execution using explicit `vkCmdPipelineBarrier` memory transitions.
   - Dispatches `cbr_reconstruct.comp` (or `cbr_reconstruct_quad.comp` using `GL_KHR_shader_subgroup_quad`).
   - Implemented closest-depth motion-vector dilation, temporal history reprojection, depth delta disocclusion testing, and YCoCg neighborhood variance clipping.
@@ -15364,8 +15364,19 @@ Since the initial prototype release, the CBR pipeline has undergone extensive ar
 * **Zero Hot-Path COM Overhead (M-03 Resolved):** Fast-path device caching skips redundant query interfaces on every command queue submission.
 * **Hardened Security Boundaries (M-04 Resolved):** All external DLL dependencies are strictly constrained to `System32`, eliminating DLL search-order planting vectors.
 
+## 9. Readme Accuracy Audit & Claim Reconciliation (Section 7)
+
+| Claim in `readme.md` | Audit Verdict | Codebase Implementation Evidence & Status |
+| :--- | :--- | :--- |
+| *"Live Vulkan graphics detours via MinHook (`vkQueuePresentKHR`, `vkCreateSwapchainKHR`, `vkCmdSetViewport`, `vkCmdSetScissor`, `vkCmdBeginRenderPass`, `vkCmdEndRenderPass`, `vkCmdSetSampleLocationsEXT`)."* | **True** | Fully implemented in `src/hooks_vulkan.cpp` alongside 18 additional resource, image-view, framebuffer, physical device enumeration, and render pass tracking hooks. |
+| *"Intercepts main scene color and depth attachments, routing them to quarter-resolution (1920×1080) targets configured with 2× MSAA."* | **True (Resolved in Codebase)** | • `res.quarterDepth` allocated as `VK_FORMAT_D32_SFLOAT` (126) with aspect mask `VK_IMAGE_ASPECT_DEPTH_BIT` (2u) (**C-01 Resolved**).<br>• `Hooked_vkCmdEndRenderPass` gates execution on `copiedColor && copiedDepth` to safely fail open if MSAA is disabled.<br>• 2× MSAA scene passes without inline 1× resolve attachments resolve/blit cleanly (**C-02 Resolved**).<br>• In-game MSAA required to be set to 2× (`VK_SAMPLE_COUNT_2_BIT`) as documented in Step 5.3. |
+| *"Vulkan SPIR-V compute pipeline, 7-binding VkDescriptorSetLayout, VkDescriptorPool, VkDescriptorSet, and vkCmdPipelineBarrier memory barrier synchronization."* | **True (Upgraded to 8 bindings)** | `CreateVulkanPipeline` allocates an 8-binding descriptor layout (bindings 0–6 for MSAA inputs, history ping-pong, velocity, and storage output; binding 7 for `CBRCameraData` UBO) with layout transition barriers and ping-pong history descriptor updating. Documentation reconciled to 8 bindings. |
+| *"Reconstruction pass writes a full-resolution history-depth target for the next frame's disocclusion test."* | **True** | Verified in `ReconstructionPass::UpdateVulkanPingPongDescriptors`: Set 0 writes `historyDepthViewB` and Set 1 writes `historyDepthViewA`. Shaders sample history depth via `texelFetch` / `.Load`. |
+| *"In-game ImGui debug overlay (placeholder only; interactive F11/Insert key toggle in progress)."* | **True** | Accurately documented as a telemetry API with hotkey gating (`GetFormattedTelemetry()`, F11/Insert state toggles); Dear ImGui draw backend remains planned for Phase 3. |
+| *"DirectX 12 graphics hooking parity (Vulkan primary; DX12 dummy device swapchain method planned for Phase 3)."* | **True (Hardened in Codebase)** | • VMT detours, root signature, compute PSO, and `DispatchDX12` implemented in `hooks_dx12.cpp` and `reconstruction_pass.cpp`.<br>• **C-03 Resolved:** Game command list descriptor heaps and compute PSO are safely saved and restored before and after CBR dispatch.<br>• **M-03 Resolved:** Fast-path check eliminates COM interface query overhead.<br>• **M-04 Resolved:** System32 DLL loading (`LOAD_LIBRARY_SEARCH_SYSTEM32`) prevents library planting. |
+
 ---
-*Report updated and validated for CODEBASE_2.md and Section 6 Verification Checklist.*
+*Report updated and validated for CODEBASE_2.md, Section 6 Verification Checklist, and Section 7 Readme Audit.*
 ```
 
 <a id="checkerboardmd"></a>
@@ -16593,7 +16604,7 @@ This mod targets Pascal-era and mid-range PC hardware—specifically the **NVIDI
 - Automated camera projection matrix scanning via AOB pattern scanner with RIP-relative address calculation and SEH memory protection.
 - Compute shader-based temporal reconstruction with linearized depth disocclusion testing, unconditional variance color clipping ($\mu \pm 1.25\sigma$), and quad-based acceleration (`cbr_reconstruct_quad.comp`).
 - 6 full-fidelity diagnostic and visualization modes (Normal, Mask, Disocclusion Heatmap, Motion Vectors, Raw Quarter-Resolution, Spatial Baseline Resolve).
-- Vulkan 7-binding descriptor set layout, dynamic descriptor pool allocation, and pipeline barrier memory synchronization.
+- Vulkan 8-binding descriptor set layout (bindings 0–6 for images/storage, binding 7 for camera UBO), dynamic descriptor pool allocation, and pipeline barrier memory synchronization.
 - Texture MIP LOD bias injection (-1.0f bias) to preserve fine texture details.
 - Centralized limits and boundaries in `include/cbr/limits.h`.
 - Automated CI build pipeline distributing pre-compiled SPIR-V shaders and release binaries via GitHub Releases.
@@ -17731,7 +17742,7 @@ The mod has proven rock-solid stability in live execution. With the host environ
 - **Dynamic Viewport Downscaling:** 4K geometry passes are intercepted and routed to 1080p 2× MSAA while preserving native 4K clarity for UI/HUD passes.
 - **Sampling Strategies Implemented:** Configurable runtime selection of `StrategyA` (0.5px horizontal viewport jitter) and `StrategyB` (`VK_EXT_sample_locations` with stationary viewport) preventing sample cancellation.
 - **AOB Camera Scanner:** Automated IDA-style signature scanner with RIP-relative address calculation and SEH memory protection.
-- **Vulkan Descriptors & Barriers:** 7-descriptor layout allocation via internal `VkDescriptorPool` and execution synchronization with `vkCmdPipelineBarrier`.
+- **Vulkan Descriptors & Barriers:** 8-descriptor layout allocation (bindings 0–6 for images/storage, binding 7 for camera UBO) via internal `VkDescriptorPool` and execution synchronization with `vkCmdPipelineBarrier`.
 
 ### 4.1 Post-Test Architectural Progression & Audit Status
 Following the live Phase 1 in-game test, the codebase advanced through subsequent implementation milestones and passed a comprehensive 19-finding security/correctness audit (Commit `80382d5`):
@@ -18222,7 +18233,7 @@ Companion to `REVIEW.md`. Part 1 lists what was implemented and verified in this
 | Resolution | **Phase 2.4 Dynamic Redirection:** Viewport/scissor downscaled from 4K to 1080p 2× MSAA while keeping UI/HUD at native 4K | Code review & CI verified |
 | Sampling | **Phase 2.5 Sampling Strategy:** Implemented `SamplingStrategy::StrategyA` (viewport shift) vs `StrategyB` (`VK_EXT_sample_locations`) with strict mutual exclusivity | Unit test & CI verified |
 | Camera Scanner | **Phase 2.5 AOB Scanner:** Pattern scanner (`pattern_scanner.cpp`) with IDA wildcard signatures, RIP-relative resolution, and SEH bounds checking | Unit test & CI verified |
-| Descriptors & Sync | **Phase 2.6 Descriptors & Barriers:** 7-descriptor layout allocation via internal `VkDescriptorPool` and execution sync via `vkCmdPipelineBarrier` | CI build verified |
+| Descriptors & Sync | **Phase 2.6 Descriptors & Barriers:** 8-descriptor layout allocation (bindings 0–6 images/storage, binding 7 camera UBO) via internal `VkDescriptorPool` and execution sync via `vkCmdPipelineBarrier` | CI build verified |
 | Quad Compute Shader | **Phase 2.7 Quad Reconstruction (`cbr_reconstruct_quad.comp`):** 1 Quad (2×2 = 4 pixels) per thread, 8×8×1 workgroup (256 pixels/group) optimizing texture cache hit rates; Wave64 / dual Wave32 alignment | Validated via `check_shader_mapping.py` + glslang |
 | Shaders (Ghosting Fix) | **Phase 2.8 Unconditional Variance Clipping & History Blend:** Removed `&& isMoving` gate that caused static geometry ghosting and TAA checkerboard shimmer | In-engine visual stability + shader tests |
 | Shaders (Debug Modes) | **Phase 2.9 Complete Debug Modes (0–5):** Implemented all 6 visualization modes (Normal, Mask, Disocclusion, Motion, Raw, Spatial Baseline) across GLSL, Quad GLSL, and HLSL | CI & test suite verified |

@@ -108,7 +108,7 @@ The mod has proven rock-solid stability in live execution. With the host environ
 - **Dynamic Viewport Downscaling:** 4K geometry passes are intercepted and routed to 1080p 2× MSAA while preserving native 4K clarity for UI/HUD passes.
 - **Sampling Strategies Implemented:** Configurable runtime selection of `StrategyA` (0.5px horizontal viewport jitter) and `StrategyB` (`VK_EXT_sample_locations` with stationary viewport) preventing sample cancellation.
 - **AOB Camera Scanner:** Automated IDA-style signature scanner with RIP-relative address calculation and SEH memory protection.
-- **Vulkan Descriptors & Barriers:** 7-descriptor layout allocation via internal `VkDescriptorPool` and execution synchronization with `vkCmdPipelineBarrier`.
+- **Vulkan Descriptors & Barriers:** 8-descriptor layout allocation (bindings 0–6 for images/storage, binding 7 for camera UBO) via internal `VkDescriptorPool` and execution synchronization with `vkCmdPipelineBarrier`.
 
 ### 4.1 Post-Test Architectural Progression & Audit Status
 Following the live Phase 1 in-game test, the codebase advanced through subsequent implementation milestones and passed a comprehensive 19-finding security/correctness audit (Commit `80382d5`):

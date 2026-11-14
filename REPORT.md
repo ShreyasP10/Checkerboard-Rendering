@@ -31,7 +31,7 @@ The plugin intercepts the presentation layer and command recording passes of the
 * **PatternScanner:** IDA-style wildcard AOB scanner with RIP-relative resolution and SEH memory protection to automatically discover camera projection matrices.
 * **RenderTargetManager:** Manages Vulkan/DX12 VRAM allocations (~300.59 MiB for 4K CBR).
 * **ReconstructionPass:** 
-  - Manages internal `VkDescriptorPool` and 7-binding `VkDescriptorSet` (MSAA color/depth, history color/depth, velocity, output storage).
+  - Manages internal `VkDescriptorPool` and 8-binding `VkDescriptorSet` (bindings 0–6 for MSAA color/depth, history color/depth, velocity, and output storage; binding 7 for `CBRCameraData` UBO).
   - Synchronizes execution using explicit `vkCmdPipelineBarrier` memory transitions.
   - Dispatches `cbr_reconstruct.comp` (or `cbr_reconstruct_quad.comp` using `GL_KHR_shader_subgroup_quad`).
   - Implemented closest-depth motion-vector dilation, temporal history reprojection, depth delta disocclusion testing, and YCoCg neighborhood variance clipping.
@@ -120,5 +120,16 @@ Since the initial prototype release, the CBR pipeline has undergone extensive ar
 * **Zero Hot-Path COM Overhead (M-03 Resolved):** Fast-path device caching skips redundant query interfaces on every command queue submission.
 * **Hardened Security Boundaries (M-04 Resolved):** All external DLL dependencies are strictly constrained to `System32`, eliminating DLL search-order planting vectors.
 
+## 9. Readme Accuracy Audit & Claim Reconciliation (Section 7)
+
+| Claim in `readme.md` | Audit Verdict | Codebase Implementation Evidence & Status |
+| :--- | :--- | :--- |
+| *"Live Vulkan graphics detours via MinHook (`vkQueuePresentKHR`, `vkCreateSwapchainKHR`, `vkCmdSetViewport`, `vkCmdSetScissor`, `vkCmdBeginRenderPass`, `vkCmdEndRenderPass`, `vkCmdSetSampleLocationsEXT`)."* | **True** | Fully implemented in `src/hooks_vulkan.cpp` alongside 18 additional resource, image-view, framebuffer, physical device enumeration, and render pass tracking hooks. |
+| *"Intercepts main scene color and depth attachments, routing them to quarter-resolution (1920×1080) targets configured with 2× MSAA."* | **True (Resolved in Codebase)** | • `res.quarterDepth` allocated as `VK_FORMAT_D32_SFLOAT` (126) with aspect mask `VK_IMAGE_ASPECT_DEPTH_BIT` (2u) (**C-01 Resolved**).<br>• `Hooked_vkCmdEndRenderPass` gates execution on `copiedColor && copiedDepth` to safely fail open if MSAA is disabled.<br>• 2× MSAA scene passes without inline 1× resolve attachments resolve/blit cleanly (**C-02 Resolved**).<br>• In-game MSAA required to be set to 2× (`VK_SAMPLE_COUNT_2_BIT`) as documented in Step 5.3. |
+| *"Vulkan SPIR-V compute pipeline, 7-binding VkDescriptorSetLayout, VkDescriptorPool, VkDescriptorSet, and vkCmdPipelineBarrier memory barrier synchronization."* | **True (Upgraded to 8 bindings)** | `CreateVulkanPipeline` allocates an 8-binding descriptor layout (bindings 0–6 for MSAA inputs, history ping-pong, velocity, and storage output; binding 7 for `CBRCameraData` UBO) with layout transition barriers and ping-pong history descriptor updating. Documentation reconciled to 8 bindings. |
+| *"Reconstruction pass writes a full-resolution history-depth target for the next frame's disocclusion test."* | **True** | Verified in `ReconstructionPass::UpdateVulkanPingPongDescriptors`: Set 0 writes `historyDepthViewB` and Set 1 writes `historyDepthViewA`. Shaders sample history depth via `texelFetch` / `.Load`. |
+| *"In-game ImGui debug overlay (placeholder only; interactive F11/Insert key toggle in progress)."* | **True** | Accurately documented as a telemetry API with hotkey gating (`GetFormattedTelemetry()`, F11/Insert state toggles); Dear ImGui draw backend remains planned for Phase 3. |
+| *"DirectX 12 graphics hooking parity (Vulkan primary; DX12 dummy device swapchain method planned for Phase 3)."* | **True (Hardened in Codebase)** | • VMT detours, root signature, compute PSO, and `DispatchDX12` implemented in `hooks_dx12.cpp` and `reconstruction_pass.cpp`.<br>• **C-03 Resolved:** Game command list descriptor heaps and compute PSO are safely saved and restored before and after CBR dispatch.<br>• **M-03 Resolved:** Fast-path check eliminates COM interface query overhead.<br>• **M-04 Resolved:** System32 DLL loading (`LOAD_LIBRARY_SEARCH_SYSTEM32`) prevents library planting. |
+
 ---
-*Report updated and validated for CODEBASE_2.md and Section 6 Verification Checklist.*
+*Report updated and validated for CODEBASE_2.md, Section 6 Verification Checklist, and Section 7 Readme Audit.*
