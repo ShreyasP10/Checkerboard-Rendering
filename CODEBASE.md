@@ -61,6 +61,7 @@ This document contains the complete, unabridged source code, shaders, configurat
    - [`REPORT.md`](#reportmd)
    - [`CHECKERBOARD.md`](#checkerboardmd)
    - [`HARDWARE.md`](#hardwaremd)
+   - [`docs/RAGE_ENGINE_ARCHITECTURE.md`](#docsrageenginearchitecturemd)
    - [`docs/PRD.md`](#docsprdmd)
    - [`docs/SRD.md`](#docssrdmd)
    - [`docs/SRS.md`](#docssrsmd)
@@ -14979,6 +14980,7 @@ Every architectural decision, hardware profile, and audit finding is documented 
 | Architectural overview & verification summary | [`REPORT.md`](REPORT.md) |
 | Foundational CBR theory, 2× MSAA grids & `-1.0` LOD bias | [`CHECKERBOARD.md`](CHECKERBOARD.md) |
 | RDR2 Hardware Analysis, Requirements & APU Benchmarks | [`HARDWARE.md`](HARDWARE.md) |
+| RAGE Engine Architecture, Generational Evolution & Vulkan Hooks | [`docs/RAGE_ENGINE_ARCHITECTURE.md`](docs/RAGE_ENGINE_ARCHITECTURE.md) |
 | Synchronized single-file codebase snapshot | [`CODEBASE.md`](CODEBASE.md) |
 | Phase 2 runtime detours & swapchain integration plan | [`nextImplementationPhase.md`](nextImplementationPhase.md) · [`docs/nextImplementationPhase.md`](docs/nextImplementationPhase.md) |
 | Live test report on RDR2 `1.0.1491.50` (GTX 1070 Ti + LML) | [`docs/IN_GAME_TEST_REPORT_v1491.md`](docs/IN_GAME_TEST_REPORT_v1491.md) |
@@ -17216,6 +17218,112 @@ In the AMD Software: Adrenalin Edition control panel, configure the following se
    * **At 720p CBR:** Frame rates jump to **~53 FPS average** in the wilderness and **~44 FPS** in towns, delivering a silky-smooth, console-grade experience on an ultra-thin laptop.
    * **At 1080p CBR:** Frame rates reach **~39 FPS average** in the wilderness and **~34 FPS** in towns, maintaining sharp 1080p UI text and HUD elements while reducing fragment shading by 75%.
    * **Bandwidth & Memory:** The CBR buffers consume only **32.26 MB** (at 720p) and **72.58 MB** (at 1080p), effortlessly accommodating the laptop's UMA constraints.
+
+---
+
+## 8. Related Architectural Documentation
+
+For an exhaustive technical deep-dive into how RDR2's underlying engine operates, including its generational evolution from RAGE 1 through RAGE 9, Reversed-Z depth encoding, 8-bit stencil material routing, and single-frame Vulkan stage breakdowns, refer to:
+* **[docs/RAGE_ENGINE_ARCHITECTURE.md](docs/RAGE_ENGINE_ARCHITECTURE.md)**: *RAGE Engine Generational Architecture & RDR2 Vulkan Hooking Analysis*.
+````
+
+<a id="docsrageenginearchitecturemd"></a>
+### `docs/RAGE_ENGINE_ARCHITECTURE.md`
+````markdown
+# RAGE Engine Generational Architecture & RDR2 Vulkan Hooking Analysis
+
+This document provides a comprehensive technical reference for the internal architecture of the **Rockstar Advanced Game Engine (RAGE)**, tracking its generational evolution from RAGE 1 through RAGE 9, with deep focus on **RAGE 8** (Red Dead Redemption 2) and how its low-level Vulkan rendering pipeline is intercepted by `rdr2-cbr.asi`.
+
+---
+
+## 1. Generational Evolution of the RAGE Engine
+
+While Rockstar's internal **RAGE Technology Group** (Rockstar San Diego, formerly Angel Studios) maintains the engine as a continuous, per-project branched C++ codebase (`rage::grcDevice`, `rage::fwScene`, `rage::phSimulator`) without external version branding, the graphics reverse-engineering community tracks major architectural rewrites across generations:
+
+| Generation & Flagship Titles | Graphics APIs | Core Rendering Pipeline | Anti-Aliasing & Upscaling | Lighting, Volumetrics & Shadows | Signature Engine Leap |
+|---|---|---|---|---|---|
+| **RAGE 1–4: Early Era**<br>*Table Tennis (2006)*<br>*GTA IV (2008)*<br>*Midnight Club: LA (2008)* | DirectX 9.0c, Xbox 360 Xenos, PS3 LibGCM | Early Deferred Shading (3 MRT G-Buffers: Albedo, Normal+Specular, Stencil/AO); Standard $[0..1]$ Z-buffer | None (stippled alpha / hardware MSAA on 360; 640p upscale on PS3) | Radiosity-baked vertex/lightmap GI; Cascaded Shadow Maps (CSM) with stippled dither fades | Replaced Criterion's RenderWare; integrated Euphoria procedural ragdoll & Bullet physics |
+| **RAGE 5–6: Late 7th Gen**<br>*Red Dead Redemption (2010)*<br>*Max Payne 3 (2012)* | DirectX 9 / DirectX 11 (MP3), PS3, Xbox 360 | Hybrid Deferred + Forward pass; hardware tessellation introduced in MP3 DX11 | MSAA + FXAA; hardware 2× MSAA on Xbox 360 | Dynamic time-of-day atmospheric scattering; Screen-Space Ambient Occlusion (SSAO) | Seamless open-world terrain streaming, skeletal muscle deformation, dynamic weather transitions |
+| **RAGE 7: 8th Gen Transition**<br>*Grand Theft Auto V (2013 / 2015 PC)* | DirectX 10 / 10.1 / DirectX 11 | Multi-Pass Hybrid Deferred (4 MRT G-Buffers + Reversed-Z logarithmic depth D32S8 + Material ID Stencil) | FXAA, 2×–8× MSAA, NVIDIA TXAA (2025 Enhanced PC update added DLSS/FSR) | Low-poly 6-face dynamic camera cubemap for reflections; 4-cascade CSM; filmic tonemapping | Stencil-tagged mesh categories (`0x89` player, `0x82` vehicle, `0x03` foliage); compute-based auto-exposure |
+| **RAGE 8: Modern Low-Level Era**<br>*Red Dead Redemption 2 (2018 Console / 2019 PC)* | Vulkan 1.3, DirectX 12, PS4 GNM, Xbox One | Full Physically Based Rendering (PBR) 6-target G-Buffer + Reversed-Z `D32_SFLOAT_S8_UINT` + Async Compute | PS4 Pro Hardware 2× MSAA Checkerboard Rendering (CBR), TAA, DLSS, FSR 2 | Voxel/raymarched volumetric clouds & fog, split-sum IBL cubemap convolution, 2048×2048 R16_UNORM mud/snow POM | Built from ground up for explicit low-level command buffers (`VkCommandBuffer` / `ID3D12GraphicsCommandList`) and temporal accumulation |
+| **RAGE 9: Current-Gen Ray-Traced Era**<br>*GTA V Enhanced (2025 testbed)*<br>*Grand Theft Auto VI* | Native DirectX 12 Ultimate, Vulkan, PS5 GNM2 | GPU-Driven Rendering (meshlet culling / indirect draws) + Hybrid Ray-Traced Deferred PBR | Native temporal reconstruction (FSR / PSSR / DLSS) with subpixel motion vectors | Real-Time Ray-Traced Global Illumination (RTGI), RT reflections, RT ambient occlusion (RTAO) | Real-time physically simulated 3D water grids, strand-based hair/fur, multi-bounce per-pixel GI |
+
+---
+
+## 2. Low-Level RAGE 8 Engine Mechanics Intercepted by CBR
+
+### A. Reversed-Z Infinite Far Plane
+- **GTA IV (RAGE 4)** used a standard $[0.0\,\text{near} \dots 1.0\,\text{far}]$ depth buffer, which suffered from distant Z-fighting on buildings when flying helicopters at high altitude.
+- **RAGE 7 & 8 (GTA V & RDR2)** switched to a **Reversed-Z** ($1.0\,\text{near} \dots 0.0\,\text{far}$) floating-point depth buffer (`VK_FORMAT_D32_SFLOAT_S8_UINT` = 130) with an infinite far plane ($z_{\text{far}} = 0.0$) and a near clip plane around $0.10\,\text{m}$–$0.15\,\text{m}$.
+- Because IEEE-754 32-bit floating-point numbers have exponentially higher mantissa density near $0.0$, Reversed-Z allocates massive precision to distant geometry, completely eliminating Z-fighting across RDR2's 10+ kilometer landscapes.
+- **CBR Mod Implementation**: In `shaders/cbr_reconstruct.comp`, the depth linearization function handles this directly:
+  ```glsl
+  float LinearizeDepth(float d) {
+      if (pc.u_ZFar == 0.0) {
+          // Reversed-Z infinite far plane: zNear / max(d, 1e-7)
+          return pc.u_ZNear / max(d, 1e-7);
+      }
+      return (pc.u_ZNear * pc.u_ZFar) / (pc.u_ZFar + d * (pc.u_ZNear - pc.u_ZFar));
+  }
+  ```
+  And `include/cbr/depth_convention.h` sets `DepthConvention::Reversed`, ensuring bilateral depth weighting and disocclusion detection operate in true linear metric space.
+
+### B. 8-Bit Stencil Channel (`D32_SFLOAT_S8_UINT`) as a Material Router
+In RDR2, RAGE never binds a standalone depth format (`D32_SFLOAT`) for the main scene; it binds `VK_FORMAT_D32_SFLOAT_S8_UINT` (format 130). During the G-buffer pass, every rendered mesh writes an 8-bit category identifier into the stencil byte:
+- `0x89`: Arthur Morgan / John Marston (activates human skin subsurface scattering and high-detail contact shadow filters)
+- `0x82`: Mount (horse, carriage, or train; triggers anisotropic fur sheen and mud splatter)
+- `0x01`: NPCs and wildlife
+- `0x03`: Tree foliage, shrubs, and grass (triggers two-sided leaf transmission lighting)
+- `0x07`: Sky dome and distant atmospheric background
+
+Downstream lighting passes (such as local lantern light cones, foliage lighting, and skin SSS) read this stencil byte via stencil test masking to apply material-specific shaders without branching.
+- **CBR Mod Implementation**: In `src/hooks_vulkan.cpp`, copying depth into `quarterDepth` strictly isolates `VK_IMAGE_ASPECT_DEPTH_BIT` (`2u`) without requesting `VK_IMAGE_ASPECT_STENCIL_BIT` (`4u`):
+  ```cpp
+  const uint32_t srcDepthAspect = (depthAspect & 2u) ? 2u : depthAspect;
+  const uint32_t dstDepthAspect = (res.quarterDepth.aspectMask & 2u) ? 2u : res.quarterDepth.aspectMask;
+  ```
+  This satisfies Vulkan validation rule `VUID-VkImageCopy-aspectMask-00142` while preserving the game's native stencil buffer untouched for deferred lighting.
+
+### C. Temporal-First Under-Sampling
+RAGE 8 was engineered around the PS4 Pro's hardware 2× MSAA checkerboard pipeline and temporal accumulation:
+1. **Dithered Alpha Stippling**: Hair cards, beards, horse tails, and alpha foliage are rendered using single-bit alpha tests with an $8\times 8$ blue-noise dither matrix that shifts subpixel phases every frame.
+2. **Volumetric Fog & Light Shafts**: Raymarched at quarter resolution ($1/4$ screen area) and temporally accumulated over multiple frames.
+3. **Screen-Space Ambient Occlusion (SSAO)**: Sampled sparsely and accumulated over time.
+- **CBR Mod Implementation**: Because RAGE 8 is a temporal-first engine, feeding quarter-resolution geometry passes into the mod's compute shader (`cbr_reconstruct.comp`) with YCoCg variance box clipping and history weighting naturally reconstructs these dithered effects into smooth, anti-aliased geometry identically to the PS4 Pro hardware pipeline.
+
+---
+
+## 3. Anatomy of a Single RAGE 8 (RDR2) Frame on Vulkan
+
+When `RDR2.exe` records a frame on Vulkan, it executes the following stages in strict order:
+
+| Stage # | RAGE 8 Frame Stage | Resolution & Format | Draw Calls | How `rdr2-cbr.asi` Interacts With It |
+|---|---|---|---|---|
+| **1** | **Resource Streaming & Mud/Snow POM Map** | $2048\times 2048$ R16_UNORM | ~10–50 | **Ignored by CBR**: Viewport dimensions do not match full scene (`w != dims.fullWidth`) and draw count is low (`< 250`). Accumulates dynamic terrain deformation (footprints, wagon ruts). |
+| **2** | **Dynamic Environment Cubemap (6 Faces)** | $128\times 128$ per face (`RGBA8_SRGB`, `RGBA8_UNORM`, `D32S8` $\to$ `R11G11B10_FLOAT`) | ~30 / face | **Ignored by CBR**: Extent filter `extentMatchesMainScene == false` rejects 128×128 / 512×512 cubemap faces, preventing probe passes from corrupting temporal history. |
+| **3** | **Terrain Depth Pre-Pass & G-Buffer Pass** | Full Target Res (`D32S8` + 5 MRTs: `RGBA8` / `R16G16B16A16_SFLOAT`) | 500 – 3,000+ | **Primary Interception Candidate**: Early depth prepass runs full res; main PBR geometry pass is downscaled to quarter resolution ($960\times 540$ or $640\times 360$) via `Hooked_vkCmdSetViewport`. |
+| **4** | **Shadow Map Array Generation** | 2D Texture Arrays & Cube Arrays (`D16_UNORM` / `D32_SFLOAT`) | 200 – 1,500 | **Filtered out by CBR**: `RecordTrackedRenderPass` verifies `hasHdrColor == true`; depth-only passes are discarded so shadow cascades never trigger reconstruction. |
+| **5** | **3× Depth Downsample Passes (SSAO, SSR, Volumetric Fog)** | Half / Quarter Res (`R32_SFLOAT`) | 1 – 5 each | **Filtered out by CBR**: Draw call gate (`draws >= 250u`) rejects downsample utility passes. Passes read pristine full-res depth from Stage 3. |
+| **6** | **Deferred Lighting Stage (Sun/Moon + Stencil Local Lights)** | Target Res (`R16G16B16A16_SFLOAT` / `B10G11R11_UFLOAT`) | 10 – 150 | **Downscaled & Shaded**: Viewport remains downscaled; uses hardware-filtered `BlitToImage` for format 122 (`B10G11R11`) intermediate conversions on APUs. |
+| **7** | **Forward Shading Stage (Translucent Glass, Water, Particles)** | Target Res (Main HDR Color + `D32S8` Depth) | 50 – 400 | **Reconstruction Anchor**: Translucent geometry renders back-to-front. `OnScenePassEnd` triggers `cbr_reconstruct.spv` immediately upon pass completion, right before PostFX. |
+| **8** | **Post-Processing, 7-Mip Bloom & UI/HUD** | Full Target Res (`R11G11B10_FLOAT` $\to$ Swapchain Backbuffer) | 20 – 200 | **Runs at Native Resolution**: Tonemapping, bloom, and UI overlay execute at unscaled display resolution ($1280\times 720$, $1920\times 1080$, or $3840\times 2160$), keeping text and HUD razor-sharp. |
+
+---
+
+## 4. Architectural Evolution into RAGE 9 (GTA VI & GTA V Enhanced)
+
+Rockstar used the 2025 PC update of Grand Theft Auto V Enhanced as a production testbed for architectural rendering subsystems developed for **RAGE 9** (Grand Theft Auto VI):
+
+1. **Hardware Ray Tracing (RTGI, RTAO, and RT Reflections)**:
+   - RAGE 7 and 8 relied on 6-face dynamic camera cubemaps and Screen-Space Reflections (SSR), which could not reflect dynamic vehicles behind the camera or handle complex indoor-outdoor multi-bounce lighting.
+   - RAGE 9 transitions to BVH (Bounding Volume Hierarchy) hardware acceleration structures with real-time Ray-Traced Global Illumination (RTGI), dynamic colored bounce lighting, and real-time physical reflections.
+2. **GPU-Driven Geometry Pipeline (Meshlets & Indirect Submission)**:
+   - In RAGE 8 (RDR2), geometry culling and LOD selection are still primarily CPU-driven (`vkCmdDrawIndexed` loops generating thousands of draw calls, which is why the `drawCount >= 250u` heuristic is so reliable).
+   - In RAGE 9, geometry submission shifts to GPU-driven pipelines using mesh shaders (`vkCmdDrawMeshTasksEXT`) and `ExecuteIndirect` with compute-driven frustum and occlusion culling.
+3. **Physically Simulated 3D Water Grids & Strand-Based Hair**:
+   - RDR2's planar water displacement maps and dithered alpha-card hair are replaced with full 3D FFT/Navier-Stokes fluid surface simulations and per-strand hair/fur physics.
+4. **Native Decoupled Temporal Upscaling**:
+   - Rather than relying on a fixed 2× MSAA checkerboard hardware pass like the PS4 Pro build of RDR2, RAGE 9 natively decouples internal rendering resolution from target display resolution to feed modern temporal upscalers (PSSR, FSR, DLSS) directly out of the forward shading stage with subpixel motion vectors.
 ````
 
 <a id="docsprdmd"></a>
