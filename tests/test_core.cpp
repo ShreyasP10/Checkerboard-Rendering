@@ -668,6 +668,20 @@ static void TestReconstructionPass(const fs::path& dir) {
     CHECK(uSet.hasCameraMatrices == 1u);
     CHECK(std::fabs(uSet.currViewProjInv[0] - invA[0]) < 1e-6f);
     CHECK(std::fabs(uSet.prevViewProj[12] - matA[12]) < 1e-6f);
+
+    // Test matrix advancing & idempotent duplicate call within same frame (Item H-01)
+    float matB[16];
+    std::memcpy(matB, matA, sizeof(matB));
+    matB[12] += 5.0f; // Translated along X
+    CHECK(pass.SetCameraMatrices(matB));
+    const CBRCameraUniforms uSetB = pass.BuildCameraUniforms();
+    CHECK(std::fabs(uSetB.prevViewProj[12] - matA[12]) < 1e-6f); // prevViewProj advanced to matA
+
+    // Duplicate call with same matrix in same frame should NOT clobber prevViewProj
+    CHECK(pass.SetCameraMatrices(matB));
+    const CBRCameraUniforms uSetB2 = pass.BuildCameraUniforms();
+    CHECK(std::fabs(uSetB2.prevViewProj[12] - matA[12]) < 1e-6f); // prevViewProj STILL matA!
+
     pass.ClearCameraMatrices();
     CHECK(pass.BuildCameraUniforms().hasCameraMatrices == 0u);
     ConfigManager::Get().Modify([](CBRConfig& c) {

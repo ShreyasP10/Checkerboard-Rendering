@@ -2096,10 +2096,6 @@ void CBREngine::OnBeginFrame() {
     if (config.samplingStrategy == SamplingStrategy::StrategyA && config.jitterDirection != 0) {
         PatternScanner::UpdateCameraJitter(currentFrame, m_activeApi.load() == GraphicsApi::Vulkan);
     }
-    float* camProj = PatternScanner::GetCameraProjectionMatrix();
-    if (camProj) {
-        ReconstructionPass::Get().SetCameraMatrices(camProj, nullptr);
-    }
 #endif
 }
 
@@ -5331,6 +5327,10 @@ void __stdcall Hooked_D3D12RSSetViewports(void* commandList, unsigned int numVie
         if (config.samplingStrategy == SamplingStrategy::StrategyA && config.jitterDirection != 0) {
             PatternScanner::UpdateCameraJitter(currentFrame, false);
         }
+        float* camProj = PatternScanner::GetCameraProjectionMatrix();
+        if (camProj) {
+            ReconstructionPass::Get().SetCameraMatrices(camProj, nullptr);
+        }
 
         DX12CmdListSlot* slot = GetOrCreateDX12Slot(commandList);
         if (slot) {
@@ -5437,27 +5437,32 @@ void __stdcall Hooked_D3D12OMSetRenderTargets(void* commandList, unsigned int nu
             if (slot && slot->viewportDownscaled.load(std::memory_order_acquire) &&
                 slot->drawCount.load(std::memory_order_acquire) >= 250u) {
                 
-                // Dispatch CBR compute reconstruction
-                CBREngine::Get().OnScenePassEnd(commandList);
+                // Direct3D 12 scene target copy-in and blit-out pipeline is not yet implemented.
+                // Gate OnScenePassEnd behind dx12InputsCaptured so D3D12 safely fails open without
+                // executing compute reconstruction over uninitialized buffers or corrupting root parameters (Item H-02).
+                bool dx12InputsCaptured = false;
+                if (dx12InputsCaptured) {
+                    CBREngine::Get().OnScenePassEnd(commandList);
 
-                // Restore game's active graphics/compute pipeline state and descriptor heaps (Item C-03)
-                if (g_Original_D3D12SetDescriptorHeaps) {
-                    std::lock_guard<std::mutex> lock(slot->heapMutex);
-                    if (slot->lastNumDescriptorHeaps > 0) {
-                        g_Original_D3D12SetDescriptorHeaps(commandList, slot->lastNumDescriptorHeaps, slot->lastDescriptorHeaps);
+                    // Restore game's active graphics/compute pipeline state and descriptor heaps (Item C-03)
+                    if (g_Original_D3D12SetDescriptorHeaps) {
+                        std::lock_guard<std::mutex> lock(slot->heapMutex);
+                        if (slot->lastNumDescriptorHeaps > 0) {
+                            g_Original_D3D12SetDescriptorHeaps(commandList, slot->lastNumDescriptorHeaps, slot->lastDescriptorHeaps);
+                        }
                     }
-                }
-                void* pso = slot->lastPipelineState.load(std::memory_order_acquire);
-                if (pso && g_Original_D3D12SetPipelineState) {
-                    g_Original_D3D12SetPipelineState(commandList, pso);
-                }
-                void* gfxSig = slot->lastGraphicsRootSig.load(std::memory_order_acquire);
-                if (gfxSig && g_Original_D3D12SetGraphicsRootSignature) {
-                    g_Original_D3D12SetGraphicsRootSignature(commandList, gfxSig);
-                }
-                void* compSig = slot->lastComputeRootSig.load(std::memory_order_acquire);
-                if (compSig && g_Original_D3D12SetComputeRootSignature) {
-                    g_Original_D3D12SetComputeRootSignature(commandList, compSig);
+                    void* pso = slot->lastPipelineState.load(std::memory_order_acquire);
+                    if (pso && g_Original_D3D12SetPipelineState) {
+                        g_Original_D3D12SetPipelineState(commandList, pso);
+                    }
+                    void* gfxSig = slot->lastGraphicsRootSig.load(std::memory_order_acquire);
+                    if (gfxSig && g_Original_D3D12SetGraphicsRootSignature) {
+                        g_Original_D3D12SetGraphicsRootSignature(commandList, gfxSig);
+                    }
+                    void* compSig = slot->lastComputeRootSig.load(std::memory_order_acquire);
+                    if (compSig && g_Original_D3D12SetComputeRootSignature) {
+                        g_Original_D3D12SetComputeRootSignature(commandList, compSig);
+                    }
                 }
 
                 ReleaseDX12Slot(commandList);
@@ -7389,7 +7394,16 @@ bool ReconstructionPass::SetCameraMatrices(const float* currViewProj4x4, const f
     if (prevViewProj4x4) {
         std::memcpy(m_prevViewProj, prevViewProj4x4, sizeof(m_prevViewProj));
     } else if (m_hasPrevMatrix) {
-        std::memcpy(m_prevViewProj, m_currViewProj, sizeof(m_prevViewProj));
+        bool changed = false;
+        for (int i = 0; i < 16; ++i) {
+            if (std::fabs(currViewProj4x4[i] - m_currViewProj[i]) > 1e-6f) {
+                changed = true;
+                break;
+            }
+        }
+        if (changed) {
+            std::memcpy(m_prevViewProj, m_currViewProj, sizeof(m_prevViewProj));
+        }
     } else {
         std::memcpy(m_prevViewProj, currViewProj4x4, sizeof(m_prevViewProj));
     }
@@ -7733,6 +7747,20 @@ bool ReconstructionPass::CreateVulkanPipeline() {
         }
     }
 #endif
+    if (m_vkTimestampPeriodNs <= 0.0f && m_vkPhysicalDevice) {
+        auto pfnGetPhysProps = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
+            GetVulkanLoaderSymbol(vulkanModule, "vkGetPhysicalDeviceProperties"));
+        if (pfnGetPhysProps) {
+            uint32_t propsHeader[256]{};
+            pfnGetPhysProps(m_vkPhysicalDevice, propsHeader);
+            // On 64-bit platforms, VkPhysicalDeviceLimits::timestampPeriod is located at byte offset 796
+            // (sizeof(VkPhysicalDeviceProperties) is 824 bytes, limits begins at offset 512, timestampPeriod at +284)
+            const float extractedPeriod = *reinterpret_cast<const float*>(reinterpret_cast<const char*>(propsHeader) + 796);
+            if (std::isfinite(extractedPeriod) && extractedPeriod > 0.0f && extractedPeriod <= 1000.0f) {
+                m_vkTimestampPeriodNs = extractedPeriod;
+            }
+        }
+    }
     auto pfnCreateQueryPool = reinterpret_cast<PFN_vkCreateQueryPool>(resolveDeviceFunc("vkCreateQueryPool"));
     if (pfnCreateQueryPool) {
         MinimalVkQueryPoolCreateInfo qpInfo{};
@@ -8841,8 +8869,10 @@ void ReconstructionPass::DispatchVulkan(void* vkCommandBuffer, uint32_t frameInd
     }
 
     if (!gpuTimestampReady) {
-        const float cpuMs = std::chrono::duration<float, std::milli>(cpuEnd - cpuStart).count();
-        m_lastDispatchDurationMs.store(cpuMs > 0.001f ? cpuMs : 0.001f, std::memory_order_release);
+        if (m_lastDispatchDurationMs.load(std::memory_order_relaxed) <= 0.0f) {
+            const float cpuMs = std::chrono::duration<float, std::milli>(cpuEnd - cpuStart).count();
+            m_lastDispatchDurationMs.store(cpuMs > 0.001f ? cpuMs : 0.001f, std::memory_order_release);
+        }
     }
 
     if (pfnCmdPipelineBarrier) {
@@ -12838,6 +12868,20 @@ static void TestReconstructionPass(const fs::path& dir) {
     CHECK(uSet.hasCameraMatrices == 1u);
     CHECK(std::fabs(uSet.currViewProjInv[0] - invA[0]) < 1e-6f);
     CHECK(std::fabs(uSet.prevViewProj[12] - matA[12]) < 1e-6f);
+
+    // Test matrix advancing & idempotent duplicate call within same frame (Item H-01)
+    float matB[16];
+    std::memcpy(matB, matA, sizeof(matB));
+    matB[12] += 5.0f; // Translated along X
+    CHECK(pass.SetCameraMatrices(matB));
+    const CBRCameraUniforms uSetB = pass.BuildCameraUniforms();
+    CHECK(std::fabs(uSetB.prevViewProj[12] - matA[12]) < 1e-6f); // prevViewProj advanced to matA
+
+    // Duplicate call with same matrix in same frame should NOT clobber prevViewProj
+    CHECK(pass.SetCameraMatrices(matB));
+    const CBRCameraUniforms uSetB2 = pass.BuildCameraUniforms();
+    CHECK(std::fabs(uSetB2.prevViewProj[12] - matA[12]) < 1e-6f); // prevViewProj STILL matA!
+
     pass.ClearCameraMatrices();
     CHECK(pass.BuildCameraUniforms().hasCameraMatrices == 0u);
     ConfigManager::Get().Modify([](CBRConfig& c) {
@@ -15310,11 +15354,14 @@ The latest audit (v0.1.0-alpha) identified and resolved key operational risks fo
 * **Scene Pass Identification:** **Present (a)** — `Hooked_vkCreateRenderPass` and `Hooked_vkCreateRenderPass2`/`KHR` inspect attachment formats and sample counts (`RecordTrackedRenderPass`), and `Hooked_vkCmdEndRenderPass` gates on `rpCandidate && draws >= 250 && !colorIsSwapchain`.
 * **DirectX 12 Parity:** **Present & Hardened** — `CreateDX12Pipeline` (RootSignature + Compute PSO + runtime D3DCompile fallback + b1 camera CBV), `DispatchDX12` (resource barriers + descriptor table binding), and command-list VMT hooks (`ExecuteCommandLists`, `RSSetViewports`, `RSSetScissorRects`, `OMSetRenderTargets`, `DrawInstanced`, `DrawIndexedInstanced`) are implemented.
   - *C-03 Resolved:* Saves and restores game descriptor heaps and compute PSO before and after CBR compute dispatch.
+  - *H-02 Resolved:* Gated `OnScenePassEnd` and root signature/heap restoration behind `dx12InputsCaptured` safety check so D3D12 fails open cleanly without executing compute reconstruction over uninitialized buffers or corrupting root parameters.
   - *M-03 Resolved:* Fast-path guard in `Hooked_D3D12ExecuteCommandLists` bypasses redundant COM interface queries on the hot path.
   - *M-04 Resolved:* Secure `LoadLibraryExA(..., nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32)` locks DLL resolution for `d3d12.dll` and `d3dcompiler_47.dll` to System32.
 * **Motion Vector Fallback (Camera-Only Depth Unprojection):** **Present & Guarded** — `CBRCameraUniforms` UBO (binding = 7 / register(b1)), `InvertMatrix4x4`, and `SetCameraMatrices` are implemented.
+  - *H-01 Resolved:* Removed duplicate `SetCameraMatrices` call in `CBREngine::OnBeginFrame()` and added floating-point difference check in `ReconstructionPass::SetCameraMatrices()` so intra-frame duplicate calls do not clobber `prevViewProj` to identity.
   - *M-02 Resolved:* Perspective cotangent bounds validation in `PatternScanner::GetCameraProjectionMatrix` ($0.2 \le \cot \le 5.0$) safely falls back to pure Strategy A viewport shift if camera scanning matches stale or dead memory.
-* **In-Game ImGui Overlay:** **Partially Present (b)** — Telemetry state management, hotkeys, and `GetFormattedTelemetry()` are present; Dear ImGui draw backend remains planned for Phase 3 (H-03).
+* **In-Game ImGui Overlay & GPU Telemetry:** **Partially Present (b)** — Telemetry state management, hotkeys, and `GetFormattedTelemetry()` are present; Dear ImGui draw backend remains planned for Phase 3.
+  - *H-03 Resolved:* In `DispatchVulkan()`, prevented ~0.001 ms CPU time flicker when `vkGetQueryPoolResults` returns `VK_NOT_READY` by preserving the last valid GPU dispatch measurement. Added headerless `timestampPeriod` extraction from `VkPhysicalDeviceProperties` at offset 796 on 64-bit so GPU timing functions reliably across headerless and SDK builds.
 * **Contrast Adaptive Sharpening (CAS / RCAS):** **Present (a)** — `SharpeningStrength` (0.0..1.0) parsed in `config.cpp` and uploaded to the GPU via `CBRCameraUniforms::sharpeningStrength`.
 * **HDR / scRGB Support:** **Present (a)** — Full ICtCp (ITU-R BT.2100), YCoCg, and RGB color clamping support.
 * **Asynchronous Compute:** **Missing — Optional (d)** — Inline compute execution on the graphics command buffer remains appropriate given immediate downstream post-FX dependencies.

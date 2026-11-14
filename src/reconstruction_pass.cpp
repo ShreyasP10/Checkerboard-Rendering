@@ -669,7 +669,16 @@ bool ReconstructionPass::SetCameraMatrices(const float* currViewProj4x4, const f
     if (prevViewProj4x4) {
         std::memcpy(m_prevViewProj, prevViewProj4x4, sizeof(m_prevViewProj));
     } else if (m_hasPrevMatrix) {
-        std::memcpy(m_prevViewProj, m_currViewProj, sizeof(m_prevViewProj));
+        bool changed = false;
+        for (int i = 0; i < 16; ++i) {
+            if (std::fabs(currViewProj4x4[i] - m_currViewProj[i]) > 1e-6f) {
+                changed = true;
+                break;
+            }
+        }
+        if (changed) {
+            std::memcpy(m_prevViewProj, m_currViewProj, sizeof(m_prevViewProj));
+        }
     } else {
         std::memcpy(m_prevViewProj, currViewProj4x4, sizeof(m_prevViewProj));
     }
@@ -1013,6 +1022,20 @@ bool ReconstructionPass::CreateVulkanPipeline() {
         }
     }
 #endif
+    if (m_vkTimestampPeriodNs <= 0.0f && m_vkPhysicalDevice) {
+        auto pfnGetPhysProps = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
+            GetVulkanLoaderSymbol(vulkanModule, "vkGetPhysicalDeviceProperties"));
+        if (pfnGetPhysProps) {
+            uint32_t propsHeader[256]{};
+            pfnGetPhysProps(m_vkPhysicalDevice, propsHeader);
+            // On 64-bit platforms, VkPhysicalDeviceLimits::timestampPeriod is located at byte offset 796
+            // (sizeof(VkPhysicalDeviceProperties) is 824 bytes, limits begins at offset 512, timestampPeriod at +284)
+            const float extractedPeriod = *reinterpret_cast<const float*>(reinterpret_cast<const char*>(propsHeader) + 796);
+            if (std::isfinite(extractedPeriod) && extractedPeriod > 0.0f && extractedPeriod <= 1000.0f) {
+                m_vkTimestampPeriodNs = extractedPeriod;
+            }
+        }
+    }
     auto pfnCreateQueryPool = reinterpret_cast<PFN_vkCreateQueryPool>(resolveDeviceFunc("vkCreateQueryPool"));
     if (pfnCreateQueryPool) {
         MinimalVkQueryPoolCreateInfo qpInfo{};
@@ -2121,8 +2144,10 @@ void ReconstructionPass::DispatchVulkan(void* vkCommandBuffer, uint32_t frameInd
     }
 
     if (!gpuTimestampReady) {
-        const float cpuMs = std::chrono::duration<float, std::milli>(cpuEnd - cpuStart).count();
-        m_lastDispatchDurationMs.store(cpuMs > 0.001f ? cpuMs : 0.001f, std::memory_order_release);
+        if (m_lastDispatchDurationMs.load(std::memory_order_relaxed) <= 0.0f) {
+            const float cpuMs = std::chrono::duration<float, std::milli>(cpuEnd - cpuStart).count();
+            m_lastDispatchDurationMs.store(cpuMs > 0.001f ? cpuMs : 0.001f, std::memory_order_release);
+        }
     }
 
     if (pfnCmdPipelineBarrier) {
