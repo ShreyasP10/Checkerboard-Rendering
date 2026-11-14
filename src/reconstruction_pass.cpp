@@ -747,15 +747,33 @@ bool ReconstructionPass::CreateVulkanPipeline() {
         return false;
     }
 
-    // Candidate search locations for cbr_reconstruct.spv
+    // Candidate search locations for cbr_reconstruct.spv (or cbr_reconstruct_1x.spv when MsaaSamples == 1)
+    const bool useSingleSample = (RenderTargetManager::Get().GetDimensions().msaaSamples == 1u);
+    const std::string primarySpv = useSingleSample ? "cbr_reconstruct_1x.spv" : "cbr_reconstruct.spv";
+    const std::string fallbackSpv = "cbr_reconstruct.spv";
+
     std::vector<std::filesystem::path> searchPaths;
-    if (!m_shaderDir.empty()) {
-        searchPaths.push_back(m_shaderDir / "cbr_reconstruct.spv");
-    }
     const auto modDir = GetCurrentModuleDirectory();
+
+    if (useSingleSample) {
+        if (!m_shaderDir.empty()) {
+            searchPaths.push_back(m_shaderDir / primarySpv);
+        }
+        if (!modDir.empty()) {
+            searchPaths.push_back(modDir / "shaders" / primarySpv);
+            searchPaths.push_back(modDir / primarySpv);
+        }
+        searchPaths.push_back(std::string("shaders/") + primarySpv);
+        searchPaths.push_back(std::string("shaders/spv/") + primarySpv);
+        searchPaths.push_back(std::string("package/rdr2-cbr/shaders/") + primarySpv);
+    }
+
+    if (!m_shaderDir.empty()) {
+        searchPaths.push_back(m_shaderDir / fallbackSpv);
+    }
     if (!modDir.empty()) {
-        searchPaths.push_back(modDir / "shaders" / "cbr_reconstruct.spv");
-        searchPaths.push_back(modDir / "cbr_reconstruct.spv");
+        searchPaths.push_back(modDir / "shaders" / fallbackSpv);
+        searchPaths.push_back(modDir / fallbackSpv);
     }
     searchPaths.push_back("shaders/cbr_reconstruct.spv");
     searchPaths.push_back("shaders/spv/cbr_reconstruct.spv");

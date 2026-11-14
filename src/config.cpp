@@ -208,6 +208,13 @@ bool ConfigManager::Load(const std::filesystem::path& configPath) {
                 else if (apiUpper == "D3D12") parsed.preferredApi = GraphicsApi::D3D12;
                 else if (apiUpper == "AUTO")  parsed.preferredApi = GraphicsApi::Auto;
                 else warnings.emplace_back("Unknown PreferredApi '" + val + "'; keeping previous.");
+            } else if (key == "MsaaSamples") {
+                int samples = 0;
+                if (TryParseIntStrict(val, samples) && (samples == 1 || samples == 2)) {
+                    parsed.msaaSamples = static_cast<uint32_t>(samples);
+                } else {
+                    warnings.emplace_back("Invalid MsaaSamples '" + val + "' (must be 1 or 2); keeping previous.");
+                }
             } else if (key == "MipLodBias") {
                 parsed.mipLodBias = ParseFloat(val, parsed.mipLodBias, -4.0f, 4.0f);
             } else if (key == "DepthTolerance") {
@@ -325,6 +332,7 @@ bool ConfigManager::Save(const std::filesystem::path& configPath) {
     file << "PreferredApi = "
          << (snapshot.preferredApi == GraphicsApi::Vulkan ? "Vulkan"
            : snapshot.preferredApi == GraphicsApi::D3D12 ? "D3D12" : "Auto") << "\n";
+    file << "MsaaSamples = " << snapshot.msaaSamples << "\n";
     file << "MipLodBias = " << snapshot.mipLodBias << "\n\n";
 
     file << "[Reconstruction]\n";

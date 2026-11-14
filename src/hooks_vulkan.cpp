@@ -1013,7 +1013,9 @@ inline void RecordTrackedRenderPass(void* rpHandle, const std::vector<TrackedRen
             }
         }
     }
-    rp.isCandidateGeometryPass = hasHdrColor && hasDepth && (hasMsaa2x || hasVelocityFmt || colorCount >= 2u);
+    const uint32_t targetSamples = RenderTargetManager::Get().GetDimensions().msaaSamples;
+    rp.isCandidateGeometryPass = hasHdrColor && hasDepth &&
+                                 (targetSamples == 1u || hasMsaa2x || hasVelocityFmt || colorCount >= 2u);
     std::lock_guard<std::mutex> lock(g_attachmentMutex);
     g_renderPasses[rpHandle] = std::move(rp);
 }

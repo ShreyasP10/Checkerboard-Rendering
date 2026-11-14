@@ -17,9 +17,14 @@ layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 // Resource Bindings
 // =============================================================================
 
-// Current frame: quarter-resolution 2x MSAA color & depth buffers
+// Current frame: quarter-resolution 2x MSAA or 1x single-sample color & depth buffers
+#ifdef CBR_SINGLE_SAMPLE
+layout(set = 0, binding = 0) uniform sampler2D u_QuarterColorMSAA;
+layout(set = 0, binding = 1) uniform sampler2D u_QuarterDepthMSAA;
+#else
 layout(set = 0, binding = 0) uniform sampler2DMS u_QuarterColorMSAA;
 layout(set = 0, binding = 1) uniform sampler2DMS u_QuarterDepthMSAA;
+#endif
 
 // History frame: full-resolution reconstructed color & depth buffers
 // SAMPLER REQUIREMENT (must match HLSL LinearClamp/PointClamp):
@@ -166,11 +171,19 @@ CbrSample MapPixelToSample(ivec2 p, uint frameParity) {
 }
 
 vec3 FetchColor(CbrSample s) {
+#ifdef CBR_SINGLE_SAMPLE
+    return texelFetch(u_QuarterColorMSAA, s.quarter, 0).rgb;
+#else
     return texelFetch(u_QuarterColorMSAA, s.quarter, s.sampleIdx).rgb;
+#endif
 }
 
 float FetchDepth(CbrSample s) {
+#ifdef CBR_SINGLE_SAMPLE
+    return texelFetch(u_QuarterDepthMSAA, s.quarter, 0).r;
+#else
     return texelFetch(u_QuarterDepthMSAA, s.quarter, s.sampleIdx).r;
+#endif
 }
 
 // MIRRORS include/cbr/depth_convention.h

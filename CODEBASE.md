@@ -249,6 +249,14 @@ if(CBR_GLSLANG)
             VERBATIM)
         list(APPEND CBR_COMPILED_SHADERS ${CMAKE_CURRENT_BINARY_DIR}/shaders/$<CONFIG>/${shader}.spv)
     endforeach()
+    add_custom_command(
+        OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/shaders/$<CONFIG>/cbr_reconstruct_1x.spv
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/shaders/$<CONFIG>
+        COMMAND ${CBR_GLSLANG} -V -DCBR_SINGLE_SAMPLE=1 ${CBR_SHADER_DIR}/cbr_reconstruct.comp -o ${CMAKE_CURRENT_BINARY_DIR}/shaders/$<CONFIG>/cbr_reconstruct_1x.spv
+        DEPENDS ${CBR_SHADER_DIR}/cbr_reconstruct.comp
+        COMMENT "Compiling cbr_reconstruct.comp (1x MSAA Off) to SPIR-V"
+        VERBATIM)
+    list(APPEND CBR_COMPILED_SHADERS ${CMAKE_CURRENT_BINARY_DIR}/shaders/$<CONFIG>/cbr_reconstruct_1x.spv)
 else()
     message(STATUS "glslangValidator not found: SPIR-V shaders will not be built.")
 endif()
@@ -370,6 +378,11 @@ TargetHeight = 2160
 
 ; Target graphics API: Vulkan (recommended for Pascal), D3D12, or Auto (use whichever runtime is loaded)
 PreferredApi = Vulkan
+
+; MSAA sample count for quarter-resolution pass:
+;   2 = 2x MSAA (default for discrete GPUs / 4K PS4 Pro CBR)
+;   1 = 1x Single-Sample ASO mode (for Vega 7 APUs / 720p & 1080p with in-game MSAA Off)
+MsaaSamples = 2
 
 ; Texture Sampler MIP LOD Bias applied during quarter-resolution rendering
 ; Default: -1.0 (mathematically compensates for 2x larger texture coordinate derivatives in
@@ -848,6 +861,10 @@ struct CBRConfig {
     uint32_t         targetHeight{ 2160 };
     GraphicsApi      preferredApi{ GraphicsApi::Vulkan };
     SamplingStrategy samplingStrategy{ SamplingStrategy::StrategyA };
+    // MSAA sample count for quarter-resolution pass:
+    //   2 = 2x MSAA (default for discrete GPUs / 4K PS4 Pro CBR)
+    //   1 = 1x Single-Sample ASO mode (for Vega 7 APUs / 720p & 1080p with in-game MSAA Off)
+    uint32_t         msaaSamples{ 2 };
     // MIP LOD Bias: -1.0f mathematically compensates for the 2x larger texture coordinate
     // derivatives in quarter-resolution (half-width, half-height) 2x MSAA rendering
     // (CHECKERBOARD.md lines 365-425 / El Mansouri 2016: LOD' = -1 + LOD).
@@ -2492,6 +2509,13 @@ bool ConfigManager::Load(const std::filesystem::path& configPath) {
                 else if (apiUpper == "D3D12") parsed.preferredApi = GraphicsApi::D3D12;
                 else if (apiUpper == "AUTO")  parsed.preferredApi = GraphicsApi::Auto;
                 else warnings.emplace_back("Unknown PreferredApi '" + val + "'; keeping previous.");
+            } else if (key == "MsaaSamples") {
+                int samples = 0;
+                if (TryParseIntStrict(val, samples) && (samples == 1 || samples == 2)) {
+                    parsed.msaaSamples = static_cast<uint32_t>(samples);
+                } else {
+                    warnings.emplace_back("Invalid MsaaSamples '" + val + "' (must be 1 or 2); keeping previous.");
+                }
             } else if (key == "MipLodBias") {
                 parsed.mipLodBias = ParseFloat(val, parsed.mipLodBias, -4.0f, 4.0f);
             } else if (key == "DepthTolerance") {
@@ -2609,6 +2633,7 @@ bool ConfigManager::Save(const std::filesystem::path& configPath) {
     file << "PreferredApi = "
          << (snapshot.preferredApi == GraphicsApi::Vulkan ? "Vulkan"
            : snapshot.preferredApi == GraphicsApi::D3D12 ? "D3D12" : "Auto") << "\n";
+    file << "MsaaSamples = " << snapshot.msaaSamples << "\n";
     file << "MipLodBias = " << snapshot.mipLodBias << "\n\n";
 
     file << "[Reconstruction]\n";
@@ -4163,7 +4188,9 @@ inline void RecordTrackedRenderPass(void* rpHandle, const std::vector<TrackedRen
             }
         }
     }
-    rp.isCandidateGeometryPass = hasHdrColor && hasDepth && (hasMsaa2x || hasVelocityFmt || colorCount >= 2u);
+    const uint32_t targetSamples = RenderTargetManager::Get().GetDimensions().msaaSamples;
+    rp.isCandidateGeometryPass = hasHdrColor && hasDepth &&
+                                 (targetSamples == 1u || hasMsaa2x || hasVelocityFmt || colorCount >= 2u);
     std::lock_guard<std::mutex> lock(g_attachmentMutex);
     g_renderPasses[rpHandle] = std::move(rp);
 }
@@ -7472,15 +7499,33 @@ bool ReconstructionPass::CreateVulkanPipeline() {
         return false;
     }
 
-    // Candidate search locations for cbr_reconstruct.spv
+    // Candidate search locations for cbr_reconstruct.spv (or cbr_reconstruct_1x.spv when MsaaSamples == 1)
+    const bool useSingleSample = (RenderTargetManager::Get().GetDimensions().msaaSamples == 1u);
+    const std::string primarySpv = useSingleSample ? "cbr_reconstruct_1x.spv" : "cbr_reconstruct.spv";
+    const std::string fallbackSpv = "cbr_reconstruct.spv";
+
     std::vector<std::filesystem::path> searchPaths;
-    if (!m_shaderDir.empty()) {
-        searchPaths.push_back(m_shaderDir / "cbr_reconstruct.spv");
-    }
     const auto modDir = GetCurrentModuleDirectory();
+
+    if (useSingleSample) {
+        if (!m_shaderDir.empty()) {
+            searchPaths.push_back(m_shaderDir / primarySpv);
+        }
+        if (!modDir.empty()) {
+            searchPaths.push_back(modDir / "shaders" / primarySpv);
+            searchPaths.push_back(modDir / primarySpv);
+        }
+        searchPaths.push_back(std::string("shaders/") + primarySpv);
+        searchPaths.push_back(std::string("shaders/spv/") + primarySpv);
+        searchPaths.push_back(std::string("package/rdr2-cbr/shaders/") + primarySpv);
+    }
+
+    if (!m_shaderDir.empty()) {
+        searchPaths.push_back(m_shaderDir / fallbackSpv);
+    }
     if (!modDir.empty()) {
-        searchPaths.push_back(modDir / "shaders" / "cbr_reconstruct.spv");
-        searchPaths.push_back(modDir / "cbr_reconstruct.spv");
+        searchPaths.push_back(modDir / "shaders" / fallbackSpv);
+        searchPaths.push_back(modDir / fallbackSpv);
     }
     searchPaths.push_back("shaders/cbr_reconstruct.spv");
     searchPaths.push_back("shaders/spv/cbr_reconstruct.spv");
@@ -9351,14 +9396,15 @@ void RenderTargetManager::Initialize(uint32_t width, uint32_t height) {
     dims.fullHeight = height;
     dims.quarterWidth = width / 2;
     dims.quarterHeight = height / 2;
-    dims.msaaSamples = 2;
+    const uint32_t configuredSamples = (ConfigManager::Get().GetConfig().msaaSamples == 1u) ? 1u : 2u;
+    dims.msaaSamples = configuredSamples;
     dims.invFullWidth = (width > 0) ? (1.0f / static_cast<float>(width)) : 0.0f;
     dims.invFullHeight = (height > 0) ? (1.0f / static_cast<float>(height)) : 0.0f;
     m_historyPingPong.store(0);
 
     // Calculate VRAM footprint:
-    size_t qColor = static_cast<size_t>(dims.quarterWidth) * dims.quarterHeight * 8 * 2;
-    size_t qDepth = static_cast<size_t>(dims.quarterWidth) * dims.quarterHeight * 4 * 2;
+    size_t qColor = static_cast<size_t>(dims.quarterWidth) * dims.quarterHeight * 8 * dims.msaaSamples;
+    size_t qDepth = static_cast<size_t>(dims.quarterWidth) * dims.quarterHeight * 4 * dims.msaaSamples;
     size_t histColor = static_cast<size_t>(dims.fullWidth) * dims.fullHeight * 8 * 2;
     size_t histDepth = static_cast<size_t>(dims.fullWidth) * dims.fullHeight * 4 * 2;
     size_t outColor = static_cast<size_t>(dims.fullWidth) * dims.fullHeight * 8;
@@ -9372,7 +9418,7 @@ void RenderTargetManager::Initialize(uint32_t width, uint32_t height) {
     }
 
     CBR_LOG_INFO("RenderTargetManager initialized for target: %ux%u", width, height);
-    CBR_LOG_INFO("Quarter-Resolution 2x MSAA Buffer size: %ux%u", dims.quarterWidth, dims.quarterHeight);
+    CBR_LOG_INFO("Quarter-Resolution %ux MSAA Buffer size: %ux%u", dims.msaaSamples, dims.quarterWidth, dims.quarterHeight);
     CBR_LOG_INFO("Total CBR VRAM Footprint: %.2f MiB (%.2f MB)",
         static_cast<double>(total) / (1024.0 * 1024.0),
         static_cast<double>(total) / 1000000.0);
@@ -9546,16 +9592,17 @@ bool RenderTargetManager::CreateVulkanResources(void* vkDevice, void* vkPhysical
     constexpr uint32_t depthUsage = kVkImageUsageSampledBit | kVkImageUsageStorageBit |
                                     kVkImageUsageTransferSrcBit | kVkImageUsageTransferDstBit;
 
-    // 1. Create Quarter-Res 2x MSAA / Input Color, Depth, and Velocity targets
-    // Binding 0 & 1 in cbr_reconstruct.comp sample these as sampler2DMS (2x MSAA required)
+    // 1. Create Quarter-Res 2x MSAA / 1x ASO Color, Depth, and Velocity targets
+    // Binding 0 & 1 in cbr_reconstruct.comp sample these as sampler2DMS (2x MSAA) or sampler2D (1x ASO)
+    const uint32_t quarterSampleBit = (dims.msaaSamples == 1u) ? kVkSampleCount1Bit : kVkSampleCount2Bit;
     if (!createTexture(dims.quarterWidth, dims.quarterHeight, kVkFormatR16G16B16A16Sfloat,
-                       msaaInputUsage, kVkImageAspectColorBit, m_vkResources.quarterColor, kVkSampleCount2Bit)) {
-        CBR_LOG_ERROR("Failed to allocate device-local QuarterColor buffer (2x MSAA)");
+                       msaaInputUsage, kVkImageAspectColorBit, m_vkResources.quarterColor, quarterSampleBit)) {
+        CBR_LOG_ERROR("Failed to allocate device-local QuarterColor buffer (%ux samples)", dims.msaaSamples);
         return false;
     }
     if (!createTexture(dims.quarterWidth, dims.quarterHeight, kVkFormatD32Sfloat,
-                       msaaDepthUsage, kVkImageAspectDepthBit, m_vkResources.quarterDepth, kVkSampleCount2Bit)) {
-        CBR_LOG_ERROR("Failed to allocate device-local QuarterDepth buffer (2x MSAA)");
+                       msaaDepthUsage, kVkImageAspectDepthBit, m_vkResources.quarterDepth, quarterSampleBit)) {
+        CBR_LOG_ERROR("Failed to allocate device-local QuarterDepth buffer (%ux samples)", dims.msaaSamples);
         return false;
     }
     if (!createTexture(dims.quarterWidth, dims.quarterHeight, kVkFormatR16G16B16A16Sfloat,
@@ -9820,11 +9867,12 @@ bool RenderTargetManager::CreateDX12Resources(void* d3d12Device) {
         return true;
     };
 
+    const uint32_t quarterSamples = (dims.msaaSamples == 1u) ? 1u : 2u;
     if (!createTex(dims.quarterWidth, dims.quarterHeight, kDxgiFormatR16G16B16A16Float,
-                   kVkSampleCount2Bit, kD3D12ResourceFlagNone, kD3D12ResourceStateNonPixelSRV,
+                   quarterSamples, kD3D12ResourceFlagNone, kD3D12ResourceStateNonPixelSRV,
                    m_dx12Resources.quarterColor) ||
         !createTex(dims.quarterWidth, dims.quarterHeight, kDxgiFormatR32Float,
-                   kVkSampleCount2Bit, kD3D12ResourceFlagNone, kD3D12ResourceStateNonPixelSRV,
+                   quarterSamples, kD3D12ResourceFlagNone, kD3D12ResourceStateNonPixelSRV,
                    m_dx12Resources.quarterDepth) ||
         !createTex(dims.quarterWidth, dims.quarterHeight, kDxgiFormatR16G16B16A16Float,
                    1, kD3D12ResourceFlagNone, kD3D12ResourceStateNonPixelSRV,
@@ -10447,9 +10495,14 @@ layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 // Resource Bindings
 // =============================================================================
 
-// Current frame: quarter-resolution 2x MSAA color & depth buffers
+// Current frame: quarter-resolution 2x MSAA or 1x single-sample color & depth buffers
+#ifdef CBR_SINGLE_SAMPLE
+layout(set = 0, binding = 0) uniform sampler2D u_QuarterColorMSAA;
+layout(set = 0, binding = 1) uniform sampler2D u_QuarterDepthMSAA;
+#else
 layout(set = 0, binding = 0) uniform sampler2DMS u_QuarterColorMSAA;
 layout(set = 0, binding = 1) uniform sampler2DMS u_QuarterDepthMSAA;
+#endif
 
 // History frame: full-resolution reconstructed color & depth buffers
 // SAMPLER REQUIREMENT (must match HLSL LinearClamp/PointClamp):
@@ -10596,11 +10649,19 @@ CbrSample MapPixelToSample(ivec2 p, uint frameParity) {
 }
 
 vec3 FetchColor(CbrSample s) {
+#ifdef CBR_SINGLE_SAMPLE
+    return texelFetch(u_QuarterColorMSAA, s.quarter, 0).rgb;
+#else
     return texelFetch(u_QuarterColorMSAA, s.quarter, s.sampleIdx).rgb;
+#endif
 }
 
 float FetchDepth(CbrSample s) {
+#ifdef CBR_SINGLE_SAMPLE
+    return texelFetch(u_QuarterDepthMSAA, s.quarter, 0).r;
+#else
     return texelFetch(u_QuarterDepthMSAA, s.quarter, s.sampleIdx).r;
+#endif
 }
 
 // MIRRORS include/cbr/depth_convention.h
@@ -12305,6 +12366,19 @@ static void TestConfigHardening(const fs::path& dir) {
     CHECK(fresh.projectionJitterSign == 1);
     CHECK(fresh.samplingStrategy == SamplingStrategy::StrategyA);
     CHECK(fresh.depthConvention == DepthConvention::Reversed);
+    CHECK(fresh.msaaSamples == 2);
+
+    WriteFile(dir / "msaa_test.ini", "[General]\nMsaaSamples = 1\n");
+    CHECK(ConfigManager::Get().Load(dir / "msaa_test.ini"));
+    CHECK(ConfigManager::Get().GetConfig().msaaSamples == 1);
+
+    WriteFile(dir / "msaa_invalid.ini", "[General]\nMsaaSamples = 4\n");
+    CHECK(ConfigManager::Get().Load(dir / "msaa_invalid.ini"));
+    CHECK(ConfigManager::Get().GetConfig().msaaSamples == 1); // Invalid keeps previous (1)
+
+    WriteFile(dir / "msaa_test2.ini", "[General]\nMsaaSamples = 2\n");
+    CHECK(ConfigManager::Get().Load(dir / "msaa_test2.ini"));
+    CHECK(ConfigManager::Get().GetConfig().msaaSamples == 2);
 
     // Invalid enum-like values keep the previous setting
     WriteFile(dir / "bad2.ini", "[Jitter]\nJitterDirection = 2\nProjectionJitterSign = 42\nSamplingStrategy = UnknownStrategy\n[Reconstruction]\nDepthConvention = sideways\n");
@@ -12652,6 +12726,7 @@ static void TestRenderTargets() {
     const auto good = r.GetDimensions();
     r.Initialize(0, 0);
     CHECK(r.GetDimensions().fullWidth == good.fullWidth);
+    ConfigManager::Get().Modify([](CBRConfig& cfg) { cfg.msaaSamples = 2; });
     r.Initialize(3840, 2160);
     // 4K: quarter colour 33,177,600 + quarter depth 16,588,800 + history colour A/B 132,710,400
     //    + history depth A/B 66,355,200 + output 66,355,200 = 315,187,200 bytes (300.58 MiB, 315.19 MB)
@@ -12662,6 +12737,18 @@ static void TestRenderTargets() {
     // 1080p (the AMD Vega 7 profile): 78,796,800 bytes = 78.80 MB
     r.Initialize(1920, 1080);
     CHECK(r.GetTotalAllocatedVramBytes() == 78796800u);
+
+    // Single-sample 1x ASO mode (APU mode):
+    ConfigManager::Get().Modify([](CBRConfig& cfg) { cfg.msaaSamples = 1; });
+    r.Initialize(3840, 2160);
+    CHECK(r.GetTotalAllocatedVramBytes() == 290304000u);
+
+    // 720p 1x ASO mode:
+    r.Initialize(1280, 720);
+    CHECK(r.GetTotalAllocatedVramBytes() == 32256000u);
+
+    // Reset back to 2x MSAA for subsequent tests
+    ConfigManager::Get().Modify([](CBRConfig& cfg) { cfg.msaaSamples = 2; });
     r.Initialize(3840, 2160);
 
     CHECK(r.GetDimensions().quarterWidth == (3840u >> 1) && r.GetDimensions().quarterHeight == (2160u >> 1));
@@ -12726,6 +12813,16 @@ static void TestRenderTargets() {
     CHECK(r.CanCopyToQuarterDepth(validDepth));
     CHECK(!r.CanCopyToQuarterDepth(depthColorMismatch));
     CHECK(!r.CanCopyToQuarterDepth(singleSampleDepth));
+
+    // Verify 1x ASO single-sample copies when msaaSamples == 1
+    ConfigManager::Get().Modify([](CBRConfig& cfg) { cfg.msaaSamples = 1; });
+    r.Initialize(3840, 2160);
+    CHECK(r.CanCopyToQuarterColor(singleSampleColor));
+    CHECK(!r.CanCopyToQuarterColor(validColor)); // 2x rejected in 1x mode
+    CHECK(r.CanCopyToQuarterDepth(singleSampleDepth));
+    CHECK(!r.CanCopyToQuarterDepth(validDepth)); // 2x rejected in 1x mode
+    ConfigManager::Get().Modify([](CBRConfig& cfg) { cfg.msaaSamples = 2; });
+    r.Initialize(3840, 2160);
     CHECK(r.CanCopyToVelocity(validVel));
     CHECK(!r.CanCopyToVelocity(validColor)); // 2x samples != 1x velocity buffer
 
@@ -14439,6 +14536,7 @@ jobs:
         run: |
           mkdir -p shaders/spv
           glslangValidator -V shaders/cbr_reconstruct.comp -o shaders/spv/cbr_reconstruct.spv
+          glslangValidator -V -DCBR_SINGLE_SAMPLE=1 shaders/cbr_reconstruct.comp -o shaders/spv/cbr_reconstruct_1x.spv
           glslangValidator -V shaders/cbr_reconstruct_quad.comp -o shaders/spv/cbr_reconstruct_quad.spv
           glslangValidator -V shaders/cbr_resolve_simple.comp -o shaders/spv/cbr_resolve_simple.spv
           # glslang's HLSL front-end is a syntax/semantics gate that runs everywhere.
@@ -15351,6 +15449,7 @@ The latest audit (v0.1.0-alpha) identified and resolved key operational risks fo
 * **Full Vulkan Resource Pipeline:** **Present & Hardened** — Descriptor ping-ponging (C-02 Resolved), initial layout transitions & history clearing (C-03 Resolved), framebuffer/image-view tracking (`vkCreateImage`, `vkCreateImageView`, `vkCreateFramebuffer`, `VkRenderPassAttachmentBeginInfo`), and `CopyImageRegion` / `BlitToImage` are fully implemented.
   - *C-01 Resolved:* `quarterDepth` allocated as `VK_FORMAT_D32_SFLOAT`, gating `OnScenePassEnd`/`BlitToImage` on `colorCopied && depthCopied` to fail open safely if MSAA is disabled.
   - *C-02 Resolved:* Handled 2× MSAA passes without inline 1× resolve attachments via separate blit/resolve path.
+  - *1× Single-Sample ASO Mode (Vega 7 APU Support):* Added `MsaaSamples` (`1` or `2`, default `2`) to `CBRConfig` and `cbr.ini`. Enables DDR4-bound integrated APUs running at 720p/1080p with in-game MSAA Off to bind `sampler2D` (`cbr_reconstruct_1x.spv`) and single-sample `quarterColor`/`quarterDepth`, eliminating 2× MSAA bandwidth overhead.
 * **Scene Pass Identification:** **Present (a)** — `Hooked_vkCreateRenderPass` and `Hooked_vkCreateRenderPass2`/`KHR` inspect attachment formats and sample counts (`RecordTrackedRenderPass`), and `Hooked_vkCmdEndRenderPass` gates on `rpCandidate && draws >= 250 && !colorIsSwapchain`.
 * **DirectX 12 Parity:** **Present & Hardened** — `CreateDX12Pipeline` (RootSignature + Compute PSO + runtime D3DCompile fallback + b1 camera CBV), `DispatchDX12` (resource barriers + descriptor table binding), and command-list VMT hooks (`ExecuteCommandLists`, `RSSetViewports`, `RSSetScissorRects`, `OMSetRenderTargets`, `DrawInstanced`, `DrawIndexedInstanced`) are implemented.
   - *C-03 Resolved:* Saves and restores game descriptor heaps and compute PSO before and after CBR compute dispatch.

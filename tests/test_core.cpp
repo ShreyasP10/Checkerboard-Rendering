@@ -105,6 +105,19 @@ static void TestConfigHardening(const fs::path& dir) {
     CHECK(fresh.projectionJitterSign == 1);
     CHECK(fresh.samplingStrategy == SamplingStrategy::StrategyA);
     CHECK(fresh.depthConvention == DepthConvention::Reversed);
+    CHECK(fresh.msaaSamples == 2);
+
+    WriteFile(dir / "msaa_test.ini", "[General]\nMsaaSamples = 1\n");
+    CHECK(ConfigManager::Get().Load(dir / "msaa_test.ini"));
+    CHECK(ConfigManager::Get().GetConfig().msaaSamples == 1);
+
+    WriteFile(dir / "msaa_invalid.ini", "[General]\nMsaaSamples = 4\n");
+    CHECK(ConfigManager::Get().Load(dir / "msaa_invalid.ini"));
+    CHECK(ConfigManager::Get().GetConfig().msaaSamples == 1); // Invalid keeps previous (1)
+
+    WriteFile(dir / "msaa_test2.ini", "[General]\nMsaaSamples = 2\n");
+    CHECK(ConfigManager::Get().Load(dir / "msaa_test2.ini"));
+    CHECK(ConfigManager::Get().GetConfig().msaaSamples == 2);
 
     // Invalid enum-like values keep the previous setting
     WriteFile(dir / "bad2.ini", "[Jitter]\nJitterDirection = 2\nProjectionJitterSign = 42\nSamplingStrategy = UnknownStrategy\n[Reconstruction]\nDepthConvention = sideways\n");
@@ -452,6 +465,7 @@ static void TestRenderTargets() {
     const auto good = r.GetDimensions();
     r.Initialize(0, 0);
     CHECK(r.GetDimensions().fullWidth == good.fullWidth);
+    ConfigManager::Get().Modify([](CBRConfig& cfg) { cfg.msaaSamples = 2; });
     r.Initialize(3840, 2160);
     // 4K: quarter colour 33,177,600 + quarter depth 16,588,800 + history colour A/B 132,710,400
     //    + history depth A/B 66,355,200 + output 66,355,200 = 315,187,200 bytes (300.58 MiB, 315.19 MB)
@@ -462,6 +476,18 @@ static void TestRenderTargets() {
     // 1080p (the AMD Vega 7 profile): 78,796,800 bytes = 78.80 MB
     r.Initialize(1920, 1080);
     CHECK(r.GetTotalAllocatedVramBytes() == 78796800u);
+
+    // Single-sample 1x ASO mode (APU mode):
+    ConfigManager::Get().Modify([](CBRConfig& cfg) { cfg.msaaSamples = 1; });
+    r.Initialize(3840, 2160);
+    CHECK(r.GetTotalAllocatedVramBytes() == 290304000u);
+
+    // 720p 1x ASO mode:
+    r.Initialize(1280, 720);
+    CHECK(r.GetTotalAllocatedVramBytes() == 32256000u);
+
+    // Reset back to 2x MSAA for subsequent tests
+    ConfigManager::Get().Modify([](CBRConfig& cfg) { cfg.msaaSamples = 2; });
     r.Initialize(3840, 2160);
 
     CHECK(r.GetDimensions().quarterWidth == (3840u >> 1) && r.GetDimensions().quarterHeight == (2160u >> 1));
@@ -526,6 +552,16 @@ static void TestRenderTargets() {
     CHECK(r.CanCopyToQuarterDepth(validDepth));
     CHECK(!r.CanCopyToQuarterDepth(depthColorMismatch));
     CHECK(!r.CanCopyToQuarterDepth(singleSampleDepth));
+
+    // Verify 1x ASO single-sample copies when msaaSamples == 1
+    ConfigManager::Get().Modify([](CBRConfig& cfg) { cfg.msaaSamples = 1; });
+    r.Initialize(3840, 2160);
+    CHECK(r.CanCopyToQuarterColor(singleSampleColor));
+    CHECK(!r.CanCopyToQuarterColor(validColor)); // 2x rejected in 1x mode
+    CHECK(r.CanCopyToQuarterDepth(singleSampleDepth));
+    CHECK(!r.CanCopyToQuarterDepth(validDepth)); // 2x rejected in 1x mode
+    ConfigManager::Get().Modify([](CBRConfig& cfg) { cfg.msaaSamples = 2; });
+    r.Initialize(3840, 2160);
     CHECK(r.CanCopyToVelocity(validVel));
     CHECK(!r.CanCopyToVelocity(validColor)); // 2x samples != 1x velocity buffer
 

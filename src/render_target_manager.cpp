@@ -311,14 +311,15 @@ void RenderTargetManager::Initialize(uint32_t width, uint32_t height) {
     dims.fullHeight = height;
     dims.quarterWidth = width / 2;
     dims.quarterHeight = height / 2;
-    dims.msaaSamples = 2;
+    const uint32_t configuredSamples = (ConfigManager::Get().GetConfig().msaaSamples == 1u) ? 1u : 2u;
+    dims.msaaSamples = configuredSamples;
     dims.invFullWidth = (width > 0) ? (1.0f / static_cast<float>(width)) : 0.0f;
     dims.invFullHeight = (height > 0) ? (1.0f / static_cast<float>(height)) : 0.0f;
     m_historyPingPong.store(0);
 
     // Calculate VRAM footprint:
-    size_t qColor = static_cast<size_t>(dims.quarterWidth) * dims.quarterHeight * 8 * 2;
-    size_t qDepth = static_cast<size_t>(dims.quarterWidth) * dims.quarterHeight * 4 * 2;
+    size_t qColor = static_cast<size_t>(dims.quarterWidth) * dims.quarterHeight * 8 * dims.msaaSamples;
+    size_t qDepth = static_cast<size_t>(dims.quarterWidth) * dims.quarterHeight * 4 * dims.msaaSamples;
     size_t histColor = static_cast<size_t>(dims.fullWidth) * dims.fullHeight * 8 * 2;
     size_t histDepth = static_cast<size_t>(dims.fullWidth) * dims.fullHeight * 4 * 2;
     size_t outColor = static_cast<size_t>(dims.fullWidth) * dims.fullHeight * 8;
@@ -332,7 +333,7 @@ void RenderTargetManager::Initialize(uint32_t width, uint32_t height) {
     }
 
     CBR_LOG_INFO("RenderTargetManager initialized for target: %ux%u", width, height);
-    CBR_LOG_INFO("Quarter-Resolution 2x MSAA Buffer size: %ux%u", dims.quarterWidth, dims.quarterHeight);
+    CBR_LOG_INFO("Quarter-Resolution %ux MSAA Buffer size: %ux%u", dims.msaaSamples, dims.quarterWidth, dims.quarterHeight);
     CBR_LOG_INFO("Total CBR VRAM Footprint: %.2f MiB (%.2f MB)",
         static_cast<double>(total) / (1024.0 * 1024.0),
         static_cast<double>(total) / 1000000.0);
@@ -506,16 +507,17 @@ bool RenderTargetManager::CreateVulkanResources(void* vkDevice, void* vkPhysical
     constexpr uint32_t depthUsage = kVkImageUsageSampledBit | kVkImageUsageStorageBit |
                                     kVkImageUsageTransferSrcBit | kVkImageUsageTransferDstBit;
 
-    // 1. Create Quarter-Res 2x MSAA / Input Color, Depth, and Velocity targets
-    // Binding 0 & 1 in cbr_reconstruct.comp sample these as sampler2DMS (2x MSAA required)
+    // 1. Create Quarter-Res 2x MSAA / 1x ASO Color, Depth, and Velocity targets
+    // Binding 0 & 1 in cbr_reconstruct.comp sample these as sampler2DMS (2x MSAA) or sampler2D (1x ASO)
+    const uint32_t quarterSampleBit = (dims.msaaSamples == 1u) ? kVkSampleCount1Bit : kVkSampleCount2Bit;
     if (!createTexture(dims.quarterWidth, dims.quarterHeight, kVkFormatR16G16B16A16Sfloat,
-                       msaaInputUsage, kVkImageAspectColorBit, m_vkResources.quarterColor, kVkSampleCount2Bit)) {
-        CBR_LOG_ERROR("Failed to allocate device-local QuarterColor buffer (2x MSAA)");
+                       msaaInputUsage, kVkImageAspectColorBit, m_vkResources.quarterColor, quarterSampleBit)) {
+        CBR_LOG_ERROR("Failed to allocate device-local QuarterColor buffer (%ux samples)", dims.msaaSamples);
         return false;
     }
     if (!createTexture(dims.quarterWidth, dims.quarterHeight, kVkFormatD32Sfloat,
-                       msaaDepthUsage, kVkImageAspectDepthBit, m_vkResources.quarterDepth, kVkSampleCount2Bit)) {
-        CBR_LOG_ERROR("Failed to allocate device-local QuarterDepth buffer (2x MSAA)");
+                       msaaDepthUsage, kVkImageAspectDepthBit, m_vkResources.quarterDepth, quarterSampleBit)) {
+        CBR_LOG_ERROR("Failed to allocate device-local QuarterDepth buffer (%ux samples)", dims.msaaSamples);
         return false;
     }
     if (!createTexture(dims.quarterWidth, dims.quarterHeight, kVkFormatR16G16B16A16Sfloat,
@@ -780,11 +782,12 @@ bool RenderTargetManager::CreateDX12Resources(void* d3d12Device) {
         return true;
     };
 
+    const uint32_t quarterSamples = (dims.msaaSamples == 1u) ? 1u : 2u;
     if (!createTex(dims.quarterWidth, dims.quarterHeight, kDxgiFormatR16G16B16A16Float,
-                   kVkSampleCount2Bit, kD3D12ResourceFlagNone, kD3D12ResourceStateNonPixelSRV,
+                   quarterSamples, kD3D12ResourceFlagNone, kD3D12ResourceStateNonPixelSRV,
                    m_dx12Resources.quarterColor) ||
         !createTex(dims.quarterWidth, dims.quarterHeight, kDxgiFormatR32Float,
-                   kVkSampleCount2Bit, kD3D12ResourceFlagNone, kD3D12ResourceStateNonPixelSRV,
+                   quarterSamples, kD3D12ResourceFlagNone, kD3D12ResourceStateNonPixelSRV,
                    m_dx12Resources.quarterDepth) ||
         !createTex(dims.quarterWidth, dims.quarterHeight, kDxgiFormatR16G16B16A16Float,
                    1, kD3D12ResourceFlagNone, kD3D12ResourceStateNonPixelSRV,

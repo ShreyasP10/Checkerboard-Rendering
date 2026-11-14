@@ -53,6 +53,10 @@ struct CBRConfig {
     uint32_t         targetHeight{ 2160 };
     GraphicsApi      preferredApi{ GraphicsApi::Vulkan };
     SamplingStrategy samplingStrategy{ SamplingStrategy::StrategyA };
+    // MSAA sample count for quarter-resolution pass:
+    //   2 = 2x MSAA (default for discrete GPUs / 4K PS4 Pro CBR)
+    //   1 = 1x Single-Sample ASO mode (for Vega 7 APUs / 720p & 1080p with in-game MSAA Off)
+    uint32_t         msaaSamples{ 2 };
     // MIP LOD Bias: -1.0f mathematically compensates for the 2x larger texture coordinate
     // derivatives in quarter-resolution (half-width, half-height) 2x MSAA rendering
     // (CHECKERBOARD.md lines 365-425 / El Mansouri 2016: LOD' = -1 + LOD).
