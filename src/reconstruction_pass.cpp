@@ -1144,9 +1144,13 @@ bool ReconstructionPass::CreateDX12Pipeline() {
         return false;
     }
 
+#ifndef LOAD_LIBRARY_SEARCH_SYSTEM32
+#define LOAD_LIBRARY_SEARCH_SYSTEM32 0x00000800
+#endif
+
     HMODULE d3d12Mod = GetModuleHandleA("d3d12.dll");
     if (!d3d12Mod) {
-        d3d12Mod = LoadLibraryA("d3d12.dll");
+        d3d12Mod = LoadLibraryExA("d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     }
     if (!d3d12Mod) {
         CBR_LOG_WARN("CreateDX12Pipeline: d3d12.dll unavailable.");
@@ -1207,7 +1211,7 @@ bool ReconstructionPass::CreateDX12Pipeline() {
 
         HMODULE d3dCompilerMod = GetModuleHandleA("d3dcompiler_47.dll");
         if (!d3dCompilerMod) {
-            d3dCompilerMod = LoadLibraryA("d3dcompiler_47.dll");
+            d3dCompilerMod = LoadLibraryExA("d3dcompiler_47.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
         }
         if (!d3dCompilerMod) {
             CBR_LOG_WARN("CreateDX12Pipeline: d3dcompiler_47.dll unavailable; DX12 compute PSO deferred.");

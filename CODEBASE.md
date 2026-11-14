@@ -4262,14 +4262,35 @@ int Hooked_vkEnumeratePhysicalDevices(void* instance, uint32_t* pPhysicalDeviceC
         pPhysicalDeviceCount && *pPhysicalDeviceCount > 0 && pPhysicalDevices &&
         g_activePhysicalDevice.load() == nullptr) {
         void* chosen = pPhysicalDevices[0];
-        if (*pPhysicalDeviceCount > 1 && g_Original_vkGetPhysicalDeviceProperties) {
-            for (uint32_t i = 0; i < *pPhysicalDeviceCount; ++i) {
-                if (!pPhysicalDevices[i]) continue;
-                uint32_t propsHeader[256]{};
-                g_Original_vkGetPhysicalDeviceProperties(pPhysicalDevices[i], propsHeader);
-                if (propsHeader[4] == 2u /* VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU */) {
-                    chosen = pPhysicalDevices[i];
-                    break;
+        if (*pPhysicalDeviceCount > 1) {
+            PFN_vkGetPhysicalDeviceProperties pfnGetProps = g_Original_vkGetPhysicalDeviceProperties;
+            if (!pfnGetProps) {
+                if (instance && g_Original_vkGetInstanceProcAddr) {
+                    pfnGetProps = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
+                        g_Original_vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceProperties"));
+                }
+#if defined(_WIN32)
+                if (!pfnGetProps) {
+                    HMODULE mod = GetModuleHandleA("vulkan-1.dll");
+                    if (mod) {
+                        pfnGetProps = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
+                            GetProcAddress(mod, "vkGetPhysicalDeviceProperties"));
+                    }
+                }
+#endif
+                if (pfnGetProps) {
+                    g_Original_vkGetPhysicalDeviceProperties = pfnGetProps;
+                }
+            }
+            if (pfnGetProps) {
+                for (uint32_t i = 0; i < *pPhysicalDeviceCount; ++i) {
+                    if (!pPhysicalDevices[i]) continue;
+                    uint32_t propsHeader[256]{};
+                    pfnGetProps(pPhysicalDevices[i], propsHeader);
+                    if (propsHeader[4] == 2u /* VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU */) {
+                        chosen = pPhysicalDevices[i];
+                        break;
+                    }
                 }
             }
         }
@@ -5256,22 +5277,24 @@ inline ULONG ReleaseCom(void* obj) {
 void __stdcall Hooked_D3D12ExecuteCommandLists(void* commandQueue, unsigned int numCommandLists, void* const* ppCommandLists) {
     if (commandQueue && CBREngine::Get().IsEnabled()) {
         try {
-            // Capture the live ID3D12Device from the game's command queue on first execution (Item H-02)
-            static const GUID kIID_ID3D12Device =
-                { 0x189819f1, 0x1db6, 0x4b57, { 0xbe, 0x54, 0x18, 0x21, 0x33, 0x9b, 0x85, 0xf7 } };
-            void* liveDev = nullptr;
-            typedef HRESULT (__stdcall *PFN_GetDevice)(void*, const GUID*, void**);
-            if (SUCCEEDED(CallVmt<PFN_GetDevice>(commandQueue, 7, &kIID_ID3D12Device, &liveDev)) && liveDev) {
-                void* prevDev = g_liveD3D12Device.load(std::memory_order_acquire);
-                if (prevDev != liveDev || !RenderTargetManager::Get().AreDX12ResourcesCreated()) {
-                    if (g_liveD3D12Device.exchange(liveDev, std::memory_order_acq_rel) != liveDev ||
-                        !RenderTargetManager::Get().AreDX12ResourcesCreated()) {
-                        if (RenderTargetManager::Get().CreateDX12Resources(liveDev)) {
-                            ReconstructionPass::Get().InitializeDX12(liveDev);
+            // Capture the live ID3D12Device from the game's command queue on first execution (Item H-02 / M-03)
+            if (!g_liveD3D12Device.load(std::memory_order_acquire) || !RenderTargetManager::Get().AreDX12ResourcesCreated()) {
+                static const GUID kIID_ID3D12Device =
+                    { 0x189819f1, 0x1db6, 0x4b57, { 0xbe, 0x54, 0x18, 0x21, 0x33, 0x9b, 0x85, 0xf7 } };
+                void* liveDev = nullptr;
+                typedef HRESULT (__stdcall *PFN_GetDevice)(void*, const GUID*, void**);
+                if (SUCCEEDED(CallVmt<PFN_GetDevice>(commandQueue, 7, &kIID_ID3D12Device, &liveDev)) && liveDev) {
+                    void* prevDev = g_liveD3D12Device.load(std::memory_order_acquire);
+                    if (prevDev != liveDev || !RenderTargetManager::Get().AreDX12ResourcesCreated()) {
+                        if (g_liveD3D12Device.exchange(liveDev, std::memory_order_acq_rel) != liveDev ||
+                            !RenderTargetManager::Get().AreDX12ResourcesCreated()) {
+                            if (RenderTargetManager::Get().CreateDX12Resources(liveDev)) {
+                                ReconstructionPass::Get().InitializeDX12(liveDev);
+                            }
                         }
                     }
+                    ReleaseCom(liveDev);
                 }
-                ReleaseCom(liveDev);
             }
 
             if (ppCommandLists && numCommandLists > 0) {
@@ -6159,6 +6182,7 @@ void Logger::Log(LogLevel level, const std::string& message) {
 #include "cbr/pattern_scanner.h"
 #include <atomic>
 #include <cctype>
+#include <cmath>
 #include <cstring>
 #include "cbr/jitter_manager.h"
 #include "cbr/logger.h"
@@ -6588,11 +6612,23 @@ bool PatternScanner::InitializeCameraScanner() {
                 if (VirtualQuery(managerPtr, &mbi, sizeof(mbi)) && (mbi.State == MEM_COMMIT)) {
                     void* targetManager = nullptr;
                     std::memcpy(&targetManager, managerPtr, sizeof(void*));
-                    if (targetManager && VirtualQuery(targetManager, &mbi, sizeof(mbi)) && (mbi.State == MEM_COMMIT)) {
-                        float* matrixPtr = reinterpret_cast<float*>(static_cast<uint8_t*>(targetManager) + 0x40);
-                        g_cachedCameraMatrix.store(matrixPtr, std::memory_order_release);
-                        CBR_LOG_INFO("RDR2 camera projection matrix acquired at 0x%p", matrixPtr);
-                        return true;
+                    if (targetManager && VirtualQuery(targetManager, &mbi, sizeof(mbi)) && (mbi.State == MEM_COMMIT) &&
+                        (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE))) {
+                        const uintptr_t targetAddr = reinterpret_cast<uintptr_t>(targetManager);
+                        const uintptr_t regionEnd = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+                        if (regionEnd >= targetAddr && (regionEnd - targetAddr) >= (0x40 + 16 * sizeof(float))) {
+                            float* matrixPtr = reinterpret_cast<float*>(static_cast<uint8_t*>(targetManager) + 0x40);
+                            const float cotX = matrixPtr[0];
+                            const float cotY = matrixPtr[5];
+                            if (!std::isnan(cotX) && !std::isnan(cotY) && !std::isinf(cotX) && !std::isinf(cotY) &&
+                                cotX >= 0.2f && cotX <= 5.0f && cotY >= 0.2f && cotY <= 5.0f) {
+                                g_cachedCameraMatrix.store(matrixPtr, std::memory_order_release);
+                                CBR_LOG_INFO("RDR2 camera projection matrix acquired at 0x%p (cotX=%.4f, cotY=%.4f)", matrixPtr, cotX, cotY);
+                                return true;
+                            } else {
+                                CBR_LOG_WARN("Camera matrix candidate at 0x%p rejected: invalid perspective cotangents (cotX=%.4f, cotY=%.4f)", matrixPtr, cotX, cotY);
+                            }
+                        }
                     }
                 }
             }
@@ -6604,16 +6640,37 @@ bool PatternScanner::InitializeCameraScanner() {
 }
 
 float* PatternScanner::GetCameraProjectionMatrix() {
-    return g_cachedCameraMatrix.load(std::memory_order_acquire);
+    float* mat = g_cachedCameraMatrix.load(std::memory_order_acquire);
+    if (!mat) return nullptr;
+#if defined(_WIN32)
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(mat, &mbi, sizeof(mbi)) != sizeof(mbi) ||
+        mbi.State != MEM_COMMIT ||
+        (mbi.Protect & (PAGE_READWRITE | PAGE_READONLY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) == 0) {
+        return nullptr;
+    }
+    const uintptr_t matrixAddr = reinterpret_cast<uintptr_t>(mat);
+    const uintptr_t regionEnd = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+    if (regionEnd < matrixAddr || (regionEnd - matrixAddr) < (16 * sizeof(float))) {
+        return nullptr;
+    }
+#endif
+    const float cotX = mat[0];
+    const float cotY = mat[5];
+    if (std::isnan(cotX) || std::isnan(cotY) || std::isinf(cotX) || std::isinf(cotY) ||
+        cotX < 0.2f || cotX > 5.0f || cotY < 0.2f || cotY > 5.0f) {
+        return nullptr;
+    }
+    return mat;
 }
 
 bool PatternScanner::UpdateCameraJitter(uint32_t frameIndex, bool isVulkan) {
-    float* cameraMatrix = g_cachedCameraMatrix.load(std::memory_order_acquire);
+    float* cameraMatrix = GetCameraProjectionMatrix();
     if (!cameraMatrix) {
         if (!InitializeCameraScanner()) {
             return false;
         }
-        cameraMatrix = g_cachedCameraMatrix.load(std::memory_order_acquire);
+        cameraMatrix = GetCameraProjectionMatrix();
     }
 
     if (cameraMatrix) {
@@ -6622,14 +6679,7 @@ bool PatternScanner::UpdateCameraJitter(uint32_t frameIndex, bool isVulkan) {
             mbi.State != MEM_COMMIT ||
             (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) == 0) {
             g_cachedCameraMatrix.store(nullptr, std::memory_order_release);
-            CBR_LOG_WARN("Camera projection matrix memory unreadable or not committed; falling back to Viewport Redirection.");
-            return false;
-        }
-        const uintptr_t matrixAddr = reinterpret_cast<uintptr_t>(cameraMatrix);
-        const uintptr_t regionEnd = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
-        if (regionEnd < matrixAddr || (regionEnd - matrixAddr) < (16 * sizeof(float))) {
-            g_cachedCameraMatrix.store(nullptr, std::memory_order_release);
-            CBR_LOG_WARN("Camera projection matrix buffer smaller than 4x4 float matrix; falling back to Viewport Redirection.");
+            CBR_LOG_WARN("Camera projection matrix memory not writable; falling back to Viewport Redirection.");
             return false;
         }
 #if defined(_MSC_VER)
@@ -7814,9 +7864,13 @@ bool ReconstructionPass::CreateDX12Pipeline() {
         return false;
     }
 
+#ifndef LOAD_LIBRARY_SEARCH_SYSTEM32
+#define LOAD_LIBRARY_SEARCH_SYSTEM32 0x00000800
+#endif
+
     HMODULE d3d12Mod = GetModuleHandleA("d3d12.dll");
     if (!d3d12Mod) {
-        d3d12Mod = LoadLibraryA("d3d12.dll");
+        d3d12Mod = LoadLibraryExA("d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     }
     if (!d3d12Mod) {
         CBR_LOG_WARN("CreateDX12Pipeline: d3d12.dll unavailable.");
@@ -7877,7 +7931,7 @@ bool ReconstructionPass::CreateDX12Pipeline() {
 
         HMODULE d3dCompilerMod = GetModuleHandleA("d3dcompiler_47.dll");
         if (!d3dCompilerMod) {
-            d3dCompilerMod = LoadLibraryA("d3dcompiler_47.dll");
+            d3dCompilerMod = LoadLibraryExA("d3dcompiler_47.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
         }
         if (!d3dCompilerMod) {
             CBR_LOG_WARN("CreateDX12Pipeline: d3dcompiler_47.dll unavailable; DX12 compute PSO deferred.");

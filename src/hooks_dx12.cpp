@@ -264,22 +264,24 @@ inline ULONG ReleaseCom(void* obj) {
 void __stdcall Hooked_D3D12ExecuteCommandLists(void* commandQueue, unsigned int numCommandLists, void* const* ppCommandLists) {
     if (commandQueue && CBREngine::Get().IsEnabled()) {
         try {
-            // Capture the live ID3D12Device from the game's command queue on first execution (Item H-02)
-            static const GUID kIID_ID3D12Device =
-                { 0x189819f1, 0x1db6, 0x4b57, { 0xbe, 0x54, 0x18, 0x21, 0x33, 0x9b, 0x85, 0xf7 } };
-            void* liveDev = nullptr;
-            typedef HRESULT (__stdcall *PFN_GetDevice)(void*, const GUID*, void**);
-            if (SUCCEEDED(CallVmt<PFN_GetDevice>(commandQueue, 7, &kIID_ID3D12Device, &liveDev)) && liveDev) {
-                void* prevDev = g_liveD3D12Device.load(std::memory_order_acquire);
-                if (prevDev != liveDev || !RenderTargetManager::Get().AreDX12ResourcesCreated()) {
-                    if (g_liveD3D12Device.exchange(liveDev, std::memory_order_acq_rel) != liveDev ||
-                        !RenderTargetManager::Get().AreDX12ResourcesCreated()) {
-                        if (RenderTargetManager::Get().CreateDX12Resources(liveDev)) {
-                            ReconstructionPass::Get().InitializeDX12(liveDev);
+            // Capture the live ID3D12Device from the game's command queue on first execution (Item H-02 / M-03)
+            if (!g_liveD3D12Device.load(std::memory_order_acquire) || !RenderTargetManager::Get().AreDX12ResourcesCreated()) {
+                static const GUID kIID_ID3D12Device =
+                    { 0x189819f1, 0x1db6, 0x4b57, { 0xbe, 0x54, 0x18, 0x21, 0x33, 0x9b, 0x85, 0xf7 } };
+                void* liveDev = nullptr;
+                typedef HRESULT (__stdcall *PFN_GetDevice)(void*, const GUID*, void**);
+                if (SUCCEEDED(CallVmt<PFN_GetDevice>(commandQueue, 7, &kIID_ID3D12Device, &liveDev)) && liveDev) {
+                    void* prevDev = g_liveD3D12Device.load(std::memory_order_acquire);
+                    if (prevDev != liveDev || !RenderTargetManager::Get().AreDX12ResourcesCreated()) {
+                        if (g_liveD3D12Device.exchange(liveDev, std::memory_order_acq_rel) != liveDev ||
+                            !RenderTargetManager::Get().AreDX12ResourcesCreated()) {
+                            if (RenderTargetManager::Get().CreateDX12Resources(liveDev)) {
+                                ReconstructionPass::Get().InitializeDX12(liveDev);
+                            }
                         }
                     }
+                    ReleaseCom(liveDev);
                 }
-                ReleaseCom(liveDev);
             }
 
             if (ppCommandLists && numCommandLists > 0) {

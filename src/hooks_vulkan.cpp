@@ -1108,14 +1108,35 @@ int Hooked_vkEnumeratePhysicalDevices(void* instance, uint32_t* pPhysicalDeviceC
         pPhysicalDeviceCount && *pPhysicalDeviceCount > 0 && pPhysicalDevices &&
         g_activePhysicalDevice.load() == nullptr) {
         void* chosen = pPhysicalDevices[0];
-        if (*pPhysicalDeviceCount > 1 && g_Original_vkGetPhysicalDeviceProperties) {
-            for (uint32_t i = 0; i < *pPhysicalDeviceCount; ++i) {
-                if (!pPhysicalDevices[i]) continue;
-                uint32_t propsHeader[256]{};
-                g_Original_vkGetPhysicalDeviceProperties(pPhysicalDevices[i], propsHeader);
-                if (propsHeader[4] == 2u /* VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU */) {
-                    chosen = pPhysicalDevices[i];
-                    break;
+        if (*pPhysicalDeviceCount > 1) {
+            PFN_vkGetPhysicalDeviceProperties pfnGetProps = g_Original_vkGetPhysicalDeviceProperties;
+            if (!pfnGetProps) {
+                if (instance && g_Original_vkGetInstanceProcAddr) {
+                    pfnGetProps = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
+                        g_Original_vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceProperties"));
+                }
+#if defined(_WIN32)
+                if (!pfnGetProps) {
+                    HMODULE mod = GetModuleHandleA("vulkan-1.dll");
+                    if (mod) {
+                        pfnGetProps = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
+                            GetProcAddress(mod, "vkGetPhysicalDeviceProperties"));
+                    }
+                }
+#endif
+                if (pfnGetProps) {
+                    g_Original_vkGetPhysicalDeviceProperties = pfnGetProps;
+                }
+            }
+            if (pfnGetProps) {
+                for (uint32_t i = 0; i < *pPhysicalDeviceCount; ++i) {
+                    if (!pPhysicalDevices[i]) continue;
+                    uint32_t propsHeader[256]{};
+                    pfnGetProps(pPhysicalDevices[i], propsHeader);
+                    if (propsHeader[4] == 2u /* VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU */) {
+                        chosen = pPhysicalDevices[i];
+                        break;
+                    }
                 }
             }
         }
