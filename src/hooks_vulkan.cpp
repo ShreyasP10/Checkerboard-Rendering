@@ -818,6 +818,14 @@ int Hooked_vkCreateDevice(void* physicalDevice, const void* pCreateInfo, const v
         g_activePhysicalDevice.store(physicalDevice);
         CBR_LOG_INFO("Vulkan physical device captured from vkCreateDevice: %p", physicalDevice);
     }
+    // Clear tracked Vulkan object metadata on new device creation so recycled driver handles never match stale entries
+    {
+        std::lock_guard<std::mutex> lock(g_attachmentMutex);
+        g_images.clear();
+        g_imageViews.clear();
+        g_framebuffers.clear();
+        g_renderPasses.clear();
+    }
     return g_Original_vkCreateDevice(physicalDevice, pCreateInfo, pAllocator, pDevice);
 }
 
@@ -831,6 +839,15 @@ void Hooked_vkDestroySwapchainKHR(void* device, void* swapchain, const void* pAl
         if (activeSc == swapchain) {
             g_activeSwapchain.store(nullptr);
             g_activeImageIndex.store(0);
+        }
+        // Purge tracked image/view/framebuffer/renderpass maps so swapchain recreation / window resize
+        // / alt-tab does not retain stale pointers or match recycled driver handles
+        {
+            std::lock_guard<std::mutex> lock(g_attachmentMutex);
+            g_images.clear();
+            g_imageViews.clear();
+            g_framebuffers.clear();
+            g_renderPasses.clear();
         }
         CBR_LOG_INFO("Vulkan swapchain %p destroyed; resources purged from tracking map.", swapchain);
     }

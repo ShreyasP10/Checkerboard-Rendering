@@ -120,7 +120,17 @@ public:
     [[nodiscard]] uint32_t GetCurrentHistoryIndex() const { return m_historyPingPong.load(); }
     [[nodiscard]] uint32_t GetPreviousHistoryIndex() const { return 1u - m_historyPingPong.load(); }
     void     SwapHistoryBuffers() { m_historyPingPong.fetch_xor(1u); }
-    void     ResetHistory() { m_historyPingPong.store(0u); }
+    void     ResetHistory() {
+        m_historyPingPong.store(0u);
+        m_forceHistoryReset.store(true);
+    }
+    void     ForceHistoryReset() {
+        m_historyPingPong.store(0u);
+        m_forceHistoryReset.store(true);
+    }
+    [[nodiscard]] bool ConsumeForceHistoryReset() {
+        return m_forceHistoryReset.exchange(false);
+    }
 
     // Memory footprint tracking
     [[nodiscard]] size_t GetTotalAllocatedVramBytes() const { return m_totalAllocatedVramBytes.load(); }
@@ -138,6 +148,7 @@ private:
     void*                     m_dx12Device{ nullptr };
     std::atomic<bool>         m_dx12ResourcesCreated{ false };
     std::atomic<uint32_t>     m_historyPingPong{ 0 };
+    std::atomic<bool>         m_forceHistoryReset{ false };
     std::atomic<size_t>       m_totalAllocatedVramBytes{ 0 };
     std::atomic<bool>         m_initialized{ false };
 };

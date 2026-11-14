@@ -150,3 +150,43 @@ For checkerboard reconstruction to resolve clean geometry, alternating pixels mu
 1. **Safety First:** Mod must never crash RDR2 or throw Vulkan validation errors. If any device call fails, the mod must fall back to the original `vkQueuePresentKHR` immediately.
 2. **Visual Fidelity:** Text, HUD, and minimap must remain razor sharp without jitter or blur.
 3. **Performance Target:** Overall reconstruction compute pass frame time must execute in **< 2.0 ms** on GTX 1070 Ti at 4K UHD.
+
+---
+
+## 5. RAGE Engine (RDR2) Runtime Rendering Gotchas & Engineering Countermeasures
+
+### 5.1 Dithered Effects & Temporal Accumulation (TAA Interplay)
+* **The Gotcha:** RDR2 uses stippled, dithered subpixel patterns for Screen-Space Ambient Occlusion (SSAO), soft contact shadows, character hair/beard alpha cards, and foliage. If in-game TAA is turned Off, the RAGE engine ceases generating its primary velocity buffer and exposes raw dither dots. Conversely, if both in-game TAA and CBR's `HistoryWeight = 0.90` run back-to-back, temporal history becomes double-damped, resulting in excessive blurring and ghost trails on foliage and horse manes.
+* **Countermeasure:**
+  1. Default `HistoryWeight` is adjusted to **`0.85`** in [cbr.ini](file:///c:/Users/Dinesh%20B%20Pawar/OneDrive/Desktop/Checkerboard-Rendering/cbr.ini) (with a recommended range of `0.75`–`0.85` when in-game TAA is active).
+  2. Subpixel camera projection jitter is decoupled from the game's Halton sequence (see Section 5.5), ensuring that RDR2's native TAA and CBR operate on aligned phase offsets.
+
+### 5.2 Opaque Deferred vs. Forward Translucent Render Passes
+* **The Gotcha:** RDR2 separates its rendering pipeline into:
+  1. Deferred G-buffer pass (opaque geometry, terrain, structures)
+  2. Async compute passes (volumetric clouds, fog, atmospheric scattering)
+  3. Clustered deferred lighting passes
+  4. Forward translucent pass (glass, water surfaces, alpha-blended particles)
+  5. Post-processing (bloom, tonemapping, depth of field) and UI compositing.
+  If CBR downscales the early G-buffer pass and immediately resolves/blits mid-frame on `vkCmdEndRenderPass`, downstream forward lighting or translucent passes may receive mismatched resolutions or operate without reconstruction.
+* **Countermeasure:**
+  In [src/hooks_vulkan.cpp](file:///c:/Users/Dinesh%20B%20Pawar/OneDrive/Desktop/Checkerboard-Rendering/src/hooks_vulkan.cpp), render pass tracking filters for HDR color + depth attachment candidates (`rpCandidateGeometryPass`) and enforces a threshold of $\ge 250$ draw calls. All sub-passes sharing G-buffer attachments are downscaled consistently, and `OnScenePassEnd` executes exactly once per frame (`m_lastDispatchedFrame.exchange(currentFrame)`) right before post-processing and UI passes begin.
+
+### 5.3 Camera Cutscenes, Scope Zooms, and Lighting Transitions
+* **The Gotcha:** During camera angle transitions in cutscenes, rapid sniper scope zooming, or transitions between interior and exterior spaces, $100\%$ of the temporal history buffer becomes invalid in a single frame. Previously, `ResetHistory()` merely flipped the ping-pong index to `0u` without forcing `u_FrameIndex = 0` in push constants, causing the shader to blend up to $90\%$ of the stale camera frame for 1 to 2 frames.
+* **Countermeasure:**
+  1. Added an atomic `m_forceHistoryReset` flag in [include/cbr/render_target_manager.h](file:///c:/Users/Dinesh%20B%20Pawar/OneDrive/Desktop/Checkerboard-Rendering/include/cbr/render_target_manager.h).
+  2. `ResetHistory()` and `ForceHistoryReset()` arm `m_forceHistoryReset.store(true)`.
+  3. In [src/reconstruction_pass.cpp](file:///c:/Users/Dinesh%20B%20Pawar/OneDrive/Desktop/Checkerboard-Rendering/src/reconstruction_pass.cpp), `BuildReconstructionPushConstants()` consumes the flag via `ConsumeForceHistoryReset()` and forces `pc.frameIndex = 0u` for that single dispatch. In both GLSL and HLSL compute shaders, `frameIndex == 0u` marks the entire screen as `isDisoccluded = true`, immediately flushing stale history.
+  4. In `SetCameraMatrices()`, cumulative matrix deltas exceeding a cut threshold ($\Delta > 15.0$) automatically invoke `ForceHistoryReset()`.
+
+### 5.4 Dynamic Resolution & Windowed Borderless Alt-Tabbing
+* **The Gotcha:** Pressing Alt+Enter, Alt+Tab, or changing monitor displays prompts RDR2 to recreate swapchains or resize render extents. While `vkDeviceWaitIdle` prevents in-flight command crashes, internal tracking maps (`g_images`, `g_imageViews`, `g_framebuffers`, `g_renderPasses`) in [src/hooks_vulkan.cpp](file:///c:/Users/Dinesh%20B%20Pawar/OneDrive/Desktop/Checkerboard-Rendering/src/hooks_vulkan.cpp) can retain stale pointers that collide with recycled driver handles.
+* **Countermeasure:**
+  Inside `Hooked_vkCreateDevice` and `Hooked_vkDestroySwapchainKHR`, `g_attachmentMutex` is locked and all tracking maps (`g_images`, `g_imageViews`, `g_framebuffers`, `g_renderPasses`) are explicitly cleared, guaranteeing that recycled Vulkan handles never inherit stale metadata across swapchain lifecycles.
+
+### 5.5 Overwriting Halton Subpixel Jitter to Prevent Double-Jittering
+* **The Gotcha:** When in-game TAA is active, RDR2 continuously injects a Halton subpixel jitter sequence into elements `proj[8]` and `proj[9]` of its camera projection matrix. In Strategy A, adding CBR's $1.0\text{ px}$ subpixel shift on top of an unknown Halton offset shifts rasterization off the exact $(0.25, 0.25)$ and $(0.75, 0.75)$ diagonal sample centers required by `MapPixelToSample`.
+* **Countermeasure:**
+  In [src/jitter_manager.cpp](file:///c:/Users/Dinesh%20B%20Pawar/OneDrive/Desktop/Checkerboard-Rendering/src/jitter_manager.cpp) (`ApplyJitterToProjection` and `SetProjectionJitter`), the base offset for symmetric camera frustums ($|\text{cur8}| < 0.015\text{ and }|\text{cur9}| < 0.015$) is clamped to `0.0f`. This overwrites RDR2's native Halton jitter with the exact, deterministic CBR checkerboard subpixel offset, ensuring $100\%$ sample alignment without double-jitter artifacts.
+

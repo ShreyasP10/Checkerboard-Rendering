@@ -429,6 +429,13 @@ static void TestPushConstantBuilder() {
     CHECK(pc.targetResolution[0] == 3840.0f && pc.targetResolution[1] == 2160.0f);
     CHECK(std::fabs(pc.invTargetResolution[0] - 1.0f / 3840.0f) < 1e-12f);
     CHECK(pc.frameIndex == 7);
+
+    // Camera cut / reset verification: ResetHistory forces frameIndex = 0 for 1 frame, then resumes
+    RenderTargetManager::Get().ResetHistory();
+    const ReconstructionPushConstants pcReset = BuildReconstructionPushConstants(7);
+    CHECK(pcReset.frameIndex == 0);
+    const ReconstructionPushConstants pcNext = BuildReconstructionPushConstants(8);
+    CHECK(pcNext.frameIndex == 8);
     CHECK(pc.depthTolerance == 0.02f && pc.historyWeight == 0.8f);
     CHECK(pc.colorSpace == 1u);
     CHECK(pc.enableSpatialFallback == 0u);
@@ -510,6 +517,8 @@ static void TestRenderTargets() {
         }
     }
     r.ResetHistory();
+    CHECK(r.ConsumeForceHistoryReset());
+    CHECK(!r.ConsumeForceHistoryReset()); // Verify exchange(false) consumes the flag
 
     // Vulkan resource lifecycle sanity checks
     CHECK(!r.AreVulkanResourcesCreated());

@@ -403,7 +403,8 @@ ColorSpace = YCoCg
 
 ; Temporal history blend weight for valid reprojected samples (0.0 to 1.0)
 ; 1.0 uses pure temporal checkerboard resolve (PS4 Pro style)
-HistoryWeight = 0.90
+; When RDR2 in-game TAA is active, 0.80 - 0.85 is recommended to avoid double temporal damping.
+HistoryWeight = 0.85
 
 ; Enable spatial cross-bilateral filter for disoccluded pixels
 EnableSpatialFallback = true
@@ -1692,7 +1693,17 @@ public:
     [[nodiscard]] uint32_t GetCurrentHistoryIndex() const { return m_historyPingPong.load(); }
     [[nodiscard]] uint32_t GetPreviousHistoryIndex() const { return 1u - m_historyPingPong.load(); }
     void     SwapHistoryBuffers() { m_historyPingPong.fetch_xor(1u); }
-    void     ResetHistory() { m_historyPingPong.store(0u); }
+    void     ResetHistory() {
+        m_historyPingPong.store(0u);
+        m_forceHistoryReset.store(true);
+    }
+    void     ForceHistoryReset() {
+        m_historyPingPong.store(0u);
+        m_forceHistoryReset.store(true);
+    }
+    [[nodiscard]] bool ConsumeForceHistoryReset() {
+        return m_forceHistoryReset.exchange(false);
+    }
 
     // Memory footprint tracking
     [[nodiscard]] size_t GetTotalAllocatedVramBytes() const { return m_totalAllocatedVramBytes.load(); }
@@ -1710,6 +1721,7 @@ private:
     void*                     m_dx12Device{ nullptr };
     std::atomic<bool>         m_dx12ResourcesCreated{ false };
     std::atomic<uint32_t>     m_historyPingPong{ 0 };
+    std::atomic<bool>         m_forceHistoryReset{ false };
     std::atomic<size_t>       m_totalAllocatedVramBytes{ 0 };
     std::atomic<bool>         m_initialized{ false };
 };
@@ -3994,6 +4006,14 @@ int Hooked_vkCreateDevice(void* physicalDevice, const void* pCreateInfo, const v
         g_activePhysicalDevice.store(physicalDevice);
         CBR_LOG_INFO("Vulkan physical device captured from vkCreateDevice: %p", physicalDevice);
     }
+    // Clear tracked Vulkan object metadata on new device creation so recycled driver handles never match stale entries
+    {
+        std::lock_guard<std::mutex> lock(g_attachmentMutex);
+        g_images.clear();
+        g_imageViews.clear();
+        g_framebuffers.clear();
+        g_renderPasses.clear();
+    }
     return g_Original_vkCreateDevice(physicalDevice, pCreateInfo, pAllocator, pDevice);
 }
 
@@ -4007,6 +4027,15 @@ void Hooked_vkDestroySwapchainKHR(void* device, void* swapchain, const void* pAl
         if (activeSc == swapchain) {
             g_activeSwapchain.store(nullptr);
             g_activeImageIndex.store(0);
+        }
+        // Purge tracked image/view/framebuffer/renderpass maps so swapchain recreation / window resize
+        // / alt-tab does not retain stale pointers or match recycled driver handles
+        {
+            std::lock_guard<std::mutex> lock(g_attachmentMutex);
+            g_images.clear();
+            g_imageViews.clear();
+            g_framebuffers.clear();
+            g_renderPasses.clear();
         }
         CBR_LOG_INFO("Vulkan swapchain %p destroyed; resources purged from tracking map.", swapchain);
     }
@@ -5875,8 +5904,12 @@ void JitterManager::ApplyJitterToProjection(float* projMatrix4x4, bool isVulkan)
             (std::fabs(cur8 - m_expectedJitteredProj.first) <= 1e-6f) &&
             (std::fabs(cur9 - m_expectedJitteredProj.second) <= 1e-6f);
 
-        float baseX = cur8;
-        float baseY = cur9;
+        // For symmetric camera frustums (where base proj[8] and proj[9] are near 0.0), overwrite
+        // with the exact CBR subpixel offset rather than adding to RDR2's internal Halton TAA jitter.
+        // Adding CBR jitter onto unknown Halton offsets causes double-jittering and shifts samples
+        // off the exact (0.25, 0.25) and (0.75, 0.75) pixel centers required by MapPixelToSample.
+        float baseX = (std::fabs(cur8) < 0.015f) ? 0.0f : cur8;
+        float baseY = (std::fabs(cur9) < 0.015f) ? 0.0f : cur9;
         bool alreadyApplied = false;
         if (stillHasExpectedJitter) {
             // Same persistent matrix still holds our previous jitter: reuse its cached unjittered base.
@@ -5976,8 +6009,10 @@ void JitterManager::SetProjectionJitter(float* outMatrix4x4, const float* inUnji
         offset = isVulkan ? m_cachedProjectionOffsetVk[phase] : m_cachedProjectionOffsetDx[phase];
     }
 
-    outMatrix4x4[8] = inUnjitteredMatrix4x4[8] + offset.first;
-    outMatrix4x4[9] = inUnjitteredMatrix4x4[9] + offset.second;
+    const float baseIn8 = (std::fabs(inUnjitteredMatrix4x4[8]) < 0.015f) ? 0.0f : inUnjitteredMatrix4x4[8];
+    const float baseIn9 = (std::fabs(inUnjitteredMatrix4x4[9]) < 0.015f) ? 0.0f : inUnjitteredMatrix4x4[9];
+    outMatrix4x4[8] = baseIn8 + offset.first;
+    outMatrix4x4[9] = baseIn9 + offset.second;
 }
 
 } // namespace cbr
@@ -7423,14 +7458,21 @@ bool ReconstructionPass::SetCameraMatrices(const float* currViewProj4x4, const f
         std::memcpy(m_prevViewProj, prevViewProj4x4, sizeof(m_prevViewProj));
     } else if (m_hasPrevMatrix) {
         bool changed = false;
+        float matrixDiff = 0.0f;
         for (int i = 0; i < 16; ++i) {
-            if (std::fabs(currViewProj4x4[i] - m_currViewProj[i]) > 1e-6f) {
+            const float diff = std::fabs(currViewProj4x4[i] - m_currViewProj[i]);
+            matrixDiff += diff;
+            if (diff > 1e-6f) {
                 changed = true;
-                break;
             }
         }
         if (changed) {
             std::memcpy(m_prevViewProj, m_currViewProj, sizeof(m_prevViewProj));
+            // Detect camera cuts: if cumulative matrix difference exceeds threshold (camera teleport / cutscene switch),
+            // trigger an immediate history flush so the old camera frame does not ghost into the new frame
+            if (matrixDiff > 15.0f) {
+                RenderTargetManager::Get().ForceHistoryReset();
+            }
         }
     } else {
         std::memcpy(m_prevViewProj, currViewProj4x4, sizeof(m_prevViewProj));
@@ -8743,7 +8785,12 @@ ReconstructionPushConstants BuildReconstructionPushConstants(uint32_t frameIndex
     pc.targetResolution[1] = fh;
     pc.invTargetResolution[0] = (dims.invFullWidth > 0.0f) ? dims.invFullWidth : (1.0f / fw);
     pc.invTargetResolution[1] = (dims.invFullHeight > 0.0f) ? dims.invFullHeight : (1.0f / fh);
-    pc.frameIndex = frameIndex;
+
+    // Camera cuts, scope zooms, interior lighting transitions, or swapchain resets:
+    // If a history reset was requested, force frameIndex = 0 for this single dispatch so the
+    // compute shader treats the entire screen as disoccluded (isDisoccluded = true) and flushes ghosting.
+    const bool forceReset = RenderTargetManager::Get().ConsumeForceHistoryReset();
+    pc.frameIndex = forceReset ? 0u : frameIndex;
     pc.depthTolerance = config.depthTolerance;
     pc.historyWeight = config.historyWeight;
     pc.debugView = config.debugView;
@@ -12692,6 +12739,13 @@ static void TestPushConstantBuilder() {
     CHECK(pc.targetResolution[0] == 3840.0f && pc.targetResolution[1] == 2160.0f);
     CHECK(std::fabs(pc.invTargetResolution[0] - 1.0f / 3840.0f) < 1e-12f);
     CHECK(pc.frameIndex == 7);
+
+    // Camera cut / reset verification: ResetHistory forces frameIndex = 0 for 1 frame, then resumes
+    RenderTargetManager::Get().ResetHistory();
+    const ReconstructionPushConstants pcReset = BuildReconstructionPushConstants(7);
+    CHECK(pcReset.frameIndex == 0);
+    const ReconstructionPushConstants pcNext = BuildReconstructionPushConstants(8);
+    CHECK(pcNext.frameIndex == 8);
     CHECK(pc.depthTolerance == 0.02f && pc.historyWeight == 0.8f);
     CHECK(pc.colorSpace == 1u);
     CHECK(pc.enableSpatialFallback == 0u);
@@ -12773,6 +12827,8 @@ static void TestRenderTargets() {
         }
     }
     r.ResetHistory();
+    CHECK(r.ConsumeForceHistoryReset());
+    CHECK(!r.ConsumeForceHistoryReset()); // Verify exchange(false) consumes the flag
 
     // Vulkan resource lifecycle sanity checks
     CHECK(!r.AreVulkanResourcesCreated());
@@ -15381,6 +15437,46 @@ For checkerboard reconstruction to resolve clean geometry, alternating pixels mu
 1. **Safety First:** Mod must never crash RDR2 or throw Vulkan validation errors. If any device call fails, the mod must fall back to the original `vkQueuePresentKHR` immediately.
 2. **Visual Fidelity:** Text, HUD, and minimap must remain razor sharp without jitter or blur.
 3. **Performance Target:** Overall reconstruction compute pass frame time must execute in **< 2.0 ms** on GTX 1070 Ti at 4K UHD.
+
+---
+
+## 5. RAGE Engine (RDR2) Runtime Rendering Gotchas & Engineering Countermeasures
+
+### 5.1 Dithered Effects & Temporal Accumulation (TAA Interplay)
+* **The Gotcha:** RDR2 uses stippled, dithered subpixel patterns for Screen-Space Ambient Occlusion (SSAO), soft contact shadows, character hair/beard alpha cards, and foliage. If in-game TAA is turned Off, the RAGE engine ceases generating its primary velocity buffer and exposes raw dither dots. Conversely, if both in-game TAA and CBR's `HistoryWeight = 0.90` run back-to-back, temporal history becomes double-damped, resulting in excessive blurring and ghost trails on foliage and horse manes.
+* **Countermeasure:**
+  1. Default `HistoryWeight` is adjusted to **`0.85`** in [cbr.ini](file:///c:/Users/Dinesh%20B%20Pawar/OneDrive/Desktop/Checkerboard-Rendering/cbr.ini) (with a recommended range of `0.75`–`0.85` when in-game TAA is active).
+  2. Subpixel camera projection jitter is decoupled from the game's Halton sequence (see Section 5.5), ensuring that RDR2's native TAA and CBR operate on aligned phase offsets.
+
+### 5.2 Opaque Deferred vs. Forward Translucent Render Passes
+* **The Gotcha:** RDR2 separates its rendering pipeline into:
+  1. Deferred G-buffer pass (opaque geometry, terrain, structures)
+  2. Async compute passes (volumetric clouds, fog, atmospheric scattering)
+  3. Clustered deferred lighting passes
+  4. Forward translucent pass (glass, water surfaces, alpha-blended particles)
+  5. Post-processing (bloom, tonemapping, depth of field) and UI compositing.
+  If CBR downscales the early G-buffer pass and immediately resolves/blits mid-frame on `vkCmdEndRenderPass`, downstream forward lighting or translucent passes may receive mismatched resolutions or operate without reconstruction.
+* **Countermeasure:**
+  In [src/hooks_vulkan.cpp](file:///c:/Users/Dinesh%20B%20Pawar/OneDrive/Desktop/Checkerboard-Rendering/src/hooks_vulkan.cpp), render pass tracking filters for HDR color + depth attachment candidates (`rpCandidateGeometryPass`) and enforces a threshold of $\ge 250$ draw calls. All sub-passes sharing G-buffer attachments are downscaled consistently, and `OnScenePassEnd` executes exactly once per frame (`m_lastDispatchedFrame.exchange(currentFrame)`) right before post-processing and UI passes begin.
+
+### 5.3 Camera Cutscenes, Scope Zooms, and Lighting Transitions
+* **The Gotcha:** During camera angle transitions in cutscenes, rapid sniper scope zooming, or transitions between interior and exterior spaces, $100\%$ of the temporal history buffer becomes invalid in a single frame. Previously, `ResetHistory()` merely flipped the ping-pong index to `0u` without forcing `u_FrameIndex = 0` in push constants, causing the shader to blend up to $90\%$ of the stale camera frame for 1 to 2 frames.
+* **Countermeasure:**
+  1. Added an atomic `m_forceHistoryReset` flag in [include/cbr/render_target_manager.h](file:///c:/Users/Dinesh%20B%20Pawar/OneDrive/Desktop/Checkerboard-Rendering/include/cbr/render_target_manager.h).
+  2. `ResetHistory()` and `ForceHistoryReset()` arm `m_forceHistoryReset.store(true)`.
+  3. In [src/reconstruction_pass.cpp](file:///c:/Users/Dinesh%20B%20Pawar/OneDrive/Desktop/Checkerboard-Rendering/src/reconstruction_pass.cpp), `BuildReconstructionPushConstants()` consumes the flag via `ConsumeForceHistoryReset()` and forces `pc.frameIndex = 0u` for that single dispatch. In both GLSL and HLSL compute shaders, `frameIndex == 0u` marks the entire screen as `isDisoccluded = true`, immediately flushing stale history.
+  4. In `SetCameraMatrices()`, cumulative matrix deltas exceeding a cut threshold ($\Delta > 15.0$) automatically invoke `ForceHistoryReset()`.
+
+### 5.4 Dynamic Resolution & Windowed Borderless Alt-Tabbing
+* **The Gotcha:** Pressing Alt+Enter, Alt+Tab, or changing monitor displays prompts RDR2 to recreate swapchains or resize render extents. While `vkDeviceWaitIdle` prevents in-flight command crashes, internal tracking maps (`g_images`, `g_imageViews`, `g_framebuffers`, `g_renderPasses`) in [src/hooks_vulkan.cpp](file:///c:/Users/Dinesh%20B%20Pawar/OneDrive/Desktop/Checkerboard-Rendering/src/hooks_vulkan.cpp) can retain stale pointers that collide with recycled driver handles.
+* **Countermeasure:**
+  Inside `Hooked_vkCreateDevice` and `Hooked_vkDestroySwapchainKHR`, `g_attachmentMutex` is locked and all tracking maps (`g_images`, `g_imageViews`, `g_framebuffers`, `g_renderPasses`) are explicitly cleared, guaranteeing that recycled Vulkan handles never inherit stale metadata across swapchain lifecycles.
+
+### 5.5 Overwriting Halton Subpixel Jitter to Prevent Double-Jittering
+* **The Gotcha:** When in-game TAA is active, RDR2 continuously injects a Halton subpixel jitter sequence into elements `proj[8]` and `proj[9]` of its camera projection matrix. In Strategy A, adding CBR's $1.0\text{ px}$ subpixel shift on top of an unknown Halton offset shifts rasterization off the exact $(0.25, 0.25)$ and $(0.75, 0.75)$ diagonal sample centers required by `MapPixelToSample`.
+* **Countermeasure:**
+  In [src/jitter_manager.cpp](file:///c:/Users/Dinesh%20B%20Pawar/OneDrive/Desktop/Checkerboard-Rendering/src/jitter_manager.cpp) (`ApplyJitterToProjection` and `SetProjectionJitter`), the base offset for symmetric camera frustums ($|\text{cur8}| < 0.015\text{ and }|\text{cur9}| < 0.015$) is clamped to `0.0f`. This overwrites RDR2's native Halton jitter with the exact, deterministic CBR checkerboard subpixel offset, ensuring $100\%$ sample alignment without double-jitter artifacts.
+
 ````
 
 <a id="reportmd"></a>

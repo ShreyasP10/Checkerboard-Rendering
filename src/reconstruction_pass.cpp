@@ -670,14 +670,21 @@ bool ReconstructionPass::SetCameraMatrices(const float* currViewProj4x4, const f
         std::memcpy(m_prevViewProj, prevViewProj4x4, sizeof(m_prevViewProj));
     } else if (m_hasPrevMatrix) {
         bool changed = false;
+        float matrixDiff = 0.0f;
         for (int i = 0; i < 16; ++i) {
-            if (std::fabs(currViewProj4x4[i] - m_currViewProj[i]) > 1e-6f) {
+            const float diff = std::fabs(currViewProj4x4[i] - m_currViewProj[i]);
+            matrixDiff += diff;
+            if (diff > 1e-6f) {
                 changed = true;
-                break;
             }
         }
         if (changed) {
             std::memcpy(m_prevViewProj, m_currViewProj, sizeof(m_prevViewProj));
+            // Detect camera cuts: if cumulative matrix difference exceeds threshold (camera teleport / cutscene switch),
+            // trigger an immediate history flush so the old camera frame does not ghost into the new frame
+            if (matrixDiff > 15.0f) {
+                RenderTargetManager::Get().ForceHistoryReset();
+            }
         }
     } else {
         std::memcpy(m_prevViewProj, currViewProj4x4, sizeof(m_prevViewProj));
@@ -1990,7 +1997,12 @@ ReconstructionPushConstants BuildReconstructionPushConstants(uint32_t frameIndex
     pc.targetResolution[1] = fh;
     pc.invTargetResolution[0] = (dims.invFullWidth > 0.0f) ? dims.invFullWidth : (1.0f / fw);
     pc.invTargetResolution[1] = (dims.invFullHeight > 0.0f) ? dims.invFullHeight : (1.0f / fh);
-    pc.frameIndex = frameIndex;
+
+    // Camera cuts, scope zooms, interior lighting transitions, or swapchain resets:
+    // If a history reset was requested, force frameIndex = 0 for this single dispatch so the
+    // compute shader treats the entire screen as disoccluded (isDisoccluded = true) and flushes ghosting.
+    const bool forceReset = RenderTargetManager::Get().ConsumeForceHistoryReset();
+    pc.frameIndex = forceReset ? 0u : frameIndex;
     pc.depthTolerance = config.depthTolerance;
     pc.historyWeight = config.historyWeight;
     pc.debugView = config.debugView;
