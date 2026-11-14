@@ -461,7 +461,6 @@ bool RenderTargetManager::CreateVulkanResources(void* vkDevice, void* vkPhysical
 
         // Support true depth aspect mask if a native depth format is requested
         constexpr uint32_t kVkFormatD16Unorm = 124;
-        constexpr uint32_t kVkFormatD32Sfloat = 126;
         constexpr uint32_t kVkFormatD24UnormS8Uint = 129;
         if (format == kVkFormatD16Unorm || format == kVkFormatD32Sfloat || format == kVkFormatD24UnormS8Uint) {
             aspectMask = kVkImageAspectDepthBit;

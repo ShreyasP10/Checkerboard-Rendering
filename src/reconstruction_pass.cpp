@@ -2077,8 +2077,6 @@ void ReconstructionPass::DispatchVulkan(void* vkCommandBuffer, uint32_t frameInd
 
     const uint32_t targetW = dims.fullWidth > 0 ? dims.fullWidth : 3840u;
     const uint32_t targetH = dims.fullHeight > 0 ? dims.fullHeight : 2160u;
-    constexpr uint32_t kWorkgroupSizeX = 16u;
-    constexpr uint32_t kWorkgroupSizeY = 16u;
     const uint32_t groupCountX = (targetW + kWorkgroupSizeX - 1u) / kWorkgroupSizeX;
     const uint32_t groupCountY = (targetH + kWorkgroupSizeY - 1u) / kWorkgroupSizeY;
 
@@ -2233,8 +2231,6 @@ void ReconstructionPass::DispatchDX12(void* d3d12GraphicsCommandList, uint32_t f
 
     const uint32_t targetW = dims.fullWidth > 0 ? dims.fullWidth : 3840u;
     const uint32_t targetH = dims.fullHeight > 0 ? dims.fullHeight : 2160u;
-    constexpr uint32_t kWorkgroupSizeX = 16u;
-    constexpr uint32_t kWorkgroupSizeY = 16u;
     const uint32_t groupCountX = (targetW + kWorkgroupSizeX - 1u) / kWorkgroupSizeX;
     const uint32_t groupCountY = (targetH + kWorkgroupSizeY - 1u) / kWorkgroupSizeY;
 

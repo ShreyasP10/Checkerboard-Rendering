@@ -1489,9 +1489,9 @@ void Hooked_vkCmdEndRenderPass(void* commandBuffer) {
                                     gameColorImage, res.quarterColor.image,
                                     dims.quarterWidth, dims.quarterHeight,
                                     dims.quarterWidth, dims.quarterHeight,
-                                    colorAspect, res.quarterColor.aspectMask,
-                                    colorFinalLayout, rtm.GetVulkanImageLayout(res.quarterColor.image),
-                                    colorFinalLayout, 5 /* SHADER_READ_ONLY_OPTIMAL */
+                                    5 /* SHADER_READ_ONLY_OPTIMAL */,
+                                    colorFinalLayout,
+                                    rtm.GetVulkanImageLayout(res.quarterColor.image)
                                 );
                             } else {
                                 ReconstructionPass::CopyImageRegion(

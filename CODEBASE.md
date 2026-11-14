@@ -4677,9 +4677,9 @@ void Hooked_vkCmdEndRenderPass(void* commandBuffer) {
                                     gameColorImage, res.quarterColor.image,
                                     dims.quarterWidth, dims.quarterHeight,
                                     dims.quarterWidth, dims.quarterHeight,
-                                    colorAspect, res.quarterColor.aspectMask,
-                                    colorFinalLayout, rtm.GetVulkanImageLayout(res.quarterColor.image),
-                                    colorFinalLayout, 5 /* SHADER_READ_ONLY_OPTIMAL */
+                                    5 /* SHADER_READ_ONLY_OPTIMAL */,
+                                    colorFinalLayout,
+                                    rtm.GetVulkanImageLayout(res.quarterColor.image)
                                 );
                             } else {
                                 ReconstructionPass::CopyImageRegion(
@@ -8889,8 +8889,6 @@ void ReconstructionPass::DispatchVulkan(void* vkCommandBuffer, uint32_t frameInd
 
     const uint32_t targetW = dims.fullWidth > 0 ? dims.fullWidth : 3840u;
     const uint32_t targetH = dims.fullHeight > 0 ? dims.fullHeight : 2160u;
-    constexpr uint32_t kWorkgroupSizeX = 16u;
-    constexpr uint32_t kWorkgroupSizeY = 16u;
     const uint32_t groupCountX = (targetW + kWorkgroupSizeX - 1u) / kWorkgroupSizeX;
     const uint32_t groupCountY = (targetH + kWorkgroupSizeY - 1u) / kWorkgroupSizeY;
 
@@ -9045,8 +9043,6 @@ void ReconstructionPass::DispatchDX12(void* d3d12GraphicsCommandList, uint32_t f
 
     const uint32_t targetW = dims.fullWidth > 0 ? dims.fullWidth : 3840u;
     const uint32_t targetH = dims.fullHeight > 0 ? dims.fullHeight : 2160u;
-    constexpr uint32_t kWorkgroupSizeX = 16u;
-    constexpr uint32_t kWorkgroupSizeY = 16u;
     const uint32_t groupCountX = (targetW + kWorkgroupSizeX - 1u) / kWorkgroupSizeX;
     const uint32_t groupCountY = (targetH + kWorkgroupSizeY - 1u) / kWorkgroupSizeY;
 
@@ -9618,7 +9614,6 @@ bool RenderTargetManager::CreateVulkanResources(void* vkDevice, void* vkPhysical
 
         // Support true depth aspect mask if a native depth format is requested
         constexpr uint32_t kVkFormatD16Unorm = 124;
-        constexpr uint32_t kVkFormatD32Sfloat = 126;
         constexpr uint32_t kVkFormatD24UnormS8Uint = 129;
         if (format == kVkFormatD16Unorm || format == kVkFormatD32Sfloat || format == kVkFormatD24UnormS8Uint) {
             aspectMask = kVkImageAspectDepthBit;
