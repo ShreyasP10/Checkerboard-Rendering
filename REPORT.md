@@ -58,5 +58,24 @@ The latest audit (v0.1.0-alpha) identified and resolved key operational risks fo
 | **RAGE Custom Suballocators** | High (Hook Miss) | Detoured command buffer viewports & render passes instead of raw image creation. |
 | **Game Update Invalidation** | High (Crash) | Implemented SEH-safe wildcard AOB pattern scanner (`pattern_scanner.cpp`). |
 
+## 7. Feature Expansion Plan & Audit Resolution Status (CODEBASE_2.md)
+
+* **Full Vulkan Resource Pipeline:** **Present & Hardened** — Descriptor ping-ponging (C-02 Resolved), initial layout transitions & history clearing (C-03 Resolved), framebuffer/image-view tracking (`vkCreateImage`, `vkCreateImageView`, `vkCreateFramebuffer`, `VkRenderPassAttachmentBeginInfo`), and `CopyImageRegion` / `BlitToImage` are fully implemented.
+  - *C-01 Resolved:* `quarterDepth` allocated as `VK_FORMAT_D32_SFLOAT`, gating `OnScenePassEnd`/`BlitToImage` on `colorCopied && depthCopied` to fail open safely if MSAA is disabled.
+  - *C-02 Resolved:* Handled 2× MSAA passes without inline 1× resolve attachments via separate blit/resolve path.
+* **Scene Pass Identification:** **Present (a)** — `Hooked_vkCreateRenderPass` and `Hooked_vkCreateRenderPass2`/`KHR` inspect attachment formats and sample counts (`RecordTrackedRenderPass`), and `Hooked_vkCmdEndRenderPass` gates on `rpCandidate && draws >= 250 && !colorIsSwapchain`.
+* **DirectX 12 Parity:** **Present & Hardened** — `CreateDX12Pipeline` (RootSignature + Compute PSO + runtime D3DCompile fallback + b1 camera CBV), `DispatchDX12` (resource barriers + descriptor table binding), and command-list VMT hooks (`ExecuteCommandLists`, `RSSetViewports`, `RSSetScissorRects`, `OMSetRenderTargets`, `DrawInstanced`, `DrawIndexedInstanced`) are implemented.
+  - *C-03 Resolved:* Saves and restores game descriptor heaps and compute PSO before and after CBR compute dispatch.
+  - *M-03 Resolved:* Fast-path guard in `Hooked_D3D12ExecuteCommandLists` bypasses redundant COM interface queries on the hot path.
+  - *M-04 Resolved:* Secure `LoadLibraryExA(..., nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32)` locks DLL resolution for `d3d12.dll` and `d3dcompiler_47.dll` to System32.
+* **Motion Vector Fallback (Camera-Only Depth Unprojection):** **Present & Guarded** — `CBRCameraUniforms` UBO (binding = 7 / register(b1)), `InvertMatrix4x4`, and `SetCameraMatrices` are implemented.
+  - *M-02 Resolved:* Perspective cotangent bounds validation in `PatternScanner::GetCameraProjectionMatrix` ($0.2 \le \cot \le 5.0$) safely falls back to pure Strategy A viewport shift if camera scanning matches stale or dead memory.
+* **In-Game ImGui Overlay:** **Partially Present (b)** — Telemetry state management, hotkeys, and `GetFormattedTelemetry()` are present; Dear ImGui draw backend remains planned for Phase 3 (H-03).
+* **Contrast Adaptive Sharpening (CAS / RCAS):** **Present (a)** — `SharpeningStrength` (0.0..1.0) parsed in `config.cpp` and uploaded to the GPU via `CBRCameraUniforms::sharpeningStrength`.
+* **HDR / scRGB Support:** **Present (a)** — Full ICtCp (ITU-R BT.2100), YCoCg, and RGB color clamping support.
+* **Asynchronous Compute:** **Missing — Optional (d)** — Inline compute execution on the graphics command buffer remains appropriate given immediate downstream post-FX dependencies.
+* **Halton Jitter:** **Intentionally Omitted (d)** — Properly rejected in favor of 2-phase 2× MSAA Checkerboard coverage.
+* **Automated Headless Rendering Test:** **Present (a)** — Added `tests/test_vulkan_headless.cpp` (`cbr_vulkan_headless` CTest target in `CMakeLists.txt`) with POSIX `libvulkan.so.1` dynamic loader support in `reconstruction_pass.cpp` and `render_target_manager.cpp`.
+
 ---
-*Report generated and validated for v0.1.0-alpha codebase.*
+*Report updated and validated for CODEBASE_2.md feature parity.*
