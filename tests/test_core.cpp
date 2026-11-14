@@ -105,6 +105,19 @@ static void TestConfigHardening(const fs::path& dir) {
     CHECK(fresh.projectionJitterSign == 1);
     CHECK(fresh.samplingStrategy == SamplingStrategy::StrategyA);
     CHECK(fresh.depthConvention == DepthConvention::Reversed);
+    CHECK(fresh.msaaSamples == 2);
+
+    WriteFile(dir / "msaa_test.ini", "[General]\nMsaaSamples = 1\n");
+    CHECK(ConfigManager::Get().Load(dir / "msaa_test.ini"));
+    CHECK(ConfigManager::Get().GetConfig().msaaSamples == 1);
+
+    WriteFile(dir / "msaa_invalid.ini", "[General]\nMsaaSamples = 4\n");
+    CHECK(ConfigManager::Get().Load(dir / "msaa_invalid.ini"));
+    CHECK(ConfigManager::Get().GetConfig().msaaSamples == 1); // Invalid keeps previous (1)
+
+    WriteFile(dir / "msaa_test2.ini", "[General]\nMsaaSamples = 2\n");
+    CHECK(ConfigManager::Get().Load(dir / "msaa_test2.ini"));
+    CHECK(ConfigManager::Get().GetConfig().msaaSamples == 2);
 
     // Invalid enum-like values keep the previous setting
     WriteFile(dir / "bad2.ini", "[Jitter]\nJitterDirection = 2\nProjectionJitterSign = 42\nSamplingStrategy = UnknownStrategy\n[Reconstruction]\nDepthConvention = sideways\n");
@@ -416,6 +429,13 @@ static void TestPushConstantBuilder() {
     CHECK(pc.targetResolution[0] == 3840.0f && pc.targetResolution[1] == 2160.0f);
     CHECK(std::fabs(pc.invTargetResolution[0] - 1.0f / 3840.0f) < 1e-12f);
     CHECK(pc.frameIndex == 7);
+
+    // Camera cut / reset verification: ResetHistory forces frameIndex = 0 for 1 frame, then resumes
+    RenderTargetManager::Get().ResetHistory();
+    const ReconstructionPushConstants pcReset = BuildReconstructionPushConstants(7);
+    CHECK(pcReset.frameIndex == 0);
+    const ReconstructionPushConstants pcNext = BuildReconstructionPushConstants(8);
+    CHECK(pcNext.frameIndex == 8);
     CHECK(pc.depthTolerance == 0.02f && pc.historyWeight == 0.8f);
     CHECK(pc.colorSpace == 1u);
     CHECK(pc.enableSpatialFallback == 0u);
@@ -452,6 +472,7 @@ static void TestRenderTargets() {
     const auto good = r.GetDimensions();
     r.Initialize(0, 0);
     CHECK(r.GetDimensions().fullWidth == good.fullWidth);
+    ConfigManager::Get().Modify([](CBRConfig& cfg) { cfg.msaaSamples = 2; });
     r.Initialize(3840, 2160);
     // 4K: quarter colour 33,177,600 + quarter depth 16,588,800 + history colour A/B 132,710,400
     //    + history depth A/B 66,355,200 + output 66,355,200 = 315,187,200 bytes (300.58 MiB, 315.19 MB)
@@ -462,6 +483,18 @@ static void TestRenderTargets() {
     // 1080p (the AMD Vega 7 profile): 78,796,800 bytes = 78.80 MB
     r.Initialize(1920, 1080);
     CHECK(r.GetTotalAllocatedVramBytes() == 78796800u);
+
+    // Single-sample 1x ASO mode (APU mode):
+    ConfigManager::Get().Modify([](CBRConfig& cfg) { cfg.msaaSamples = 1; });
+    r.Initialize(3840, 2160);
+    CHECK(r.GetTotalAllocatedVramBytes() == 290304000u);
+
+    // 720p 1x ASO mode:
+    r.Initialize(1280, 720);
+    CHECK(r.GetTotalAllocatedVramBytes() == 32256000u);
+
+    // Reset back to 2x MSAA for subsequent tests
+    ConfigManager::Get().Modify([](CBRConfig& cfg) { cfg.msaaSamples = 2; });
     r.Initialize(3840, 2160);
 
     CHECK(r.GetDimensions().quarterWidth == (3840u >> 1) && r.GetDimensions().quarterHeight == (2160u >> 1));
@@ -484,6 +517,8 @@ static void TestRenderTargets() {
         }
     }
     r.ResetHistory();
+    CHECK(r.ConsumeForceHistoryReset());
+    CHECK(!r.ConsumeForceHistoryReset()); // Verify exchange(false) consumes the flag
 
     // Vulkan resource lifecycle sanity checks
     CHECK(!r.AreVulkanResourcesCreated());
@@ -526,6 +561,19 @@ static void TestRenderTargets() {
     CHECK(r.CanCopyToQuarterDepth(validDepth));
     CHECK(!r.CanCopyToQuarterDepth(depthColorMismatch));
     CHECK(!r.CanCopyToQuarterDepth(singleSampleDepth));
+
+    // Verify 1x ASO single-sample copies when msaaSamples == 1
+    const VulkanImageMetadata b10g11r11SingleSample{ 3840, 2160, 122, 1, 0x10 };
+    ConfigManager::Get().Modify([](CBRConfig& cfg) { cfg.msaaSamples = 1; });
+    r.Initialize(3840, 2160);
+    CHECK(r.CanCopyToQuarterColor(singleSampleColor));
+    CHECK(r.CanCopyToQuarterColor(b10g11r11SingleSample)); // Format 122 allowed in 1x APU mode (Item 7)
+    CHECK(!r.CanCopyToQuarterColor(validColor)); // 2x rejected in 1x mode
+    CHECK(r.CanCopyToQuarterDepth(singleSampleDepth));
+    CHECK(!r.CanCopyToQuarterDepth(validDepth)); // 2x rejected in 1x mode
+    ConfigManager::Get().Modify([](CBRConfig& cfg) { cfg.msaaSamples = 2; });
+    r.Initialize(3840, 2160);
+    CHECK(!r.CanCopyToQuarterColor(b10g11r11SingleSample)); // Format 122 rejected in 2x mode
     CHECK(r.CanCopyToVelocity(validVel));
     CHECK(!r.CanCopyToVelocity(validColor)); // 2x samples != 1x velocity buffer
 
@@ -668,6 +716,20 @@ static void TestReconstructionPass(const fs::path& dir) {
     CHECK(uSet.hasCameraMatrices == 1u);
     CHECK(std::fabs(uSet.currViewProjInv[0] - invA[0]) < 1e-6f);
     CHECK(std::fabs(uSet.prevViewProj[12] - matA[12]) < 1e-6f);
+
+    // Test matrix advancing & idempotent duplicate call within same frame (Item H-01)
+    float matB[16];
+    std::memcpy(matB, matA, sizeof(matB));
+    matB[12] += 5.0f; // Translated along X
+    CHECK(pass.SetCameraMatrices(matB));
+    const CBRCameraUniforms uSetB = pass.BuildCameraUniforms();
+    CHECK(std::fabs(uSetB.prevViewProj[12] - matA[12]) < 1e-6f); // prevViewProj advanced to matA
+
+    // Duplicate call with same matrix in same frame should NOT clobber prevViewProj
+    CHECK(pass.SetCameraMatrices(matB));
+    const CBRCameraUniforms uSetB2 = pass.BuildCameraUniforms();
+    CHECK(std::fabs(uSetB2.prevViewProj[12] - matA[12]) < 1e-6f); // prevViewProj STILL matA!
+
     pass.ClearCameraMatrices();
     CHECK(pass.BuildCameraUniforms().hasCameraMatrices == 0u);
     ConfigManager::Get().Modify([](CBRConfig& c) {

@@ -26,6 +26,7 @@ jobs:
         run: |
           mkdir -p shaders/spv
           glslangValidator -V shaders/cbr_reconstruct.comp -o shaders/spv/cbr_reconstruct.spv
+          glslangValidator -V -DCBR_SINGLE_SAMPLE=1 shaders/cbr_reconstruct.comp -o shaders/spv/cbr_reconstruct_1x.spv
           glslangValidator -V shaders/cbr_reconstruct_quad.comp -o shaders/spv/cbr_reconstruct_quad.spv
           glslangValidator -V shaders/cbr_resolve_simple.comp -o shaders/spv/cbr_resolve_simple.spv
           # glslang's HLSL front-end is a syntax/semantics gate that runs everywhere.

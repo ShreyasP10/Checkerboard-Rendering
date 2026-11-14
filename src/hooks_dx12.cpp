@@ -264,22 +264,24 @@ inline ULONG ReleaseCom(void* obj) {
 void __stdcall Hooked_D3D12ExecuteCommandLists(void* commandQueue, unsigned int numCommandLists, void* const* ppCommandLists) {
     if (commandQueue && CBREngine::Get().IsEnabled()) {
         try {
-            // Capture the live ID3D12Device from the game's command queue on first execution (Item H-02)
-            static const GUID kIID_ID3D12Device =
-                { 0x189819f1, 0x1db6, 0x4b57, { 0xbe, 0x54, 0x18, 0x21, 0x33, 0x9b, 0x85, 0xf7 } };
-            void* liveDev = nullptr;
-            typedef HRESULT (__stdcall *PFN_GetDevice)(void*, const GUID*, void**);
-            if (SUCCEEDED(CallVmt<PFN_GetDevice>(commandQueue, 7, &kIID_ID3D12Device, &liveDev)) && liveDev) {
-                void* prevDev = g_liveD3D12Device.load(std::memory_order_acquire);
-                if (prevDev != liveDev || !RenderTargetManager::Get().AreDX12ResourcesCreated()) {
-                    if (g_liveD3D12Device.exchange(liveDev, std::memory_order_acq_rel) != liveDev ||
-                        !RenderTargetManager::Get().AreDX12ResourcesCreated()) {
-                        if (RenderTargetManager::Get().CreateDX12Resources(liveDev)) {
-                            ReconstructionPass::Get().InitializeDX12(liveDev);
+            // Capture the live ID3D12Device from the game's command queue on first execution (Item H-02 / M-03)
+            if (!g_liveD3D12Device.load(std::memory_order_acquire) || !RenderTargetManager::Get().AreDX12ResourcesCreated()) {
+                static const GUID kIID_ID3D12Device =
+                    { 0x189819f1, 0x1db6, 0x4b57, { 0xbe, 0x54, 0x18, 0x21, 0x33, 0x9b, 0x85, 0xf7 } };
+                void* liveDev = nullptr;
+                typedef HRESULT (__stdcall *PFN_GetDevice)(void*, const GUID*, void**);
+                if (SUCCEEDED(CallVmt<PFN_GetDevice>(commandQueue, 7, &kIID_ID3D12Device, &liveDev)) && liveDev) {
+                    void* prevDev = g_liveD3D12Device.load(std::memory_order_acquire);
+                    if (prevDev != liveDev || !RenderTargetManager::Get().AreDX12ResourcesCreated()) {
+                        if (g_liveD3D12Device.exchange(liveDev, std::memory_order_acq_rel) != liveDev ||
+                            !RenderTargetManager::Get().AreDX12ResourcesCreated()) {
+                            if (RenderTargetManager::Get().CreateDX12Resources(liveDev)) {
+                                ReconstructionPass::Get().InitializeDX12(liveDev);
+                            }
                         }
                     }
+                    ReleaseCom(liveDev);
                 }
-                ReleaseCom(liveDev);
             }
 
             if (ppCommandLists && numCommandLists > 0) {
@@ -315,6 +317,10 @@ void __stdcall Hooked_D3D12RSSetViewports(void* commandList, unsigned int numVie
         const uint32_t currentFrame = CBREngine::Get().GetCurrentFrameIndex();
         if (config.samplingStrategy == SamplingStrategy::StrategyA && config.jitterDirection != 0) {
             PatternScanner::UpdateCameraJitter(currentFrame, false);
+        }
+        float* camProj = PatternScanner::GetCameraProjectionMatrix();
+        if (camProj) {
+            ReconstructionPass::Get().SetCameraMatrices(camProj, nullptr);
         }
 
         DX12CmdListSlot* slot = GetOrCreateDX12Slot(commandList);
@@ -422,27 +428,32 @@ void __stdcall Hooked_D3D12OMSetRenderTargets(void* commandList, unsigned int nu
             if (slot && slot->viewportDownscaled.load(std::memory_order_acquire) &&
                 slot->drawCount.load(std::memory_order_acquire) >= 250u) {
                 
-                // Dispatch CBR compute reconstruction
-                CBREngine::Get().OnScenePassEnd(commandList);
+                // Direct3D 12 scene target copy-in and blit-out pipeline is not yet implemented.
+                // Gate OnScenePassEnd behind dx12InputsCaptured so D3D12 safely fails open without
+                // executing compute reconstruction over uninitialized buffers or corrupting root parameters (Item H-02).
+                bool dx12InputsCaptured = false;
+                if (dx12InputsCaptured) {
+                    CBREngine::Get().OnScenePassEnd(commandList);
 
-                // Restore game's active graphics/compute pipeline state and descriptor heaps (Item C-03)
-                if (g_Original_D3D12SetDescriptorHeaps) {
-                    std::lock_guard<std::mutex> lock(slot->heapMutex);
-                    if (slot->lastNumDescriptorHeaps > 0) {
-                        g_Original_D3D12SetDescriptorHeaps(commandList, slot->lastNumDescriptorHeaps, slot->lastDescriptorHeaps);
+                    // Restore game's active graphics/compute pipeline state and descriptor heaps (Item C-03)
+                    if (g_Original_D3D12SetDescriptorHeaps) {
+                        std::lock_guard<std::mutex> lock(slot->heapMutex);
+                        if (slot->lastNumDescriptorHeaps > 0) {
+                            g_Original_D3D12SetDescriptorHeaps(commandList, slot->lastNumDescriptorHeaps, slot->lastDescriptorHeaps);
+                        }
                     }
-                }
-                void* pso = slot->lastPipelineState.load(std::memory_order_acquire);
-                if (pso && g_Original_D3D12SetPipelineState) {
-                    g_Original_D3D12SetPipelineState(commandList, pso);
-                }
-                void* gfxSig = slot->lastGraphicsRootSig.load(std::memory_order_acquire);
-                if (gfxSig && g_Original_D3D12SetGraphicsRootSignature) {
-                    g_Original_D3D12SetGraphicsRootSignature(commandList, gfxSig);
-                }
-                void* compSig = slot->lastComputeRootSig.load(std::memory_order_acquire);
-                if (compSig && g_Original_D3D12SetComputeRootSignature) {
-                    g_Original_D3D12SetComputeRootSignature(commandList, compSig);
+                    void* pso = slot->lastPipelineState.load(std::memory_order_acquire);
+                    if (pso && g_Original_D3D12SetPipelineState) {
+                        g_Original_D3D12SetPipelineState(commandList, pso);
+                    }
+                    void* gfxSig = slot->lastGraphicsRootSig.load(std::memory_order_acquire);
+                    if (gfxSig && g_Original_D3D12SetGraphicsRootSignature) {
+                        g_Original_D3D12SetGraphicsRootSignature(commandList, gfxSig);
+                    }
+                    void* compSig = slot->lastComputeRootSig.load(std::memory_order_acquire);
+                    if (compSig && g_Original_D3D12SetComputeRootSignature) {
+                        g_Original_D3D12SetComputeRootSignature(commandList, compSig);
+                    }
                 }
 
                 ReleaseDX12Slot(commandList);

@@ -164,6 +164,14 @@ if(CBR_GLSLANG)
             VERBATIM)
         list(APPEND CBR_COMPILED_SHADERS ${CMAKE_CURRENT_BINARY_DIR}/shaders/$<CONFIG>/${shader}.spv)
     endforeach()
+    add_custom_command(
+        OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/shaders/$<CONFIG>/cbr_reconstruct_1x.spv
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/shaders/$<CONFIG>
+        COMMAND ${CBR_GLSLANG} -V -DCBR_SINGLE_SAMPLE=1 ${CBR_SHADER_DIR}/cbr_reconstruct.comp -o ${CMAKE_CURRENT_BINARY_DIR}/shaders/$<CONFIG>/cbr_reconstruct_1x.spv
+        DEPENDS ${CBR_SHADER_DIR}/cbr_reconstruct.comp
+        COMMENT "Compiling cbr_reconstruct.comp (1x MSAA Off) to SPIR-V"
+        VERBATIM)
+    list(APPEND CBR_COMPILED_SHADERS ${CMAKE_CURRENT_BINARY_DIR}/shaders/$<CONFIG>/cbr_reconstruct_1x.spv)
 else()
     message(STATUS "glslangValidator not found: SPIR-V shaders will not be built.")
 endif()

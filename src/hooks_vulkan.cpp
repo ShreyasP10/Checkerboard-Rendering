@@ -818,6 +818,14 @@ int Hooked_vkCreateDevice(void* physicalDevice, const void* pCreateInfo, const v
         g_activePhysicalDevice.store(physicalDevice);
         CBR_LOG_INFO("Vulkan physical device captured from vkCreateDevice: %p", physicalDevice);
     }
+    // Clear tracked Vulkan object metadata on new device creation so recycled driver handles never match stale entries
+    {
+        std::lock_guard<std::mutex> lock(g_attachmentMutex);
+        g_images.clear();
+        g_imageViews.clear();
+        g_framebuffers.clear();
+        g_renderPasses.clear();
+    }
     return g_Original_vkCreateDevice(physicalDevice, pCreateInfo, pAllocator, pDevice);
 }
 
@@ -831,6 +839,15 @@ void Hooked_vkDestroySwapchainKHR(void* device, void* swapchain, const void* pAl
         if (activeSc == swapchain) {
             g_activeSwapchain.store(nullptr);
             g_activeImageIndex.store(0);
+        }
+        // Purge tracked image/view/framebuffer/renderpass maps so swapchain recreation / window resize
+        // / alt-tab does not retain stale pointers or match recycled driver handles
+        {
+            std::lock_guard<std::mutex> lock(g_attachmentMutex);
+            g_images.clear();
+            g_imageViews.clear();
+            g_framebuffers.clear();
+            g_renderPasses.clear();
         }
         CBR_LOG_INFO("Vulkan swapchain %p destroyed; resources purged from tracking map.", swapchain);
     }
@@ -1013,7 +1030,9 @@ inline void RecordTrackedRenderPass(void* rpHandle, const std::vector<TrackedRen
             }
         }
     }
-    rp.isCandidateGeometryPass = hasHdrColor && hasDepth && (hasMsaa2x || hasVelocityFmt || colorCount >= 2u);
+    const uint32_t targetSamples = RenderTargetManager::Get().GetDimensions().msaaSamples;
+    rp.isCandidateGeometryPass = hasHdrColor && hasDepth &&
+                                 (targetSamples == 1u || hasMsaa2x || hasVelocityFmt || colorCount >= 2u);
     std::lock_guard<std::mutex> lock(g_attachmentMutex);
     g_renderPasses[rpHandle] = std::move(rp);
 }
@@ -1108,14 +1127,35 @@ int Hooked_vkEnumeratePhysicalDevices(void* instance, uint32_t* pPhysicalDeviceC
         pPhysicalDeviceCount && *pPhysicalDeviceCount > 0 && pPhysicalDevices &&
         g_activePhysicalDevice.load() == nullptr) {
         void* chosen = pPhysicalDevices[0];
-        if (*pPhysicalDeviceCount > 1 && g_Original_vkGetPhysicalDeviceProperties) {
-            for (uint32_t i = 0; i < *pPhysicalDeviceCount; ++i) {
-                if (!pPhysicalDevices[i]) continue;
-                uint32_t propsHeader[256]{};
-                g_Original_vkGetPhysicalDeviceProperties(pPhysicalDevices[i], propsHeader);
-                if (propsHeader[4] == 2u /* VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU */) {
-                    chosen = pPhysicalDevices[i];
-                    break;
+        if (*pPhysicalDeviceCount > 1) {
+            PFN_vkGetPhysicalDeviceProperties pfnGetProps = g_Original_vkGetPhysicalDeviceProperties;
+            if (!pfnGetProps) {
+                if (instance && g_Original_vkGetInstanceProcAddr) {
+                    pfnGetProps = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
+                        g_Original_vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceProperties"));
+                }
+#if defined(_WIN32)
+                if (!pfnGetProps) {
+                    HMODULE mod = GetModuleHandleA("vulkan-1.dll");
+                    if (mod) {
+                        pfnGetProps = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
+                            GetProcAddress(mod, "vkGetPhysicalDeviceProperties"));
+                    }
+                }
+#endif
+                if (pfnGetProps) {
+                    g_Original_vkGetPhysicalDeviceProperties = pfnGetProps;
+                }
+            }
+            if (pfnGetProps) {
+                for (uint32_t i = 0; i < *pPhysicalDeviceCount; ++i) {
+                    if (!pPhysicalDevices[i]) continue;
+                    uint32_t propsHeader[256]{};
+                    pfnGetProps(pPhysicalDevices[i], propsHeader);
+                    if (propsHeader[4] == 2u /* VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU */) {
+                        chosen = pPhysicalDevices[i];
+                        break;
+                    }
                 }
             }
         }
@@ -1376,8 +1416,13 @@ void Hooked_vkCmdEndRenderPass(void* commandBuffer) {
                 colorIsSwapchain = slot->colorIsSwapchain.load(std::memory_order_acquire);
                 rpCandidate = slot->rpCandidateGeometryPass.load(std::memory_order_acquire);
 
-                // Gate on HDR+depth RenderPass candidate (when tracked) AND >= 250 draws to ignore early shadow/depth pre-passes (Item H-03)
-                isScenePass = (downscaled || matching) && rpCandidate && (draws >= 250u) && !colorIsSwapchain;
+                // Gate on HDR+depth RenderPass candidate (when tracked) AND >= 250 draws to ignore early shadow/depth pre-passes (Item H-03).
+                // Gotcha 10: Require strictly that render dimensions match the main scene target resolution (or quarter downscaled)
+                // so secondary planar mirror reflections (512x512 / 1024x1024) and cubemap passes never corrupt the main camera history.
+                const auto sceneDims = RenderTargetManager::Get().GetDimensions();
+                const bool extentMatchesMainScene = (rw == sceneDims.fullWidth && rh == sceneDims.fullHeight) ||
+                                                    (downscaled && (rw == sceneDims.quarterWidth && rh == sceneDims.quarterHeight));
+                isScenePass = (downscaled || matching) && extentMatchesMainScene && rpCandidate && (draws >= 250u) && !colorIsSwapchain;
 
                 // Release slot back to pool
                 slot->hasMatchingExtent.store(false, std::memory_order_relaxed);
@@ -1437,18 +1482,31 @@ void Hooked_vkCmdEndRenderPass(void* commandBuffer) {
                     if (gameColorImage) {
                         const VulkanImageMetadata colorMeta = LookupImageMetadata(gameColorImage);
                         if (rtm.CanCopyToQuarterColor(colorMeta)) {
-                            ReconstructionPass::CopyImageRegion(
-                                commandBuffer,
-                                gameColorImage, res.quarterColor.image,
-                                0, 0, 0, 0,
-                                dims.quarterWidth, dims.quarterHeight,
-                                colorAspect,
-                                colorFinalLayout,
-                                rtm.GetVulkanImageLayout(res.quarterColor.image),
-                                colorFinalLayout,
-                                5 /* SHADER_READ_ONLY_OPTIMAL */,
-                                res.quarterColor.aspectMask
-                            );
+                            if (colorMeta.format == 122u /* B10G11R11 */ && dims.msaaSamples == 1u) {
+                                // Format 122 requires vkCmdBlitImage for 32-bit -> 64-bit format conversion (Item 7)
+                                ReconstructionPass::BlitToImage(
+                                    commandBuffer,
+                                    gameColorImage, res.quarterColor.image,
+                                    dims.quarterWidth, dims.quarterHeight,
+                                    dims.quarterWidth, dims.quarterHeight,
+                                    5 /* SHADER_READ_ONLY_OPTIMAL */,
+                                    colorFinalLayout,
+                                    rtm.GetVulkanImageLayout(res.quarterColor.image)
+                                );
+                            } else {
+                                ReconstructionPass::CopyImageRegion(
+                                    commandBuffer,
+                                    gameColorImage, res.quarterColor.image,
+                                    0, 0, 0, 0,
+                                    dims.quarterWidth, dims.quarterHeight,
+                                    colorAspect,
+                                    colorFinalLayout,
+                                    rtm.GetVulkanImageLayout(res.quarterColor.image),
+                                    colorFinalLayout,
+                                    5 /* SHADER_READ_ONLY_OPTIMAL */,
+                                    res.quarterColor.aspectMask
+                                );
+                            }
                             copiedColor = true;
                         } else {
                             static std::atomic<bool> s_warnedColorCopy{ false };
@@ -1618,9 +1676,15 @@ int Hooked_vkCreateSampler(void* device, const MinimalVkSamplerCreateInfo* pCrea
         return -1; // VK_ERROR_INITIALIZATION_FAILED
     }
     const auto& config = ConfigManager::Get().GetConfig();
-    // Apply mipLodBias selectively only to mipmapped anisotropic scene material samplers (Item M-03)
+    // Apply mipLodBias selectively only to mipmapped anisotropic scene material samplers (Item M-03 & Gotcha 9).
+    // Tiling geometry samplers use VK_SAMPLER_ADDRESS_MODE_REPEAT (0), whereas IBL cubemaps, LUTs, and screen-space
+    // mip chains use VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE (2).
+    constexpr int32_t kVkSamplerAddressModeRepeat = 0;
     if (pCreateInfo && config.mipLodBias != 0.0f &&
-        pCreateInfo->maxLod > 1.0f && pCreateInfo->anisotropyEnable == 1u) {
+        pCreateInfo->maxLod > 1.0f &&
+        pCreateInfo->anisotropyEnable == 1u &&
+        pCreateInfo->addressModeU == kVkSamplerAddressModeRepeat &&
+        pCreateInfo->addressModeV == kVkSamplerAddressModeRepeat) {
         MinimalVkSamplerCreateInfo modifiedInfo = *pCreateInfo;
         modifiedInfo.mipLodBias += config.mipLodBias;
         return g_Original_vkCreateSampler(device, &modifiedInfo, pAllocator, pSampler);

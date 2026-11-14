@@ -143,8 +143,12 @@ void JitterManager::ApplyJitterToProjection(float* projMatrix4x4, bool isVulkan)
             (std::fabs(cur8 - m_expectedJitteredProj.first) <= 1e-6f) &&
             (std::fabs(cur9 - m_expectedJitteredProj.second) <= 1e-6f);
 
-        float baseX = cur8;
-        float baseY = cur9;
+        // For symmetric camera frustums (where base proj[8] and proj[9] are near 0.0), overwrite
+        // with the exact CBR subpixel offset rather than adding to RDR2's internal Halton TAA jitter.
+        // Adding CBR jitter onto unknown Halton offsets causes double-jittering and shifts samples
+        // off the exact (0.25, 0.25) and (0.75, 0.75) pixel centers required by MapPixelToSample.
+        float baseX = (std::fabs(cur8) < 0.015f) ? 0.0f : cur8;
+        float baseY = (std::fabs(cur9) < 0.015f) ? 0.0f : cur9;
         bool alreadyApplied = false;
         if (stillHasExpectedJitter) {
             // Same persistent matrix still holds our previous jitter: reuse its cached unjittered base.
@@ -244,8 +248,10 @@ void JitterManager::SetProjectionJitter(float* outMatrix4x4, const float* inUnji
         offset = isVulkan ? m_cachedProjectionOffsetVk[phase] : m_cachedProjectionOffsetDx[phase];
     }
 
-    outMatrix4x4[8] = inUnjitteredMatrix4x4[8] + offset.first;
-    outMatrix4x4[9] = inUnjitteredMatrix4x4[9] + offset.second;
+    const float baseIn8 = (std::fabs(inUnjitteredMatrix4x4[8]) < 0.015f) ? 0.0f : inUnjitteredMatrix4x4[8];
+    const float baseIn9 = (std::fabs(inUnjitteredMatrix4x4[9]) < 0.015f) ? 0.0f : inUnjitteredMatrix4x4[9];
+    outMatrix4x4[8] = baseIn8 + offset.first;
+    outMatrix4x4[9] = baseIn9 + offset.second;
 }
 
 } // namespace cbr

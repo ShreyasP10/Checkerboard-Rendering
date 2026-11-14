@@ -191,10 +191,6 @@ void CBREngine::OnBeginFrame() {
     if (config.samplingStrategy == SamplingStrategy::StrategyA && config.jitterDirection != 0) {
         PatternScanner::UpdateCameraJitter(currentFrame, m_activeApi.load() == GraphicsApi::Vulkan);
     }
-    float* camProj = PatternScanner::GetCameraProjectionMatrix();
-    if (camProj) {
-        ReconstructionPass::Get().SetCameraMatrices(camProj, nullptr);
-    }
 #endif
 }
 

@@ -669,7 +669,23 @@ bool ReconstructionPass::SetCameraMatrices(const float* currViewProj4x4, const f
     if (prevViewProj4x4) {
         std::memcpy(m_prevViewProj, prevViewProj4x4, sizeof(m_prevViewProj));
     } else if (m_hasPrevMatrix) {
-        std::memcpy(m_prevViewProj, m_currViewProj, sizeof(m_prevViewProj));
+        bool changed = false;
+        float matrixDiff = 0.0f;
+        for (int i = 0; i < 16; ++i) {
+            const float diff = std::fabs(currViewProj4x4[i] - m_currViewProj[i]);
+            matrixDiff += diff;
+            if (diff > 1e-6f) {
+                changed = true;
+            }
+        }
+        if (changed) {
+            std::memcpy(m_prevViewProj, m_currViewProj, sizeof(m_prevViewProj));
+            // Detect camera cuts: if cumulative matrix difference exceeds threshold (camera teleport / cutscene switch),
+            // trigger an immediate history flush so the old camera frame does not ghost into the new frame
+            if (matrixDiff > 15.0f) {
+                RenderTargetManager::Get().ForceHistoryReset();
+            }
+        }
     } else {
         std::memcpy(m_prevViewProj, currViewProj4x4, sizeof(m_prevViewProj));
     }
@@ -738,15 +754,33 @@ bool ReconstructionPass::CreateVulkanPipeline() {
         return false;
     }
 
-    // Candidate search locations for cbr_reconstruct.spv
+    // Candidate search locations for cbr_reconstruct.spv (or cbr_reconstruct_1x.spv when MsaaSamples == 1)
+    const bool useSingleSample = (RenderTargetManager::Get().GetDimensions().msaaSamples == 1u);
+    const std::string primarySpv = useSingleSample ? "cbr_reconstruct_1x.spv" : "cbr_reconstruct.spv";
+    const std::string fallbackSpv = "cbr_reconstruct.spv";
+
     std::vector<std::filesystem::path> searchPaths;
-    if (!m_shaderDir.empty()) {
-        searchPaths.push_back(m_shaderDir / "cbr_reconstruct.spv");
-    }
     const auto modDir = GetCurrentModuleDirectory();
+
+    if (useSingleSample) {
+        if (!m_shaderDir.empty()) {
+            searchPaths.push_back(m_shaderDir / primarySpv);
+        }
+        if (!modDir.empty()) {
+            searchPaths.push_back(modDir / "shaders" / primarySpv);
+            searchPaths.push_back(modDir / primarySpv);
+        }
+        searchPaths.push_back(std::string("shaders/") + primarySpv);
+        searchPaths.push_back(std::string("shaders/spv/") + primarySpv);
+        searchPaths.push_back(std::string("package/rdr2-cbr/shaders/") + primarySpv);
+    }
+
+    if (!m_shaderDir.empty()) {
+        searchPaths.push_back(m_shaderDir / fallbackSpv);
+    }
     if (!modDir.empty()) {
-        searchPaths.push_back(modDir / "shaders" / "cbr_reconstruct.spv");
-        searchPaths.push_back(modDir / "cbr_reconstruct.spv");
+        searchPaths.push_back(modDir / "shaders" / fallbackSpv);
+        searchPaths.push_back(modDir / fallbackSpv);
     }
     searchPaths.push_back("shaders/cbr_reconstruct.spv");
     searchPaths.push_back("shaders/spv/cbr_reconstruct.spv");
@@ -1013,6 +1047,20 @@ bool ReconstructionPass::CreateVulkanPipeline() {
         }
     }
 #endif
+    if (m_vkTimestampPeriodNs <= 0.0f && m_vkPhysicalDevice) {
+        auto pfnGetPhysProps = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
+            GetVulkanLoaderSymbol(vulkanModule, "vkGetPhysicalDeviceProperties"));
+        if (pfnGetPhysProps) {
+            uint32_t propsHeader[256]{};
+            pfnGetPhysProps(m_vkPhysicalDevice, propsHeader);
+            // On 64-bit platforms, VkPhysicalDeviceLimits::timestampPeriod is located at byte offset 796
+            // (sizeof(VkPhysicalDeviceProperties) is 824 bytes, limits begins at offset 512, timestampPeriod at +284)
+            const float extractedPeriod = *reinterpret_cast<const float*>(reinterpret_cast<const char*>(propsHeader) + 796);
+            if (std::isfinite(extractedPeriod) && extractedPeriod > 0.0f && extractedPeriod <= 1000.0f) {
+                m_vkTimestampPeriodNs = extractedPeriod;
+            }
+        }
+    }
     auto pfnCreateQueryPool = reinterpret_cast<PFN_vkCreateQueryPool>(resolveDeviceFunc("vkCreateQueryPool"));
     if (pfnCreateQueryPool) {
         MinimalVkQueryPoolCreateInfo qpInfo{};
@@ -1144,9 +1192,13 @@ bool ReconstructionPass::CreateDX12Pipeline() {
         return false;
     }
 
+#ifndef LOAD_LIBRARY_SEARCH_SYSTEM32
+#define LOAD_LIBRARY_SEARCH_SYSTEM32 0x00000800
+#endif
+
     HMODULE d3d12Mod = GetModuleHandleA("d3d12.dll");
     if (!d3d12Mod) {
-        d3d12Mod = LoadLibraryA("d3d12.dll");
+        d3d12Mod = LoadLibraryExA("d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     }
     if (!d3d12Mod) {
         CBR_LOG_WARN("CreateDX12Pipeline: d3d12.dll unavailable.");
@@ -1207,7 +1259,7 @@ bool ReconstructionPass::CreateDX12Pipeline() {
 
         HMODULE d3dCompilerMod = GetModuleHandleA("d3dcompiler_47.dll");
         if (!d3dCompilerMod) {
-            d3dCompilerMod = LoadLibraryA("d3dcompiler_47.dll");
+            d3dCompilerMod = LoadLibraryExA("d3dcompiler_47.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
         }
         if (!d3dCompilerMod) {
             CBR_LOG_WARN("CreateDX12Pipeline: d3dcompiler_47.dll unavailable; DX12 compute PSO deferred.");
@@ -1945,7 +1997,12 @@ ReconstructionPushConstants BuildReconstructionPushConstants(uint32_t frameIndex
     pc.targetResolution[1] = fh;
     pc.invTargetResolution[0] = (dims.invFullWidth > 0.0f) ? dims.invFullWidth : (1.0f / fw);
     pc.invTargetResolution[1] = (dims.invFullHeight > 0.0f) ? dims.invFullHeight : (1.0f / fh);
-    pc.frameIndex = frameIndex;
+
+    // Camera cuts, scope zooms, interior lighting transitions, or swapchain resets:
+    // If a history reset was requested, force frameIndex = 0 for this single dispatch so the
+    // compute shader treats the entire screen as disoccluded (isDisoccluded = true) and flushes ghosting.
+    const bool forceReset = RenderTargetManager::Get().ConsumeForceHistoryReset();
+    pc.frameIndex = forceReset ? 0u : frameIndex;
     pc.depthTolerance = config.depthTolerance;
     pc.historyWeight = config.historyWeight;
     pc.debugView = config.debugView;
@@ -2020,8 +2077,6 @@ void ReconstructionPass::DispatchVulkan(void* vkCommandBuffer, uint32_t frameInd
 
     const uint32_t targetW = dims.fullWidth > 0 ? dims.fullWidth : 3840u;
     const uint32_t targetH = dims.fullHeight > 0 ? dims.fullHeight : 2160u;
-    constexpr uint32_t kWorkgroupSizeX = 16u;
-    constexpr uint32_t kWorkgroupSizeY = 16u;
     const uint32_t groupCountX = (targetW + kWorkgroupSizeX - 1u) / kWorkgroupSizeX;
     const uint32_t groupCountY = (targetH + kWorkgroupSizeY - 1u) / kWorkgroupSizeY;
 
@@ -2117,8 +2172,10 @@ void ReconstructionPass::DispatchVulkan(void* vkCommandBuffer, uint32_t frameInd
     }
 
     if (!gpuTimestampReady) {
-        const float cpuMs = std::chrono::duration<float, std::milli>(cpuEnd - cpuStart).count();
-        m_lastDispatchDurationMs.store(cpuMs > 0.001f ? cpuMs : 0.001f, std::memory_order_release);
+        if (m_lastDispatchDurationMs.load(std::memory_order_relaxed) <= 0.0f) {
+            const float cpuMs = std::chrono::duration<float, std::milli>(cpuEnd - cpuStart).count();
+            m_lastDispatchDurationMs.store(cpuMs > 0.001f ? cpuMs : 0.001f, std::memory_order_release);
+        }
     }
 
     if (pfnCmdPipelineBarrier) {
@@ -2174,8 +2231,6 @@ void ReconstructionPass::DispatchDX12(void* d3d12GraphicsCommandList, uint32_t f
 
     const uint32_t targetW = dims.fullWidth > 0 ? dims.fullWidth : 3840u;
     const uint32_t targetH = dims.fullHeight > 0 ? dims.fullHeight : 2160u;
-    constexpr uint32_t kWorkgroupSizeX = 16u;
-    constexpr uint32_t kWorkgroupSizeY = 16u;
     const uint32_t groupCountX = (targetW + kWorkgroupSizeX - 1u) / kWorkgroupSizeX;
     const uint32_t groupCountY = (targetH + kWorkgroupSizeY - 1u) / kWorkgroupSizeY;
 

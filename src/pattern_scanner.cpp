@@ -1,6 +1,7 @@
 #include "cbr/pattern_scanner.h"
 #include <atomic>
 #include <cctype>
+#include <cmath>
 #include <cstring>
 #include "cbr/jitter_manager.h"
 #include "cbr/logger.h"
@@ -430,11 +431,23 @@ bool PatternScanner::InitializeCameraScanner() {
                 if (VirtualQuery(managerPtr, &mbi, sizeof(mbi)) && (mbi.State == MEM_COMMIT)) {
                     void* targetManager = nullptr;
                     std::memcpy(&targetManager, managerPtr, sizeof(void*));
-                    if (targetManager && VirtualQuery(targetManager, &mbi, sizeof(mbi)) && (mbi.State == MEM_COMMIT)) {
-                        float* matrixPtr = reinterpret_cast<float*>(static_cast<uint8_t*>(targetManager) + 0x40);
-                        g_cachedCameraMatrix.store(matrixPtr, std::memory_order_release);
-                        CBR_LOG_INFO("RDR2 camera projection matrix acquired at 0x%p", matrixPtr);
-                        return true;
+                    if (targetManager && VirtualQuery(targetManager, &mbi, sizeof(mbi)) && (mbi.State == MEM_COMMIT) &&
+                        (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE))) {
+                        const uintptr_t targetAddr = reinterpret_cast<uintptr_t>(targetManager);
+                        const uintptr_t regionEnd = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+                        if (regionEnd >= targetAddr && (regionEnd - targetAddr) >= (0x40 + 16 * sizeof(float))) {
+                            float* matrixPtr = reinterpret_cast<float*>(static_cast<uint8_t*>(targetManager) + 0x40);
+                            const float cotX = matrixPtr[0];
+                            const float cotY = matrixPtr[5];
+                            if (!std::isnan(cotX) && !std::isnan(cotY) && !std::isinf(cotX) && !std::isinf(cotY) &&
+                                cotX >= 0.2f && cotX <= 5.0f && cotY >= 0.2f && cotY <= 5.0f) {
+                                g_cachedCameraMatrix.store(matrixPtr, std::memory_order_release);
+                                CBR_LOG_INFO("RDR2 camera projection matrix acquired at 0x%p (cotX=%.4f, cotY=%.4f)", matrixPtr, cotX, cotY);
+                                return true;
+                            } else {
+                                CBR_LOG_WARN("Camera matrix candidate at 0x%p rejected: invalid perspective cotangents (cotX=%.4f, cotY=%.4f)", matrixPtr, cotX, cotY);
+                            }
+                        }
                     }
                 }
             }
@@ -446,16 +459,37 @@ bool PatternScanner::InitializeCameraScanner() {
 }
 
 float* PatternScanner::GetCameraProjectionMatrix() {
-    return g_cachedCameraMatrix.load(std::memory_order_acquire);
+    float* mat = g_cachedCameraMatrix.load(std::memory_order_acquire);
+    if (!mat) return nullptr;
+#if defined(_WIN32)
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(mat, &mbi, sizeof(mbi)) != sizeof(mbi) ||
+        mbi.State != MEM_COMMIT ||
+        (mbi.Protect & (PAGE_READWRITE | PAGE_READONLY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) == 0) {
+        return nullptr;
+    }
+    const uintptr_t matrixAddr = reinterpret_cast<uintptr_t>(mat);
+    const uintptr_t regionEnd = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+    if (regionEnd < matrixAddr || (regionEnd - matrixAddr) < (16 * sizeof(float))) {
+        return nullptr;
+    }
+#endif
+    const float cotX = mat[0];
+    const float cotY = mat[5];
+    if (std::isnan(cotX) || std::isnan(cotY) || std::isinf(cotX) || std::isinf(cotY) ||
+        cotX < 0.2f || cotX > 5.0f || cotY < 0.2f || cotY > 5.0f) {
+        return nullptr;
+    }
+    return mat;
 }
 
 bool PatternScanner::UpdateCameraJitter(uint32_t frameIndex, bool isVulkan) {
-    float* cameraMatrix = g_cachedCameraMatrix.load(std::memory_order_acquire);
+    float* cameraMatrix = GetCameraProjectionMatrix();
     if (!cameraMatrix) {
         if (!InitializeCameraScanner()) {
             return false;
         }
-        cameraMatrix = g_cachedCameraMatrix.load(std::memory_order_acquire);
+        cameraMatrix = GetCameraProjectionMatrix();
     }
 
     if (cameraMatrix) {
@@ -464,14 +498,7 @@ bool PatternScanner::UpdateCameraJitter(uint32_t frameIndex, bool isVulkan) {
             mbi.State != MEM_COMMIT ||
             (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) == 0) {
             g_cachedCameraMatrix.store(nullptr, std::memory_order_release);
-            CBR_LOG_WARN("Camera projection matrix memory unreadable or not committed; falling back to Viewport Redirection.");
-            return false;
-        }
-        const uintptr_t matrixAddr = reinterpret_cast<uintptr_t>(cameraMatrix);
-        const uintptr_t regionEnd = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
-        if (regionEnd < matrixAddr || (regionEnd - matrixAddr) < (16 * sizeof(float))) {
-            g_cachedCameraMatrix.store(nullptr, std::memory_order_release);
-            CBR_LOG_WARN("Camera projection matrix buffer smaller than 4x4 float matrix; falling back to Viewport Redirection.");
+            CBR_LOG_WARN("Camera projection matrix memory not writable; falling back to Viewport Redirection.");
             return false;
         }
 #if defined(_MSC_VER)
