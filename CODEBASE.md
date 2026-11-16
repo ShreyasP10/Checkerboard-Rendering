@@ -11152,6 +11152,12 @@ void main() {
         ) * 0.25;
     }
 
+    // Final defensive NaN/Inf sanitization before imageStore
+    if (any(isnan(finalColor)) || any(isinf(finalColor))) {
+        vec3 fallback = isCurrentSampleActive ? currentColor : cardinalColor[0];
+        finalColor = any(isnan(fallback)) || any(isinf(fallback)) ? vec3(0.0) : fallback;
+    }
+
     // Write final reconstructed pixel to output storage image (alpha = 1.0 for valid history)
     imageStore(u_OutputImage, pixelCoord, vec4(finalColor, 1.0));
 
@@ -11667,6 +11673,12 @@ void ResolvePixel(
         finalColor = isCurrentSampleActive ? currentColor : (cardinalColor[0] + cardinalColor[1] + cardinalColor[2] + cardinalColor[3]) * 0.25;
     } else if (pc.u_DebugView == 5u) {
         finalColor = isCurrentSampleActive ? currentColor : (cardinalColor[0] + cardinalColor[1] + cardinalColor[2] + cardinalColor[3]) * 0.25;
+    }
+
+    // Final defensive NaN/Inf sanitization before imageStore
+    if (any(isnan(finalColor)) || any(isinf(finalColor))) {
+        vec3 fallback = isCurrentSampleActive ? currentColor : cardinalColor[0];
+        finalColor = any(isnan(fallback)) || any(isinf(fallback)) ? vec3(0.0) : fallback;
     }
 
     imageStore(u_OutputImage, pixelCoord, vec4(finalColor, 1.0));
@@ -12325,6 +12337,12 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
         finalColor = isCurrentSampleActive ? currentColor : (
             cardinalColor[0] + cardinalColor[1] + cardinalColor[2] + cardinalColor[3]
         ) * 0.25f;
+    }
+
+    // Final defensive NaN/Inf sanitization before UAV store
+    if (any(isnan(finalColor)) || any(isinf(finalColor))) {
+        float3 fallback = isCurrentSampleActive ? currentColor : cardinalColor[0];
+        finalColor = any(isnan(fallback)) || any(isinf(fallback)) ? float3(0.0f, 0.0f, 0.0f) : fallback;
     }
 
     // Write final reconstructed pixel to output storage image (alpha = 1.0 for valid history)

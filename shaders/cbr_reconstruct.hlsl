@@ -586,6 +586,12 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
         ) * 0.25f;
     }
 
+    // Final defensive NaN/Inf sanitization before UAV store
+    if (any(isnan(finalColor)) || any(isinf(finalColor))) {
+        float3 fallback = isCurrentSampleActive ? currentColor : cardinalColor[0];
+        finalColor = any(isnan(fallback)) || any(isinf(fallback)) ? float3(0.0f, 0.0f, 0.0f) : fallback;
+    }
+
     // Write final reconstructed pixel to output storage image (alpha = 1.0 for valid history)
     g_OutputImage[pixelCoord] = float4(finalColor, 1.0f);
 
