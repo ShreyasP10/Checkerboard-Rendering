@@ -14687,7 +14687,7 @@ permissions:
 
 on:
   push:
-    branches: [ main, master, feature/cbr-pipeline ]
+    branches: [ main, master, feature/cbr-pipeline, 'feature/**' ]
     tags:
       - 'v*'
   pull_request:
