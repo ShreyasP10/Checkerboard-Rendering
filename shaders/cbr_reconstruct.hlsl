@@ -225,6 +225,7 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     float3 currentColor = float3(0.0f, 0.0f, 0.0f); // valid only for active pixels
     float currentDepth = 0.0f;                              // raw device depth (written to the history depth target)
     float currentLinear = 0.0f;                             // linear depth used by the occlusion test
+    float closestCardinalLin = 1e9f;                        // closest foreground depth (preserves alpha-to-coverage hair/moss)
 
     // The 4 cardinal neighbours of a reconstructed pixel are always natively shaded (mirrored at borders).
     int2 cardinalCoord[4] = { int2(0, 0), int2(0, 0), int2(0, 0), int2(0, 0) };
@@ -238,11 +239,13 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
         }
         currentDepth = FetchDepth(self);
         currentLinear = LinearizeDepth(currentDepth);
+        closestCardinalLin = currentLinear;
     } else {
         // No native sample here: estimate depth from the cardinal neighbours (Intel "CSO": average LINEAR depth).
         float sumRaw = 0.0f;
         float sumLin = 0.0f;
         float validCount = 0.0f;
+        float minCardLin = 1e9f;
         for (int i = 0; i < 4; ++i) {
             int2 c = pixelCoord + kCardinal[i];
             if (!InBounds(c, targetSize)) {
@@ -261,14 +264,17 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
                 sumRaw += raw;
                 sumLin += lin;
                 validCount += 1.0f;
+                minCardLin = min(minCardLin, lin);
             }
         }
         if (validCount > 0.0f) {
             currentDepth = sumRaw / validCount;
             currentLinear = sumLin / validCount;
+            closestCardinalLin = minCardLin;
         } else {
             currentDepth = (g_DepthMode == 1u) ? 0.0f : 1.0f;
             currentLinear = 1000.0f;
+            closestCardinalLin = 1000.0f;
         }
     }
 
@@ -358,7 +364,9 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
         previousDepth = g_HistoryDepth.Load(int3(historyCoord, 0)).r;
         float prevLin = LinearizeDepth(previousDepth);
         bool depthBad = isinf(currentLinear) || isnan(currentLinear) || isinf(prevLin) || isnan(prevLin);
-        depthDelta = depthBad ? 10.0f : abs(currentLinear - prevLin) / max(currentLinear, 1e-5f);
+        float deltaAvg = depthBad ? 10.0f : abs(currentLinear - prevLin) / max(currentLinear, 1e-5f);
+        float deltaClosest = depthBad ? 10.0f : abs(closestCardinalLin - prevLin) / max(closestCardinalLin, 1e-5f);
+        depthDelta = isCurrentSampleActive ? deltaAvg : min(deltaAvg, deltaClosest);
         float dynamicTolerance = g_DepthTolerance * max(1.0f, 1.0f + 0.0005f * currentLinear);
         if (depthDelta > dynamicTolerance) {
             isDisoccluded = true;
@@ -384,6 +392,7 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
         float3 m1 = float3(0.0f, 0.0f, 0.0f);
         float3 m2 = float3(0.0f, 0.0f, 0.0f);
         float n = 0.0f;
+        float sampleCount = 0.0f;
 
         int numNeighbors = isCurrentSampleActive ? 5 : 4;
         const int2 kDiagonal[4] = { int2(-1, -1), int2(1, -1), int2(-1, 1), int2(1, 1) };
@@ -410,12 +419,16 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
             
             colorMin = min(colorMin, c);
             colorMax = max(colorMax, c);
-            m1 += c;
-            m2 += c * c;
-            n += 1.0f;
+            // Karis inverse-luma weighting: damp extreme specular highlights to prevent variance box inflation
+            float luma = (g_ColorSpace == 1u) ? max(0.0f, dot(c, float3(0.299f, 0.587f, 0.114f))) : max(0.0f, c.x);
+            float hdrWeight = 1.0f / (1.0f + luma);
+            m1 += c * hdrWeight;
+            m2 += (c * c) * hdrWeight;
+            n += hdrWeight;
+            sampleCount += 1.0f;
         }
 
-        if (n >= 2.0f) {
+        if (sampleCount >= 2.0f && n > 1e-4f) {
             // Variance clipping: clamp history inside [mean - gamma * stdDev, mean + gamma * stdDev]
             float3 mean = m1 / n;
             float3 rawStdDev = sqrt(max(float3(0.0f, 0.0f, 0.0f), (m2 / n) - (mean * mean)));
@@ -451,6 +464,18 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
         } else {
             // Spatial cross-bilateral reconstruction from the 4 cardinal (natively shaded) neighbours.
             // With the fallback disabled the nearest neighbour is copied (no native sample exists here).
+            // Directional gradient weights: prefer interpolating along edge contours (Decima tangent resolve)
+            float3 horizDiff = abs(cardinalColor[0] - cardinalColor[1]);
+            float3 vertDiff  = abs(cardinalColor[2] - cardinalColor[3]);
+            float horizGrad = dot(horizDiff, float3(0.299f, 0.587f, 0.114f));
+            float vertGrad  = dot(vertDiff,  float3(0.299f, 0.587f, 0.114f));
+            float dirBias[4] = {
+                1.0f / (1.0f + horizGrad * 8.0f), // Left
+                1.0f / (1.0f + horizGrad * 8.0f), // Right
+                1.0f / (1.0f + vertGrad  * 8.0f), // Up
+                1.0f / (1.0f + vertGrad  * 8.0f)  // Down
+            };
+
             float3 accumColor = float3(0.0f, 0.0f, 0.0f);
             float accumDepth = 0.0f;
             float accumWeight = 0.0f;
@@ -462,10 +487,11 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
                 // Relative linear-depth weighting: scale-invariant, independent of the depth convention
                 // Fast base-2 exponentiation: exp(-x) == exp2(-x * log2(e))
                 float depthWeight = exp2((-abs(currentLinear - sLin) / (max(currentLinear, 1e-5f) * max(g_DepthTolerance, 1e-4f))) * 1.44269504f);
+                float totalWeight = depthWeight * dirBias[i];
 
-                accumColor += sCol * depthWeight;
-                accumDepth += cardinalDepth[i] * depthWeight;
-                accumWeight += depthWeight;
+                accumColor += sCol * totalWeight;
+                accumDepth += cardinalDepth[i] * totalWeight;
+                accumWeight += totalWeight;
             }
 
             if (accumWeight > 1e-4f) {

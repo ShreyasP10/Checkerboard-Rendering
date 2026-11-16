@@ -197,11 +197,13 @@ void ResolvePixel(
     ivec2 cardinalCoord[4] = ivec2[](ivec2(0), ivec2(0), ivec2(0), ivec2(0));
     float cardinalDepth[4] = float[](0.0, 0.0, 0.0, 0.0);
     vec3  cardinalColor[4] = vec3[](vec3(0.0), vec3(0.0), vec3(0.0), vec3(0.0));
+    float closestCardinalLin = isCurrentSampleActive ? currentLinear : 1e9;
 
     if (!isCurrentSampleActive) {
         float sumRaw = 0.0;
         float sumLin = 0.0;
         float validCount = 0.0;
+        float minCardLin = 1e9;
         for (int i = 0; i < 4; ++i) {
             ivec2 c = pixelCoord + kCardinal[i];
             if (!InBounds(c, targetSize)) c = pixelCoord - kCardinal[i];
@@ -227,14 +229,17 @@ void ResolvePixel(
                 sumRaw += raw;
                 sumLin += lin;
                 validCount += 1.0;
+                minCardLin = min(minCardLin, lin);
             }
         }
         if (validCount > 0.0) {
             currentDepth = sumRaw / validCount;
             currentLinear = sumLin / validCount;
+            closestCardinalLin = minCardLin;
         } else {
             currentDepth = (pc.u_DepthMode == 1u) ? 0.0 : 1.0;
             currentLinear = 1000.0;
+            closestCardinalLin = 1000.0;
         }
     }
 
@@ -308,7 +313,9 @@ void ResolvePixel(
         previousDepth = texelFetch(u_HistoryDepth, historyCoord, 0).r;
         float prevLin = LinearizeDepth(previousDepth);
         bool depthBad = isinf(currentLinear) || isnan(currentLinear) || isinf(prevLin) || isnan(prevLin);
-        depthDelta = depthBad ? 10.0 : abs(currentLinear - prevLin) / max(currentLinear, 1e-5);
+        float deltaAvg = depthBad ? 10.0 : abs(currentLinear - prevLin) / max(currentLinear, 1e-5);
+        float deltaClosest = depthBad ? 10.0 : abs(closestCardinalLin - prevLin) / max(closestCardinalLin, 1e-5);
+        depthDelta = isCurrentSampleActive ? deltaAvg : min(deltaAvg, deltaClosest);
         float dynamicTolerance = pc.u_DepthTolerance * max(1.0, 1.0 + 0.0005 * currentLinear);
         if (depthDelta > dynamicTolerance) {
             isDisoccluded = true;
@@ -325,6 +332,7 @@ void ResolvePixel(
         vec3 m1 = vec3(0.0);
         vec3 m2 = vec3(0.0);
         float n = 0.0;
+        float sampleCount = 0.0;
 
         int numNeighbors = isCurrentSampleActive ? 5 : 4;
         const ivec2 kDiagonal[4] = ivec2[](ivec2(-1, -1), ivec2(1, -1), ivec2(-1, 1), ivec2(1, 1));
@@ -345,12 +353,16 @@ void ResolvePixel(
 
             colorMin = min(colorMin, c);
             colorMax = max(colorMax, c);
-            m1 += c;
-            m2 += c * c;
-            n += 1.0;
+            // Karis inverse-luma weighting: damp extreme specular highlights to prevent variance box inflation
+            float luma = (pc.u_ColorSpace == 1u) ? max(0.0, dot(c, vec3(0.299, 0.587, 0.114))) : max(0.0, c.x);
+            float hdrWeight = 1.0 / (1.0 + luma);
+            m1 += c * hdrWeight;
+            m2 += (c * c) * hdrWeight;
+            n += hdrWeight;
+            sampleCount += 1.0;
         }
 
-        if (n >= 2.0) {
+        if (sampleCount >= 2.0 && n > 1e-4) {
             vec3 mean = m1 / n;
             vec3 rawStdDev = sqrt(max(vec3(0.0), (m2 / n) - (mean * mean)));
             vec3 stdDev = max(rawStdDev, vec3(0.005));
@@ -379,6 +391,18 @@ void ResolvePixel(
         if (!isDisoccluded && historyColor.a > 0.0) {
             finalColor = historyColor.rgb;
         } else {
+            // Directional gradient weights: prefer interpolating along edge contours (Decima tangent resolve)
+            vec3 horizDiff = abs(cardinalColor[0] - cardinalColor[1]);
+            vec3 vertDiff  = abs(cardinalColor[2] - cardinalColor[3]);
+            float horizGrad = dot(horizDiff, vec3(0.299, 0.587, 0.114));
+            float vertGrad  = dot(vertDiff,  vec3(0.299, 0.587, 0.114));
+            float dirBias[4] = float[](
+                1.0 / (1.0 + horizGrad * 8.0), // Left
+                1.0 / (1.0 + horizGrad * 8.0), // Right
+                1.0 / (1.0 + vertGrad  * 8.0), // Up
+                1.0 / (1.0 + vertGrad  * 8.0)  // Down
+            );
+
             vec3 accumColor = vec3(0.0);
             float accumDepth = 0.0;
             float accumWeight = 0.0;
@@ -387,9 +411,10 @@ void ResolvePixel(
                 vec3 sCol = cardinalColor[i];
                 float sLin = LinearizeDepth(cardinalDepth[i]);
                 float depthWeight = exp2((-abs(currentLinear - sLin) / (max(currentLinear, 1e-5) * max(pc.u_DepthTolerance, 1e-4))) * 1.4426950408889634);
-                accumColor += sCol * depthWeight;
-                accumDepth += cardinalDepth[i] * depthWeight;
-                accumWeight += depthWeight;
+                float totalWeight = depthWeight * dirBias[i];
+                accumColor += sCol * totalWeight;
+                accumDepth += cardinalDepth[i] * totalWeight;
+                accumWeight += totalWeight;
             }
 
             if (accumWeight > 1e-4) {

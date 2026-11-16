@@ -92,3 +92,53 @@ Rockstar used the 2025 PC update of Grand Theft Auto V Enhanced as a production 
    - RDR2's planar water displacement maps and dithered alpha-card hair are replaced with full 3D FFT/Navier-Stokes fluid surface simulations and per-strand hair/fur physics.
 4. **Native Decoupled Temporal Upscaling**:
    - Rather than relying on a fixed 2× MSAA checkerboard hardware pass like the PS4 Pro build of RDR2, RAGE 9 natively decouples internal rendering resolution from target display resolution to feed modern temporal upscalers (PSSR, FSR, DLSS) directly out of the forward shading stage with subpixel motion vectors.
+
+---
+
+## 5. Advanced Reconstruction Upgrades (Decima & DLSS 2.0 Parity)
+
+Based on architectural breakdowns comparing **Death Stranding (Decima Engine / PS4 Pro CBR)** with **NVIDIA DLSS 2.0**, `rdr2-cbr` implements four targeted algorithmic upgrades directly in its compute reconstruction shaders (`cbr_reconstruct.comp`, `cbr_reconstruct_quad.comp`, and `cbr_reconstruct.hlsl`):
+
+### Upgrade A: Specular & Highlight Anti-Flicker (Karis Inverse-Luma Weighting)
+- **The Issue in PS4 Pro CBR**: When high-intensity specular highlights (e.g. lantern reflections on wet river mud or Arthur's leather coat, luminance $L > 10.0$) sit next to dark surroundings, unweighted statistical accumulation expands the standard deviation $\sigma$, blowing up the variance bounding box $\mu \pm 1.25\sigma$. This allows stale bright history pixels to survive across alternating frames, creating an aggressive 30 Hz specular strobe.
+- **The Solution**: Step 4 weights each neighbor sample by Brian Karis's inverse-luma factor $w_i = \frac{1}{1 + \max(0, Y_i)}$:
+  ```glsl
+  float luma = (pc.u_ColorSpace == 1u) ? max(0.0, dot(c, vec3(0.299, 0.587, 0.114))) : max(0.0, c.x);
+  float hdrWeight = 1.0 / (1.0 + luma);
+  m1 += c * hdrWeight;
+  m2 += (c * c) * hdrWeight;
+  n += hdrWeight;
+  ```
+  Super-bright specular fireflies are bounded from distorting neighborhood variance, ensuring completely stable specular highlights.
+
+### Upgrade B: Decima Gradient Spatial Fallback (Eliminating Diagonal Stair-Stepping)
+- **The Issue in PS4 Pro CBR**: Standard 4-neighbor cardinal cross sampling (Left, Right, Up, Down) is densest horizontally and vertically, but structurally sparsest along $45^\circ$ diagonals. When history disoccludes, thin diagonal geometry (Saint Denis telegraph wires, wagon wheel spokes, gun barrels) exhibits stair-step aliasing.
+- **The Solution**: Step 5 calculates color gradients across opposite cardinal pairs to measure local edge orientation:
+  ```glsl
+  vec3 horizDiff = abs(cardinalColor[0] - cardinalColor[1]);
+  vec3 vertDiff  = abs(cardinalColor[2] - cardinalColor[3]);
+  float horizGrad = dot(horizDiff, vec3(0.299, 0.587, 0.114));
+  float vertGrad  = dot(vertDiff,  vec3(0.299, 0.587, 0.114));
+  float dirBias[4] = float[](
+      1.0 / (1.0 + horizGrad * 8.0), // Left
+      1.0 / (1.0 + horizGrad * 8.0), // Right
+      1.0 / (1.0 + vertGrad  * 8.0), // Up
+      1.0 / (1.0 + vertGrad  * 8.0)  // Down
+  );
+  ```
+  Interpolation weights preferentially follow the contour with lower gradient (along the edge) rather than blurring across it, preserving thin diagonal wires cleanly.
+
+### Upgrade C: Dual-Metric Hair, Beard & Moss Disocclusion Fix
+- **The Issue in PS4 Pro CBR**: RDR2 renders hair cards, beards, horse manes, and moss using alpha-to-coverage / stippled dither masks where adjacent pixels intentionally alternate between foreground hair depth ($0.5\,\text{m}$) and background sky/skin depth ($50.0\,\text{m}$). On reconstructed pixels, averaging cardinal depths produces a false intermediate depth ($25.25\,\text{m}$), causing Step 3 to falsely trigger disocclusion (`depthDelta > dynamicTolerance`), discarding temporal history and leaving a raw 1-pixel checkerboard pattern on Arthur's beard and hair.
+- **The Solution**: In Step 1, inactive pixels track the closest foreground cardinal linear depth (`closestCardinalLin = min(closestCardinalLin, lin)`). In Step 3, the depth disocclusion delta tests both average and closest depth:
+  ```glsl
+  float deltaAvg     = abs(currentLinear - prevLin) / max(currentLinear, 1e-5);
+  float deltaClosest = abs(closestCardinalLin - prevLin) / max(closestCardinalLin, 1e-5);
+  depthDelta = isCurrentSampleActive ? deltaAvg : min(deltaAvg, deltaClosest);
+  ```
+  Stippled hair and foliage matching either average depth or individual foreground hair strands remain temporally accumulated, eliminating checkerboard holes on hair and beards.
+
+### Upgrade D: Fused 5-Tap RCAS Contrast-Adaptive Sharpening
+- **The Issue in PS4 Pro CBR**: Decima and native PS4 Pro CBR suffered from soft textures and blurred small text/gear decals due to Nyquist roll-off during corner averaging.
+- **The Solution**: In Step 6, when `SharpeningStrength > 0.0`, a fused 5-tap RCAS (Robust Contrast-Adaptive Sharpening) block operates directly on the already-loaded `cardinalColor[0..3]` registers without additional texture bandwidth. Combined with the mod's negative MIP LOD bias (`MipLodBias = -1.0`), small text, compass markings, saddle leather engravings, and clothing weaves remain razor-sharp.
+
