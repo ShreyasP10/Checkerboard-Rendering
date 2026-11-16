@@ -90,6 +90,11 @@ struct CBRConfig {
     // Compensates for the 1-pixel horizontal shift when sampling unjittered history from the previous frame.
     float         jitterCompensation{ 1.0f };
 
+    // Safety & Overrides (Items H-03, H-05, H-06)
+    uint64_t      forcedSceneRenderPassHandle{ 0 }; // 0 = auto-detect; nonzero = force exact VkRenderPass handle (Item H-03)
+    bool          cameraMatrixVerified{ false }; // false = untrusted; true = verified ViewProj matrix (Item H-05)
+    bool          enableProjectionJitterWrite{ false }; // false = safe viewport shift only; true = opt-in game memory writes (Item H-06)
+
     // Debug
     bool        showOverlay{ false };
     uint32_t    debugView{ 0 }; // 0=Normal, 1=Mask, 2=Disocclusion, 3=Motion, 4=Raw, 5=SpatialUpscaleBaseline

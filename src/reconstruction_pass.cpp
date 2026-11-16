@@ -1053,9 +1053,15 @@ bool ReconstructionPass::CreateVulkanPipeline() {
         if (pfnGetPhysProps) {
             uint32_t propsHeader[256]{};
             pfnGetPhysProps(m_vkPhysicalDevice, propsHeader);
-            // On 64-bit platforms, VkPhysicalDeviceLimits::timestampPeriod is located at byte offset 796
-            // (sizeof(VkPhysicalDeviceProperties) is 824 bytes, limits begins at offset 512, timestampPeriod at +284)
-            const float extractedPeriod = *reinterpret_cast<const float*>(reinterpret_cast<const char*>(propsHeader) + 796);
+            // VkPhysicalDeviceProperties memory layout (vulkan_core.h):
+            //   Fixed prefix: apiVersion(4) + driverVersion(4) + vendorID(4) + deviceID(4) + deviceType(4)
+            //                 + deviceName[256] + pipelineCacheUUID[16] = 292 bytes (limits offset = 292).
+            //   VkPhysicalDeviceLimits: timestampPeriod is preceded by 96 members + alignment padding:
+            //     - 64-bit (LP64/LLP64: size_t=8, VkDeviceSize=8): timestampPeriod is at limits offset 424.
+            //     - 32-bit (size_t=4, VkDeviceSize=8): timestampPeriod is at limits offset 416.
+            //   Absolute offset in VkPhysicalDeviceProperties: 292 + 424 = 716 on 64-bit, 292 + 416 = 708 on 32-bit (Item H-08).
+            constexpr size_t kTimestampPeriodOffset = (sizeof(void*) == 8) ? 716 : 708;
+            const float extractedPeriod = *reinterpret_cast<const float*>(reinterpret_cast<const char*>(propsHeader) + kTimestampPeriodOffset);
             if (std::isfinite(extractedPeriod) && extractedPeriod > 0.0f && extractedPeriod <= 1000.0f) {
                 m_vkTimestampPeriodNs = extractedPeriod;
             }

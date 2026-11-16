@@ -1060,10 +1060,16 @@ inline void RecordTrackedRenderPass(void* rpHandle, const std::vector<TrackedRen
     bool hasDepth = false;
     bool hasMsaa2x = false;
     bool hasVelocityFmt = false;
+    bool depthFinalLayoutReadOnly = false;
     uint32_t colorCount = 0;
     for (const auto& att : rp.attachments) {
         if (RenderTargetManager::IsVulkanDepthFormat(att.format)) {
             hasDepth = true;
+            // Depth read-only layout (Item H-03): SHADER_READ_ONLY_OPTIMAL (5),
+            // DEPTH_STENCIL_READ_ONLY_OPTIMAL (4), or DEPTH_READ_ONLY_OPTIMAL (1000241000)
+            if (att.finalLayout == 5u || att.finalLayout == 4u || att.finalLayout == 1000241000u) {
+                depthFinalLayoutReadOnly = true;
+            }
         } else {
             ++colorCount;
             if (att.format == 97 /* R16G16B16A16_SFLOAT */ ||
@@ -1080,8 +1086,13 @@ inline void RecordTrackedRenderPass(void* rpHandle, const std::vector<TrackedRen
         }
     }
     const uint32_t targetSamples = RenderTargetManager::Get().GetDimensions().msaaSamples;
-    rp.isCandidateGeometryPass = hasHdrColor && hasDepth &&
-                                 (targetSamples == 1u || hasMsaa2x || hasVelocityFmt || colorCount >= 2u);
+    const auto& config = ConfigManager::Get().GetConfig();
+    if (config.forcedSceneRenderPassHandle != 0) {
+        rp.isCandidateGeometryPass = (reinterpret_cast<uint64_t>(rpHandle) == config.forcedSceneRenderPassHandle);
+    } else {
+        rp.isCandidateGeometryPass = hasHdrColor && hasDepth && depthFinalLayoutReadOnly &&
+                                     (targetSamples == 1u || hasMsaa2x || hasVelocityFmt || colorCount >= 2u);
+    }
     std::lock_guard<std::mutex> lock(g_attachmentMutex);
     g_renderPasses[rpHandle] = std::move(rp);
 }
@@ -1353,9 +1364,11 @@ void Hooked_vkCmdBeginRenderPass(void* commandBuffer, const void* pRenderPassBeg
                 if (config.samplingStrategy == SamplingStrategy::StrategyA && config.jitterDirection != 0) {
                     PatternScanner::UpdateCameraJitter(CBREngine::Get().GetCurrentFrameIndex(), true);
                 }
-                float* camProj = PatternScanner::GetCameraProjectionMatrix();
-                if (camProj) {
-                    ReconstructionPass::Get().SetCameraMatrices(camProj, nullptr);
+                if (config.cameraMatrixVerified) {
+                    float* camProj = PatternScanner::GetCameraProjectionMatrix();
+                    if (camProj) {
+                        ReconstructionPass::Get().SetCameraMatrices(camProj, nullptr);
+                    }
                 }
             }
 

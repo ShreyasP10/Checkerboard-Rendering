@@ -1050,6 +1050,11 @@ bool RenderTargetManager::CanCopyToQuarterColor(const VulkanImageMetadata& srcMe
             return false;
         }
     }
+    // Item H-07: Require VK_IMAGE_USAGE_TRANSFER_SRC_BIT (0x01) on non-zero usage metadata
+    constexpr uint32_t kVkImageUsageTransferSrcBit = 0x00000001u;
+    if (srcMeta.usage != 0u && (srcMeta.usage & kVkImageUsageTransferSrcBit) == 0u) {
+        return false;
+    }
     return true;
 }
 
@@ -1066,6 +1071,10 @@ bool RenderTargetManager::CanCopyToQuarterDepth(const VulkanImageMetadata& srcMe
         return false;
     }
     if (srcMeta.format != 0u && !IsDepthCopyFormatCompatible(srcMeta.format, kVkFormatD32Sfloat)) {
+        return false;
+    }
+    // Item H-07: Require VK_IMAGE_USAGE_TRANSFER_SRC_BIT (0x01) on non-zero usage metadata
+    if (srcMeta.usage != 0u && (srcMeta.usage & kVkImageUsageTransferSrcBit) == 0u) {
         return false;
     }
     return true;
@@ -1086,6 +1095,10 @@ bool RenderTargetManager::CanCopyToVelocity(const VulkanImageMetadata& srcMeta) 
         return false;
     }
     if (srcMeta.format != 0u && !IsColorCopyFormatCompatible(srcMeta.format, kVkFormatR16G16B16A16Sfloat)) {
+        return false;
+    }
+    // Item H-07: Require VK_IMAGE_USAGE_TRANSFER_SRC_BIT (0x01) on non-zero usage metadata
+    if (srcMeta.usage != 0u && (srcMeta.usage & kVkImageUsageTransferSrcBit) == 0u) {
         return false;
     }
     return true;
@@ -1109,6 +1122,11 @@ bool RenderTargetManager::ShouldBlitReconstructionToSceneColor(const void* gameC
     // vkCmdBlitImage permits format conversion only between formats with matching texel block size.
     // Source historyColor is R16G16B16A16_SFLOAT (64-bit). Destination must also be 64-bit copy-compatible.
     if (dstMeta.format != 0u && !IsColorCopyFormatCompatible(kVkFormatR16G16B16A16Sfloat, dstMeta.format)) {
+        return false;
+    }
+    // Item H-07: Require VK_IMAGE_USAGE_TRANSFER_DST_BIT (0x02) on non-zero usage metadata
+    constexpr uint32_t kVkImageUsageTransferDstBit = 0x00000002u;
+    if (dstMeta.usage != 0u && (dstMeta.usage & kVkImageUsageTransferDstBit) == 0u) {
         return false;
     }
     const TargetDimensions dims = GetDimensions();

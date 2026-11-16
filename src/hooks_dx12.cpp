@@ -379,9 +379,11 @@ void __stdcall Hooked_D3D12RSSetViewports(void* commandList, unsigned int numVie
         if (config.samplingStrategy == SamplingStrategy::StrategyA && config.jitterDirection != 0) {
             PatternScanner::UpdateCameraJitter(currentFrame, false);
         }
-        float* camProj = PatternScanner::GetCameraProjectionMatrix();
-        if (camProj) {
-            ReconstructionPass::Get().SetCameraMatrices(camProj, nullptr);
+        if (config.cameraMatrixVerified) {
+            float* camProj = PatternScanner::GetCameraProjectionMatrix();
+            if (camProj) {
+                ReconstructionPass::Get().SetCameraMatrices(camProj, nullptr);
+            }
         }
 
         DX12CmdListSlot* slot = GetOrCreateDX12Slot(commandList);

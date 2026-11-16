@@ -446,6 +446,18 @@ ProjectionJitterSign = 1
 ; Default: 1.0 (compensates for the 1-pixel horizontal shift when sampling history from the previous frame).
 JitterCompensation = 1.0
 
+; Camera projection matrix verification gate (Item H-05).
+; Default: false (prevents unverified projection matrices from being treated as view-projection in camera motion fallback).
+CameraMatrixVerified = false
+
+; Memory write gate for camera projection jittering (Item H-06).
+; Default: false (keeps memory writes disabled; Strategy A viewport shift is the safe, non-mutating path).
+EnableProjectionJitterWrite = false
+
+; Manual override to pin the exact VkRenderPass handle for main scene geometry (Item H-03).
+; Default: 0 (automatic heuristic detection). Set to hex/decimal handle from RenderDoc capture if needed.
+ForcedSceneRenderPassHandle = 0
+
 ; Sampling Strategy: StrategyA (ViewportShift) or StrategyB (ProgrammableSampleLocations)
 ; - StrategyA: Shorter pass jitter via 0.5px horizontal viewport offset on odd frames.
 ; - StrategyB: Hardware programmable 2x MSAA sample locations (VK_EXT_sample_locations)
@@ -907,6 +919,11 @@ struct CBRConfig {
     // Multiplier applied to the jitter delta when reprojecting history: default 1.0 (Item H-02).
     // Compensates for the 1-pixel horizontal shift when sampling unjittered history from the previous frame.
     float         jitterCompensation{ 1.0f };
+
+    // Safety & Overrides (Items H-03, H-05, H-06)
+    uint64_t      forcedSceneRenderPassHandle{ 0 }; // 0 = auto-detect; nonzero = force exact VkRenderPass handle (Item H-03)
+    bool          cameraMatrixVerified{ false }; // false = untrusted; true = verified ViewProj matrix (Item H-05)
+    bool          enableProjectionJitterWrite{ false }; // false = safe viewport shift only; true = opt-in game memory writes (Item H-06)
 
     // Debug
     bool        showOverlay{ false };
@@ -2408,6 +2425,20 @@ uint32_t ParseUInt(const std::string& val, uint32_t defaultVal, uint32_t minVal,
     }
 }
 
+uint64_t ParseUInt64(const std::string& val, uint64_t defaultVal) {
+    if (val.empty()) return defaultVal;
+    try {
+        if (val.front() == '-') return defaultVal;
+        size_t idx = 0;
+        int base = (val.size() > 2 && (val[1] == 'x' || val[1] == 'X')) ? 16 : 10;
+        unsigned long long result = std::stoull(val, &idx, base);
+        if (idx == 0 || idx != val.size()) return defaultVal;
+        return static_cast<uint64_t>(result);
+    } catch (...) {
+        return defaultVal;
+    }
+}
+
 float ParseFloat(const std::string& val, float defaultVal, float minVal, float maxVal) {
     if (val.empty()) return defaultVal;
     float result = defaultVal;
@@ -2597,6 +2628,12 @@ bool ConfigManager::Load(const std::filesystem::path& configPath) {
                 }
             } else if (key == "JitterCompensation") {
                 parsed.jitterCompensation = ParseFloat(val, parsed.jitterCompensation, -1.0f, 1.0f);
+            } else if (key == "CameraMatrixVerified") {
+                parsed.cameraMatrixVerified = ParseBool(val, parsed.cameraMatrixVerified);
+            } else if (key == "EnableProjectionJitterWrite") {
+                parsed.enableProjectionJitterWrite = ParseBool(val, parsed.enableProjectionJitterWrite);
+            } else if (key == "ForcedSceneRenderPassHandle") {
+                parsed.forcedSceneRenderPassHandle = ParseUInt64(val, parsed.forcedSceneRenderPassHandle);
             } else if (key == "SamplingStrategy") {
                 const std::string s = ToUpper(Trim(val));
                 if (s == "STRATEGYA" || s == "VIEWPORTSHIFT" || s == "STRATEGY_A") {
@@ -2679,6 +2716,9 @@ bool ConfigManager::Save(const std::filesystem::path& configPath) {
     file << "JitterDirection = " << snapshot.jitterDirection << "\n";
     file << "ProjectionJitterSign = " << snapshot.projectionJitterSign << "\n";
     file << "JitterCompensation = " << snapshot.jitterCompensation << "\n";
+    file << "CameraMatrixVerified = " << (snapshot.cameraMatrixVerified ? "true" : "false") << "\n";
+    file << "EnableProjectionJitterWrite = " << (snapshot.enableProjectionJitterWrite ? "true" : "false") << "\n";
+    file << "ForcedSceneRenderPassHandle = " << snapshot.forcedSceneRenderPassHandle << "\n";
     file << "SamplingStrategy = "
          << (snapshot.samplingStrategy == SamplingStrategy::StrategyB ? "StrategyB" : "StrategyA") << "\n\n";
 
@@ -4256,10 +4296,16 @@ inline void RecordTrackedRenderPass(void* rpHandle, const std::vector<TrackedRen
     bool hasDepth = false;
     bool hasMsaa2x = false;
     bool hasVelocityFmt = false;
+    bool depthFinalLayoutReadOnly = false;
     uint32_t colorCount = 0;
     for (const auto& att : rp.attachments) {
         if (RenderTargetManager::IsVulkanDepthFormat(att.format)) {
             hasDepth = true;
+            // Depth read-only layout (Item H-03): SHADER_READ_ONLY_OPTIMAL (5),
+            // DEPTH_STENCIL_READ_ONLY_OPTIMAL (4), or DEPTH_READ_ONLY_OPTIMAL (1000241000)
+            if (att.finalLayout == 5u || att.finalLayout == 4u || att.finalLayout == 1000241000u) {
+                depthFinalLayoutReadOnly = true;
+            }
         } else {
             ++colorCount;
             if (att.format == 97 /* R16G16B16A16_SFLOAT */ ||
@@ -4276,8 +4322,13 @@ inline void RecordTrackedRenderPass(void* rpHandle, const std::vector<TrackedRen
         }
     }
     const uint32_t targetSamples = RenderTargetManager::Get().GetDimensions().msaaSamples;
-    rp.isCandidateGeometryPass = hasHdrColor && hasDepth &&
-                                 (targetSamples == 1u || hasMsaa2x || hasVelocityFmt || colorCount >= 2u);
+    const auto& config = ConfigManager::Get().GetConfig();
+    if (config.forcedSceneRenderPassHandle != 0) {
+        rp.isCandidateGeometryPass = (reinterpret_cast<uint64_t>(rpHandle) == config.forcedSceneRenderPassHandle);
+    } else {
+        rp.isCandidateGeometryPass = hasHdrColor && hasDepth && depthFinalLayoutReadOnly &&
+                                     (targetSamples == 1u || hasMsaa2x || hasVelocityFmt || colorCount >= 2u);
+    }
     std::lock_guard<std::mutex> lock(g_attachmentMutex);
     g_renderPasses[rpHandle] = std::move(rp);
 }
@@ -4549,9 +4600,11 @@ void Hooked_vkCmdBeginRenderPass(void* commandBuffer, const void* pRenderPassBeg
                 if (config.samplingStrategy == SamplingStrategy::StrategyA && config.jitterDirection != 0) {
                     PatternScanner::UpdateCameraJitter(CBREngine::Get().GetCurrentFrameIndex(), true);
                 }
-                float* camProj = PatternScanner::GetCameraProjectionMatrix();
-                if (camProj) {
-                    ReconstructionPass::Get().SetCameraMatrices(camProj, nullptr);
+                if (config.cameraMatrixVerified) {
+                    float* camProj = PatternScanner::GetCameraProjectionMatrix();
+                    if (camProj) {
+                        ReconstructionPass::Get().SetCameraMatrices(camProj, nullptr);
+                    }
                 }
             }
 
@@ -5604,9 +5657,11 @@ void __stdcall Hooked_D3D12RSSetViewports(void* commandList, unsigned int numVie
         if (config.samplingStrategy == SamplingStrategy::StrategyA && config.jitterDirection != 0) {
             PatternScanner::UpdateCameraJitter(currentFrame, false);
         }
-        float* camProj = PatternScanner::GetCameraProjectionMatrix();
-        if (camProj) {
-            ReconstructionPass::Get().SetCameraMatrices(camProj, nullptr);
+        if (config.cameraMatrixVerified) {
+            float* camProj = PatternScanner::GetCameraProjectionMatrix();
+            if (camProj) {
+                ReconstructionPass::Get().SetCameraMatrices(camProj, nullptr);
+            }
         }
 
         DX12CmdListSlot* slot = GetOrCreateDX12Slot(commandList);
@@ -6910,13 +6965,20 @@ bool PatternScanner::InitializeCameraScanner() {
                             float* matrixPtr = reinterpret_cast<float*>(static_cast<uint8_t*>(targetManager) + 0x40);
                             const float cotX = matrixPtr[0];
                             const float cotY = matrixPtr[5];
+                            const float m11 = matrixPtr[11];
+                            const float m14 = matrixPtr[14];
+                            // Item H-06: Validate perspective row entries and small unjittered base offsets
+                            const bool hasPerspectiveW = (std::fabs(m11 + 1.0f) < 0.05f || std::fabs(m14 + 1.0f) < 0.05f);
+                            const bool hasSmallJitterBase = (std::fabs(matrixPtr[8]) < 0.1f && std::fabs(matrixPtr[9]) < 0.1f);
                             if (!std::isnan(cotX) && !std::isnan(cotY) && !std::isinf(cotX) && !std::isinf(cotY) &&
-                                cotX >= 0.2f && cotX <= 5.0f && cotY >= 0.2f && cotY <= 5.0f) {
+                                cotX >= 0.2f && cotX <= 5.0f && cotY >= 0.2f && cotY <= 5.0f &&
+                                hasPerspectiveW && hasSmallJitterBase) {
                                 g_cachedCameraMatrix.store(matrixPtr, std::memory_order_release);
                                 CBR_LOG_INFO("RDR2 camera projection matrix acquired at 0x%p (cotX=%.4f, cotY=%.4f)", matrixPtr, cotX, cotY);
                                 return true;
                             } else {
-                                CBR_LOG_WARN("Camera matrix candidate at 0x%p rejected: invalid perspective cotangents (cotX=%.4f, cotY=%.4f)", matrixPtr, cotX, cotY);
+                                CBR_LOG_WARN("Camera matrix candidate at 0x%p rejected: failed validation (cotX=%.4f, cotY=%.4f, perspW=%d, base=%d)",
+                                             matrixPtr, cotX, cotY, hasPerspectiveW ? 1 : 0, hasSmallJitterBase ? 1 : 0);
                             }
                         }
                     }
@@ -6955,6 +7017,11 @@ float* PatternScanner::GetCameraProjectionMatrix() {
 }
 
 bool PatternScanner::UpdateCameraJitter(uint32_t frameIndex, bool isVulkan) {
+    // Item H-06: Opt-in gate for memory writes to game space (default: false, preserving safe viewport shift)
+    if (!ConfigManager::Get().GetConfig().enableProjectionJitterWrite) {
+        return false;
+    }
+
     float* cameraMatrix = GetCameraProjectionMatrix();
     if (!cameraMatrix) {
         if (!InitializeCameraScanner()) {
@@ -8063,9 +8130,15 @@ bool ReconstructionPass::CreateVulkanPipeline() {
         if (pfnGetPhysProps) {
             uint32_t propsHeader[256]{};
             pfnGetPhysProps(m_vkPhysicalDevice, propsHeader);
-            // On 64-bit platforms, VkPhysicalDeviceLimits::timestampPeriod is located at byte offset 796
-            // (sizeof(VkPhysicalDeviceProperties) is 824 bytes, limits begins at offset 512, timestampPeriod at +284)
-            const float extractedPeriod = *reinterpret_cast<const float*>(reinterpret_cast<const char*>(propsHeader) + 796);
+            // VkPhysicalDeviceProperties memory layout (vulkan_core.h):
+            //   Fixed prefix: apiVersion(4) + driverVersion(4) + vendorID(4) + deviceID(4) + deviceType(4)
+            //                 + deviceName[256] + pipelineCacheUUID[16] = 292 bytes (limits offset = 292).
+            //   VkPhysicalDeviceLimits: timestampPeriod is preceded by 96 members + alignment padding:
+            //     - 64-bit (LP64/LLP64: size_t=8, VkDeviceSize=8): timestampPeriod is at limits offset 424.
+            //     - 32-bit (size_t=4, VkDeviceSize=8): timestampPeriod is at limits offset 416.
+            //   Absolute offset in VkPhysicalDeviceProperties: 292 + 424 = 716 on 64-bit, 292 + 416 = 708 on 32-bit (Item H-08).
+            constexpr size_t kTimestampPeriodOffset = (sizeof(void*) == 8) ? 716 : 708;
+            const float extractedPeriod = *reinterpret_cast<const float*>(reinterpret_cast<const char*>(propsHeader) + kTimestampPeriodOffset);
             if (std::isfinite(extractedPeriod) && extractedPeriod > 0.0f && extractedPeriod <= 1000.0f) {
                 m_vkTimestampPeriodNs = extractedPeriod;
             }
@@ -10404,6 +10477,11 @@ bool RenderTargetManager::CanCopyToQuarterColor(const VulkanImageMetadata& srcMe
             return false;
         }
     }
+    // Item H-07: Require VK_IMAGE_USAGE_TRANSFER_SRC_BIT (0x01) on non-zero usage metadata
+    constexpr uint32_t kVkImageUsageTransferSrcBit = 0x00000001u;
+    if (srcMeta.usage != 0u && (srcMeta.usage & kVkImageUsageTransferSrcBit) == 0u) {
+        return false;
+    }
     return true;
 }
 
@@ -10420,6 +10498,10 @@ bool RenderTargetManager::CanCopyToQuarterDepth(const VulkanImageMetadata& srcMe
         return false;
     }
     if (srcMeta.format != 0u && !IsDepthCopyFormatCompatible(srcMeta.format, kVkFormatD32Sfloat)) {
+        return false;
+    }
+    // Item H-07: Require VK_IMAGE_USAGE_TRANSFER_SRC_BIT (0x01) on non-zero usage metadata
+    if (srcMeta.usage != 0u && (srcMeta.usage & kVkImageUsageTransferSrcBit) == 0u) {
         return false;
     }
     return true;
@@ -10440,6 +10522,10 @@ bool RenderTargetManager::CanCopyToVelocity(const VulkanImageMetadata& srcMeta) 
         return false;
     }
     if (srcMeta.format != 0u && !IsColorCopyFormatCompatible(srcMeta.format, kVkFormatR16G16B16A16Sfloat)) {
+        return false;
+    }
+    // Item H-07: Require VK_IMAGE_USAGE_TRANSFER_SRC_BIT (0x01) on non-zero usage metadata
+    if (srcMeta.usage != 0u && (srcMeta.usage & kVkImageUsageTransferSrcBit) == 0u) {
         return false;
     }
     return true;
@@ -10463,6 +10549,11 @@ bool RenderTargetManager::ShouldBlitReconstructionToSceneColor(const void* gameC
     // vkCmdBlitImage permits format conversion only between formats with matching texel block size.
     // Source historyColor is R16G16B16A16_SFLOAT (64-bit). Destination must also be 64-bit copy-compatible.
     if (dstMeta.format != 0u && !IsColorCopyFormatCompatible(kVkFormatR16G16B16A16Sfloat, dstMeta.format)) {
+        return false;
+    }
+    // Item H-07: Require VK_IMAGE_USAGE_TRANSFER_DST_BIT (0x02) on non-zero usage metadata
+    constexpr uint32_t kVkImageUsageTransferDstBit = 0x00000002u;
+    if (dstMeta.usage != 0u && (dstMeta.usage & kVkImageUsageTransferDstBit) == 0u) {
         return false;
     }
     const TargetDimensions dims = GetDimensions();
@@ -11106,10 +11197,9 @@ void main() {
     }
     // JitterCompensation (Item M-08): 0.0 when velocity buffer is unjittered or Strategy A viewport shift is active;
     // set to 1.0 only if velocity vectors encode the projection jitter delta (verify via RenderDoc).
-    // Jitter dampener: dampens jitter compensation on zero-velocity passes (transparent particles, fog, smoke)
-    // to prevent half-pixel oscillation when alpha-blended particles lack motion vectors.
-    float jitterDampener = (dot(velocity, velocity) < 1e-9) ? 0.0 : 1.0;
-    vec2 historyUV = uv - velocity - (pc.u_JitterDelta * (pc.u_JitterCompensation * jitterDampener));
+    // JitterCompensation (Item H-02): Compensates for the 1-pixel horizontal shift when sampling history from the previous frame.
+    // Static geometry has velocity=0, but content shifted by u_JitterDelta; do not zero jitter compensation on static scenes.
+    vec2 historyUV = uv - velocity - (pc.u_JitterDelta * pc.u_JitterCompensation);
     // Clamp historyUV to valid subpixel inner border to prevent edge sample bleeding
     vec2 minUV = 0.5 * pc.u_InvTargetResolution;
     vec2 maxUV = vec2(1.0) - minUV;
@@ -11672,10 +11762,9 @@ void ResolvePixel(
     }
     // JitterCompensation (Item M-08): 0.0 when velocity buffer is unjittered or Strategy A viewport shift is active;
     // set to 1.0 only if velocity vectors encode the projection jitter delta (verify via RenderDoc).
-    // Jitter dampener: dampens jitter compensation on zero-velocity passes (transparent particles, fog, smoke)
-    // to prevent half-pixel oscillation when alpha-blended particles lack motion vectors.
-    float jitterDampener = (dot(velocity, velocity) < 1e-9) ? 0.0 : 1.0;
-    vec2 historyUV = uv - velocity - (pc.u_JitterDelta * (pc.u_JitterCompensation * jitterDampener));
+    // JitterCompensation (Item H-02): Compensates for the 1-pixel horizontal shift when sampling history from the previous frame.
+    // Static geometry has velocity=0, but content shifted by u_JitterDelta; do not zero jitter compensation on static scenes.
+    vec2 historyUV = uv - velocity - (pc.u_JitterDelta * pc.u_JitterCompensation);
     vec2 minUV = 0.5 * pc.u_InvTargetResolution;
     vec2 maxUV = vec2(1.0) - minUV;
     historyUV = clamp(historyUV, minUV, maxUV);
@@ -12291,10 +12380,9 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     }
     // JitterCompensation (Item M-08): 0.0 when velocity buffer is unjittered or Strategy A viewport shift is active;
     // set to 1.0 only if velocity vectors encode the projection jitter delta (verify via RenderDoc).
-    // Jitter dampener: dampens jitter compensation on zero-velocity passes (transparent particles, fog, smoke)
-    // to prevent half-pixel oscillation when alpha-blended particles lack motion vectors.
-    float jitterDampener = (dot(velocity, velocity) < 1e-9f) ? 0.0f : 1.0f;
-    float2 historyUV = uv - velocity - (g_JitterDelta * (g_JitterCompensation * jitterDampener));
+    // JitterCompensation (Item H-02): Compensates for the 1-pixel horizontal shift when sampling history from the previous frame.
+    // Static geometry has velocity=0, but content shifted by u_JitterDelta; do not zero jitter compensation on static scenes.
+    float2 historyUV = uv - velocity - (g_JitterDelta * g_JitterCompensation);
     float2 minUV = 0.5f * g_InvTargetResolution;
     float2 maxUV = float2(1.0f, 1.0f) - minUV;
     historyUV = clamp(historyUV, minUV, maxUV);
@@ -12801,6 +12889,9 @@ static void TestConfigMissingFileAndRoundTrip(const fs::path& dir) {
     CHECK(after.depthNear == before.depthNear && after.depthFar == before.depthFar);
     CHECK(after.sharpeningStrength == before.sharpeningStrength);
     CHECK(after.enableCameraMotionFallback == before.enableCameraMotionFallback);
+    CHECK(after.forcedSceneRenderPassHandle == before.forcedSceneRenderPassHandle);
+    CHECK(after.cameraMatrixVerified == before.cameraMatrixVerified);
+    CHECK(after.enableProjectionJitterWrite == before.enableProjectionJitterWrite);
 
     // Verify thread-safe Modify callback executes and commits successfully
     ConfigManager::Get().Modify([](CBRConfig& cfg) {
@@ -13221,15 +13312,15 @@ static void TestRenderTargets() {
     CHECK(!RenderTargetManager::IsDepthCopyFormatCompatible(124, 126)); // D16_UNORM -> D32_SFLOAT disallowed (16bpp vs 32bpp)
 
     r.Initialize(3840, 2160);
-    const VulkanImageMetadata validColor{ 3840, 2160, 97, 2, 0x10 };
-    const VulkanImageMetadata color32bpp{ 3840, 2160, 37, 2, 0x10 };
-    const VulkanImageMetadata singleSampleColor{ 3840, 2160, 97, 1, 0x10 };
-    const VulkanImageMetadata validDepth{ 3840, 2160, 126, 2, 0x20 };
-    const VulkanImageMetadata depthColorMismatch{ 3840, 2160, 100, 2, 0x10 };
-    const VulkanImageMetadata singleSampleDepth{ 3840, 2160, 126, 1, 0x20 };
-    const VulkanImageMetadata depthMetaDst{ 3840, 2160, 126, 1, 0x20 };
-    const VulkanImageMetadata tooSmallColor{ 960, 540, 97, 2, 0x10 };
-    const VulkanImageMetadata validVel{ 1920, 1080, 97, 1, 0x10 };
+    const VulkanImageMetadata validColor{ 3840, 2160, 97, 2, 0x11 }; // 0x10 COLOR_ATTACHMENT | 0x01 TRANSFER_SRC
+    const VulkanImageMetadata color32bpp{ 3840, 2160, 37, 2, 0x11 };
+    const VulkanImageMetadata singleSampleColor{ 3840, 2160, 97, 1, 0x13 }; // 0x10 COLOR_ATTACHMENT | 0x01 TRANSFER_SRC | 0x02 TRANSFER_DST
+    const VulkanImageMetadata validDepth{ 3840, 2160, 126, 2, 0x21 }; // 0x20 DEPTH_ATTACHMENT | 0x01 TRANSFER_SRC
+    const VulkanImageMetadata depthColorMismatch{ 3840, 2160, 100, 2, 0x11 };
+    const VulkanImageMetadata singleSampleDepth{ 3840, 2160, 126, 1, 0x21 };
+    const VulkanImageMetadata depthMetaDst{ 3840, 2160, 126, 1, 0x22 };
+    const VulkanImageMetadata tooSmallColor{ 960, 540, 97, 2, 0x11 };
+    const VulkanImageMetadata validVel{ 1920, 1080, 97, 1, 0x11 };
     CHECK(RenderTargetManager::IsColorCopyFormatCompatible(97, 97));
     CHECK(RenderTargetManager::IsColorCopyFormatCompatible(103, 97));  // 64bpp R32G32_SFLOAT -> RGBA16F
     CHECK(!RenderTargetManager::IsColorCopyFormatCompatible(37, 97));  // 32bpp RGBA8 -> 64bpp RGBA16F disallowed
@@ -13241,8 +13332,18 @@ static void TestRenderTargets() {
     CHECK(!r.CanCopyToQuarterDepth(depthColorMismatch));
     CHECK(!r.CanCopyToQuarterDepth(singleSampleDepth));
 
+    // Item H-07: Verify VK_IMAGE_USAGE_TRANSFER_SRC_BIT and TRANSFER_DST_BIT validation
+    const VulkanImageMetadata colorNoTransferSrc{ 3840, 2160, 97, 2, 0x10 }; // Missing TRANSFER_SRC_BIT
+    CHECK(!r.CanCopyToQuarterColor(colorNoTransferSrc));
+    const VulkanImageMetadata depthNoTransferSrc{ 3840, 2160, 126, 2, 0x20 }; // Missing TRANSFER_SRC_BIT
+    CHECK(!r.CanCopyToQuarterDepth(depthNoTransferSrc));
+    const VulkanImageMetadata velNoTransferSrc{ 1920, 1080, 97, 1, 0x10 }; // Missing TRANSFER_SRC_BIT
+    CHECK(!r.CanCopyToVelocity(velNoTransferSrc));
+    const VulkanImageMetadata dstNoTransferDst{ 3840, 2160, 97, 1, 0x11 }; // Missing TRANSFER_DST_BIT
+    CHECK(!r.ShouldBlitReconstructionToSceneColor(&fakeImg, false, 3840, 2160, dstNoTransferDst));
+
     // Verify 1x ASO single-sample copies when msaaSamples == 1
-    const VulkanImageMetadata b10g11r11SingleSample{ 3840, 2160, 122, 1, 0x10 };
+    const VulkanImageMetadata b10g11r11SingleSample{ 3840, 2160, 122, 1, 0x11 };
     ConfigManager::Get().Modify([](CBRConfig& cfg) { cfg.msaaSamples = 1; });
     r.Initialize(3840, 2160);
     CHECK(r.CanCopyToQuarterColor(singleSampleColor));
@@ -13255,7 +13356,7 @@ static void TestRenderTargets() {
     CHECK(!r.CanCopyToQuarterColor(b10g11r11SingleSample)); // Format 122 rejected in 2x mode
     CHECK(r.CanCopyToVelocity(validVel));
     CHECK(!r.CanCopyToVelocity(validColor)); // 2x samples != 1x velocity buffer
-    const VulkanImageMetadata vel32bpp{ 1920, 1080, 37, 1, 0x10 };
+    const VulkanImageMetadata vel32bpp{ 1920, 1080, 37, 1, 0x11 };
     CHECK(!r.CanCopyToVelocity(vel32bpp)); // 32bpp velocity buffer rejected (C-02)
 
     const int fakeImg = 1;

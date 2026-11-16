@@ -291,10 +291,9 @@ void ResolvePixel(
     }
     // JitterCompensation (Item M-08): 0.0 when velocity buffer is unjittered or Strategy A viewport shift is active;
     // set to 1.0 only if velocity vectors encode the projection jitter delta (verify via RenderDoc).
-    // Jitter dampener: dampens jitter compensation on zero-velocity passes (transparent particles, fog, smoke)
-    // to prevent half-pixel oscillation when alpha-blended particles lack motion vectors.
-    float jitterDampener = (dot(velocity, velocity) < 1e-9) ? 0.0 : 1.0;
-    vec2 historyUV = uv - velocity - (pc.u_JitterDelta * (pc.u_JitterCompensation * jitterDampener));
+    // JitterCompensation (Item H-02): Compensates for the 1-pixel horizontal shift when sampling history from the previous frame.
+    // Static geometry has velocity=0, but content shifted by u_JitterDelta; do not zero jitter compensation on static scenes.
+    vec2 historyUV = uv - velocity - (pc.u_JitterDelta * pc.u_JitterCompensation);
     vec2 minUV = 0.5 * pc.u_InvTargetResolution;
     vec2 maxUV = vec2(1.0) - minUV;
     historyUV = clamp(historyUV, minUV, maxUV);

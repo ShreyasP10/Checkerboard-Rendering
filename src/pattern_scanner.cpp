@@ -439,13 +439,20 @@ bool PatternScanner::InitializeCameraScanner() {
                             float* matrixPtr = reinterpret_cast<float*>(static_cast<uint8_t*>(targetManager) + 0x40);
                             const float cotX = matrixPtr[0];
                             const float cotY = matrixPtr[5];
+                            const float m11 = matrixPtr[11];
+                            const float m14 = matrixPtr[14];
+                            // Item H-06: Validate perspective row entries and small unjittered base offsets
+                            const bool hasPerspectiveW = (std::fabs(m11 + 1.0f) < 0.05f || std::fabs(m14 + 1.0f) < 0.05f);
+                            const bool hasSmallJitterBase = (std::fabs(matrixPtr[8]) < 0.1f && std::fabs(matrixPtr[9]) < 0.1f);
                             if (!std::isnan(cotX) && !std::isnan(cotY) && !std::isinf(cotX) && !std::isinf(cotY) &&
-                                cotX >= 0.2f && cotX <= 5.0f && cotY >= 0.2f && cotY <= 5.0f) {
+                                cotX >= 0.2f && cotX <= 5.0f && cotY >= 0.2f && cotY <= 5.0f &&
+                                hasPerspectiveW && hasSmallJitterBase) {
                                 g_cachedCameraMatrix.store(matrixPtr, std::memory_order_release);
                                 CBR_LOG_INFO("RDR2 camera projection matrix acquired at 0x%p (cotX=%.4f, cotY=%.4f)", matrixPtr, cotX, cotY);
                                 return true;
                             } else {
-                                CBR_LOG_WARN("Camera matrix candidate at 0x%p rejected: invalid perspective cotangents (cotX=%.4f, cotY=%.4f)", matrixPtr, cotX, cotY);
+                                CBR_LOG_WARN("Camera matrix candidate at 0x%p rejected: failed validation (cotX=%.4f, cotY=%.4f, perspW=%d, base=%d)",
+                                             matrixPtr, cotX, cotY, hasPerspectiveW ? 1 : 0, hasSmallJitterBase ? 1 : 0);
                             }
                         }
                     }
@@ -484,6 +491,11 @@ float* PatternScanner::GetCameraProjectionMatrix() {
 }
 
 bool PatternScanner::UpdateCameraJitter(uint32_t frameIndex, bool isVulkan) {
+    // Item H-06: Opt-in gate for memory writes to game space (default: false, preserving safe viewport shift)
+    if (!ConfigManager::Get().GetConfig().enableProjectionJitterWrite) {
+        return false;
+    }
+
     float* cameraMatrix = GetCameraProjectionMatrix();
     if (!cameraMatrix) {
         if (!InitializeCameraScanner()) {

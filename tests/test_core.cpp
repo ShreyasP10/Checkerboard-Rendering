@@ -162,6 +162,9 @@ static void TestConfigMissingFileAndRoundTrip(const fs::path& dir) {
     CHECK(after.depthNear == before.depthNear && after.depthFar == before.depthFar);
     CHECK(after.sharpeningStrength == before.sharpeningStrength);
     CHECK(after.enableCameraMotionFallback == before.enableCameraMotionFallback);
+    CHECK(after.forcedSceneRenderPassHandle == before.forcedSceneRenderPassHandle);
+    CHECK(after.cameraMatrixVerified == before.cameraMatrixVerified);
+    CHECK(after.enableProjectionJitterWrite == before.enableProjectionJitterWrite);
 
     // Verify thread-safe Modify callback executes and commits successfully
     ConfigManager::Get().Modify([](CBRConfig& cfg) {
@@ -582,15 +585,15 @@ static void TestRenderTargets() {
     CHECK(!RenderTargetManager::IsDepthCopyFormatCompatible(124, 126)); // D16_UNORM -> D32_SFLOAT disallowed (16bpp vs 32bpp)
 
     r.Initialize(3840, 2160);
-    const VulkanImageMetadata validColor{ 3840, 2160, 97, 2, 0x10 };
-    const VulkanImageMetadata color32bpp{ 3840, 2160, 37, 2, 0x10 };
-    const VulkanImageMetadata singleSampleColor{ 3840, 2160, 97, 1, 0x10 };
-    const VulkanImageMetadata validDepth{ 3840, 2160, 126, 2, 0x20 };
-    const VulkanImageMetadata depthColorMismatch{ 3840, 2160, 100, 2, 0x10 };
-    const VulkanImageMetadata singleSampleDepth{ 3840, 2160, 126, 1, 0x20 };
-    const VulkanImageMetadata depthMetaDst{ 3840, 2160, 126, 1, 0x20 };
-    const VulkanImageMetadata tooSmallColor{ 960, 540, 97, 2, 0x10 };
-    const VulkanImageMetadata validVel{ 1920, 1080, 97, 1, 0x10 };
+    const VulkanImageMetadata validColor{ 3840, 2160, 97, 2, 0x11 }; // 0x10 COLOR_ATTACHMENT | 0x01 TRANSFER_SRC
+    const VulkanImageMetadata color32bpp{ 3840, 2160, 37, 2, 0x11 };
+    const VulkanImageMetadata singleSampleColor{ 3840, 2160, 97, 1, 0x13 }; // 0x10 COLOR_ATTACHMENT | 0x01 TRANSFER_SRC | 0x02 TRANSFER_DST
+    const VulkanImageMetadata validDepth{ 3840, 2160, 126, 2, 0x21 }; // 0x20 DEPTH_ATTACHMENT | 0x01 TRANSFER_SRC
+    const VulkanImageMetadata depthColorMismatch{ 3840, 2160, 100, 2, 0x11 };
+    const VulkanImageMetadata singleSampleDepth{ 3840, 2160, 126, 1, 0x21 };
+    const VulkanImageMetadata depthMetaDst{ 3840, 2160, 126, 1, 0x22 };
+    const VulkanImageMetadata tooSmallColor{ 960, 540, 97, 2, 0x11 };
+    const VulkanImageMetadata validVel{ 1920, 1080, 97, 1, 0x11 };
     CHECK(RenderTargetManager::IsColorCopyFormatCompatible(97, 97));
     CHECK(RenderTargetManager::IsColorCopyFormatCompatible(103, 97));  // 64bpp R32G32_SFLOAT -> RGBA16F
     CHECK(!RenderTargetManager::IsColorCopyFormatCompatible(37, 97));  // 32bpp RGBA8 -> 64bpp RGBA16F disallowed
@@ -602,8 +605,18 @@ static void TestRenderTargets() {
     CHECK(!r.CanCopyToQuarterDepth(depthColorMismatch));
     CHECK(!r.CanCopyToQuarterDepth(singleSampleDepth));
 
+    // Item H-07: Verify VK_IMAGE_USAGE_TRANSFER_SRC_BIT and TRANSFER_DST_BIT validation
+    const VulkanImageMetadata colorNoTransferSrc{ 3840, 2160, 97, 2, 0x10 }; // Missing TRANSFER_SRC_BIT
+    CHECK(!r.CanCopyToQuarterColor(colorNoTransferSrc));
+    const VulkanImageMetadata depthNoTransferSrc{ 3840, 2160, 126, 2, 0x20 }; // Missing TRANSFER_SRC_BIT
+    CHECK(!r.CanCopyToQuarterDepth(depthNoTransferSrc));
+    const VulkanImageMetadata velNoTransferSrc{ 1920, 1080, 97, 1, 0x10 }; // Missing TRANSFER_SRC_BIT
+    CHECK(!r.CanCopyToVelocity(velNoTransferSrc));
+    const VulkanImageMetadata dstNoTransferDst{ 3840, 2160, 97, 1, 0x11 }; // Missing TRANSFER_DST_BIT
+    CHECK(!r.ShouldBlitReconstructionToSceneColor(&fakeImg, false, 3840, 2160, dstNoTransferDst));
+
     // Verify 1x ASO single-sample copies when msaaSamples == 1
-    const VulkanImageMetadata b10g11r11SingleSample{ 3840, 2160, 122, 1, 0x10 };
+    const VulkanImageMetadata b10g11r11SingleSample{ 3840, 2160, 122, 1, 0x11 };
     ConfigManager::Get().Modify([](CBRConfig& cfg) { cfg.msaaSamples = 1; });
     r.Initialize(3840, 2160);
     CHECK(r.CanCopyToQuarterColor(singleSampleColor));
@@ -616,7 +629,7 @@ static void TestRenderTargets() {
     CHECK(!r.CanCopyToQuarterColor(b10g11r11SingleSample)); // Format 122 rejected in 2x mode
     CHECK(r.CanCopyToVelocity(validVel));
     CHECK(!r.CanCopyToVelocity(validColor)); // 2x samples != 1x velocity buffer
-    const VulkanImageMetadata vel32bpp{ 1920, 1080, 37, 1, 0x10 };
+    const VulkanImageMetadata vel32bpp{ 1920, 1080, 37, 1, 0x11 };
     CHECK(!r.CanCopyToVelocity(vel32bpp)); // 32bpp velocity buffer rejected (C-02)
 
     const int fakeImg = 1;
