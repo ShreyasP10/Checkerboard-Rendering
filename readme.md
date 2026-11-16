@@ -234,6 +234,7 @@ Every architectural decision, hardware profile, and audit finding is documented 
 | Foundational CBR theory, 2× MSAA grids & `-1.0` LOD bias | [`CHECKERBOARD.md`](CHECKERBOARD.md) |
 | RDR2 Hardware Analysis, Requirements & APU Benchmarks | [`HARDWARE.md`](HARDWARE.md) |
 | RAGE Engine Architecture, Generational Evolution & Vulkan Hooks | [`docs/RAGE_ENGINE_ARCHITECTURE.md`](docs/RAGE_ENGINE_ARCHITECTURE.md) |
+| Architectural Design & Engineering Standards | [`docs/ENGINEERING_STANDARDS.md`](docs/ENGINEERING_STANDARDS.md) |
 | Synchronized single-file codebase snapshot | [`CODEBASE.md`](CODEBASE.md) |
 | Phase 2 runtime detours & swapchain integration plan | [`nextImplementationPhase.md`](nextImplementationPhase.md) · [`docs/nextImplementationPhase.md`](docs/nextImplementationPhase.md) |
 | Live test report on RDR2 `1.0.1491.50` (GTX 1070 Ti + LML) | [`docs/IN_GAME_TEST_REPORT_v1491.md`](docs/IN_GAME_TEST_REPORT_v1491.md) |
