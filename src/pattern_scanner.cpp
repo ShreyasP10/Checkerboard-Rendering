@@ -3,6 +3,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstring>
+#include "cbr/config.h"
 #include "cbr/jitter_manager.h"
 #include "cbr/logger.h"
 

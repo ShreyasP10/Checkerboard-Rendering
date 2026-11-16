@@ -1051,7 +1051,6 @@ bool RenderTargetManager::CanCopyToQuarterColor(const VulkanImageMetadata& srcMe
         }
     }
     // Item H-07: Require VK_IMAGE_USAGE_TRANSFER_SRC_BIT (0x01) on non-zero usage metadata
-    constexpr uint32_t kVkImageUsageTransferSrcBit = 0x00000001u;
     if (srcMeta.usage != 0u && (srcMeta.usage & kVkImageUsageTransferSrcBit) == 0u) {
         return false;
     }
@@ -1125,7 +1124,6 @@ bool RenderTargetManager::ShouldBlitReconstructionToSceneColor(const void* gameC
         return false;
     }
     // Item H-07: Require VK_IMAGE_USAGE_TRANSFER_DST_BIT (0x02) on non-zero usage metadata
-    constexpr uint32_t kVkImageUsageTransferDstBit = 0x00000002u;
     if (dstMeta.usage != 0u && (dstMeta.usage & kVkImageUsageTransferDstBit) == 0u) {
         return false;
     }
