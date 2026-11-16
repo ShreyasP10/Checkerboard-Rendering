@@ -605,15 +605,13 @@ static void TestRenderTargets() {
     CHECK(!r.CanCopyToQuarterDepth(depthColorMismatch));
     CHECK(!r.CanCopyToQuarterDepth(singleSampleDepth));
 
-    // Item H-07: Verify VK_IMAGE_USAGE_TRANSFER_SRC_BIT and TRANSFER_DST_BIT validation
+    // Item H-07: Verify VK_IMAGE_USAGE_TRANSFER_SRC_BIT validation
     const VulkanImageMetadata colorNoTransferSrc{ 3840, 2160, 97, 2, 0x10 }; // Missing TRANSFER_SRC_BIT
     CHECK(!r.CanCopyToQuarterColor(colorNoTransferSrc));
     const VulkanImageMetadata depthNoTransferSrc{ 3840, 2160, 126, 2, 0x20 }; // Missing TRANSFER_SRC_BIT
     CHECK(!r.CanCopyToQuarterDepth(depthNoTransferSrc));
     const VulkanImageMetadata velNoTransferSrc{ 1920, 1080, 97, 1, 0x10 }; // Missing TRANSFER_SRC_BIT
     CHECK(!r.CanCopyToVelocity(velNoTransferSrc));
-    const VulkanImageMetadata dstNoTransferDst{ 3840, 2160, 97, 1, 0x11 }; // Missing TRANSFER_DST_BIT
-    CHECK(!r.ShouldBlitReconstructionToSceneColor(&fakeImg, false, 3840, 2160, dstNoTransferDst));
 
     // Verify 1x ASO single-sample copies when msaaSamples == 1
     const VulkanImageMetadata b10g11r11SingleSample{ 3840, 2160, 122, 1, 0x11 };
@@ -633,6 +631,9 @@ static void TestRenderTargets() {
     CHECK(!r.CanCopyToVelocity(vel32bpp)); // 32bpp velocity buffer rejected (C-02)
 
     const int fakeImg = 1;
+    // Item H-07: Verify VK_IMAGE_USAGE_TRANSFER_DST_BIT validation
+    const VulkanImageMetadata dstNoTransferDst{ 3840, 2160, 97, 1, 0x11 }; // Missing TRANSFER_DST_BIT (0x02)
+    CHECK(!r.ShouldBlitReconstructionToSceneColor(&fakeImg, false, 3840, 2160, dstNoTransferDst));
     CHECK(r.ShouldBlitReconstructionToSceneColor(&fakeImg, false, 3840, 2160));
     CHECK(r.ShouldBlitReconstructionToSceneColor(&fakeImg, false, 3840, 2160, singleSampleColor));
     CHECK(!r.ShouldBlitReconstructionToSceneColor(&fakeImg, false, 3840, 2160, color32bpp));    // 32bpp blit dst invalid (C-03)
