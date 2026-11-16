@@ -12739,7 +12739,7 @@ static void TestConfigHardening(const fs::path& dir) {
 
     // Defaults of a fresh config
     const CBRConfig fresh{};
-    CHECK(fresh.jitterCompensation == 0.0f); // whole-pixel jitter needs NO history compensation
+    CHECK(fresh.jitterCompensation == 1.0f); // default 1.0 history reprojection compensation (Item H-02)
     CHECK(fresh.jitterDirection == 1);
     CHECK(fresh.projectionJitterSign == 1);
     CHECK(fresh.samplingStrategy == SamplingStrategy::StrategyA);
@@ -13246,7 +13246,7 @@ static void TestRenderTargets() {
     ConfigManager::Get().Modify([](CBRConfig& cfg) { cfg.msaaSamples = 1; });
     r.Initialize(3840, 2160);
     CHECK(r.CanCopyToQuarterColor(singleSampleColor));
-    CHECK(r.CanCopyToQuarterColor(b10g11r11SingleSample)); // Format 122 allowed in 1x APU mode (Item 7)
+    CHECK(!r.CanCopyToQuarterColor(b10g11r11SingleSample)); // Format 122 rejected because 32bpp is incompatible with 64bpp quarterColor (C-03)
     CHECK(!r.CanCopyToQuarterColor(validColor)); // 2x rejected in 1x mode
     CHECK(r.CanCopyToQuarterDepth(singleSampleDepth));
     CHECK(!r.CanCopyToQuarterDepth(validDepth)); // 2x rejected in 1x mode
@@ -13255,10 +13255,13 @@ static void TestRenderTargets() {
     CHECK(!r.CanCopyToQuarterColor(b10g11r11SingleSample)); // Format 122 rejected in 2x mode
     CHECK(r.CanCopyToVelocity(validVel));
     CHECK(!r.CanCopyToVelocity(validColor)); // 2x samples != 1x velocity buffer
+    const VulkanImageMetadata vel32bpp{ 1920, 1080, 37, 1, 0x10 };
+    CHECK(!r.CanCopyToVelocity(vel32bpp)); // 32bpp velocity buffer rejected (C-02)
 
     const int fakeImg = 1;
     CHECK(r.ShouldBlitReconstructionToSceneColor(&fakeImg, false, 3840, 2160));
     CHECK(r.ShouldBlitReconstructionToSceneColor(&fakeImg, false, 3840, 2160, singleSampleColor));
+    CHECK(!r.ShouldBlitReconstructionToSceneColor(&fakeImg, false, 3840, 2160, color32bpp));    // 32bpp blit dst invalid (C-03)
     CHECK(!r.ShouldBlitReconstructionToSceneColor(&fakeImg, false, 3840, 2160, validColor));    // 2x MSAA blit dst invalid (C-04)
     CHECK(!r.ShouldBlitReconstructionToSceneColor(&fakeImg, false, 3840, 2160, depthMetaDst));  // depth dst invalid (C-04)
     CHECK(!r.ShouldBlitReconstructionToSceneColor(&fakeImg, true, 3840, 2160));                 // never blit swapchain mid-frame (C-04)
