@@ -274,7 +274,7 @@ $$C_{\text{spatial}} = \frac{\sum_{k=1}^4 w_k C_k}{\sum_{k=1}^4 w_k}, \quad w_k 
 | Component | Minimum Specification | Recommended (Target Discrete) | Recommended (Target APU / Integrated) | Role in CBR Pipeline |
 |---|---|---|---|---|
 | **GPU** | GTX 1060 (6 GB) / RX 580 (8 GB) / Vega 7 (Vulkan 1.3 / DX12) | **NVIDIA GeForce GTX 1070 Ti (8 GB GDDR5)** | **AMD Radeon Vega 7 (Ryzen 5 4600G/5600H/5700U APU)** | Wave32 (Pascal) / Wave64 (Vega) compute shader execution, 2× MSAA rasterization |
-| **GPU VRAM** | 1 GB (1080p CBR) / 6 GB (4K CBR) | **8 GB GDDR5** (`300.58 MiB` / `315.19 MB` CBR buffers at 4K) | **512 MB – 2 GB Shared UMA DDR4** (`75.15 MiB` / `78.80 MB` CBR buffers at 1080p) | Stores quarter-res 2× MSAA, ping-pong history, and output targets |
+| **GPU VRAM** | 1 GB (1080p CBR) / 6 GB (4K CBR) | **8 GB GDDR5** (`237.30 MiB` / `248.83 MB` CBR buffers at 4K) | **512 MB – 2 GB Shared UMA DDR4** (`59.33 MiB` / `62.21 MB` CBR buffers at 1080p) | Stores quarter-res 2× MSAA and ping-pong history targets (Item M-06: unused output targets eliminated) |
 | **CPU** | Quad-Core (i5-8400 / Ryzen 2600; scalar AOB fallback) | **6-Core / 12-Thread (AVX2 capable)** | **AMD Ryzen 5 4600G / 5600H (6C / 12T, AVX2)** | Frame pacing, intercept dispatch & AVX2 SIMD AOB scanning |
 | **RAM** | 8 GB Dual-Channel | **16 GB DDR4 Dual-Channel** | **16 GB Dual-Channel DDR4-3200+** | Essential on APUs for shared GPU/CPU memory bandwidth |
 | **OS** | Windows 10 (64-bit, 19041+) | **Windows 10 / Windows 11 (64-bit)** | **Windows 10 / Windows 11 (64-bit)** | Native `vulkan-1.dll` (1.3) and DirectX 12 runtime |
@@ -405,7 +405,7 @@ LogLevel = Info              ; Debug, Info, Warning, Error
    - **MSAA:** **2×** (**Required!** In-game MSAA must be set to **2×** so that the scene geometry color and depth attachments render with 2× MSAA / `VK_SAMPLE_COUNT_2_BIT`. `CanCopyToQuarterColor` and `CanCopyToQuarterDepth` enforce 2× MSAA matching `quarterColor` and `quarterDepth`. If MSAA is set to Off (1×), the C-01 safety gate safely fails open and preserves the native image without black-screening, but CBR compute reconstruction will not trigger).
    - **FXAA:** **Off** (recommended Off to prevent post-filtering blurring).
 4. **Quality Baseline (4K on 8 GB Pascal GPUs):**
-   - Lower **Volumetrics**, **Water**, and **Reflections** to **Medium**; keep **Anisotropic Filtering** at **16×** and reduce **Texture Quality** from **Ultra** to **High** if approaching the 8 GB VRAM ceiling (`300.58 MiB` used by CBR buffers at 4K). On **AMD Vega 7 (512 MB UMA)** laptops, use **1080p** (`75.15 MiB` CBR buffers) and Low/Medium RDR2 presets (`docs/AMD_VEGA_OPTIMIZATION.md`).
+   - Lower **Volumetrics**, **Water**, and **Reflections** to **Medium**; keep **Anisotropic Filtering** at **16×** and reduce **Texture Quality** from **Ultra** to **High** if approaching the 8 GB VRAM ceiling (`237.30 MiB` used by CBR buffers at 4K). On **AMD Vega 7 (512 MB UMA)** laptops, use **1080p** (`59.33 MiB` CBR buffers) and Low/Medium RDR2 presets (`docs/AMD_VEGA_OPTIMIZATION.md`).
 
 ---
 
@@ -424,7 +424,7 @@ After launching RDR2 Story Mode, inspect `cbr.log` next to `RDR2.exe`:
 [INFO] Configuration loaded from cbr.ini (Target: 3840x2160, API: Vulkan, CBR Enabled: true)
 [INFO] RenderTargetManager initialized for target: 3840x2160
 [INFO] Quarter-Resolution 2x MSAA Buffer size: 1920x1080
-[INFO] Total CBR VRAM Footprint: 300.58 MiB (315.19 MB)
+[INFO] Total CBR VRAM Footprint: 237.30 MiB (248.83 MB)
 [INFO] Vulkan graphics interception is now ACTIVE.
 [INFO] Vulkan CBR reconstruction compute pipeline created successfully!
 ```

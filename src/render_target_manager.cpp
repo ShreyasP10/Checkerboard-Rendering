@@ -323,9 +323,9 @@ void RenderTargetManager::Initialize(uint32_t width, uint32_t height) {
     size_t qDepth = static_cast<size_t>(dims.quarterWidth) * dims.quarterHeight * 4 * dims.msaaSamples;
     size_t histColor = static_cast<size_t>(dims.fullWidth) * dims.fullHeight * 8 * 2;
     size_t histDepth = static_cast<size_t>(dims.fullWidth) * dims.fullHeight * 4 * 2;
-    size_t outColor = static_cast<size_t>(dims.fullWidth) * dims.fullHeight * 8;
-
-    const size_t total = qColor + qDepth + histColor + histDepth + outColor;
+    // Item M-06: Auxiliary output storage color and depth are omitted because reconstruction writes directly
+    // to alternating history targets; saves ~95 MiB at 4K.
+    const size_t total = qColor + qDepth + histColor + histDepth;
     {
         std::unique_lock<std::shared_mutex> lock(m_mutex);
         m_dims = dims;
@@ -544,17 +544,10 @@ bool RenderTargetManager::CreateVulkanResources(void* vkDevice, void* vkPhysical
         }
     }
 
-    // 4. Create Full-Res Output Storage Color & Depth
-    if (!createTexture(dims.fullWidth, dims.fullHeight, kVkFormatR16G16B16A16Sfloat,
-                       colorUsage, kVkImageAspectColorBit, m_vkResources.outputColor)) {
-        CBR_LOG_ERROR("Failed to allocate device-local OutputColor image");
-        return false;
-    }
-    if (!createTexture(dims.fullWidth, dims.fullHeight, kVkFormatR32Sfloat,
-                       depthUsage, kVkImageAspectColorBit, m_vkResources.outputDepth)) {
-        CBR_LOG_ERROR("Failed to allocate device-local OutputDepth image");
-        return false;
-    }
+    // 4. Auxiliary full-res output targets omitted: reconstruction writes directly to alternating
+    // history targets (Item M-06), saving ~95 MiB of device-local VRAM at 4K.
+    m_vkResources.outputColor = {};
+    m_vkResources.outputDepth = {};
 
     // 5. Create Linear & Point Samplers (Clamp-to-Edge)
     MinimalVkSamplerCreateInfo samplerInfo{};
@@ -803,13 +796,8 @@ bool RenderTargetManager::CreateDX12Resources(void* d3d12Device) {
                    m_dx12Resources.historyDepth[0]) ||
         !createTex(dims.fullWidth, dims.fullHeight, kDxgiFormatR32Float,
                    1, kD3D12ResourceFlagAllowUAV, kD3D12ResourceStateUAV,
-                   m_dx12Resources.historyDepth[1]) ||
-        !createTex(dims.fullWidth, dims.fullHeight, kDxgiFormatR16G16B16A16Float,
-                   1, kD3D12ResourceFlagAllowUAV, kD3D12ResourceStateUAV,
-                   m_dx12Resources.outputColor) ||
-        !createTex(dims.fullWidth, dims.fullHeight, kDxgiFormatR32Float,
-                   1, kD3D12ResourceFlagAllowUAV, kD3D12ResourceStateUAV,
-                   m_dx12Resources.outputDepth)) {
+                   m_dx12Resources.historyDepth[1])) {
+        // Item M-06: Auxiliary output storage color and depth omitted; direct ping-pong to history saves ~95 MiB at 4K.
         CBR_LOG_ERROR("CreateDX12Resources: failed to allocate one or more D3D12 textures.");
         DestroyDX12Resources();
         return false;

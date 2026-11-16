@@ -60,9 +60,9 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y g++-mingw-w64-x86-64
       - name: Syntax check Windows sources
         run: |
-          for f in logger config jitter_manager render_target_manager reconstruction_pass ui_overlay cbr_engine hooks main hooks_vulkan hooks_dx12 crash_handler; do
+          for f in logger config jitter_manager pattern_scanner render_target_manager reconstruction_pass ui_overlay cbr_engine hooks main hooks_vulkan hooks_dx12 crash_handler; do
             echo "Checking src/$f.cpp..."
-            x86_64-w64-mingw32-g++ -std=c++20 -fsyntax-only -Wall -Wextra -Wpedantic -Wshadow -Iinclude -Ivendor/minhook/include src/$f.cpp
+            x86_64-w64-mingw32-g++ -std=c++20 -fsyntax-only -Wall -Wextra -Wpedantic -Wshadow -Werror -Iinclude -Ivendor/minhook/include src/$f.cpp
           done
 
   windows-release:

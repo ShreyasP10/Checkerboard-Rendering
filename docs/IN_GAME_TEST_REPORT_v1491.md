@@ -1,5 +1,9 @@
 # In-Game Execution & Test Report: RDR2 v1.0.1491.50
 
+> [!NOTE]
+> **Phase 1 Baseline Evidence Notice (Item M-16):**
+> This document records Phase 1 in-game baseline evidence for host execution, ASI loader injection, and subsystem initialization on RDR2 build `1.0.1491.50`. It validates that `rdr2-cbr.asi` initializes without crashing, parses configuration, and operates dormant fallback when graphics hooks are unengaged. Active in-game RenderDoc verification of Vulkan attachment formats and pass intercept order represents Phase 2 verification.
+
 **Document ID:** TR-RDR2CBR-1491-01  
 **Test Date:** October 23, 2026  
 **Author:** Shreyas Pawar  

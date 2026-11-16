@@ -758,6 +758,10 @@ inline bool CanDownscaleCommandBuffer(void* commandBuffer) {
 }
 
 inline void IncrementDrawCount(void* cmdBuffer) {
+    // Fast path: skip pass slot lookup on non-candidate passes to minimize per-draw overhead (Item M-14)
+    if (!CBREngine::Get().IsCandidatePassActive(cmdBuffer)) {
+        return;
+    }
     PassSlot* slot = FindPassSlot(cmdBuffer);
     if (slot) {
         slot->drawCount.fetch_add(1, std::memory_order_relaxed);
@@ -897,6 +901,15 @@ void Hooked_vkDestroySwapchainKHR(void* device, void* swapchain, const void* pAl
             g_imageViews.clear();
             g_framebuffers.clear();
             g_renderPasses.clear();
+        }
+        // Item M-08: Reset pass slot tracking metadata on swapchain destruction
+        for (size_t i = 0; i < kMaxTrackedPassSlots; ++i) {
+            g_passSlots[i].cmdBuffer.store(nullptr, std::memory_order_relaxed);
+            g_passSlots[i].hasMatchingExtent.store(false, std::memory_order_relaxed);
+            g_passSlots[i].viewportDownscaled.store(false, std::memory_order_relaxed);
+            g_passSlots[i].drawCount.store(0, std::memory_order_relaxed);
+            g_passSlots[i].hasSavedViewport.store(false, std::memory_order_relaxed);
+            g_passSlots[i].hasSavedScissor.store(false, std::memory_order_relaxed);
         }
         CBR_LOG_INFO("Vulkan swapchain %p destroyed; resources purged from tracking map.", swapchain);
     }
@@ -1800,11 +1813,17 @@ int Hooked_vkCreateSampler(void* device, const MinimalVkSamplerCreateInfo* pCrea
         return -1; // VK_ERROR_INITIALIZATION_FAILED
     }
     const auto& config = ConfigManager::Get().GetConfig();
+    // Item M-09: Validate sType == 31 (VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO) via memcpy before reading pCreateInfo
+    constexpr uint32_t kVkStructureTypeSamplerCreateInfo = 31;
+    uint32_t sType = 0;
+    if (pCreateInfo) {
+        std::memcpy(&sType, pCreateInfo, sizeof(uint32_t));
+    }
     // Apply mipLodBias selectively only to mipmapped anisotropic scene material samplers (Item M-03 & Gotcha 9).
     // Tiling geometry samplers use VK_SAMPLER_ADDRESS_MODE_REPEAT (0), whereas IBL cubemaps, LUTs, and screen-space
     // mip chains use VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE (2).
     constexpr int32_t kVkSamplerAddressModeRepeat = 0;
-    if (pCreateInfo && config.mipLodBias != 0.0f &&
+    if (pCreateInfo && sType == kVkStructureTypeSamplerCreateInfo && config.mipLodBias != 0.0f &&
         pCreateInfo->maxLod > 1.0f &&
         pCreateInfo->anisotropyEnable == 1u &&
         pCreateInfo->addressModeU == kVkSamplerAddressModeRepeat &&
@@ -1991,13 +2010,23 @@ bool HookManager::InstallVulkanHooks() {
         installExportHook(devEntries[i].name, devEntries[i].hookFn, devEntries[i].origSlot, devEntries[i].countsAsCore);
     }
 
-    if (hookedAny) {
+    // Item M-11: Gate m_vulkanHooked on critical load-bearing hooks being successfully resolved
+    const bool hasRequiredHooks = (g_Original_vkCmdEndRenderPass != nullptr) &&
+                                  (g_Original_vkQueuePresentKHR != nullptr) &&
+                                  (g_Original_vkCreateSwapchainKHR != nullptr);
+    if (hookedAny && hasRequiredHooks) {
         m_vulkanHooked.store(true);
         CBR_LOG_INFO("Vulkan graphics interception is now ACTIVE.");
         return true;
     }
 
-    CBR_LOG_ERROR("Failed to establish any Vulkan detour hooks.");
+    if (hookedAny && !hasRequiredHooks) {
+        CBR_LOG_ERROR("InstallVulkanHooks: core export hooks installed, but load-bearing hooks "
+                      "(vkCmdEndRenderPass=%p, vkQueuePresentKHR=%p, vkCreateSwapchainKHR=%p) failed to detour.",
+                      g_Original_vkCmdEndRenderPass, g_Original_vkQueuePresentKHR, g_Original_vkCreateSwapchainKHR);
+    } else {
+        CBR_LOG_ERROR("Failed to establish any Vulkan detour hooks.");
+    }
     return false;
 }
 
@@ -2013,6 +2042,40 @@ void HookManager::UninstallVulkanHooks() {
         }
         g_HookedVulkanTargets.clear();
         m_vulkanHooked.store(false);
+        g_Original_vkGetDeviceProcAddr = nullptr;
+        g_Original_vkGetInstanceProcAddr = nullptr;
+        g_Original_vkQueuePresentKHR = nullptr;
+        g_Original_vkCreateSwapchainKHR = nullptr;
+        g_Original_vkDestroySwapchainKHR = nullptr;
+        g_Original_vkCreateDevice = nullptr;
+        g_Original_vkGetSwapchainImagesKHR = nullptr;
+        g_Original_vkAcquireNextImageKHR = nullptr;
+        g_Original_vkAcquireNextImage2KHR = nullptr;
+        g_Original_vkCmdSetViewport = nullptr;
+        g_Original_vkCmdSetScissor = nullptr;
+        g_Original_vkCmdBeginRenderPass = nullptr;
+        g_Original_vkCmdEndRenderPass = nullptr;
+        g_Original_vkCmdBeginRendering = nullptr;
+        g_Original_vkCmdBeginRenderingKHR = nullptr;
+        g_Original_vkCmdEndRendering = nullptr;
+        g_Original_vkCmdEndRenderingKHR = nullptr;
+        g_Original_vkCmdDraw = nullptr;
+        g_Original_vkCmdDrawIndexed = nullptr;
+        g_Original_vkCmdSetSampleLocationsEXT = nullptr;
+        g_Original_vkCreateSampler = nullptr;
+        g_Original_vkCreateImage = nullptr;
+        g_Original_vkDestroyImage = nullptr;
+        g_Original_vkCreateImageView = nullptr;
+        g_Original_vkDestroyImageView = nullptr;
+        g_Original_vkCreateFramebuffer = nullptr;
+        g_Original_vkDestroyFramebuffer = nullptr;
+        g_Original_vkCreateRenderPass = nullptr;
+        g_Original_vkCreateRenderPass2 = nullptr;
+        g_Original_vkCreateRenderPass2KHR = nullptr;
+        g_Original_vkDestroyRenderPass = nullptr;
+        g_Original_vkEnumeratePhysicalDevices = nullptr;
+        g_Original_vkGetPhysicalDeviceProperties = nullptr;
+        g_Original_vkGetPhysicalDeviceMemoryProperties = nullptr;
         g_Original_vkCmdResolveImage = nullptr;
         g_pendingResolveColorImage.store(nullptr, std::memory_order_release);
         {

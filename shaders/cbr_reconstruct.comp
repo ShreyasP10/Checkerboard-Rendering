@@ -165,6 +165,12 @@ CbrSample MapPixelToSample(ivec2 p, uint frameParity) {
         qx = (p.x + 1 - yBit) >> 1;
     }
     ivec2 qMax = ivec2(pc.u_TargetResolution * 0.5) - ivec2(1);
+    // Item M-17: At boundary columns where unclamped qx falls outside [0, qMax.x]
+    // (e.g. x = targetW - 1 on odd frames with shiftDir = -1), no hardware sample exists.
+    // Mark inactive to fail-open to spatial fallback rather than clamping to duplicate neighbor.
+    if (qx < 0 || qx > qMax.x) {
+        s.isActive = false;
+    }
     s.quarter = ivec2(clamp(qx, 0, qMax.x), min(p.y >> 1, qMax.y));
     s.sampleIdx = 1 - yBit;
     return s;
@@ -244,12 +250,15 @@ void main() {
     if (isCurrentSampleActive) {
         currentColor = FetchColor(self);
         if (any(isnan(currentColor)) || any(isinf(currentColor))) {
-            currentColor = vec3(0.0);
+            // Item M-19: Active sample has non-finite color; route through spatial reconstruction rather than falling back to black
+            isCurrentSampleActive = false;
+        } else {
+            currentDepth = FetchDepth(self);
+            currentLinear = LinearizeDepth(currentDepth);
+            closestCardinalLin = currentLinear;
         }
-        currentDepth = FetchDepth(self);
-        currentLinear = LinearizeDepth(currentDepth);
-        closestCardinalLin = currentLinear;
-    } else {
+    }
+    if (!isCurrentSampleActive) {
         // No native sample here: estimate depth from the cardinal neighbours (Intel "CSO": average LINEAR depth).
         float sumRaw = 0.0;
         float sumLin = 0.0;
@@ -472,46 +481,51 @@ void main() {
         if (!isDisoccluded && historyColor.a > 0.0) {
             finalColor = historyColor.rgb;
         } else {
-            // Spatial cross-bilateral reconstruction from the 4 cardinal (natively shaded) neighbours.
-            // With the fallback disabled the nearest neighbour is copied (no native sample exists here).
-            // Directional gradient weights: prefer interpolating along edge contours (Decima tangent resolve)
-            vec3 horizDiff = abs(cardinalColor[0] - cardinalColor[1]);
-            vec3 vertDiff  = abs(cardinalColor[2] - cardinalColor[3]);
-            float horizGrad = dot(horizDiff, vec3(0.299, 0.587, 0.114));
-            float vertGrad  = dot(vertDiff,  vec3(0.299, 0.587, 0.114));
-            float dirBias[4] = float[](
-                1.0 / (1.0 + horizGrad * 8.0), // Left
-                1.0 / (1.0 + horizGrad * 8.0), // Right
-                1.0 / (1.0 + vertGrad  * 8.0), // Up
-                1.0 / (1.0 + vertGrad  * 8.0)  // Down
-            );
-
-            vec3 accumColor = vec3(0.0);
-            float accumDepth = 0.0;
-            float accumWeight = 0.0;
-
-            for (int i = 0; i < 4 && pc.u_EnableSpatialFallback != 0u; ++i) {
-                vec3 sCol = cardinalColor[i];
-                float sLin = LinearizeDepth(cardinalDepth[i]);
-
-                // Relative linear-depth weighting: scale-invariant, independent of the depth convention
-                // Fast base-2 exponentiation: exp(-x) == exp2(-x * log2(e))
-                float depthWeight = exp2((-abs(currentLinear - sLin) / (max(currentLinear, 1e-5) * max(pc.u_DepthTolerance, 1e-4))) * 1.4426950408889634);
-                float totalWeight = depthWeight * dirBias[i];
-
-                accumColor += sCol * totalWeight;
-                accumDepth += cardinalDepth[i] * totalWeight;
-                accumWeight += totalWeight;
-            }
-
-            if (accumWeight > 1e-4) {
-                finalColor = accumColor / accumWeight;
-                spatialDepth = accumDepth / accumWeight;
+            // Spatial reconstruction from the 4 cardinal (natively shaded) neighbours.
+            // When spatial fallback is disabled, copy the nearest cardinal neighbour directly (Item M-04).
+            if (pc.u_EnableSpatialFallback == 0u) {
+                finalColor = cardinalColor[0];
+                spatialDepth = cardinalDepth[0];
             } else {
-                // When depth divergence across all 4 samples is high, average cardinal samples
-                // to prevent single-pixel directional bias (Item 58)
-                finalColor = isCurrentSampleActive ? currentColor : (cardinalColor[0] + cardinalColor[1] + cardinalColor[2] + cardinalColor[3]) * 0.25;
-                spatialDepth = isCurrentSampleActive ? currentDepth : (cardinalDepth[0] + cardinalDepth[1] + cardinalDepth[2] + cardinalDepth[3]) * 0.25;
+                // Directional gradient weights: prefer interpolating along edge contours (Decima tangent resolve)
+                vec3 horizDiff = abs(cardinalColor[0] - cardinalColor[1]);
+                vec3 vertDiff  = abs(cardinalColor[2] - cardinalColor[3]);
+                float horizGrad = dot(horizDiff, vec3(0.299, 0.587, 0.114));
+                float vertGrad  = dot(vertDiff,  vec3(0.299, 0.587, 0.114));
+                float dirBias[4] = float[](
+                    1.0 / (1.0 + horizGrad * 8.0), // Left
+                    1.0 / (1.0 + horizGrad * 8.0), // Right
+                    1.0 / (1.0 + vertGrad  * 8.0), // Up
+                    1.0 / (1.0 + vertGrad  * 8.0)  // Down
+                );
+
+                vec3 accumColor = vec3(0.0);
+                float accumDepth = 0.0;
+                float accumWeight = 0.0;
+
+                for (int i = 0; i < 4; ++i) {
+                    vec3 sCol = cardinalColor[i];
+                    float sLin = LinearizeDepth(cardinalDepth[i]);
+
+                    // Relative linear-depth weighting: scale-invariant, independent of the depth convention
+                    // Fast base-2 exponentiation: exp(-x) == exp2(-x * log2(e))
+                    float depthWeight = exp2((-abs(currentLinear - sLin) / (max(currentLinear, 1e-5) * max(pc.u_DepthTolerance, 1e-4))) * 1.4426950408889634);
+                    float totalWeight = depthWeight * dirBias[i];
+
+                    accumColor += sCol * totalWeight;
+                    accumDepth += cardinalDepth[i] * totalWeight;
+                    accumWeight += totalWeight;
+                }
+
+                if (accumWeight > 1e-4) {
+                    finalColor = accumColor / accumWeight;
+                    spatialDepth = accumDepth / accumWeight;
+                } else {
+                    // When depth divergence across all 4 samples is high, average cardinal samples
+                    // to prevent single-pixel directional bias (Item 58)
+                    finalColor = isCurrentSampleActive ? currentColor : (cardinalColor[0] + cardinalColor[1] + cardinalColor[2] + cardinalColor[3]) * 0.25;
+                    spatialDepth = isCurrentSampleActive ? currentDepth : (cardinalDepth[0] + cardinalDepth[1] + cardinalDepth[2] + cardinalDepth[3]) * 0.25;
+                }
             }
         }
     }
@@ -541,9 +555,10 @@ void main() {
                         sc = hc.rgb;
                     }
                 } else {
-                    ivec2 stepAxis = (i < 2) ? ivec2(kCardinal[i].x, 1) : ivec2(1, kCardinal[i].y);
-                    ivec2 diag = pixelCoord + stepAxis;
-                    if (!InBounds(diag, targetSize)) diag = pixelCoord - stepAxis;
+                    // Item M-02: Use symmetric diagonal offsets (-1,-1), (1,-1), (-1,1), (1,1)
+                    const ivec2 kDiag[4] = ivec2[](ivec2(-1, -1), ivec2(1, -1), ivec2(-1, 1), ivec2(1, 1));
+                    ivec2 diag = pixelCoord + kDiag[i];
+                    if (!InBounds(diag, targetSize)) diag = pixelCoord - kDiag[i];
                     if (InBounds(diag, targetSize)) {
                         vec3 dc = FetchColor(MapPixelToSample(diag, frameParity));
                         if (!any(isnan(dc)) && !any(isinf(dc))) sc = dc;
@@ -583,8 +598,10 @@ void main() {
         float speed = clamp(length(normVel), 0.0, 1.0);
         finalColor = vec3(clamp(normVel * 0.5 + 0.5, 0.0, 1.0), speed);
     } else if (pc.u_DebugView == 4u) {
-        // Quarter-resolution raw colour without directional bias (Item 61)
-        finalColor = isCurrentSampleActive ? currentColor : (cardinalColor[0] + cardinalColor[1] + cardinalColor[2] + cardinalColor[3]) * 0.25;
+        // Mode 4: Quarter-resolution raw color nearest-upsampled (Item M-03)
+        // Shows the raw quarter-resolution texel without cardinal averaging
+        ivec2 qCoord = clamp(pixelCoord >> 1, ivec2(0), max(ivec2(pc.u_TargetResolution * 0.5) - ivec2(1), ivec2(0)));
+        finalColor = texelFetch(u_QuarterColorMSAA, qCoord, 0).rgb;
     } else if (pc.u_DebugView == 5u) {
         // Spatial baseline resolve: average of 4 cardinal samples for reconstructed pixels
         // (direct visual A/B baseline comparison against temporal CBR, matching reference Space toggle)

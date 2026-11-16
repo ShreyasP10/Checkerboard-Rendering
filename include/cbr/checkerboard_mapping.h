@@ -89,9 +89,10 @@ struct CheckerboardSample {
 // For inactive pixels the returned location is the (meaningless) sample that would be there if
 // the pixel were active; callers must check `active`.
 // quarterX may fall outside the render target at the left/right screen edge; callers must clamp.
-constexpr CheckerboardSample MapPixelToSample(int32_t x, int32_t y, uint32_t frameParity, int32_t shiftDir = 1) noexcept {
+// If targetWidth > 0, boundary pixels with unclamped qx outside [0, (targetWidth >> 1) - 1] are marked inactive (Item M-17).
+constexpr CheckerboardSample MapPixelToSample(int32_t x, int32_t y, uint32_t frameParity, int32_t shiftDir = 1, int32_t targetWidth = 0) noexcept {
     const int32_t yBit = y & 1;
-    const bool active = ((static_cast<uint32_t>(x ^ y) & 1u) == (frameParity & 1u));
+    bool active = ((static_cast<uint32_t>(x ^ y) & 1u) == (frameParity & 1u));
     int32_t qx = 0;
     if ((frameParity & 1u) == 0u || shiftDir == 0) {
         qx = x >> 1;
@@ -101,6 +102,11 @@ constexpr CheckerboardSample MapPixelToSample(int32_t x, int32_t y, uint32_t fra
     } else {
         // -1 px shift
         qx = (x + 1 - yBit) >> 1;
+    }
+    // Item M-17: When targetWidth is specified, unclamped qx outside [0, (targetWidth >> 1) - 1]
+    // has no hardware sample; mark inactive so callers know it's not natively shaded.
+    if (targetWidth > 0 && (qx < 0 || qx >= (targetWidth >> 1))) {
+        active = false;
     }
     return { active, qx, y >> 1, static_cast<uint32_t>(1 - yBit) };
 }

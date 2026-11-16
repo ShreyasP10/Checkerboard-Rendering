@@ -21,7 +21,7 @@ def _check_coords(x: int, y: int, target_w: int, target_h: int) -> None:
     if target_w <= 0 or target_h <= 0:
         raise ValueError("target dimensions must be positive")
 
-def cpp_map_pixel_to_sample(x: int, y: int, frame_parity: int, shift_dir: int = 1) -> Dict[str, int]:
+def cpp_map_pixel_to_sample(x: int, y: int, frame_parity: int, shift_dir: int = 1, target_w: int = 0) -> Dict[str, int]:
     if x < 0 or y < 0:
         raise ValueError(f"pixel coords must be >= 0, got ({x}, {y})")
     if frame_parity not in (0, 1):
@@ -34,6 +34,8 @@ def cpp_map_pixel_to_sample(x: int, y: int, frame_parity: int, shift_dir: int = 
         qx = (x - y_bit if x > y_bit else 0) >> 1
     else:
         qx = (x + 1 - y_bit) >> 1
+    if target_w > 0 and (qx < 0 or qx >= (target_w >> 1)):
+        active = False
     qy = y >> 1
     sample = 1 - y_bit
     return {
@@ -55,6 +57,9 @@ def glsl_map_pixel_to_sample(x: int, y: int, frame_parity: int, shift_dir: int, 
         qx = (x + 1 - y_bit) >> 1
     q_max_x = (target_w // 2) - 1
     q_max_y = (target_h // 2) - 1
+    # Item M-17: When unclamped qx falls outside [0, q_max_x], mark inactive
+    if qx < 0 or qx > q_max_x:
+        is_active = False
     clamped_qx = max(0, min(qx, q_max_x))
     clamped_qy = min(y >> 1, q_max_y)
     sample_idx = 1 - y_bit
@@ -81,7 +86,7 @@ def test_mapping_equivalence():
             y_samples = list(range(0, 32)) + list(range(target_h // 2 - 16, target_h // 2 + 16)) + list(range(target_h - 32, target_h))
             for y in y_samples:
                 for x in x_samples:
-                    cpp_res = cpp_map_pixel_to_sample(x, y, frame_parity, shift_dir)
+                    cpp_res = cpp_map_pixel_to_sample(x, y, frame_parity, shift_dir, target_w)
                     glsl_res = glsl_map_pixel_to_sample(x, y, frame_parity, shift_dir, target_w, target_h)
                     hlsl_res = hlsl_map_pixel_to_sample(x, y, frame_parity, shift_dir, target_w, target_h)
 
@@ -94,13 +99,23 @@ def test_mapping_equivalence():
                     tested += 1
 
     # Explicit boundary case (Item M-06): (x=0, y=1, frameParity=1, shiftDir=1) -> x - yBit = -1 must clamp to 0
-    neg_edge_cpp = cpp_map_pixel_to_sample(0, 1, 1, 1)
+    neg_edge_cpp = cpp_map_pixel_to_sample(0, 1, 1, 1, target_w)
     neg_edge_glsl = glsl_map_pixel_to_sample(0, 1, 1, 1, target_w, target_h)
     neg_edge_hlsl = hlsl_map_pixel_to_sample(0, 1, 1, 1, target_w, target_h)
     assert neg_edge_cpp["quarterX"] == 0 and neg_edge_glsl["unclamped_qx"] == 0 and neg_edge_glsl["quarterX"] == 0, (
         f"Expected negative shift clamp to 0 for (0,1,parity=1,shift=1), got {neg_edge_cpp} / {neg_edge_glsl}"
     )
     assert neg_edge_hlsl["quarterX"] == 0 and neg_edge_cpp["sample"] == 0 and neg_edge_cpp["active"] is True
+
+    # Explicit right-edge boundary case (Item M-17): (x = target_w - 1, y = 0, frameParity = 1, shiftDir = -1)
+    # qx = (3839 + 1 - 0) >> 1 = 1920 > q_max_x (1919) -> must fail-open to active = False
+    pos_edge_cpp = cpp_map_pixel_to_sample(target_w - 1, 0, 1, -1, target_w)
+    pos_edge_glsl = glsl_map_pixel_to_sample(target_w - 1, 0, 1, -1, target_w, target_h)
+    pos_edge_hlsl = hlsl_map_pixel_to_sample(target_w - 1, 0, 1, -1, target_w, target_h)
+    assert pos_edge_cpp["active"] is False, f"Expected cpp active=False at right edge shiftDir=-1, got {pos_edge_cpp}"
+    assert pos_edge_glsl["active"] is False, f"Expected glsl active=False at right edge shiftDir=-1, got {pos_edge_glsl}"
+    assert pos_edge_hlsl["active"] is False, f"Expected hlsl active=False at right edge shiftDir=-1, got {pos_edge_hlsl}"
+    assert pos_edge_glsl["quarterX"] == (target_w // 2) - 1
 
     print(f"[PASS] Verified mapping equivalence across {tested} coordinate combinations.")
 
@@ -193,6 +208,11 @@ def test_source_code_consistency():
     assert "fallback = float3(0.0f, 0.0f, 0.0f);" in hlsl_src, "H-05 double-guarded fallback missing in cbr_reconstruct.hlsl"
     assert "GL_KHR_shader_subgroup" not in quad_src, "M-07 unused subgroup extensions must be removed"
     assert "QuadActiveSample" in quad_src and "cardinalColor" in quad_src, "M-07/H-05 quad register sharing missing"
+
+    # Verify M-17 boundary check presence across all reconstruction shaders
+    assert "if (qx < 0 || qx > qMax.x)" in comp_src, "M-17 boundary check missing in cbr_reconstruct.comp"
+    assert "if (qx < 0 || qx > qMax.x)" in quad_src, "M-17 boundary check missing in cbr_reconstruct_quad.comp"
+    assert "if (qx < 0 || qx > qMax.x)" in hlsl_src, "M-17 boundary check missing in cbr_reconstruct.hlsl"
 
     print("[PASS] Verified source code consistency across GLSL, HLSL, and C++ header.")
 

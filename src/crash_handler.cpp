@@ -294,7 +294,7 @@ CrashHandler& CrashHandler::Get() {
 }
 
 void CrashHandler::Install(const std::filesystem::path& logDirectory) {
-    if (m_installed) return;
+    if (m_installed.exchange(true, std::memory_order_acq_rel)) return;
     m_logDirectory = logDirectory;
     g_crashLogDirectory = logDirectory;
 
@@ -324,12 +324,11 @@ void CrashHandler::Install(const std::filesystem::path& logDirectory) {
     }
 
     g_previousFilter = SetUnhandledExceptionFilter(CBRUnhandledExceptionFilter);
-    m_installed = true;
     CBR_LOG_INFO("CrashHandler installed. Unhandled exceptions & crash telemetry will be logged to cbr_crash.log.");
 }
 
 void CrashHandler::Uninstall() {
-    if (!m_installed) return;
+    if (!m_installed.exchange(false, std::memory_order_acq_rel)) return;
     SetUnhandledExceptionFilter(g_previousFilter);
     g_previousFilter = nullptr;
 
@@ -349,7 +348,6 @@ void CrashHandler::Uninstall() {
     }
     g_dumpPathW[0] = L'\0';
 
-    m_installed = false;
     CBR_LOG_INFO("CrashHandler uninstalled.");
 }
 

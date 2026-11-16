@@ -804,7 +804,7 @@ bool ReconstructionPass::CreateVulkanPipeline() {
         if (!s_loggedMissing.exchange(true)) {
             CBR_LOG_WARN("SPIR-V shader binary 'cbr_reconstruct.spv' not found in search paths. Pipeline compilation deferred.");
         }
-        return true;
+        return false;
     }
 
     CBR_LOG_INFO("Loading CBR SPIR-V shader from: %s (%zu bytes)", resolvedShaderPath.string().c_str(), spvBytecode.size() * sizeof(uint32_t));
@@ -2013,6 +2013,7 @@ ReconstructionPushConstants BuildReconstructionPushConstants(uint32_t frameIndex
     pc.historyWeight = config.historyWeight;
     pc.debugView = config.debugView;
     pc.enableColorClamping = config.enableColorClamping ? 1u : 0u;
+    // MipLodBias applied directly to game material samplers in Hooked_vkCreateSampler (Item M-05); field preserved for push constant ABI stability
     pc.mipLodBias = config.mipLodBias;
     pc.colorSpace = (config.colorSpace == ColorSpace::RGB) ? 1u : ((config.colorSpace == ColorSpace::ICtCp) ? 2u : 0u);
     pc.enableSpatialFallback = config.enableSpatialFallback ? 1u : 0u;

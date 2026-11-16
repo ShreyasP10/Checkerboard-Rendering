@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <filesystem>
 #include <string>
 
@@ -13,7 +14,7 @@ public:
     void Install(const std::filesystem::path& logDirectory);
     void Uninstall();
 
-    bool IsInstalled() const { return m_installed; }
+    bool IsInstalled() const { return m_installed.load(std::memory_order_acquire); }
 
     // Logs detailed system and game runtime telemetry to cbr.log
     void LogSystemTelemetry();
@@ -24,7 +25,7 @@ private:
     CrashHandler(const CrashHandler&) = delete;
     CrashHandler& operator=(const CrashHandler&) = delete;
 
-    bool m_installed{ false };
+    std::atomic<bool> m_installed{ false };
     std::filesystem::path m_logDirectory;
 };
 

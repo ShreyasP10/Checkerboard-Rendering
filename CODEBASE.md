@@ -404,8 +404,8 @@ ColorSpace = YCoCg
 
 ; Temporal history blend weight for valid reprojected samples (0.0 to 1.0)
 ; 1.0 uses pure temporal checkerboard resolve (PS4 Pro style)
-; When RDR2 in-game TAA is active, 0.80 - 0.85 is recommended to avoid double temporal damping.
-HistoryWeight = 0.85
+; Default: 0.90 (balanced stability and ghosting suppression)
+HistoryWeight = 0.90
 
 ; Enable spatial cross-bilateral filter for disoccluded pixels
 EnableSpatialFallback = true
@@ -424,7 +424,7 @@ DepthNear = 0.1
 DepthFar = 0.0
 
 ; Fused 5-tap RCAS contrast-adaptive sharpening strength (0.0 = disabled, 0.20 = recommended for small text & gear decals, 1.0 = max)
-SharpeningStrength = 0.20
+SharpeningStrength = 0.0
 
 [Jitter]
 ; Projection jitter pattern: Checkerboard (alternating whole-pixel shift). Halton is reserved/not implemented yet.
@@ -806,9 +806,10 @@ struct CheckerboardSample {
 // For inactive pixels the returned location is the (meaningless) sample that would be there if
 // the pixel were active; callers must check `active`.
 // quarterX may fall outside the render target at the left/right screen edge; callers must clamp.
-constexpr CheckerboardSample MapPixelToSample(int32_t x, int32_t y, uint32_t frameParity, int32_t shiftDir = 1) noexcept {
+// If targetWidth > 0, boundary pixels with unclamped qx outside [0, (targetWidth >> 1) - 1] are marked inactive (Item M-17).
+constexpr CheckerboardSample MapPixelToSample(int32_t x, int32_t y, uint32_t frameParity, int32_t shiftDir = 1, int32_t targetWidth = 0) noexcept {
     const int32_t yBit = y & 1;
-    const bool active = ((static_cast<uint32_t>(x ^ y) & 1u) == (frameParity & 1u));
+    bool active = ((static_cast<uint32_t>(x ^ y) & 1u) == (frameParity & 1u));
     int32_t qx = 0;
     if ((frameParity & 1u) == 0u || shiftDir == 0) {
         qx = x >> 1;
@@ -818,6 +819,11 @@ constexpr CheckerboardSample MapPixelToSample(int32_t x, int32_t y, uint32_t fra
     } else {
         // -1 px shift
         qx = (x + 1 - yBit) >> 1;
+    }
+    // Item M-17: When targetWidth is specified, unclamped qx outside [0, (targetWidth >> 1) - 1]
+    // has no hardware sample; mark inactive so callers know it's not natively shaded.
+    if (targetWidth > 0 && (qx < 0 || qx >= (targetWidth >> 1))) {
+        active = false;
     }
     return { active, qx, y >> 1, static_cast<uint32_t>(1 - yBit) };
 }
@@ -980,6 +986,7 @@ private:
 ```cpp
 #pragma once
 
+#include <atomic>
 #include <filesystem>
 #include <string>
 
@@ -993,7 +1000,7 @@ public:
     void Install(const std::filesystem::path& logDirectory);
     void Uninstall();
 
-    bool IsInstalled() const { return m_installed; }
+    bool IsInstalled() const { return m_installed.load(std::memory_order_acquire); }
 
     // Logs detailed system and game runtime telemetry to cbr.log
     void LogSystemTelemetry();
@@ -1004,7 +1011,7 @@ private:
     CrashHandler(const CrashHandler&) = delete;
     CrashHandler& operator=(const CrashHandler&) = delete;
 
-    bool m_installed{ false };
+    std::atomic<bool> m_installed{ false };
     std::filesystem::path m_logDirectory;
 };
 
@@ -1919,9 +1926,11 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID /*lpRese
                 &pinned)) {
                 // Pin failed: do not spawn a thread that would execute unmapped code.
                 // Record directory anyway so a later CBR_PluginInit can still initialize.
+                const DWORD err = GetLastError();
                 const auto modDir = GetModuleDirectoryPath(hModule);
                 cbr::CBREngine::Get().SetModuleDirectory(modDir);
                 cbr::CrashHandler::Get().Install(modDir);
+                CBR_LOG_ERROR("DllMain: Failed to pin CBR module in memory (GetModuleHandleExW error: %lu). Background initialization thread aborted to prevent executing unmapped code.", err);
                 break;
             }
 
@@ -3039,7 +3048,7 @@ CrashHandler& CrashHandler::Get() {
 }
 
 void CrashHandler::Install(const std::filesystem::path& logDirectory) {
-    if (m_installed) return;
+    if (m_installed.exchange(true, std::memory_order_acq_rel)) return;
     m_logDirectory = logDirectory;
     g_crashLogDirectory = logDirectory;
 
@@ -3069,12 +3078,11 @@ void CrashHandler::Install(const std::filesystem::path& logDirectory) {
     }
 
     g_previousFilter = SetUnhandledExceptionFilter(CBRUnhandledExceptionFilter);
-    m_installed = true;
     CBR_LOG_INFO("CrashHandler installed. Unhandled exceptions & crash telemetry will be logged to cbr_crash.log.");
 }
 
 void CrashHandler::Uninstall() {
-    if (!m_installed) return;
+    if (!m_installed.exchange(false, std::memory_order_acq_rel)) return;
     SetUnhandledExceptionFilter(g_previousFilter);
     g_previousFilter = nullptr;
 
@@ -3094,7 +3102,6 @@ void CrashHandler::Uninstall() {
     }
     g_dumpPathW[0] = L'\0';
 
-    m_installed = false;
     CBR_LOG_INFO("CrashHandler uninstalled.");
 }
 
@@ -3994,6 +4001,10 @@ inline bool CanDownscaleCommandBuffer(void* commandBuffer) {
 }
 
 inline void IncrementDrawCount(void* cmdBuffer) {
+    // Fast path: skip pass slot lookup on non-candidate passes to minimize per-draw overhead (Item M-14)
+    if (!CBREngine::Get().IsCandidatePassActive(cmdBuffer)) {
+        return;
+    }
     PassSlot* slot = FindPassSlot(cmdBuffer);
     if (slot) {
         slot->drawCount.fetch_add(1, std::memory_order_relaxed);
@@ -4133,6 +4144,15 @@ void Hooked_vkDestroySwapchainKHR(void* device, void* swapchain, const void* pAl
             g_imageViews.clear();
             g_framebuffers.clear();
             g_renderPasses.clear();
+        }
+        // Item M-08: Reset pass slot tracking metadata on swapchain destruction
+        for (size_t i = 0; i < kMaxTrackedPassSlots; ++i) {
+            g_passSlots[i].cmdBuffer.store(nullptr, std::memory_order_relaxed);
+            g_passSlots[i].hasMatchingExtent.store(false, std::memory_order_relaxed);
+            g_passSlots[i].viewportDownscaled.store(false, std::memory_order_relaxed);
+            g_passSlots[i].drawCount.store(0, std::memory_order_relaxed);
+            g_passSlots[i].hasSavedViewport.store(false, std::memory_order_relaxed);
+            g_passSlots[i].hasSavedScissor.store(false, std::memory_order_relaxed);
         }
         CBR_LOG_INFO("Vulkan swapchain %p destroyed; resources purged from tracking map.", swapchain);
     }
@@ -5036,11 +5056,17 @@ int Hooked_vkCreateSampler(void* device, const MinimalVkSamplerCreateInfo* pCrea
         return -1; // VK_ERROR_INITIALIZATION_FAILED
     }
     const auto& config = ConfigManager::Get().GetConfig();
+    // Item M-09: Validate sType == 31 (VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO) via memcpy before reading pCreateInfo
+    constexpr uint32_t kVkStructureTypeSamplerCreateInfo = 31;
+    uint32_t sType = 0;
+    if (pCreateInfo) {
+        std::memcpy(&sType, pCreateInfo, sizeof(uint32_t));
+    }
     // Apply mipLodBias selectively only to mipmapped anisotropic scene material samplers (Item M-03 & Gotcha 9).
     // Tiling geometry samplers use VK_SAMPLER_ADDRESS_MODE_REPEAT (0), whereas IBL cubemaps, LUTs, and screen-space
     // mip chains use VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE (2).
     constexpr int32_t kVkSamplerAddressModeRepeat = 0;
-    if (pCreateInfo && config.mipLodBias != 0.0f &&
+    if (pCreateInfo && sType == kVkStructureTypeSamplerCreateInfo && config.mipLodBias != 0.0f &&
         pCreateInfo->maxLod > 1.0f &&
         pCreateInfo->anisotropyEnable == 1u &&
         pCreateInfo->addressModeU == kVkSamplerAddressModeRepeat &&
@@ -5227,13 +5253,23 @@ bool HookManager::InstallVulkanHooks() {
         installExportHook(devEntries[i].name, devEntries[i].hookFn, devEntries[i].origSlot, devEntries[i].countsAsCore);
     }
 
-    if (hookedAny) {
+    // Item M-11: Gate m_vulkanHooked on critical load-bearing hooks being successfully resolved
+    const bool hasRequiredHooks = (g_Original_vkCmdEndRenderPass != nullptr) &&
+                                  (g_Original_vkQueuePresentKHR != nullptr) &&
+                                  (g_Original_vkCreateSwapchainKHR != nullptr);
+    if (hookedAny && hasRequiredHooks) {
         m_vulkanHooked.store(true);
         CBR_LOG_INFO("Vulkan graphics interception is now ACTIVE.");
         return true;
     }
 
-    CBR_LOG_ERROR("Failed to establish any Vulkan detour hooks.");
+    if (hookedAny && !hasRequiredHooks) {
+        CBR_LOG_ERROR("InstallVulkanHooks: core export hooks installed, but load-bearing hooks "
+                      "(vkCmdEndRenderPass=%p, vkQueuePresentKHR=%p, vkCreateSwapchainKHR=%p) failed to detour.",
+                      g_Original_vkCmdEndRenderPass, g_Original_vkQueuePresentKHR, g_Original_vkCreateSwapchainKHR);
+    } else {
+        CBR_LOG_ERROR("Failed to establish any Vulkan detour hooks.");
+    }
     return false;
 }
 
@@ -5249,6 +5285,40 @@ void HookManager::UninstallVulkanHooks() {
         }
         g_HookedVulkanTargets.clear();
         m_vulkanHooked.store(false);
+        g_Original_vkGetDeviceProcAddr = nullptr;
+        g_Original_vkGetInstanceProcAddr = nullptr;
+        g_Original_vkQueuePresentKHR = nullptr;
+        g_Original_vkCreateSwapchainKHR = nullptr;
+        g_Original_vkDestroySwapchainKHR = nullptr;
+        g_Original_vkCreateDevice = nullptr;
+        g_Original_vkGetSwapchainImagesKHR = nullptr;
+        g_Original_vkAcquireNextImageKHR = nullptr;
+        g_Original_vkAcquireNextImage2KHR = nullptr;
+        g_Original_vkCmdSetViewport = nullptr;
+        g_Original_vkCmdSetScissor = nullptr;
+        g_Original_vkCmdBeginRenderPass = nullptr;
+        g_Original_vkCmdEndRenderPass = nullptr;
+        g_Original_vkCmdBeginRendering = nullptr;
+        g_Original_vkCmdBeginRenderingKHR = nullptr;
+        g_Original_vkCmdEndRendering = nullptr;
+        g_Original_vkCmdEndRenderingKHR = nullptr;
+        g_Original_vkCmdDraw = nullptr;
+        g_Original_vkCmdDrawIndexed = nullptr;
+        g_Original_vkCmdSetSampleLocationsEXT = nullptr;
+        g_Original_vkCreateSampler = nullptr;
+        g_Original_vkCreateImage = nullptr;
+        g_Original_vkDestroyImage = nullptr;
+        g_Original_vkCreateImageView = nullptr;
+        g_Original_vkDestroyImageView = nullptr;
+        g_Original_vkCreateFramebuffer = nullptr;
+        g_Original_vkDestroyFramebuffer = nullptr;
+        g_Original_vkCreateRenderPass = nullptr;
+        g_Original_vkCreateRenderPass2 = nullptr;
+        g_Original_vkCreateRenderPass2KHR = nullptr;
+        g_Original_vkDestroyRenderPass = nullptr;
+        g_Original_vkEnumeratePhysicalDevices = nullptr;
+        g_Original_vkGetPhysicalDeviceProperties = nullptr;
+        g_Original_vkGetPhysicalDeviceMemoryProperties = nullptr;
         g_Original_vkCmdResolveImage = nullptr;
         g_pendingResolveColorImage.store(nullptr, std::memory_order_release);
         {
@@ -7893,7 +7963,7 @@ bool ReconstructionPass::CreateVulkanPipeline() {
         if (!s_loggedMissing.exchange(true)) {
             CBR_LOG_WARN("SPIR-V shader binary 'cbr_reconstruct.spv' not found in search paths. Pipeline compilation deferred.");
         }
-        return true;
+        return false;
     }
 
     CBR_LOG_INFO("Loading CBR SPIR-V shader from: %s (%zu bytes)", resolvedShaderPath.string().c_str(), spvBytecode.size() * sizeof(uint32_t));
@@ -9102,6 +9172,7 @@ ReconstructionPushConstants BuildReconstructionPushConstants(uint32_t frameIndex
     pc.historyWeight = config.historyWeight;
     pc.debugView = config.debugView;
     pc.enableColorClamping = config.enableColorClamping ? 1u : 0u;
+    // MipLodBias applied directly to game material samplers in Hooked_vkCreateSampler (Item M-05); field preserved for push constant ABI stability
     pc.mipLodBias = config.mipLodBias;
     pc.colorSpace = (config.colorSpace == ColorSpace::RGB) ? 1u : ((config.colorSpace == ColorSpace::ICtCp) ? 2u : 0u);
     pc.enableSpatialFallback = config.enableSpatialFallback ? 1u : 0u;
@@ -9762,9 +9833,9 @@ void RenderTargetManager::Initialize(uint32_t width, uint32_t height) {
     size_t qDepth = static_cast<size_t>(dims.quarterWidth) * dims.quarterHeight * 4 * dims.msaaSamples;
     size_t histColor = static_cast<size_t>(dims.fullWidth) * dims.fullHeight * 8 * 2;
     size_t histDepth = static_cast<size_t>(dims.fullWidth) * dims.fullHeight * 4 * 2;
-    size_t outColor = static_cast<size_t>(dims.fullWidth) * dims.fullHeight * 8;
-
-    const size_t total = qColor + qDepth + histColor + histDepth + outColor;
+    // Item M-06: Auxiliary output storage color and depth are omitted because reconstruction writes directly
+    // to alternating history targets; saves ~95 MiB at 4K.
+    const size_t total = qColor + qDepth + histColor + histDepth;
     {
         std::unique_lock<std::shared_mutex> lock(m_mutex);
         m_dims = dims;
@@ -9983,17 +10054,10 @@ bool RenderTargetManager::CreateVulkanResources(void* vkDevice, void* vkPhysical
         }
     }
 
-    // 4. Create Full-Res Output Storage Color & Depth
-    if (!createTexture(dims.fullWidth, dims.fullHeight, kVkFormatR16G16B16A16Sfloat,
-                       colorUsage, kVkImageAspectColorBit, m_vkResources.outputColor)) {
-        CBR_LOG_ERROR("Failed to allocate device-local OutputColor image");
-        return false;
-    }
-    if (!createTexture(dims.fullWidth, dims.fullHeight, kVkFormatR32Sfloat,
-                       depthUsage, kVkImageAspectColorBit, m_vkResources.outputDepth)) {
-        CBR_LOG_ERROR("Failed to allocate device-local OutputDepth image");
-        return false;
-    }
+    // 4. Auxiliary full-res output targets omitted: reconstruction writes directly to alternating
+    // history targets (Item M-06), saving ~95 MiB of device-local VRAM at 4K.
+    m_vkResources.outputColor = {};
+    m_vkResources.outputDepth = {};
 
     // 5. Create Linear & Point Samplers (Clamp-to-Edge)
     MinimalVkSamplerCreateInfo samplerInfo{};
@@ -10242,13 +10306,8 @@ bool RenderTargetManager::CreateDX12Resources(void* d3d12Device) {
                    m_dx12Resources.historyDepth[0]) ||
         !createTex(dims.fullWidth, dims.fullHeight, kDxgiFormatR32Float,
                    1, kD3D12ResourceFlagAllowUAV, kD3D12ResourceStateUAV,
-                   m_dx12Resources.historyDepth[1]) ||
-        !createTex(dims.fullWidth, dims.fullHeight, kDxgiFormatR16G16B16A16Float,
-                   1, kD3D12ResourceFlagAllowUAV, kD3D12ResourceStateUAV,
-                   m_dx12Resources.outputColor) ||
-        !createTex(dims.fullWidth, dims.fullHeight, kDxgiFormatR32Float,
-                   1, kD3D12ResourceFlagAllowUAV, kD3D12ResourceStateUAV,
-                   m_dx12Resources.outputDepth)) {
+                   m_dx12Resources.historyDepth[1])) {
+        // Item M-06: Auxiliary output storage color and depth omitted; direct ping-pong to history saves ~95 MiB at 4K.
         CBR_LOG_ERROR("CreateDX12Resources: failed to allocate one or more D3D12 textures.");
         DestroyDX12Resources();
         return false;
@@ -11024,6 +11083,12 @@ CbrSample MapPixelToSample(ivec2 p, uint frameParity) {
         qx = (p.x + 1 - yBit) >> 1;
     }
     ivec2 qMax = ivec2(pc.u_TargetResolution * 0.5) - ivec2(1);
+    // Item M-17: At boundary columns where unclamped qx falls outside [0, qMax.x]
+    // (e.g. x = targetW - 1 on odd frames with shiftDir = -1), no hardware sample exists.
+    // Mark inactive to fail-open to spatial fallback rather than clamping to duplicate neighbor.
+    if (qx < 0 || qx > qMax.x) {
+        s.isActive = false;
+    }
     s.quarter = ivec2(clamp(qx, 0, qMax.x), min(p.y >> 1, qMax.y));
     s.sampleIdx = 1 - yBit;
     return s;
@@ -11103,12 +11168,15 @@ void main() {
     if (isCurrentSampleActive) {
         currentColor = FetchColor(self);
         if (any(isnan(currentColor)) || any(isinf(currentColor))) {
-            currentColor = vec3(0.0);
+            // Item M-19: Active sample has non-finite color; route through spatial reconstruction rather than falling back to black
+            isCurrentSampleActive = false;
+        } else {
+            currentDepth = FetchDepth(self);
+            currentLinear = LinearizeDepth(currentDepth);
+            closestCardinalLin = currentLinear;
         }
-        currentDepth = FetchDepth(self);
-        currentLinear = LinearizeDepth(currentDepth);
-        closestCardinalLin = currentLinear;
-    } else {
+    }
+    if (!isCurrentSampleActive) {
         // No native sample here: estimate depth from the cardinal neighbours (Intel "CSO": average LINEAR depth).
         float sumRaw = 0.0;
         float sumLin = 0.0;
@@ -11331,46 +11399,51 @@ void main() {
         if (!isDisoccluded && historyColor.a > 0.0) {
             finalColor = historyColor.rgb;
         } else {
-            // Spatial cross-bilateral reconstruction from the 4 cardinal (natively shaded) neighbours.
-            // With the fallback disabled the nearest neighbour is copied (no native sample exists here).
-            // Directional gradient weights: prefer interpolating along edge contours (Decima tangent resolve)
-            vec3 horizDiff = abs(cardinalColor[0] - cardinalColor[1]);
-            vec3 vertDiff  = abs(cardinalColor[2] - cardinalColor[3]);
-            float horizGrad = dot(horizDiff, vec3(0.299, 0.587, 0.114));
-            float vertGrad  = dot(vertDiff,  vec3(0.299, 0.587, 0.114));
-            float dirBias[4] = float[](
-                1.0 / (1.0 + horizGrad * 8.0), // Left
-                1.0 / (1.0 + horizGrad * 8.0), // Right
-                1.0 / (1.0 + vertGrad  * 8.0), // Up
-                1.0 / (1.0 + vertGrad  * 8.0)  // Down
-            );
-
-            vec3 accumColor = vec3(0.0);
-            float accumDepth = 0.0;
-            float accumWeight = 0.0;
-
-            for (int i = 0; i < 4 && pc.u_EnableSpatialFallback != 0u; ++i) {
-                vec3 sCol = cardinalColor[i];
-                float sLin = LinearizeDepth(cardinalDepth[i]);
-
-                // Relative linear-depth weighting: scale-invariant, independent of the depth convention
-                // Fast base-2 exponentiation: exp(-x) == exp2(-x * log2(e))
-                float depthWeight = exp2((-abs(currentLinear - sLin) / (max(currentLinear, 1e-5) * max(pc.u_DepthTolerance, 1e-4))) * 1.4426950408889634);
-                float totalWeight = depthWeight * dirBias[i];
-
-                accumColor += sCol * totalWeight;
-                accumDepth += cardinalDepth[i] * totalWeight;
-                accumWeight += totalWeight;
-            }
-
-            if (accumWeight > 1e-4) {
-                finalColor = accumColor / accumWeight;
-                spatialDepth = accumDepth / accumWeight;
+            // Spatial reconstruction from the 4 cardinal (natively shaded) neighbours.
+            // When spatial fallback is disabled, copy the nearest cardinal neighbour directly (Item M-04).
+            if (pc.u_EnableSpatialFallback == 0u) {
+                finalColor = cardinalColor[0];
+                spatialDepth = cardinalDepth[0];
             } else {
-                // When depth divergence across all 4 samples is high, average cardinal samples
-                // to prevent single-pixel directional bias (Item 58)
-                finalColor = isCurrentSampleActive ? currentColor : (cardinalColor[0] + cardinalColor[1] + cardinalColor[2] + cardinalColor[3]) * 0.25;
-                spatialDepth = isCurrentSampleActive ? currentDepth : (cardinalDepth[0] + cardinalDepth[1] + cardinalDepth[2] + cardinalDepth[3]) * 0.25;
+                // Directional gradient weights: prefer interpolating along edge contours (Decima tangent resolve)
+                vec3 horizDiff = abs(cardinalColor[0] - cardinalColor[1]);
+                vec3 vertDiff  = abs(cardinalColor[2] - cardinalColor[3]);
+                float horizGrad = dot(horizDiff, vec3(0.299, 0.587, 0.114));
+                float vertGrad  = dot(vertDiff,  vec3(0.299, 0.587, 0.114));
+                float dirBias[4] = float[](
+                    1.0 / (1.0 + horizGrad * 8.0), // Left
+                    1.0 / (1.0 + horizGrad * 8.0), // Right
+                    1.0 / (1.0 + vertGrad  * 8.0), // Up
+                    1.0 / (1.0 + vertGrad  * 8.0)  // Down
+                );
+
+                vec3 accumColor = vec3(0.0);
+                float accumDepth = 0.0;
+                float accumWeight = 0.0;
+
+                for (int i = 0; i < 4; ++i) {
+                    vec3 sCol = cardinalColor[i];
+                    float sLin = LinearizeDepth(cardinalDepth[i]);
+
+                    // Relative linear-depth weighting: scale-invariant, independent of the depth convention
+                    // Fast base-2 exponentiation: exp(-x) == exp2(-x * log2(e))
+                    float depthWeight = exp2((-abs(currentLinear - sLin) / (max(currentLinear, 1e-5) * max(pc.u_DepthTolerance, 1e-4))) * 1.4426950408889634);
+                    float totalWeight = depthWeight * dirBias[i];
+
+                    accumColor += sCol * totalWeight;
+                    accumDepth += cardinalDepth[i] * totalWeight;
+                    accumWeight += totalWeight;
+                }
+
+                if (accumWeight > 1e-4) {
+                    finalColor = accumColor / accumWeight;
+                    spatialDepth = accumDepth / accumWeight;
+                } else {
+                    // When depth divergence across all 4 samples is high, average cardinal samples
+                    // to prevent single-pixel directional bias (Item 58)
+                    finalColor = isCurrentSampleActive ? currentColor : (cardinalColor[0] + cardinalColor[1] + cardinalColor[2] + cardinalColor[3]) * 0.25;
+                    spatialDepth = isCurrentSampleActive ? currentDepth : (cardinalDepth[0] + cardinalDepth[1] + cardinalDepth[2] + cardinalDepth[3]) * 0.25;
+                }
             }
         }
     }
@@ -11400,9 +11473,10 @@ void main() {
                         sc = hc.rgb;
                     }
                 } else {
-                    ivec2 stepAxis = (i < 2) ? ivec2(kCardinal[i].x, 1) : ivec2(1, kCardinal[i].y);
-                    ivec2 diag = pixelCoord + stepAxis;
-                    if (!InBounds(diag, targetSize)) diag = pixelCoord - stepAxis;
+                    // Item M-02: Use symmetric diagonal offsets (-1,-1), (1,-1), (-1,1), (1,1)
+                    const ivec2 kDiag[4] = ivec2[](ivec2(-1, -1), ivec2(1, -1), ivec2(-1, 1), ivec2(1, 1));
+                    ivec2 diag = pixelCoord + kDiag[i];
+                    if (!InBounds(diag, targetSize)) diag = pixelCoord - kDiag[i];
                     if (InBounds(diag, targetSize)) {
                         vec3 dc = FetchColor(MapPixelToSample(diag, frameParity));
                         if (!any(isnan(dc)) && !any(isinf(dc))) sc = dc;
@@ -11442,8 +11516,10 @@ void main() {
         float speed = clamp(length(normVel), 0.0, 1.0);
         finalColor = vec3(clamp(normVel * 0.5 + 0.5, 0.0, 1.0), speed);
     } else if (pc.u_DebugView == 4u) {
-        // Quarter-resolution raw colour without directional bias (Item 61)
-        finalColor = isCurrentSampleActive ? currentColor : (cardinalColor[0] + cardinalColor[1] + cardinalColor[2] + cardinalColor[3]) * 0.25;
+        // Mode 4: Quarter-resolution raw color nearest-upsampled (Item M-03)
+        // Shows the raw quarter-resolution texel without cardinal averaging
+        ivec2 qCoord = clamp(pixelCoord >> 1, ivec2(0), max(ivec2(pc.u_TargetResolution * 0.5) - ivec2(1), ivec2(0)));
+        finalColor = texelFetch(u_QuarterColorMSAA, qCoord, 0).rgb;
     } else if (pc.u_DebugView == 5u) {
         // Spatial baseline resolve: average of 4 cardinal samples for reconstructed pixels
         // (direct visual A/B baseline comparison against temporal CBR, matching reference Space toggle)
@@ -11615,6 +11691,10 @@ CbrSample MapPixelToSample(ivec2 p, uint frameParity) {
         qx = (p.x + 1 - yBit) >> 1;
     }
     ivec2 qMax = ivec2(pc.u_TargetResolution * 0.5) - ivec2(1);
+    // Item M-17: Out-of-bounds boundary columns fail open to spatial fallback
+    if (qx < 0 || qx > qMax.x) {
+        s.isActive = false;
+    }
     s.quarter = ivec2(clamp(qx, 0, qMax.x), min(p.y >> 1, qMax.y));
     s.sampleIdx = 1 - yBit;
     return s;
@@ -11871,38 +11951,45 @@ void ResolvePixel(
         if (!isDisoccluded && historyColor.a > 0.0) {
             finalColor = historyColor.rgb;
         } else {
-            // Directional gradient weights: prefer interpolating along edge contours (Decima tangent resolve)
-            vec3 horizDiff = abs(cardinalColor[0] - cardinalColor[1]);
-            vec3 vertDiff  = abs(cardinalColor[2] - cardinalColor[3]);
-            float horizGrad = dot(horizDiff, vec3(0.299, 0.587, 0.114));
-            float vertGrad  = dot(vertDiff,  vec3(0.299, 0.587, 0.114));
-            float dirBias[4] = float[](
-                1.0 / (1.0 + horizGrad * 8.0), // Left
-                1.0 / (1.0 + horizGrad * 8.0), // Right
-                1.0 / (1.0 + vertGrad  * 8.0), // Up
-                1.0 / (1.0 + vertGrad  * 8.0)  // Down
-            );
-
-            vec3 accumColor = vec3(0.0);
-            float accumDepth = 0.0;
-            float accumWeight = 0.0;
-
-            for (int i = 0; i < 4 && pc.u_EnableSpatialFallback != 0u; ++i) {
-                vec3 sCol = cardinalColor[i];
-                float sLin = LinearizeDepth(cardinalDepth[i]);
-                float depthWeight = exp2((-abs(currentLinear - sLin) / (max(currentLinear, 1e-5) * max(pc.u_DepthTolerance, 1e-4))) * 1.4426950408889634);
-                float totalWeight = depthWeight * dirBias[i];
-                accumColor += sCol * totalWeight;
-                accumDepth += cardinalDepth[i] * totalWeight;
-                accumWeight += totalWeight;
-            }
-
-            if (accumWeight > 1e-4) {
-                finalColor = accumColor / accumWeight;
-                spatialDepth = accumDepth / accumWeight;
+            // Spatial reconstruction from the 4 cardinal (natively shaded) neighbours.
+            // When spatial fallback is disabled, copy the nearest cardinal neighbour directly (Item M-04).
+            if (pc.u_EnableSpatialFallback == 0u) {
+                finalColor = cardinalColor[0];
+                spatialDepth = cardinalDepth[0];
             } else {
-                finalColor = isCurrentSampleActive ? currentColor : (cardinalColor[0] + cardinalColor[1] + cardinalColor[2] + cardinalColor[3]) * 0.25;
-                spatialDepth = isCurrentSampleActive ? currentDepth : (cardinalDepth[0] + cardinalDepth[1] + cardinalDepth[2] + cardinalDepth[3]) * 0.25;
+                // Directional gradient weights: prefer interpolating along edge contours (Decima tangent resolve)
+                vec3 horizDiff = abs(cardinalColor[0] - cardinalColor[1]);
+                vec3 vertDiff  = abs(cardinalColor[2] - cardinalColor[3]);
+                float horizGrad = dot(horizDiff, vec3(0.299, 0.587, 0.114));
+                float vertGrad  = dot(vertDiff,  vec3(0.299, 0.587, 0.114));
+                float dirBias[4] = float[](
+                    1.0 / (1.0 + horizGrad * 8.0), // Left
+                    1.0 / (1.0 + horizGrad * 8.0), // Right
+                    1.0 / (1.0 + vertGrad  * 8.0), // Up
+                    1.0 / (1.0 + vertGrad  * 8.0)  // Down
+                );
+
+                vec3 accumColor = vec3(0.0);
+                float accumDepth = 0.0;
+                float accumWeight = 0.0;
+
+                for (int i = 0; i < 4; ++i) {
+                    vec3 sCol = cardinalColor[i];
+                    float sLin = LinearizeDepth(cardinalDepth[i]);
+                    float depthWeight = exp2((-abs(currentLinear - sLin) / (max(currentLinear, 1e-5) * max(pc.u_DepthTolerance, 1e-4))) * 1.4426950408889634);
+                    float totalWeight = depthWeight * dirBias[i];
+                    accumColor += sCol * totalWeight;
+                    accumDepth += cardinalDepth[i] * totalWeight;
+                    accumWeight += totalWeight;
+                }
+
+                if (accumWeight > 1e-4) {
+                    finalColor = accumColor / accumWeight;
+                    spatialDepth = accumDepth / accumWeight;
+                } else {
+                    finalColor = isCurrentSampleActive ? currentColor : (cardinalColor[0] + cardinalColor[1] + cardinalColor[2] + cardinalColor[3]) * 0.25;
+                    spatialDepth = isCurrentSampleActive ? currentDepth : (cardinalDepth[0] + cardinalDepth[1] + cardinalDepth[2] + cardinalDepth[3]) * 0.25;
+                }
             }
         }
     }
@@ -11932,9 +12019,10 @@ void ResolvePixel(
                         sc = hc.rgb;
                     }
                 } else {
-                    ivec2 stepAxis = (i < 2) ? ivec2(kCardinal[i].x, 1) : ivec2(1, kCardinal[i].y);
-                    ivec2 diag = pixelCoord + stepAxis;
-                    if (!InBounds(diag, targetSize)) diag = pixelCoord - stepAxis;
+                    // Item M-02: Use symmetric diagonal offsets (-1,-1), (1,-1), (-1,1), (1,1)
+                    const ivec2 kDiag[4] = ivec2[](ivec2(-1, -1), ivec2(1, -1), ivec2(-1, 1), ivec2(1, 1));
+                    ivec2 diag = pixelCoord + kDiag[i];
+                    if (!InBounds(diag, targetSize)) diag = pixelCoord - kDiag[i];
                     if (InBounds(diag, targetSize)) {
                         vec3 dc = FetchColor(MapPixelToSample(diag, frameParity));
                         if (!any(isnan(dc)) && !any(isinf(dc))) sc = dc;
@@ -11969,7 +12057,9 @@ void ResolvePixel(
         float speed = clamp(length(normVel), 0.0, 1.0);
         finalColor = vec3(clamp(normVel * 0.5 + 0.5, 0.0, 1.0), speed);
     } else if (pc.u_DebugView == 4u) {
-        finalColor = isCurrentSampleActive ? currentColor : (cardinalColor[0] + cardinalColor[1] + cardinalColor[2] + cardinalColor[3]) * 0.25;
+        // Mode 4: Quarter-resolution raw color nearest-upsampled (Item M-03)
+        ivec2 qCoord = clamp(pixelCoord >> 1, ivec2(0), max(ivec2(pc.u_TargetResolution * 0.5) - ivec2(1), ivec2(0)));
+        finalColor = texelFetch(u_QuarterColorMSAA, qCoord, 0).rgb;
     } else if (pc.u_DebugView == 5u) {
         finalColor = isCurrentSampleActive ? currentColor : (cardinalColor[0] + cardinalColor[1] + cardinalColor[2] + cardinalColor[3]) * 0.25;
     }
@@ -12018,24 +12108,32 @@ void main() {
         CbrSample s0 = MapPixelToSample(act0Coord, frameParity);
         act0.coord = act0Coord;
         act0.color = FetchColor(s0);
-        if (any(isnan(act0.color)) || any(isinf(act0.color))) {
+        bool act0Valid = s0.isActive && !any(isnan(act0.color)) && !any(isinf(act0.color));
+        if (act0Valid) {
+            act0.depth = FetchDepth(s0);
+            act0.linearDepth = LinearizeDepth(act0.depth);
+            ResolvePixel(act0Coord, targetSize, frameParity, true, act0.color, act0.depth, act0.linearDepth, false, act0, act1);
+        } else {
             act0.color = vec3(0.0);
+            act0.coord = ivec2(-1);
+            ResolvePixel(act0Coord, targetSize, frameParity, false, vec3(0.0), 0.0, 0.0, false, act0, act1);
         }
-        act0.depth = FetchDepth(s0);
-        act0.linearDepth = LinearizeDepth(act0.depth);
-        ResolvePixel(act0Coord, targetSize, frameParity, true, act0.color, act0.depth, act0.linearDepth, false, act0, act1);
     }
 
     if (InBounds(act1Coord, targetSize)) {
         CbrSample s1 = MapPixelToSample(act1Coord, frameParity);
         act1.coord = act1Coord;
         act1.color = FetchColor(s1);
-        if (any(isnan(act1.color)) || any(isinf(act1.color))) {
+        bool act1Valid = s1.isActive && !any(isnan(act1.color)) && !any(isinf(act1.color));
+        if (act1Valid) {
+            act1.depth = FetchDepth(s1);
+            act1.linearDepth = LinearizeDepth(act1.depth);
+            ResolvePixel(act1Coord, targetSize, frameParity, true, act1.color, act1.depth, act1.linearDepth, false, act0, act1);
+        } else {
             act1.color = vec3(0.0);
+            act1.coord = ivec2(-1);
+            ResolvePixel(act1Coord, targetSize, frameParity, false, vec3(0.0), 0.0, 0.0, false, act0, act1);
         }
-        act1.depth = FetchDepth(s1);
-        act1.linearDepth = LinearizeDepth(act1.depth);
-        ResolvePixel(act1Coord, targetSize, frameParity, true, act1.color, act1.depth, act1.linearDepth, false, act0, act1);
     }
 
     if (InBounds(inact0Coord, targetSize)) {
@@ -12213,6 +12311,12 @@ CbrSample MapPixelToSample(int2 p, uint frameParity) {
         qx = (p.x + 1 - yBit) >> 1;
     }
     int2 qMax = int2(g_TargetResolution * 0.5f) - int2(1, 1);
+    // Item M-17: At boundary columns where unclamped qx falls outside [0, qMax.x]
+    // (e.g. x = targetW - 1 on odd frames with shiftDir = -1), no hardware sample exists.
+    // Mark inactive to fail-open to spatial fallback rather than clamping to duplicate neighbor.
+    if (qx < 0 || qx > qMax.x) {
+        s.isActive = false;
+    }
     s.quarter = int2(clamp(qx, 0, qMax.x), min(p.y >> 1, qMax.y));
     s.sampleIdx = 1 - yBit;
     return s;
@@ -12287,12 +12391,15 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     if (isCurrentSampleActive) {
         currentColor = FetchColor(self);
         if (any(isnan(currentColor)) || any(isinf(currentColor))) {
-            currentColor = float3(0.0f, 0.0f, 0.0f);
+            // Item M-19: Active sample has non-finite color; route through spatial reconstruction rather than falling back to black
+            isCurrentSampleActive = false;
+        } else {
+            currentDepth = FetchDepth(self);
+            currentLinear = LinearizeDepth(currentDepth);
+            closestCardinalLin = currentLinear;
         }
-        currentDepth = FetchDepth(self);
-        currentLinear = LinearizeDepth(currentDepth);
-        closestCardinalLin = currentLinear;
-    } else {
+    }
+    if (!isCurrentSampleActive) {
         // No native sample here: estimate depth from the cardinal neighbours (Intel "CSO": average LINEAR depth).
         float sumRaw = 0.0f;
         float sumLin = 0.0f;
@@ -12513,46 +12620,51 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
         if (!isDisoccluded && historyColor.a > 0.0f) {
             finalColor = historyColor.rgb;
         } else {
-            // Spatial cross-bilateral reconstruction from the 4 cardinal (natively shaded) neighbours.
-            // With the fallback disabled the nearest neighbour is copied (no native sample exists here).
-            // Directional gradient weights: prefer interpolating along edge contours (Decima tangent resolve)
-            float3 horizDiff = abs(cardinalColor[0] - cardinalColor[1]);
-            float3 vertDiff  = abs(cardinalColor[2] - cardinalColor[3]);
-            float horizGrad = dot(horizDiff, float3(0.299f, 0.587f, 0.114f));
-            float vertGrad  = dot(vertDiff,  float3(0.299f, 0.587f, 0.114f));
-            float dirBias[4] = {
-                1.0f / (1.0f + horizGrad * 8.0f), // Left
-                1.0f / (1.0f + horizGrad * 8.0f), // Right
-                1.0f / (1.0f + vertGrad  * 8.0f), // Up
-                1.0f / (1.0f + vertGrad  * 8.0f)  // Down
-            };
-
-            float3 accumColor = float3(0.0f, 0.0f, 0.0f);
-            float accumDepth = 0.0f;
-            float accumWeight = 0.0f;
-
-            for (int i = 0; i < 4 && g_EnableSpatialFallback != 0u; ++i) {
-                float3 sCol = cardinalColor[i];
-                float sLin = LinearizeDepth(cardinalDepth[i]);
-
-                // Relative linear-depth weighting: scale-invariant, independent of the depth convention
-                // Fast base-2 exponentiation: exp(-x) == exp2(-x * log2(e))
-                float depthWeight = exp2((-abs(currentLinear - sLin) / (max(currentLinear, 1e-5f) * max(g_DepthTolerance, 1e-4f))) * 1.44269504f);
-                float totalWeight = depthWeight * dirBias[i];
-
-                accumColor += sCol * totalWeight;
-                accumDepth += cardinalDepth[i] * totalWeight;
-                accumWeight += totalWeight;
-            }
-
-            if (accumWeight > 1e-4f) {
-                finalColor = accumColor / accumWeight;
-                spatialDepth = accumDepth / accumWeight;
+            // Spatial reconstruction from the 4 cardinal (natively shaded) neighbours.
+            // When spatial fallback is disabled, copy the nearest cardinal neighbour directly (Item M-04).
+            if (g_EnableSpatialFallback == 0u) {
+                finalColor = cardinalColor[0];
+                spatialDepth = cardinalDepth[0];
             } else {
-                finalColor = isCurrentSampleActive ? currentColor : (
-                    cardinalColor[0] + cardinalColor[1] + cardinalColor[2] + cardinalColor[3]
-                ) * 0.25f;
-                spatialDepth = isCurrentSampleActive ? currentDepth : (cardinalDepth[0] + cardinalDepth[1] + cardinalDepth[2] + cardinalDepth[3]) * 0.25f;
+                // Directional gradient weights: prefer interpolating along edge contours (Decima tangent resolve)
+                float3 horizDiff = abs(cardinalColor[0] - cardinalColor[1]);
+                float3 vertDiff  = abs(cardinalColor[2] - cardinalColor[3]);
+                float horizGrad = dot(horizDiff, float3(0.299f, 0.587f, 0.114f));
+                float vertGrad  = dot(vertDiff,  float3(0.299f, 0.587f, 0.114f));
+                float dirBias[4] = {
+                    1.0f / (1.0f + horizGrad * 8.0f), // Left
+                    1.0f / (1.0f + horizGrad * 8.0f), // Right
+                    1.0f / (1.0f + vertGrad  * 8.0f), // Up
+                    1.0f / (1.0f + vertGrad  * 8.0f)  // Down
+                };
+
+                float3 accumColor = float3(0.0f, 0.0f, 0.0f);
+                float accumDepth = 0.0f;
+                float accumWeight = 0.0f;
+
+                for (int i = 0; i < 4; ++i) {
+                    float3 sCol = cardinalColor[i];
+                    float sLin = LinearizeDepth(cardinalDepth[i]);
+
+                    // Relative linear-depth weighting: scale-invariant, independent of the depth convention
+                    // Fast base-2 exponentiation: exp(-x) == exp2(-x * log2(e))
+                    float depthWeight = exp2((-abs(currentLinear - sLin) / (max(currentLinear, 1e-5f) * max(g_DepthTolerance, 1e-4f))) * 1.44269504f);
+                    float totalWeight = depthWeight * dirBias[i];
+
+                    accumColor += sCol * totalWeight;
+                    accumDepth += cardinalDepth[i] * totalWeight;
+                    accumWeight += totalWeight;
+                }
+
+                if (accumWeight > 1e-4f) {
+                    finalColor = accumColor / accumWeight;
+                    spatialDepth = accumDepth / accumWeight;
+                } else {
+                    finalColor = isCurrentSampleActive ? currentColor : (
+                        cardinalColor[0] + cardinalColor[1] + cardinalColor[2] + cardinalColor[3]
+                    ) * 0.25f;
+                    spatialDepth = isCurrentSampleActive ? currentDepth : (cardinalDepth[0] + cardinalDepth[1] + cardinalDepth[2] + cardinalDepth[3]) * 0.25f;
+                }
             }
         }
     }
@@ -12582,9 +12694,10 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
                         sc = hc.rgb;
                     }
                 } else {
-                    int2 stepAxis = (i < 2) ? int2(kCardinal[i].x, 1) : int2(1, kCardinal[i].y);
-                    int2 diag = pixelCoord + stepAxis;
-                    if (!InBounds(diag, targetSize)) diag = pixelCoord - stepAxis;
+                    // Item M-02: Use symmetric diagonal offsets (-1,-1), (1,-1), (-1,1), (1,1)
+                    static const int2 kDiag[4] = { int2(-1, -1), int2(1, -1), int2(-1, 1), int2(1, 1) };
+                    int2 diag = pixelCoord + kDiag[i];
+                    if (!InBounds(diag, targetSize)) diag = pixelCoord - kDiag[i];
                     if (InBounds(diag, targetSize)) {
                         float3 dc = FetchColor(MapPixelToSample(diag, frameParity));
                         if (!any(isnan(dc)) && !any(isinf(dc))) sc = dc;
@@ -12625,10 +12738,11 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
         float speed = clamp(length(normVel), 0.0f, 1.0f);
         finalColor = float3(clamp(normVel * 0.5f + 0.5f, 0.0f, 1.0f), speed);
     } else if (g_DebugView == 4u) {
-        // Quarter-resolution raw colour without directional bias
-        finalColor = isCurrentSampleActive ? currentColor : (
-            cardinalColor[0] + cardinalColor[1] + cardinalColor[2] + cardinalColor[3]
-        ) * 0.25f;
+        // Mode 4: Quarter-resolution raw color nearest-upsampled (Item M-03)
+        // Shows the raw quarter-resolution texel without cardinal averaging
+        int2 qMax = max(int2(g_TargetResolution * 0.5f) - int2(1, 1), int2(0, 0));
+        int2 qCoord = clamp(pixelCoord >> 1, int2(0, 0), qMax);
+        finalColor = g_QuarterColorMSAA.Load(qCoord, 0).rgb;
     } else if (g_DebugView == 5u) {
         // Spatial baseline resolve: average of 4 cardinal samples for reconstructed pixels
         // (direct visual A/B baseline comparison against temporal CBR, matching reference Space toggle)
@@ -13255,23 +13369,23 @@ static void TestRenderTargets() {
     ConfigManager::Get().Modify([](CBRConfig& cfg) { cfg.msaaSamples = 2; });
     r.Initialize(3840, 2160);
     // 4K: quarter colour 33,177,600 + quarter depth 16,588,800 + history colour A/B 132,710,400
-    //    + history depth A/B 66,355,200 + output 66,355,200 = 315,187,200 bytes (300.58 MiB, 315.19 MB)
-    CHECK(r.GetTotalAllocatedVramBytes() == 315187200u);
+    //    + history depth A/B 66,355,200 (Item M-06: unused output targets omitted) = 248,832,000 bytes (237.30 MiB, 248.83 MB)
+    CHECK(r.GetTotalAllocatedVramBytes() == 248832000u);
     const double mib = static_cast<double>(r.GetTotalAllocatedVramBytes()) / (1024.0 * 1024.0);
-    CHECK(std::fabs(mib - 300.58) < 0.01);
+    CHECK(std::fabs(mib - 237.30) < 0.01);
 
-    // 1080p (the AMD Vega 7 profile): 78,796,800 bytes = 78.80 MB
+    // 1080p (the AMD Vega 7 profile): 62,208,000 bytes = 59.33 MiB (62.21 MB)
     r.Initialize(1920, 1080);
-    CHECK(r.GetTotalAllocatedVramBytes() == 78796800u);
+    CHECK(r.GetTotalAllocatedVramBytes() == 62208000u);
 
     // Single-sample 1x ASO mode (APU mode):
     ConfigManager::Get().Modify([](CBRConfig& cfg) { cfg.msaaSamples = 1; });
     r.Initialize(3840, 2160);
-    CHECK(r.GetTotalAllocatedVramBytes() == 290304000u);
+    CHECK(r.GetTotalAllocatedVramBytes() == 223948800u);
 
     // 720p 1x ASO mode:
     r.Initialize(1280, 720);
-    CHECK(r.GetTotalAllocatedVramBytes() == 32256000u);
+    CHECK(r.GetTotalAllocatedVramBytes() == 24883200u);
 
     // Reset back to 2x MSAA for subsequent tests
     ConfigManager::Get().Modify([](CBRConfig& cfg) { cfg.msaaSamples = 2; });
@@ -14849,7 +14963,7 @@ def _check_coords(x: int, y: int, target_w: int, target_h: int) -> None:
     if target_w <= 0 or target_h <= 0:
         raise ValueError("target dimensions must be positive")
 
-def cpp_map_pixel_to_sample(x: int, y: int, frame_parity: int, shift_dir: int = 1) -> Dict[str, int]:
+def cpp_map_pixel_to_sample(x: int, y: int, frame_parity: int, shift_dir: int = 1, target_w: int = 0) -> Dict[str, int]:
     if x < 0 or y < 0:
         raise ValueError(f"pixel coords must be >= 0, got ({x}, {y})")
     if frame_parity not in (0, 1):
@@ -14862,6 +14976,8 @@ def cpp_map_pixel_to_sample(x: int, y: int, frame_parity: int, shift_dir: int = 
         qx = (x - y_bit if x > y_bit else 0) >> 1
     else:
         qx = (x + 1 - y_bit) >> 1
+    if target_w > 0 and (qx < 0 or qx >= (target_w >> 1)):
+        active = False
     qy = y >> 1
     sample = 1 - y_bit
     return {
@@ -14883,6 +14999,9 @@ def glsl_map_pixel_to_sample(x: int, y: int, frame_parity: int, shift_dir: int, 
         qx = (x + 1 - y_bit) >> 1
     q_max_x = (target_w // 2) - 1
     q_max_y = (target_h // 2) - 1
+    # Item M-17: When unclamped qx falls outside [0, q_max_x], mark inactive
+    if qx < 0 or qx > q_max_x:
+        is_active = False
     clamped_qx = max(0, min(qx, q_max_x))
     clamped_qy = min(y >> 1, q_max_y)
     sample_idx = 1 - y_bit
@@ -14909,7 +15028,7 @@ def test_mapping_equivalence():
             y_samples = list(range(0, 32)) + list(range(target_h // 2 - 16, target_h // 2 + 16)) + list(range(target_h - 32, target_h))
             for y in y_samples:
                 for x in x_samples:
-                    cpp_res = cpp_map_pixel_to_sample(x, y, frame_parity, shift_dir)
+                    cpp_res = cpp_map_pixel_to_sample(x, y, frame_parity, shift_dir, target_w)
                     glsl_res = glsl_map_pixel_to_sample(x, y, frame_parity, shift_dir, target_w, target_h)
                     hlsl_res = hlsl_map_pixel_to_sample(x, y, frame_parity, shift_dir, target_w, target_h)
 
@@ -14922,13 +15041,23 @@ def test_mapping_equivalence():
                     tested += 1
 
     # Explicit boundary case (Item M-06): (x=0, y=1, frameParity=1, shiftDir=1) -> x - yBit = -1 must clamp to 0
-    neg_edge_cpp = cpp_map_pixel_to_sample(0, 1, 1, 1)
+    neg_edge_cpp = cpp_map_pixel_to_sample(0, 1, 1, 1, target_w)
     neg_edge_glsl = glsl_map_pixel_to_sample(0, 1, 1, 1, target_w, target_h)
     neg_edge_hlsl = hlsl_map_pixel_to_sample(0, 1, 1, 1, target_w, target_h)
     assert neg_edge_cpp["quarterX"] == 0 and neg_edge_glsl["unclamped_qx"] == 0 and neg_edge_glsl["quarterX"] == 0, (
         f"Expected negative shift clamp to 0 for (0,1,parity=1,shift=1), got {neg_edge_cpp} / {neg_edge_glsl}"
     )
     assert neg_edge_hlsl["quarterX"] == 0 and neg_edge_cpp["sample"] == 0 and neg_edge_cpp["active"] is True
+
+    # Explicit right-edge boundary case (Item M-17): (x = target_w - 1, y = 0, frameParity = 1, shiftDir = -1)
+    # qx = (3839 + 1 - 0) >> 1 = 1920 > q_max_x (1919) -> must fail-open to active = False
+    pos_edge_cpp = cpp_map_pixel_to_sample(target_w - 1, 0, 1, -1, target_w)
+    pos_edge_glsl = glsl_map_pixel_to_sample(target_w - 1, 0, 1, -1, target_w, target_h)
+    pos_edge_hlsl = hlsl_map_pixel_to_sample(target_w - 1, 0, 1, -1, target_w, target_h)
+    assert pos_edge_cpp["active"] is False, f"Expected cpp active=False at right edge shiftDir=-1, got {pos_edge_cpp}"
+    assert pos_edge_glsl["active"] is False, f"Expected glsl active=False at right edge shiftDir=-1, got {pos_edge_glsl}"
+    assert pos_edge_hlsl["active"] is False, f"Expected hlsl active=False at right edge shiftDir=-1, got {pos_edge_hlsl}"
+    assert pos_edge_glsl["quarterX"] == (target_w // 2) - 1
 
     print(f"[PASS] Verified mapping equivalence across {tested} coordinate combinations.")
 
@@ -15021,6 +15150,11 @@ def test_source_code_consistency():
     assert "fallback = float3(0.0f, 0.0f, 0.0f);" in hlsl_src, "H-05 double-guarded fallback missing in cbr_reconstruct.hlsl"
     assert "GL_KHR_shader_subgroup" not in quad_src, "M-07 unused subgroup extensions must be removed"
     assert "QuadActiveSample" in quad_src and "cardinalColor" in quad_src, "M-07/H-05 quad register sharing missing"
+
+    # Verify M-17 boundary check presence across all reconstruction shaders
+    assert "if (qx < 0 || qx > qMax.x)" in comp_src, "M-17 boundary check missing in cbr_reconstruct.comp"
+    assert "if (qx < 0 || qx > qMax.x)" in quad_src, "M-17 boundary check missing in cbr_reconstruct_quad.comp"
+    assert "if (qx < 0 || qx > qMax.x)" in hlsl_src, "M-17 boundary check missing in cbr_reconstruct.hlsl"
 
     print("[PASS] Verified source code consistency across GLSL, HLSL, and C++ header.")
 
@@ -15130,9 +15264,9 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y g++-mingw-w64-x86-64
       - name: Syntax check Windows sources
         run: |
-          for f in logger config jitter_manager render_target_manager reconstruction_pass ui_overlay cbr_engine hooks main hooks_vulkan hooks_dx12 crash_handler; do
+          for f in logger config jitter_manager pattern_scanner render_target_manager reconstruction_pass ui_overlay cbr_engine hooks main hooks_vulkan hooks_dx12 crash_handler; do
             echo "Checking src/$f.cpp..."
-            x86_64-w64-mingw32-g++ -std=c++20 -fsyntax-only -Wall -Wextra -Wpedantic -Wshadow -Iinclude -Ivendor/minhook/include src/$f.cpp
+            x86_64-w64-mingw32-g++ -std=c++20 -fsyntax-only -Wall -Wextra -Wpedantic -Wshadow -Werror -Iinclude -Ivendor/minhook/include src/$f.cpp
           done
 
   windows-release:
@@ -15490,7 +15624,7 @@ $$C_{\text{spatial}} = \frac{\sum_{k=1}^4 w_k C_k}{\sum_{k=1}^4 w_k}, \quad w_k 
 | Component | Minimum Specification | Recommended (Target Discrete) | Recommended (Target APU / Integrated) | Role in CBR Pipeline |
 |---|---|---|---|---|
 | **GPU** | GTX 1060 (6 GB) / RX 580 (8 GB) / Vega 7 (Vulkan 1.3 / DX12) | **NVIDIA GeForce GTX 1070 Ti (8 GB GDDR5)** | **AMD Radeon Vega 7 (Ryzen 5 4600G/5600H/5700U APU)** | Wave32 (Pascal) / Wave64 (Vega) compute shader execution, 2× MSAA rasterization |
-| **GPU VRAM** | 1 GB (1080p CBR) / 6 GB (4K CBR) | **8 GB GDDR5** (`300.58 MiB` / `315.19 MB` CBR buffers at 4K) | **512 MB – 2 GB Shared UMA DDR4** (`75.15 MiB` / `78.80 MB` CBR buffers at 1080p) | Stores quarter-res 2× MSAA, ping-pong history, and output targets |
+| **GPU VRAM** | 1 GB (1080p CBR) / 6 GB (4K CBR) | **8 GB GDDR5** (`237.30 MiB` / `248.83 MB` CBR buffers at 4K) | **512 MB – 2 GB Shared UMA DDR4** (`59.33 MiB` / `62.21 MB` CBR buffers at 1080p) | Stores quarter-res 2× MSAA and ping-pong history targets (Item M-06: unused output targets eliminated) |
 | **CPU** | Quad-Core (i5-8400 / Ryzen 2600; scalar AOB fallback) | **6-Core / 12-Thread (AVX2 capable)** | **AMD Ryzen 5 4600G / 5600H (6C / 12T, AVX2)** | Frame pacing, intercept dispatch & AVX2 SIMD AOB scanning |
 | **RAM** | 8 GB Dual-Channel | **16 GB DDR4 Dual-Channel** | **16 GB Dual-Channel DDR4-3200+** | Essential on APUs for shared GPU/CPU memory bandwidth |
 | **OS** | Windows 10 (64-bit, 19041+) | **Windows 10 / Windows 11 (64-bit)** | **Windows 10 / Windows 11 (64-bit)** | Native `vulkan-1.dll` (1.3) and DirectX 12 runtime |
@@ -15621,7 +15755,7 @@ LogLevel = Info              ; Debug, Info, Warning, Error
    - **MSAA:** **2×** (**Required!** In-game MSAA must be set to **2×** so that the scene geometry color and depth attachments render with 2× MSAA / `VK_SAMPLE_COUNT_2_BIT`. `CanCopyToQuarterColor` and `CanCopyToQuarterDepth` enforce 2× MSAA matching `quarterColor` and `quarterDepth`. If MSAA is set to Off (1×), the C-01 safety gate safely fails open and preserves the native image without black-screening, but CBR compute reconstruction will not trigger).
    - **FXAA:** **Off** (recommended Off to prevent post-filtering blurring).
 4. **Quality Baseline (4K on 8 GB Pascal GPUs):**
-   - Lower **Volumetrics**, **Water**, and **Reflections** to **Medium**; keep **Anisotropic Filtering** at **16×** and reduce **Texture Quality** from **Ultra** to **High** if approaching the 8 GB VRAM ceiling (`300.58 MiB` used by CBR buffers at 4K). On **AMD Vega 7 (512 MB UMA)** laptops, use **1080p** (`75.15 MiB` CBR buffers) and Low/Medium RDR2 presets (`docs/AMD_VEGA_OPTIMIZATION.md`).
+   - Lower **Volumetrics**, **Water**, and **Reflections** to **Medium**; keep **Anisotropic Filtering** at **16×** and reduce **Texture Quality** from **Ultra** to **High** if approaching the 8 GB VRAM ceiling (`237.30 MiB` used by CBR buffers at 4K). On **AMD Vega 7 (512 MB UMA)** laptops, use **1080p** (`59.33 MiB` CBR buffers) and Low/Medium RDR2 presets (`docs/AMD_VEGA_OPTIMIZATION.md`).
 
 ---
 
@@ -15640,7 +15774,7 @@ After launching RDR2 Story Mode, inspect `cbr.log` next to `RDR2.exe`:
 [INFO] Configuration loaded from cbr.ini (Target: 3840x2160, API: Vulkan, CBR Enabled: true)
 [INFO] RenderTargetManager initialized for target: 3840x2160
 [INFO] Quarter-Resolution 2x MSAA Buffer size: 1920x1080
-[INFO] Total CBR VRAM Footprint: 300.58 MiB (315.19 MB)
+[INFO] Total CBR VRAM Footprint: 237.30 MiB (248.83 MB)
 [INFO] Vulkan graphics interception is now ACTIVE.
 [INFO] Vulkan CBR reconstruction compute pipeline created successfully!
 ```
@@ -17511,13 +17645,13 @@ Our newly implemented `msaaSamples = 1` setting and companion compute shader `cb
 
 Because the ASUS VivoBook 16X has a default dedicated UMA allocation of **512 MB** (`AdapterRAM = 536,870,912`), buffer sizing is vital. The table below illustrates why running the default 4K configuration caused performance regression, and how the 720p/1080p single-sample modes resolve it:
 
-| Configuration Profile | Quarter Color | Quarter Depth | History Color (A+B) | History Depth (A+B) | Output Target | Total CBR VRAM Footprint | Impact on 512 MB UMA Carve-out |
+| Configuration Profile | Quarter Color | Quarter Depth | History Color (A+B) | History Depth (A+B) | Output Target (Item M-06) | Total CBR VRAM Footprint | Impact on 512 MB UMA Carve-out |
 |---|---|---|---|---|---|---|---|
-| **4K Target (2× MSAA - Default)** | 33.18 MB | 16.59 MB | 132.71 MB | 66.36 MB | 66.36 MB | **315.19 MB (300.58 MiB)** | **Consumes 61.5% of VRAM!** (Causes out-of-memory stalls) |
-| **1080p Target (2× MSAA)** | 8.29 MB | 4.15 MB | 33.18 MB | 16.59 MB | 16.59 MB | **78.79 MB (75.14 MiB)** | Consumes 15.4% of VRAM |
-| **1080p Target (1× Single-Sample)**| 4.15 MB | 2.07 MB | 33.18 MB | 16.59 MB | 16.59 MB | **72.58 MB (69.21 MiB)** | **Consumes only 14.1% of VRAM** |
-| **720p Target (2× MSAA)** | 3.69 MB | 1.84 MB | 14.75 MB | 7.37 MB | 7.37 MB | **35.02 MB (33.40 MiB)** | Consumes 6.8% of VRAM |
-| **720p Target (1× Single-Sample)** | 1.84 MB | 0.92 MB | 14.75 MB | 7.37 MB | 7.37 MB | **32.26 MB (30.76 MiB)** | **Consumes only 6.3% of VRAM** |
+| **4K Target (2× MSAA - Default)** | 33.18 MB | 16.59 MB | 132.71 MB | 66.36 MB | 0.00 MB | **248.83 MB (237.30 MiB)** | **Consumes 46.3% of VRAM** |
+| **1080p Target (2× MSAA)** | 8.29 MB | 4.15 MB | 33.18 MB | 16.59 MB | 0.00 MB | **62.21 MB (59.33 MiB)** | Consumes 11.6% of VRAM |
+| **1080p Target (1× Single-Sample)**| 4.15 MB | 2.07 MB | 33.18 MB | 16.59 MB | 0.00 MB | **55.99 MB (53.40 MiB)** | **Consumes only 10.4% of VRAM** |
+| **720p Target (2× MSAA)** | 3.69 MB | 1.84 MB | 14.75 MB | 7.37 MB | 0.00 MB | **27.65 MB (26.37 MiB)** | Consumes 5.2% of VRAM |
+| **720p Target (1× Single-Sample)** | 1.84 MB | 0.92 MB | 14.75 MB | 7.37 MB | 0.00 MB | **24.88 MB (23.73 MiB)** | **Consumes only 4.6% of VRAM** |
 
 ---
 
@@ -19102,6 +19236,10 @@ In `reconstruction_pass.cpp`, CBR manages compute pipeline resources dynamically
 ### `docs/IN_GAME_TEST_REPORT_v1491.md`
 ````markdown
 # In-Game Execution & Test Report: RDR2 v1.0.1491.50
+
+> [!NOTE]
+> **Phase 1 Baseline Evidence Notice (Item M-16):**
+> This document records Phase 1 in-game baseline evidence for host execution, ASI loader injection, and subsystem initialization on RDR2 build `1.0.1491.50`. It validates that `rdr2-cbr.asi` initializes without crashing, parses configuration, and operates dormant fallback when graphics hooks are unengaged. Active in-game RenderDoc verification of Vulkan attachment formats and pass intercept order represents Phase 2 verification.
 
 **Document ID:** TR-RDR2CBR-1491-01  
 **Test Date:** October 23, 2026  

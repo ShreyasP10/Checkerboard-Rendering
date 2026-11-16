@@ -84,9 +84,11 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID /*lpRese
                 &pinned)) {
                 // Pin failed: do not spawn a thread that would execute unmapped code.
                 // Record directory anyway so a later CBR_PluginInit can still initialize.
+                const DWORD err = GetLastError();
                 const auto modDir = GetModuleDirectoryPath(hModule);
                 cbr::CBREngine::Get().SetModuleDirectory(modDir);
                 cbr::CrashHandler::Get().Install(modDir);
+                CBR_LOG_ERROR("DllMain: Failed to pin CBR module in memory (GetModuleHandleExW error: %lu). Background initialization thread aborted to prevent executing unmapped code.", err);
                 break;
             }
 

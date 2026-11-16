@@ -518,23 +518,23 @@ static void TestRenderTargets() {
     ConfigManager::Get().Modify([](CBRConfig& cfg) { cfg.msaaSamples = 2; });
     r.Initialize(3840, 2160);
     // 4K: quarter colour 33,177,600 + quarter depth 16,588,800 + history colour A/B 132,710,400
-    //    + history depth A/B 66,355,200 + output 66,355,200 = 315,187,200 bytes (300.58 MiB, 315.19 MB)
-    CHECK(r.GetTotalAllocatedVramBytes() == 315187200u);
+    //    + history depth A/B 66,355,200 (Item M-06: unused output targets omitted) = 248,832,000 bytes (237.30 MiB, 248.83 MB)
+    CHECK(r.GetTotalAllocatedVramBytes() == 248832000u);
     const double mib = static_cast<double>(r.GetTotalAllocatedVramBytes()) / (1024.0 * 1024.0);
-    CHECK(std::fabs(mib - 300.58) < 0.01);
+    CHECK(std::fabs(mib - 237.30) < 0.01);
 
-    // 1080p (the AMD Vega 7 profile): 78,796,800 bytes = 78.80 MB
+    // 1080p (the AMD Vega 7 profile): 62,208,000 bytes = 59.33 MiB (62.21 MB)
     r.Initialize(1920, 1080);
-    CHECK(r.GetTotalAllocatedVramBytes() == 78796800u);
+    CHECK(r.GetTotalAllocatedVramBytes() == 62208000u);
 
     // Single-sample 1x ASO mode (APU mode):
     ConfigManager::Get().Modify([](CBRConfig& cfg) { cfg.msaaSamples = 1; });
     r.Initialize(3840, 2160);
-    CHECK(r.GetTotalAllocatedVramBytes() == 290304000u);
+    CHECK(r.GetTotalAllocatedVramBytes() == 223948800u);
 
     // 720p 1x ASO mode:
     r.Initialize(1280, 720);
-    CHECK(r.GetTotalAllocatedVramBytes() == 32256000u);
+    CHECK(r.GetTotalAllocatedVramBytes() == 24883200u);
 
     // Reset back to 2x MSAA for subsequent tests
     ConfigManager::Get().Modify([](CBRConfig& cfg) { cfg.msaaSamples = 2; });
