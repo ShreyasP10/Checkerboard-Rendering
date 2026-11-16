@@ -77,44 +77,58 @@ static void RunVulkanTests() {
     // Reconstruction + history swap happen at most once per frame
     CHECK(e.GetCurrentFrameIndex() == 0);
     CHECK(rt.GetCurrentHistoryIndex() == 0);
+    CHECK(!e.HasDispatchedThisFrame());
     e.OnScenePassEnd(nullptr);
+    CHECK(e.HasDispatchedThisFrame());
     CHECK(rt.GetCurrentHistoryIndex() == 1);
     CHECK(e.GetLastReconstructionDurationMs() > 0.0f);
     // One duplicate call: an unguarded engine would swap twice and land back on index 0. (An odd
     // number of duplicates would pass by parity luck, so keep the total number of calls even.)
     e.OnScenePassEnd(nullptr);                            // second matching pass in the same frame
     CHECK(rt.GetCurrentHistoryIndex() == 1);
+    CHECK(e.HasDispatchedThisFrame());
 
     // Parity only advances for the main present target
     e.OnPostPresent(&g_a);                                // first present defines the main target
     CHECK(e.GetCurrentFrameIndex() == 1);
+    CHECK(!e.HasDispatchedThisFrame());
     e.OnPostPresent(&g_b);                                // overlay / secondary swapchain
     CHECK(e.GetCurrentFrameIndex() == 1);
+    CHECK(!e.HasDispatchedThisFrame());
     e.OnPostPresent(&g_a);
     CHECK(e.GetCurrentFrameIndex() == 2);
+    CHECK(!e.HasDispatchedThisFrame());
 
     // New frame -> one more swap allowed
+    CHECK(!e.HasDispatchedThisFrame());
     e.OnScenePassEnd(nullptr);
+    CHECK(e.HasDispatchedThisFrame());
     CHECK(rt.GetCurrentHistoryIndex() == 0);
     e.OnScenePassEnd(nullptr);
     CHECK(rt.GetCurrentHistoryIndex() == 0);
+    CHECK(e.HasDispatchedThisFrame());
 
     // Disabled engine does nothing
     e.SetEnabled(false);
     e.OnPostPresent(&g_a);                                // frame advances, but...
+    CHECK(!e.HasDispatchedThisFrame());
     e.OnScenePassEnd(nullptr);
     CHECK(rt.GetCurrentHistoryIndex() == 0);              // ...no swap while disabled
+    CHECK(!e.HasDispatchedThisFrame());
     e.SetEnabled(true);
 
     // Swapchain recreation resets parity, history and the once-per-frame guard
     e.OnSwapchainRecreated();
     CHECK(e.GetCurrentFrameIndex() == 0);
     CHECK(rt.GetCurrentHistoryIndex() == 0);
+    CHECK(!e.HasDispatchedThisFrame());
     e.OnScenePassEnd(nullptr);
+    CHECK(e.HasDispatchedThisFrame());
     CHECK(rt.GetCurrentHistoryIndex() == 1);
     CHECK(e.GetLastReconstructionDurationMs() > 0.0f);              // frame 0 is dispatchable again
     e.OnPostPresent(&g_b);                                // a different target may become the main one
     CHECK(e.GetCurrentFrameIndex() == 1);
+    CHECK(!e.HasDispatchedThisFrame());
     e.OnPostPresent(&g_a);
     CHECK(e.GetCurrentFrameIndex() == 1);
 

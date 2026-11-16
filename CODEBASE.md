@@ -71,7 +71,6 @@ This document contains the complete, unabridged source code, shaders, configurat
    - [`docs/RISK_REGISTER.md`](#docsriskregistermd)
    - [`docs/VULKAN_HOOKING_GUIDE.md`](#docsvulkanhookingguidemd)
    - [`docs/IN_GAME_TEST_REPORT_v1491.md`](#docsingametestreportv1491md)
-   - [`docs/nextImplementationPhase.md`](#docsnextimplementationphasemd)
    - [`docs/AMD_VEGA_OPTIMIZATION.md`](#docsamdvegaoptimizationmd)
    - [`docs/INTEL_CBR_REFERENCE.md`](#docsintelcbrreferencemd)
    - [`docs/IMPROVEMENTS.md`](#docsimprovementsmd)
@@ -659,6 +658,11 @@ public:
     void        SetEnabled(bool enabled) { m_enabled.store(enabled); }
     GraphicsApi GetActiveApi() const { return m_activeApi.load(); }
     void        SetActiveApi(GraphicsApi api) { m_activeApi.store(api); }
+
+    [[nodiscard]] bool HasDispatchedThisFrame() const {
+        return m_lastDispatchedFrame.load(std::memory_order_acquire) ==
+               m_frameIndex.load(std::memory_order_acquire);
+    }
 
     // Performance metrics
     float GetLastReconstructionDurationMs() const { return m_lastReconDurationMs.load(); }
@@ -3875,21 +3879,26 @@ struct PassSlot {
     std::atomic<uint32_t> velocityFinalLayout{ 2 };
     std::atomic<bool>     colorIsSwapchain{ false };
     std::atomic<bool>     rpCandidateGeometryPass{ true };
+    std::atomic<bool>     hasSavedViewport{ false };
+    std::atomic<bool>     hasSavedScissor{ false };
+    MinimalVkViewport     savedViewport{};
+    MinimalVkRect2D       savedScissor{};
 };
 
 constexpr size_t kMaxTrackedPassSlots = 64;
 static PassSlot g_passSlots[kMaxTrackedPassSlots];
+static std::atomic<void*> g_verifiedSceneRenderPass{ nullptr };
 
 inline PassSlot* GetOrCreatePassSlot(void* cmdBuffer) {
     if (!cmdBuffer) return nullptr;
     const size_t startIdx = (reinterpret_cast<uintptr_t>(cmdBuffer) >> 4) % kMaxTrackedPassSlots;
-    for (size_t i = 0; i < 8; ++i) {
+    for (size_t i = 0; i < kMaxTrackedPassSlots; ++i) {
         size_t idx = (startIdx + i) % kMaxTrackedPassSlots;
         if (g_passSlots[idx].cmdBuffer.load(std::memory_order_relaxed) == cmdBuffer) {
             return &g_passSlots[idx];
         }
     }
-    for (size_t i = 0; i < 8; ++i) {
+    for (size_t i = 0; i < kMaxTrackedPassSlots; ++i) {
         size_t idx = (startIdx + i) % kMaxTrackedPassSlots;
         void* expected = nullptr;
         if (g_passSlots[idx].cmdBuffer.compare_exchange_strong(expected, cmdBuffer, std::memory_order_acq_rel)) {
@@ -3902,13 +3911,41 @@ inline PassSlot* GetOrCreatePassSlot(void* cmdBuffer) {
 inline PassSlot* FindPassSlot(void* cmdBuffer) {
     if (!cmdBuffer) return nullptr;
     const size_t startIdx = (reinterpret_cast<uintptr_t>(cmdBuffer) >> 4) % kMaxTrackedPassSlots;
-    for (size_t i = 0; i < 8; ++i) {
+    for (size_t i = 0; i < kMaxTrackedPassSlots; ++i) {
         size_t idx = (startIdx + i) % kMaxTrackedPassSlots;
         if (g_passSlots[idx].cmdBuffer.load(std::memory_order_relaxed) == cmdBuffer) {
             return &g_passSlots[idx];
         }
     }
     return nullptr;
+}
+
+inline bool CanDownscaleCommandBuffer(void* commandBuffer) {
+    // 1. Never downscale any pass (post-FX, bloom, UI/HUD) after CBR has already dispatched this frame
+    if (CBREngine::Get().HasDispatchedThisFrame()) {
+        return false;
+    }
+    PassSlot* slot = FindPassSlot(commandBuffer);
+    if (!slot) {
+        // vkCmdSetViewport called before vkCmdBeginRenderPass: allow provisional downscale,
+        // which Hooked_vkCmdBeginRenderPass will restore if the renderPass is not a scene pass.
+        return true;
+    }
+    // If a render pass is already active on this commandBuffer, verify it is an offscreen HDR+Depth candidate
+    if (slot->activeRenderPass.load(std::memory_order_acquire) != nullptr ||
+        slot->activeFramebuffer.load(std::memory_order_acquire) != nullptr) {
+        if (!slot->hasMatchingExtent.load(std::memory_order_acquire) ||
+            !slot->rpCandidateGeometryPass.load(std::memory_order_acquire) ||
+            slot->colorIsSwapchain.load(std::memory_order_acquire)) {
+            return false;
+        }
+        void* verifiedRp = g_verifiedSceneRenderPass.load(std::memory_order_acquire);
+        void* activeRp   = slot->activeRenderPass.load(std::memory_order_acquire);
+        if (verifiedRp != nullptr && activeRp != nullptr && activeRp != verifiedRp) {
+            return false;
+        }
+    }
+    return true;
 }
 
 inline void IncrementDrawCount(void* cmdBuffer) {
@@ -4019,6 +4056,15 @@ int Hooked_vkCreateDevice(void* physicalDevice, const void* pCreateInfo, const v
         g_framebuffers.clear();
         g_renderPasses.clear();
     }
+    for (size_t i = 0; i < kMaxTrackedPassSlots; ++i) {
+        g_passSlots[i].cmdBuffer.store(nullptr, std::memory_order_relaxed);
+        g_passSlots[i].hasMatchingExtent.store(false, std::memory_order_relaxed);
+        g_passSlots[i].viewportDownscaled.store(false, std::memory_order_relaxed);
+        g_passSlots[i].drawCount.store(0, std::memory_order_relaxed);
+        g_passSlots[i].hasSavedViewport.store(false, std::memory_order_relaxed);
+        g_passSlots[i].hasSavedScissor.store(false, std::memory_order_relaxed);
+    }
+    g_verifiedSceneRenderPass.store(nullptr, std::memory_order_release);
     return g_Original_vkCreateDevice(physicalDevice, pCreateInfo, pAllocator, pDevice);
 }
 
@@ -4033,6 +4079,7 @@ void Hooked_vkDestroySwapchainKHR(void* device, void* swapchain, const void* pAl
             g_activeSwapchain.store(nullptr);
             g_activeImageIndex.store(0);
         }
+        g_verifiedSceneRenderPass.store(nullptr, std::memory_order_release);
         // Purge tracked image/view/framebuffer/renderpass maps so swapchain recreation / window resize
         // / alt-tab does not retain stale pointers or match recycled driver handles
         {
@@ -4295,6 +4342,9 @@ int Hooked_vkCreateRenderPass2KHR(void* device, const void* pCreateInfo, const v
 
 void Hooked_vkDestroyRenderPass(void* device, void* renderPass, const void* pAllocator) {
     if (renderPass) {
+        if (g_verifiedSceneRenderPass.load(std::memory_order_acquire) == renderPass) {
+            g_verifiedSceneRenderPass.store(nullptr, std::memory_order_release);
+        }
         std::lock_guard<std::mutex> lock(g_attachmentMutex);
         g_renderPasses.erase(renderPass);
     }
@@ -4380,7 +4430,9 @@ void Hooked_vkCmdSetViewport(void* commandBuffer, uint32_t firstViewport, uint32
     }
 
     const auto dims = RenderTargetManager::Get().GetDimensions();
-    if (viewportCount == 1 && RenderTargetManager::Get().IsTargetInterceptCandidate(
+    if (viewportCount == 1 &&
+        CanDownscaleCommandBuffer(commandBuffer) &&
+        RenderTargetManager::Get().IsTargetInterceptCandidate(
             static_cast<uint32_t>(pViewports[0].width),
             static_cast<uint32_t>(pViewports[0].height),
             0)) {
@@ -4391,6 +4443,8 @@ void Hooked_vkCmdSetViewport(void* commandBuffer, uint32_t firstViewport, uint32
         PassSlot* slot = GetOrCreatePassSlot(commandBuffer);
         if (slot) {
             slot->viewportDownscaled.store(true, std::memory_order_release);
+            slot->savedViewport = pViewports[0];
+            slot->hasSavedViewport.store(true, std::memory_order_release);
         }
 
         MinimalVkViewport redirected = pViewports[0];
@@ -4439,10 +4493,18 @@ void Hooked_vkCmdSetScissor(void* commandBuffer, uint32_t firstScissor, uint32_t
     }
 
     const auto dims = RenderTargetManager::Get().GetDimensions();
-    if (scissorCount == 1 && RenderTargetManager::Get().IsTargetInterceptCandidate(
+    if (scissorCount == 1 &&
+        CanDownscaleCommandBuffer(commandBuffer) &&
+        RenderTargetManager::Get().IsTargetInterceptCandidate(
             pScissors[0].extent.width,
             pScissors[0].extent.height,
             0)) {
+
+        PassSlot* slot = GetOrCreatePassSlot(commandBuffer);
+        if (slot) {
+            slot->savedScissor = pScissors[0];
+            slot->hasSavedScissor.store(true, std::memory_order_release);
+        }
 
         MinimalVkRect2D redirected = pScissors[0];
         redirected.extent.width = dims.quarterWidth;
@@ -4457,6 +4519,11 @@ void Hooked_vkCmdSetScissor(void* commandBuffer, uint32_t firstScissor, uint32_t
 
 void Hooked_vkCmdBeginRenderPass(void* commandBuffer, const void* pRenderPassBegin, uint32_t contents) {
     if (!g_Original_vkCmdBeginRenderPass) return;
+
+    bool restoreViewport = false;
+    bool restoreScissor = false;
+    MinimalVkViewport restoredVp{};
+    MinimalVkRect2D restoredSc{};
 
     if (pRenderPassBegin && CBREngine::Get().IsEnabled()) {
         uint32_t sType = 0;
@@ -4518,8 +4585,38 @@ void Hooked_vkCmdBeginRenderPass(void* commandBuffer, const void* pRenderPassBeg
                     resolved = ResolveAttachmentViews({}, nullptr, info.renderPass);
                 }
 
+                void* verifiedRp = g_verifiedSceneRenderPass.load(std::memory_order_acquire);
+                const bool wasProvisionallyDownscaled = slot->viewportDownscaled.load(std::memory_order_acquire);
+                const bool passCandidate = matching &&
+                                           !resolved.colorIsSwapchain &&
+                                           (!resolved.rpTracked || resolved.rpCandidateGeometryPass) &&
+                                           !CBREngine::Get().HasDispatchedThisFrame() &&
+                                           (!verifiedRp || !info.renderPass || info.renderPass == verifiedRp);
+
+                if (wasProvisionallyDownscaled && !passCandidate) {
+                    // Provisional downscale happened before vkCmdBeginRenderPass, but this pass is NOT an offscreen scene pass!
+                    // Restore native full-resolution viewport and scissor.
+                    slot->viewportDownscaled.store(false, std::memory_order_release);
+                    CBREngine::Get().ConsumeCandidatePassActive(commandBuffer);
+                    if (slot->hasSavedViewport.load(std::memory_order_acquire)) {
+                        restoreViewport = true;
+                        restoredVp = slot->savedViewport;
+                        slot->hasSavedViewport.store(false, std::memory_order_release);
+                    }
+                    if (slot->hasSavedScissor.load(std::memory_order_acquire)) {
+                        restoreScissor = true;
+                        restoredSc = slot->savedScissor;
+                        slot->hasSavedScissor.store(false, std::memory_order_release);
+                    }
+                } else if (!wasProvisionallyDownscaled) {
+                    slot->hasSavedViewport.store(false, std::memory_order_relaxed);
+                    slot->hasSavedScissor.store(false, std::memory_order_relaxed);
+                }
+
                 slot->hasMatchingExtent.store(matching, std::memory_order_release);
-                slot->viewportDownscaled.store(false, std::memory_order_release);
+                if (!passCandidate) {
+                    slot->viewportDownscaled.store(false, std::memory_order_release);
+                }
                 slot->drawCount.store(0, std::memory_order_release);
                 slot->activeFramebuffer.store(info.framebuffer, std::memory_order_release);
                 slot->activeRenderPass.store(info.renderPass, std::memory_order_release);
@@ -4543,6 +4640,13 @@ void Hooked_vkCmdBeginRenderPass(void* commandBuffer, const void* pRenderPassBeg
     }
 
     g_Original_vkCmdBeginRenderPass(commandBuffer, pRenderPassBegin, contents);
+
+    if (restoreViewport && g_Original_vkCmdSetViewport) {
+        g_Original_vkCmdSetViewport(commandBuffer, 0, 1, &restoredVp);
+    }
+    if (restoreScissor && g_Original_vkCmdSetScissor) {
+        g_Original_vkCmdSetScissor(commandBuffer, 0, 1, &restoredSc);
+    }
 }
 
 void Hooked_vkCmdDraw(void* commandBuffer, uint32_t vertexCount, uint32_t instanceCount, uint32_t firstVertex, uint32_t firstInstance) {
@@ -4621,6 +4725,8 @@ void Hooked_vkCmdEndRenderPass(void* commandBuffer) {
                 slot->hasMatchingExtent.store(false, std::memory_order_relaxed);
                 slot->viewportDownscaled.store(false, std::memory_order_relaxed);
                 slot->drawCount.store(0, std::memory_order_relaxed);
+                slot->hasSavedViewport.store(false, std::memory_order_relaxed);
+                slot->hasSavedScissor.store(false, std::memory_order_relaxed);
                 slot->activeFramebuffer.store(nullptr, std::memory_order_relaxed);
                 slot->activeRenderPass.store(nullptr, std::memory_order_relaxed);
                 slot->renderWidth.store(0, std::memory_order_relaxed);
@@ -4637,6 +4743,9 @@ void Hooked_vkCmdEndRenderPass(void* commandBuffer) {
             // Always consume any candidate pass marker for this commandBuffer, while requiring >= 250 draws before dispatch (Item H-03)
             CBREngine::Get().ConsumeCandidatePassActive(commandBuffer);
             if (isScenePass && !colorIsSwapchain) {
+                if (activeRp) {
+                    g_verifiedSceneRenderPass.store(activeRp, std::memory_order_release);
+                }
                 if (!gameColorImage && activeFb) {
                     const ResolvedSceneAttachments fallback = ResolveFramebufferAttachments(activeFb, activeRp);
                     gameColorImage = fallback.colorImage;
@@ -5084,6 +5193,22 @@ void HookManager::UninstallVulkanHooks() {
         m_vulkanHooked.store(false);
         g_Original_vkCmdResolveImage = nullptr;
         g_pendingResolveColorImage.store(nullptr, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> attLock(g_attachmentMutex);
+            g_images.clear();
+            g_imageViews.clear();
+            g_framebuffers.clear();
+            g_renderPasses.clear();
+        }
+        for (size_t i = 0; i < kMaxTrackedPassSlots; ++i) {
+            g_passSlots[i].cmdBuffer.store(nullptr, std::memory_order_relaxed);
+            g_passSlots[i].hasMatchingExtent.store(false, std::memory_order_relaxed);
+            g_passSlots[i].viewportDownscaled.store(false, std::memory_order_relaxed);
+            g_passSlots[i].drawCount.store(0, std::memory_order_relaxed);
+            g_passSlots[i].hasSavedViewport.store(false, std::memory_order_relaxed);
+            g_passSlots[i].hasSavedScissor.store(false, std::memory_order_relaxed);
+        }
+        g_verifiedSceneRenderPass.store(nullptr, std::memory_order_release);
     }
 }
 
@@ -5186,13 +5311,13 @@ static DX12CmdListSlot g_dx12Slots[kMaxDX12Slots];
 inline DX12CmdListSlot* GetOrCreateDX12Slot(void* cmdList) {
     if (!cmdList) return nullptr;
     const size_t start = (reinterpret_cast<uintptr_t>(cmdList) >> 4) % kMaxDX12Slots;
-    for (size_t i = 0; i < 8; ++i) {
+    for (size_t i = 0; i < kMaxDX12Slots; ++i) {
         size_t idx = (start + i) % kMaxDX12Slots;
         if (g_dx12Slots[idx].cmdList.load(std::memory_order_relaxed) == cmdList) {
             return &g_dx12Slots[idx];
         }
     }
-    for (size_t i = 0; i < 8; ++i) {
+    for (size_t i = 0; i < kMaxDX12Slots; ++i) {
         size_t idx = (start + i) % kMaxDX12Slots;
         void* expected = nullptr;
         if (g_dx12Slots[idx].cmdList.compare_exchange_strong(expected, cmdList, std::memory_order_acq_rel)) {
@@ -5215,7 +5340,7 @@ inline DX12CmdListSlot* GetOrCreateDX12Slot(void* cmdList) {
 inline DX12CmdListSlot* FindDX12Slot(void* cmdList) {
     if (!cmdList) return nullptr;
     const size_t start = (reinterpret_cast<uintptr_t>(cmdList) >> 4) % kMaxDX12Slots;
-    for (size_t i = 0; i < 8; ++i) {
+    for (size_t i = 0; i < kMaxDX12Slots; ++i) {
         size_t idx = (start + i) % kMaxDX12Slots;
         if (g_dx12Slots[idx].cmdList.load(std::memory_order_relaxed) == cmdList) {
             return &g_dx12Slots[idx];
@@ -5404,7 +5529,9 @@ void __stdcall Hooked_D3D12RSSetViewports(void* commandList, unsigned int numVie
     MinimalD3D12Viewport firstVp{};
     std::memcpy(&firstVp, pViewports, sizeof(firstVp));
     const auto dims = RenderTargetManager::Get().GetDimensions();
-    if (numViewports == 1 && RenderTargetManager::Get().IsTargetInterceptCandidate(
+    if (numViewports == 1 &&
+        !CBREngine::Get().HasDispatchedThisFrame() &&
+        RenderTargetManager::Get().IsTargetInterceptCandidate(
             static_cast<uint32_t>(firstVp.Width),
             static_cast<uint32_t>(firstVp.Height),
             0)) {
@@ -5451,7 +5578,9 @@ void __stdcall Hooked_D3D12RSSetScissorRects(void* commandList, unsigned int num
     const uint32_t width = (firstRect.right > firstRect.left) ? static_cast<uint32_t>(firstRect.right - firstRect.left) : 0u;
     const uint32_t height = (firstRect.bottom > firstRect.top) ? static_cast<uint32_t>(firstRect.bottom - firstRect.top) : 0u;
     const auto dims = RenderTargetManager::Get().GetDimensions();
-    if (numRects == 1 && RenderTargetManager::Get().IsTargetInterceptCandidate(width, height, 0)) {
+    if (numRects == 1 &&
+        !CBREngine::Get().HasDispatchedThisFrame() &&
+        RenderTargetManager::Get().IsTargetInterceptCandidate(width, height, 0)) {
         firstRect.right = firstRect.left + static_cast<int32_t>(dims.quarterWidth);
         firstRect.bottom = firstRect.top + static_cast<int32_t>(dims.quarterHeight);
         g_Original_D3D12RSSetScissorRects(commandList, 1, &firstRect);
@@ -8907,6 +9036,9 @@ void ReconstructionPass::DispatchVulkan(void* vkCommandBuffer, uint32_t frameInd
             if (!tex.image) return;
             // Use tracked layout rather than hardcoded UNDEFINED (0) so Step-1 copied inputs and initial history aren't discarded (Item C-03).
             const uint32_t oldLayout = RenderTargetManager::Get().GetVulkanImageLayout(tex.image);
+            if (oldLayout == newLayout && oldLayout == kVkImageLayoutShaderReadOnlyOptimal) {
+                return; // Already in SHADER_READ_ONLY_OPTIMAL with compute read visibility from CopyImageRegion / previous pass
+            }
             uint32_t srcStage = kVkPipelineStageTopOfPipeBit;
             uint32_t srcAccess = 0;
             StageAccessForLayout(oldLayout, tex.aspectMask, srcStage, srcAccess);
@@ -13356,44 +13488,58 @@ static void RunVulkanTests() {
     // Reconstruction + history swap happen at most once per frame
     CHECK(e.GetCurrentFrameIndex() == 0);
     CHECK(rt.GetCurrentHistoryIndex() == 0);
+    CHECK(!e.HasDispatchedThisFrame());
     e.OnScenePassEnd(nullptr);
+    CHECK(e.HasDispatchedThisFrame());
     CHECK(rt.GetCurrentHistoryIndex() == 1);
     CHECK(e.GetLastReconstructionDurationMs() > 0.0f);
     // One duplicate call: an unguarded engine would swap twice and land back on index 0. (An odd
     // number of duplicates would pass by parity luck, so keep the total number of calls even.)
     e.OnScenePassEnd(nullptr);                            // second matching pass in the same frame
     CHECK(rt.GetCurrentHistoryIndex() == 1);
+    CHECK(e.HasDispatchedThisFrame());
 
     // Parity only advances for the main present target
     e.OnPostPresent(&g_a);                                // first present defines the main target
     CHECK(e.GetCurrentFrameIndex() == 1);
+    CHECK(!e.HasDispatchedThisFrame());
     e.OnPostPresent(&g_b);                                // overlay / secondary swapchain
     CHECK(e.GetCurrentFrameIndex() == 1);
+    CHECK(!e.HasDispatchedThisFrame());
     e.OnPostPresent(&g_a);
     CHECK(e.GetCurrentFrameIndex() == 2);
+    CHECK(!e.HasDispatchedThisFrame());
 
     // New frame -> one more swap allowed
+    CHECK(!e.HasDispatchedThisFrame());
     e.OnScenePassEnd(nullptr);
+    CHECK(e.HasDispatchedThisFrame());
     CHECK(rt.GetCurrentHistoryIndex() == 0);
     e.OnScenePassEnd(nullptr);
     CHECK(rt.GetCurrentHistoryIndex() == 0);
+    CHECK(e.HasDispatchedThisFrame());
 
     // Disabled engine does nothing
     e.SetEnabled(false);
     e.OnPostPresent(&g_a);                                // frame advances, but...
+    CHECK(!e.HasDispatchedThisFrame());
     e.OnScenePassEnd(nullptr);
     CHECK(rt.GetCurrentHistoryIndex() == 0);              // ...no swap while disabled
+    CHECK(!e.HasDispatchedThisFrame());
     e.SetEnabled(true);
 
     // Swapchain recreation resets parity, history and the once-per-frame guard
     e.OnSwapchainRecreated();
     CHECK(e.GetCurrentFrameIndex() == 0);
     CHECK(rt.GetCurrentHistoryIndex() == 0);
+    CHECK(!e.HasDispatchedThisFrame());
     e.OnScenePassEnd(nullptr);
+    CHECK(e.HasDispatchedThisFrame());
     CHECK(rt.GetCurrentHistoryIndex() == 1);
     CHECK(e.GetLastReconstructionDurationMs() > 0.0f);              // frame 0 is dispatchable again
     e.OnPostPresent(&g_b);                                // a different target may become the main one
     CHECK(e.GetCurrentFrameIndex() == 1);
+    CHECK(!e.HasDispatchedThisFrame());
     e.OnPostPresent(&g_a);
     CHECK(e.GetCurrentFrameIndex() == 1);
 
@@ -15082,7 +15228,7 @@ Every architectural decision, hardware profile, and audit finding is documented 
 | RAGE Engine Architecture, Generational Evolution & Vulkan Hooks | [`docs/RAGE_ENGINE_ARCHITECTURE.md`](docs/RAGE_ENGINE_ARCHITECTURE.md) |
 | Architectural Design & Engineering Standards | [`docs/ENGINEERING_STANDARDS.md`](docs/ENGINEERING_STANDARDS.md) |
 | Synchronized single-file codebase snapshot | [`CODEBASE.md`](CODEBASE.md) |
-| Phase 2 runtime detours & swapchain integration plan | [`nextImplementationPhase.md`](nextImplementationPhase.md) · [`docs/nextImplementationPhase.md`](docs/nextImplementationPhase.md) |
+| Phase 2 runtime detours & swapchain integration plan | [`nextImplementationPhase.md`](nextImplementationPhase.md) |
 | Live test report on RDR2 `1.0.1491.50` (GTX 1070 Ti + LML) | [`docs/IN_GAME_TEST_REPORT_v1491.md`](docs/IN_GAME_TEST_REPORT_v1491.md) |
 | Vulkan loader detours, image barriers & compute pass guide | [`docs/VULKAN_HOOKING_GUIDE.md`](docs/VULKAN_HOOKING_GUIDE.md) |
 | Intel 2018 CBR reference analysis (Mcferron & Lake) | [`docs/INTEL_CBR_REFERENCE.md`](docs/INTEL_CBR_REFERENCE.md) |
@@ -18853,163 +18999,6 @@ Following the live Phase 1 in-game test, the codebase advanced through subsequen
 
 See [nextImplementationPhase.md](file:///c:/Users/Dinesh%20B%20Pawar/OneDrive/Desktop/Checkerboard-Rendering/nextImplementationPhase.md) and [docs/VULKAN_HOOKING_GUIDE.md](file:///c:/Users/Dinesh%20B%20Pawar/OneDrive/Desktop/Checkerboard-Rendering/docs/VULKAN_HOOKING_GUIDE.md) for full technical guides.
 
-````
-
-<a id="docsnextimplementationphasemd"></a>
-### `docs/nextImplementationPhase.md`
-````markdown
-# Next Implementation Phase: Runtime Graphics Detours & Frame Interception
-
-**Project:** RDR2 Checkerboard Rendering Mod (CBR)  
-**Target Platform:** Red Dead Redemption 2 (`1.0.1491.50`+) | PC (Windows 10/11 x64)  
-**Target Hardware:** NVIDIA GeForce GTX 1070 Ti (Pascal GP104) & Vulkan / DirectX 12  
-**Baseline Verification:** Passed in-game load test on 2026-10-23 (`rdr2-cbr.asi` at `0x00007FFE9ABA0000`, `vulkan-1.dll` at `0x00007FFE66510000`)
-
----
-
-## 1. Executive Summary & Objective
-
-In our initial in-game deployment, the mod successfully proved:
-1. **Host Stability:** Loaded cleanly via Alexander Blade's ASI loader alongside Lenny's Mod Loader (`vfs.asi`) and Visual Redemption with **zero game crashes or memory corruption**.
-2. **Subsystem Readiness:** Configuration loaded from [cbr.ini](file:///c:/Users/Dinesh%20B%20Pawar/OneDrive/Desktop/Checkerboard-Rendering/cbr.ini), allocating 2× MSAA quarter-resolution buffers (1920×1080) with a measured 300.59 MiB VRAM footprint.
-3. **Safe Fallback:** Because graphics hook stubs were protected by safety flags, the mod timed out gracefully after 60 seconds without disrupting game rendering.
-
-### The Core Goal of This Phase
-**Transition from dormant stub hooks to active function detours (via MinHook / API wrapping) that intercept RDR2's graphics pipeline, execute the checkerboard reconstruction compute pass, and blit the reconstructed 4K frame to the swapchain backbuffer prior to presentation.**
-
-```
-[RDR2 Render Thread]
-        │
-        ▼
-   RAGE Engine (Draws to 1920x1080 2x MSAA Target + Jitter)
-        │
-        ▼
-[vkQueuePresentKHR / IDXGISwapChain::Present Hooked]
-        │
-        ├──> 1. Acquire Current Backbuffer & Command Buffer
-        ├──> 2. Insert Pipeline Barriers (Layout Transition)
-        ├──> 3. Bind Shaders (cbr_reconstruct.comp) + Descriptors
-        ├──> 4. Dispatch Compute Reconstruction (3840x2160 grid)
-        ├──> 5. Blit / Resolve Reconstructed Image to Swapchain
-        └──> 6. Call Original vkQueuePresentKHR / Present
-```
-
----
-
-## 2. Detailed Technical Breakdown & Tasks
-
-### Task 2.1: MinHook Integration & Vulkan Detour Table
-
-#### Problem Statement
-Currently, [src/hooks_vulkan.cpp](file:///c:/Users/Dinesh%20B%20Pawar/OneDrive/Desktop/Checkerboard-Rendering/src/hooks_vulkan.cpp) locates `vulkan-1.dll` and resolves `vkGetInstanceProcAddr`, but returns `false` without modifying the dispatch table.
-
-#### Implementation Steps
-1. **Incorporate MinHook / Trampoline Library:**
-   - Link `minhook` or vendor an in-tree x64 trampoline engine into [CMakeLists.txt](file:///c:/Users/Dinesh%20B%20Pawar/OneDrive/Desktop/Checkerboard-Rendering/CMakeLists.txt).
-   - Alternatively, intercept Vulkan via `vkGetInstanceProcAddr` and `vkGetDeviceProcAddr` hook chain, replacing function pointers in the device dispatch table before RAGE engine calls them.
-2. **Detour Targets:**
-   - `vkCreateSwapchainKHR`: Intercept swapchain creation to capture the `VkDevice`, backbuffer count, extent (width/height), and format (`VK_FORMAT_B8G8R8A8_UNORM` / `VK_FORMAT_R16G16B16A16_SFLOAT`).
-   - `vkDestroySwapchainKHR`: Release allocated compute pipelines, command buffers, and descriptor sets associated with the stale swapchain.
-   - `vkQueuePresentKHR`: Intercept every frame right before presentation to execute the CBR reconstruction pass.
-   - `vkAcquireNextImageKHR`: Track active backbuffer index.
-
-```cpp
-// Target MinHook Hook Structure for Vulkan
-MH_STATUS status = MH_CreateHook(
-    reinterpret_cast<LPVOID>(pfn_vkQueuePresentKHR),
-    reinterpret_cast<LPVOID>(&Hooked_vkQueuePresentKHR),
-    reinterpret_cast<LPVOID*>(&g_Original_vkQueuePresentKHR)
-);
-MH_EnableHook(pfn_vkQueuePresentKHR);
-```
-
----
-
-### Task 2.2: Swapchain Image Acquisition & Command Injection
-
-#### Implementation Steps
-1. **Swapchain Resource Tracking:**
-   - Enumerate swapchain images via `vkGetSwapchainImagesKHR`.
-   - Create a `VkImageView` for each swapchain image for compute write or blit destinations.
-2. **Dedicated Command Infrastructure:**
-   - Create a dedicated `VkCommandPool` associated with the presentation queue family (`VkQueueFamilyProperties`).
-   - Allocate a `VkCommandBuffer` and `VkFence` per swapchain image to ensure non-blocking, multi-frame synchronization without stalling the GPU pipeline.
-3. **Pipeline Barriers & Synchronization:**
-   - Insert execution barrier transitioning the swapchain backbuffer from `VK_IMAGE_LAYOUT_PRESENT_SRC_KHR` to `VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL` (or `VK_IMAGE_LAYOUT_GENERAL`).
-   - Synchronize with the game's render completion semaphore (`waitSemaphoreCount` in `VkPresentInfoKHR`).
-
----
-
-### Task 2.3: Reconstruction Compute Pass Execution
-
-#### Implementation Steps
-1. **SPIR-V Shader Module Management:**
-   - Ensure [shaders/cbr_reconstruct.comp](file:///c:/Users/Dinesh%20B%20Pawar/OneDrive/Desktop/Checkerboard-Rendering/shaders/cbr_reconstruct.comp) is compiled to SPIR-V bytecode (`cbr_reconstruct.spv`) during build time via `glslangValidator -V`.
-   - Embed or load the binary at runtime via `vkCreateShaderModule`.
-2. **Descriptor Set Layout:**
-   - Binding 0: `QuarterColorMSAA` (`VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER`)
-   - Binding 1: `QuarterDepthMSAA` (`VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER`)
-   - Binding 2: `HistoryColor` (`VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER`)
-   - Binding 3: `VelocityVectors` (`VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER`)
-   - Binding 4: `ReconstructedOutput` (`VK_DESCRIPTOR_TYPE_STORAGE_IMAGE`)
-   - Binding 5: Push Constants (Dimensions, Parity, Jitter Offsets, Camera Near/Far).
-3. **Dispatch Dimensions:**
-   - Dispatch workgroups covering the 3840×2160 canvas:
-     $$\text{Groups}_X = \lceil 3840 / 16 \rceil = 240, \quad \text{Groups}_Y = \lceil 2160 / 16 \rceil = 135$$
-4. **Blit / Copy to Swapchain:**
-   - Use `vkCmdBlitImage` or direct compute storage write to place the final reconstructed 4K image onto the swapchain backbuffer.
-   - Transition swapchain image back to `VK_IMAGE_LAYOUT_PRESENT_SRC_KHR` prior to calling original `vkQueuePresentKHR`.
-
----
-
-### Task 2.4: Camera Projection Matrix & Subpixel Jitter Injection
-
-#### Problem Statement
-For checkerboard reconstruction to resolve clean geometry, alternating pixels must be sampled across successive frames.
-
-#### Implementation Steps
-1. **Memory Pattern Scanning for RDR2 `1.0.1491.50`:**
-   - Scan RAGE camera manager memory space for projection matrix updates.
-   - Inject alternating horizontal/vertical subpixel jitter offsets:
-     * Frame $N$: $(+0.25 / W, +0.25 / H)$
-     * Frame $N+1$: $(-0.25 / W, -0.25 / H)$
-2. **Programmable Sample Locations (Vulkan Alternative):**
-   - If camera matrix patching is bypassed, utilize `VK_EXT_sample_locations` on the 2× MSAA render target, toggling sample locations between frames according to [CHECKERBOARD.md](file:///c:/Users/Dinesh%20B%20Pawar/OneDrive/Desktop/Checkerboard-Rendering/CHECKERBOARD.md):
-     * Frame 0: $(0.75, 0.75)$ and $(0.25, 0.25)$
-     * Frame 1: $(0.25, 0.75)$ and $(0.75, 0.25)$
-
----
-
-### Task 2.5: DirectX 12 Parity Hooking
-
-#### Implementation Steps
-1. **Dummy Device Swapchain Method:**
-   - In [src/hooks_dx12.cpp](file:///c:/Users/Dinesh%20B%20Pawar/OneDrive/Desktop/Checkerboard-Rendering/src/hooks_dx12.cpp), spawn a lightweight hidden window and create a temporary `D3D12CreateDevice` and `IDXGIFactory4::CreateSwapChain`.
-   - Query the Virtual Method Table (VMT) of `IDXGISwapChain3` to retrieve the address of `Present` (VMT index 8).
-   - Hook `Present` via MinHook or VMT pointer swap.
-2. **DX12 Pipeline Execution:**
-   - Record compute command list executing [shaders/cbr_reconstruct.hlsl](file:///c:/Users/Dinesh%20B%20Pawar/OneDrive/Desktop/Checkerboard-Rendering/shaders/cbr_reconstruct.hlsl) on `ID3D12CommandQueue`.
-
----
-
-## 3. Implementation Roadmap & Timeline
-
-| Phase Subtask | Description | Status | Target Outcome |
-|---|---|---|---|
-| **Phase 2.1** | MinHook Integration & Vulkan Proc Table Detours | **COMPLETE** | Intercept `vkQueuePresentKHR` & swapchain events reliably |
-| **Phase 2.2** | Swapchain Image Tracking & Layout Management | **COMPLETE** | Acquire swapchain backbuffers and manage pipeline barriers |
-| **Phase 2.3** | SPIR-V Loader & Compute Pipeline Dispatch | **COMPLETE** | Execute reconstruction compute pass during present call |
-| **Phase 2.4** | Render Target Hooking & Resolution Redirection | **COMPLETE** | Downscale RDR2 internal pass to 1080p 2× MSAA |
-| **Phase 2.5** | Camera Jitter Injection / Sample Locations | **COMPLETE** | Alternate subpixel spatial coverage per frame (Strategy A/B & AOB scanner) |
-| **Phase 2.6** | Telemetry, UI Overlay & Performance Tuning | **IN PROGRESS** | Real-time FPS, frame-time graphs & interactive toggles |
-
----
-
-## 4. Verification & Validation Criteria
-
-1. **Safety First:** Mod must never crash RDR2 or throw Vulkan validation errors. If any device call fails, the mod must fall back to the original `vkQueuePresentKHR` immediately.
-2. **Visual Fidelity:** Text, HUD, and minimap must remain razor sharp without jitter or blur.
-3. **Performance Target:** Overall reconstruction compute pass frame time must execute in **< 2.0 ms** on GTX 1070 Ti at 4K UHD.
 ````
 
 <a id="docsamdvegaoptimizationmd"></a>

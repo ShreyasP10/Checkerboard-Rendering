@@ -682,21 +682,26 @@ struct PassSlot {
     std::atomic<uint32_t> velocityFinalLayout{ 2 };
     std::atomic<bool>     colorIsSwapchain{ false };
     std::atomic<bool>     rpCandidateGeometryPass{ true };
+    std::atomic<bool>     hasSavedViewport{ false };
+    std::atomic<bool>     hasSavedScissor{ false };
+    MinimalVkViewport     savedViewport{};
+    MinimalVkRect2D       savedScissor{};
 };
 
 constexpr size_t kMaxTrackedPassSlots = 64;
 static PassSlot g_passSlots[kMaxTrackedPassSlots];
+static std::atomic<void*> g_verifiedSceneRenderPass{ nullptr };
 
 inline PassSlot* GetOrCreatePassSlot(void* cmdBuffer) {
     if (!cmdBuffer) return nullptr;
     const size_t startIdx = (reinterpret_cast<uintptr_t>(cmdBuffer) >> 4) % kMaxTrackedPassSlots;
-    for (size_t i = 0; i < 8; ++i) {
+    for (size_t i = 0; i < kMaxTrackedPassSlots; ++i) {
         size_t idx = (startIdx + i) % kMaxTrackedPassSlots;
         if (g_passSlots[idx].cmdBuffer.load(std::memory_order_relaxed) == cmdBuffer) {
             return &g_passSlots[idx];
         }
     }
-    for (size_t i = 0; i < 8; ++i) {
+    for (size_t i = 0; i < kMaxTrackedPassSlots; ++i) {
         size_t idx = (startIdx + i) % kMaxTrackedPassSlots;
         void* expected = nullptr;
         if (g_passSlots[idx].cmdBuffer.compare_exchange_strong(expected, cmdBuffer, std::memory_order_acq_rel)) {
@@ -709,13 +714,41 @@ inline PassSlot* GetOrCreatePassSlot(void* cmdBuffer) {
 inline PassSlot* FindPassSlot(void* cmdBuffer) {
     if (!cmdBuffer) return nullptr;
     const size_t startIdx = (reinterpret_cast<uintptr_t>(cmdBuffer) >> 4) % kMaxTrackedPassSlots;
-    for (size_t i = 0; i < 8; ++i) {
+    for (size_t i = 0; i < kMaxTrackedPassSlots; ++i) {
         size_t idx = (startIdx + i) % kMaxTrackedPassSlots;
         if (g_passSlots[idx].cmdBuffer.load(std::memory_order_relaxed) == cmdBuffer) {
             return &g_passSlots[idx];
         }
     }
     return nullptr;
+}
+
+inline bool CanDownscaleCommandBuffer(void* commandBuffer) {
+    // 1. Never downscale any pass (post-FX, bloom, UI/HUD) after CBR has already dispatched this frame
+    if (CBREngine::Get().HasDispatchedThisFrame()) {
+        return false;
+    }
+    PassSlot* slot = FindPassSlot(commandBuffer);
+    if (!slot) {
+        // vkCmdSetViewport called before vkCmdBeginRenderPass: allow provisional downscale,
+        // which Hooked_vkCmdBeginRenderPass will restore if the renderPass is not a scene pass.
+        return true;
+    }
+    // If a render pass is already active on this commandBuffer, verify it is an offscreen HDR+Depth candidate
+    if (slot->activeRenderPass.load(std::memory_order_acquire) != nullptr ||
+        slot->activeFramebuffer.load(std::memory_order_acquire) != nullptr) {
+        if (!slot->hasMatchingExtent.load(std::memory_order_acquire) ||
+            !slot->rpCandidateGeometryPass.load(std::memory_order_acquire) ||
+            slot->colorIsSwapchain.load(std::memory_order_acquire)) {
+            return false;
+        }
+        void* verifiedRp = g_verifiedSceneRenderPass.load(std::memory_order_acquire);
+        void* activeRp   = slot->activeRenderPass.load(std::memory_order_acquire);
+        if (verifiedRp != nullptr && activeRp != nullptr && activeRp != verifiedRp) {
+            return false;
+        }
+    }
+    return true;
 }
 
 inline void IncrementDrawCount(void* cmdBuffer) {
@@ -826,6 +859,15 @@ int Hooked_vkCreateDevice(void* physicalDevice, const void* pCreateInfo, const v
         g_framebuffers.clear();
         g_renderPasses.clear();
     }
+    for (size_t i = 0; i < kMaxTrackedPassSlots; ++i) {
+        g_passSlots[i].cmdBuffer.store(nullptr, std::memory_order_relaxed);
+        g_passSlots[i].hasMatchingExtent.store(false, std::memory_order_relaxed);
+        g_passSlots[i].viewportDownscaled.store(false, std::memory_order_relaxed);
+        g_passSlots[i].drawCount.store(0, std::memory_order_relaxed);
+        g_passSlots[i].hasSavedViewport.store(false, std::memory_order_relaxed);
+        g_passSlots[i].hasSavedScissor.store(false, std::memory_order_relaxed);
+    }
+    g_verifiedSceneRenderPass.store(nullptr, std::memory_order_release);
     return g_Original_vkCreateDevice(physicalDevice, pCreateInfo, pAllocator, pDevice);
 }
 
@@ -840,6 +882,7 @@ void Hooked_vkDestroySwapchainKHR(void* device, void* swapchain, const void* pAl
             g_activeSwapchain.store(nullptr);
             g_activeImageIndex.store(0);
         }
+        g_verifiedSceneRenderPass.store(nullptr, std::memory_order_release);
         // Purge tracked image/view/framebuffer/renderpass maps so swapchain recreation / window resize
         // / alt-tab does not retain stale pointers or match recycled driver handles
         {
@@ -1102,6 +1145,9 @@ int Hooked_vkCreateRenderPass2KHR(void* device, const void* pCreateInfo, const v
 
 void Hooked_vkDestroyRenderPass(void* device, void* renderPass, const void* pAllocator) {
     if (renderPass) {
+        if (g_verifiedSceneRenderPass.load(std::memory_order_acquire) == renderPass) {
+            g_verifiedSceneRenderPass.store(nullptr, std::memory_order_release);
+        }
         std::lock_guard<std::mutex> lock(g_attachmentMutex);
         g_renderPasses.erase(renderPass);
     }
@@ -1187,7 +1233,9 @@ void Hooked_vkCmdSetViewport(void* commandBuffer, uint32_t firstViewport, uint32
     }
 
     const auto dims = RenderTargetManager::Get().GetDimensions();
-    if (viewportCount == 1 && RenderTargetManager::Get().IsTargetInterceptCandidate(
+    if (viewportCount == 1 &&
+        CanDownscaleCommandBuffer(commandBuffer) &&
+        RenderTargetManager::Get().IsTargetInterceptCandidate(
             static_cast<uint32_t>(pViewports[0].width),
             static_cast<uint32_t>(pViewports[0].height),
             0)) {
@@ -1198,6 +1246,8 @@ void Hooked_vkCmdSetViewport(void* commandBuffer, uint32_t firstViewport, uint32
         PassSlot* slot = GetOrCreatePassSlot(commandBuffer);
         if (slot) {
             slot->viewportDownscaled.store(true, std::memory_order_release);
+            slot->savedViewport = pViewports[0];
+            slot->hasSavedViewport.store(true, std::memory_order_release);
         }
 
         MinimalVkViewport redirected = pViewports[0];
@@ -1246,10 +1296,18 @@ void Hooked_vkCmdSetScissor(void* commandBuffer, uint32_t firstScissor, uint32_t
     }
 
     const auto dims = RenderTargetManager::Get().GetDimensions();
-    if (scissorCount == 1 && RenderTargetManager::Get().IsTargetInterceptCandidate(
+    if (scissorCount == 1 &&
+        CanDownscaleCommandBuffer(commandBuffer) &&
+        RenderTargetManager::Get().IsTargetInterceptCandidate(
             pScissors[0].extent.width,
             pScissors[0].extent.height,
             0)) {
+
+        PassSlot* slot = GetOrCreatePassSlot(commandBuffer);
+        if (slot) {
+            slot->savedScissor = pScissors[0];
+            slot->hasSavedScissor.store(true, std::memory_order_release);
+        }
 
         MinimalVkRect2D redirected = pScissors[0];
         redirected.extent.width = dims.quarterWidth;
@@ -1264,6 +1322,11 @@ void Hooked_vkCmdSetScissor(void* commandBuffer, uint32_t firstScissor, uint32_t
 
 void Hooked_vkCmdBeginRenderPass(void* commandBuffer, const void* pRenderPassBegin, uint32_t contents) {
     if (!g_Original_vkCmdBeginRenderPass) return;
+
+    bool restoreViewport = false;
+    bool restoreScissor = false;
+    MinimalVkViewport restoredVp{};
+    MinimalVkRect2D restoredSc{};
 
     if (pRenderPassBegin && CBREngine::Get().IsEnabled()) {
         uint32_t sType = 0;
@@ -1325,8 +1388,38 @@ void Hooked_vkCmdBeginRenderPass(void* commandBuffer, const void* pRenderPassBeg
                     resolved = ResolveAttachmentViews({}, nullptr, info.renderPass);
                 }
 
+                void* verifiedRp = g_verifiedSceneRenderPass.load(std::memory_order_acquire);
+                const bool wasProvisionallyDownscaled = slot->viewportDownscaled.load(std::memory_order_acquire);
+                const bool passCandidate = matching &&
+                                           !resolved.colorIsSwapchain &&
+                                           (!resolved.rpTracked || resolved.rpCandidateGeometryPass) &&
+                                           !CBREngine::Get().HasDispatchedThisFrame() &&
+                                           (!verifiedRp || !info.renderPass || info.renderPass == verifiedRp);
+
+                if (wasProvisionallyDownscaled && !passCandidate) {
+                    // Provisional downscale happened before vkCmdBeginRenderPass, but this pass is NOT an offscreen scene pass!
+                    // Restore native full-resolution viewport and scissor.
+                    slot->viewportDownscaled.store(false, std::memory_order_release);
+                    CBREngine::Get().ConsumeCandidatePassActive(commandBuffer);
+                    if (slot->hasSavedViewport.load(std::memory_order_acquire)) {
+                        restoreViewport = true;
+                        restoredVp = slot->savedViewport;
+                        slot->hasSavedViewport.store(false, std::memory_order_release);
+                    }
+                    if (slot->hasSavedScissor.load(std::memory_order_acquire)) {
+                        restoreScissor = true;
+                        restoredSc = slot->savedScissor;
+                        slot->hasSavedScissor.store(false, std::memory_order_release);
+                    }
+                } else if (!wasProvisionallyDownscaled) {
+                    slot->hasSavedViewport.store(false, std::memory_order_relaxed);
+                    slot->hasSavedScissor.store(false, std::memory_order_relaxed);
+                }
+
                 slot->hasMatchingExtent.store(matching, std::memory_order_release);
-                slot->viewportDownscaled.store(false, std::memory_order_release);
+                if (!passCandidate) {
+                    slot->viewportDownscaled.store(false, std::memory_order_release);
+                }
                 slot->drawCount.store(0, std::memory_order_release);
                 slot->activeFramebuffer.store(info.framebuffer, std::memory_order_release);
                 slot->activeRenderPass.store(info.renderPass, std::memory_order_release);
@@ -1350,6 +1443,13 @@ void Hooked_vkCmdBeginRenderPass(void* commandBuffer, const void* pRenderPassBeg
     }
 
     g_Original_vkCmdBeginRenderPass(commandBuffer, pRenderPassBegin, contents);
+
+    if (restoreViewport && g_Original_vkCmdSetViewport) {
+        g_Original_vkCmdSetViewport(commandBuffer, 0, 1, &restoredVp);
+    }
+    if (restoreScissor && g_Original_vkCmdSetScissor) {
+        g_Original_vkCmdSetScissor(commandBuffer, 0, 1, &restoredSc);
+    }
 }
 
 void Hooked_vkCmdDraw(void* commandBuffer, uint32_t vertexCount, uint32_t instanceCount, uint32_t firstVertex, uint32_t firstInstance) {
@@ -1428,6 +1528,8 @@ void Hooked_vkCmdEndRenderPass(void* commandBuffer) {
                 slot->hasMatchingExtent.store(false, std::memory_order_relaxed);
                 slot->viewportDownscaled.store(false, std::memory_order_relaxed);
                 slot->drawCount.store(0, std::memory_order_relaxed);
+                slot->hasSavedViewport.store(false, std::memory_order_relaxed);
+                slot->hasSavedScissor.store(false, std::memory_order_relaxed);
                 slot->activeFramebuffer.store(nullptr, std::memory_order_relaxed);
                 slot->activeRenderPass.store(nullptr, std::memory_order_relaxed);
                 slot->renderWidth.store(0, std::memory_order_relaxed);
@@ -1444,6 +1546,9 @@ void Hooked_vkCmdEndRenderPass(void* commandBuffer) {
             // Always consume any candidate pass marker for this commandBuffer, while requiring >= 250 draws before dispatch (Item H-03)
             CBREngine::Get().ConsumeCandidatePassActive(commandBuffer);
             if (isScenePass && !colorIsSwapchain) {
+                if (activeRp) {
+                    g_verifiedSceneRenderPass.store(activeRp, std::memory_order_release);
+                }
                 if (!gameColorImage && activeFb) {
                     const ResolvedSceneAttachments fallback = ResolveFramebufferAttachments(activeFb, activeRp);
                     gameColorImage = fallback.colorImage;
@@ -1891,6 +1996,22 @@ void HookManager::UninstallVulkanHooks() {
         m_vulkanHooked.store(false);
         g_Original_vkCmdResolveImage = nullptr;
         g_pendingResolveColorImage.store(nullptr, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> attLock(g_attachmentMutex);
+            g_images.clear();
+            g_imageViews.clear();
+            g_framebuffers.clear();
+            g_renderPasses.clear();
+        }
+        for (size_t i = 0; i < kMaxTrackedPassSlots; ++i) {
+            g_passSlots[i].cmdBuffer.store(nullptr, std::memory_order_relaxed);
+            g_passSlots[i].hasMatchingExtent.store(false, std::memory_order_relaxed);
+            g_passSlots[i].viewportDownscaled.store(false, std::memory_order_relaxed);
+            g_passSlots[i].drawCount.store(0, std::memory_order_relaxed);
+            g_passSlots[i].hasSavedViewport.store(false, std::memory_order_relaxed);
+            g_passSlots[i].hasSavedScissor.store(false, std::memory_order_relaxed);
+        }
+        g_verifiedSceneRenderPass.store(nullptr, std::memory_order_release);
     }
 }
 

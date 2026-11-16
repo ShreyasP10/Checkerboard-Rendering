@@ -91,13 +91,13 @@ static DX12CmdListSlot g_dx12Slots[kMaxDX12Slots];
 inline DX12CmdListSlot* GetOrCreateDX12Slot(void* cmdList) {
     if (!cmdList) return nullptr;
     const size_t start = (reinterpret_cast<uintptr_t>(cmdList) >> 4) % kMaxDX12Slots;
-    for (size_t i = 0; i < 8; ++i) {
+    for (size_t i = 0; i < kMaxDX12Slots; ++i) {
         size_t idx = (start + i) % kMaxDX12Slots;
         if (g_dx12Slots[idx].cmdList.load(std::memory_order_relaxed) == cmdList) {
             return &g_dx12Slots[idx];
         }
     }
-    for (size_t i = 0; i < 8; ++i) {
+    for (size_t i = 0; i < kMaxDX12Slots; ++i) {
         size_t idx = (start + i) % kMaxDX12Slots;
         void* expected = nullptr;
         if (g_dx12Slots[idx].cmdList.compare_exchange_strong(expected, cmdList, std::memory_order_acq_rel)) {
@@ -120,7 +120,7 @@ inline DX12CmdListSlot* GetOrCreateDX12Slot(void* cmdList) {
 inline DX12CmdListSlot* FindDX12Slot(void* cmdList) {
     if (!cmdList) return nullptr;
     const size_t start = (reinterpret_cast<uintptr_t>(cmdList) >> 4) % kMaxDX12Slots;
-    for (size_t i = 0; i < 8; ++i) {
+    for (size_t i = 0; i < kMaxDX12Slots; ++i) {
         size_t idx = (start + i) % kMaxDX12Slots;
         if (g_dx12Slots[idx].cmdList.load(std::memory_order_relaxed) == cmdList) {
             return &g_dx12Slots[idx];
@@ -309,7 +309,9 @@ void __stdcall Hooked_D3D12RSSetViewports(void* commandList, unsigned int numVie
     MinimalD3D12Viewport firstVp{};
     std::memcpy(&firstVp, pViewports, sizeof(firstVp));
     const auto dims = RenderTargetManager::Get().GetDimensions();
-    if (numViewports == 1 && RenderTargetManager::Get().IsTargetInterceptCandidate(
+    if (numViewports == 1 &&
+        !CBREngine::Get().HasDispatchedThisFrame() &&
+        RenderTargetManager::Get().IsTargetInterceptCandidate(
             static_cast<uint32_t>(firstVp.Width),
             static_cast<uint32_t>(firstVp.Height),
             0)) {
@@ -356,7 +358,9 @@ void __stdcall Hooked_D3D12RSSetScissorRects(void* commandList, unsigned int num
     const uint32_t width = (firstRect.right > firstRect.left) ? static_cast<uint32_t>(firstRect.right - firstRect.left) : 0u;
     const uint32_t height = (firstRect.bottom > firstRect.top) ? static_cast<uint32_t>(firstRect.bottom - firstRect.top) : 0u;
     const auto dims = RenderTargetManager::Get().GetDimensions();
-    if (numRects == 1 && RenderTargetManager::Get().IsTargetInterceptCandidate(width, height, 0)) {
+    if (numRects == 1 &&
+        !CBREngine::Get().HasDispatchedThisFrame() &&
+        RenderTargetManager::Get().IsTargetInterceptCandidate(width, height, 0)) {
         firstRect.right = firstRect.left + static_cast<int32_t>(dims.quarterWidth);
         firstRect.bottom = firstRect.top + static_cast<int32_t>(dims.quarterHeight);
         g_Original_D3D12RSSetScissorRects(commandList, 1, &firstRect);

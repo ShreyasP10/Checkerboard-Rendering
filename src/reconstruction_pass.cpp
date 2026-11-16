@@ -2090,6 +2090,9 @@ void ReconstructionPass::DispatchVulkan(void* vkCommandBuffer, uint32_t frameInd
             if (!tex.image) return;
             // Use tracked layout rather than hardcoded UNDEFINED (0) so Step-1 copied inputs and initial history aren't discarded (Item C-03).
             const uint32_t oldLayout = RenderTargetManager::Get().GetVulkanImageLayout(tex.image);
+            if (oldLayout == newLayout && oldLayout == kVkImageLayoutShaderReadOnlyOptimal) {
+                return; // Already in SHADER_READ_ONLY_OPTIMAL with compute read visibility from CopyImageRegion / previous pass
+            }
             uint32_t srcStage = kVkPipelineStageTopOfPipeBit;
             uint32_t srcAccess = 0;
             StageAccessForLayout(oldLayout, tex.aspectMask, srcStage, srcAccess);
