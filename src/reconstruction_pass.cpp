@@ -1214,7 +1214,7 @@ bool ReconstructionPass::CreateDX12Pipeline() {
     typedef long (__stdcall *PFN_D3D12SerializeRootSignature)(
         const MinimalD3D12RootSignatureDesc*, uint32_t, void**, void**);
     auto pfnSerializeRootSig = reinterpret_cast<PFN_D3D12SerializeRootSignature>(
-        GetProcAddress(d3d12Mod, "D3D12SerializeRootSignature"));
+        reinterpret_cast<void*>(GetProcAddress(d3d12Mod, "D3D12SerializeRootSignature")));
     if (!pfnSerializeRootSig) {
         CBR_LOG_ERROR("CreateDX12Pipeline: D3D12SerializeRootSignature not found.");
         return false;
@@ -1275,7 +1275,8 @@ bool ReconstructionPass::CreateDX12Pipeline() {
         typedef long (__stdcall *PFN_D3DCompile)(
             const void*, size_t, const char*, const void*, void*,
             const char*, const char*, uint32_t, uint32_t, void**, void**);
-        auto pfnD3DCompile = reinterpret_cast<PFN_D3DCompile>(GetProcAddress(d3dCompilerMod, "D3DCompile"));
+        auto pfnD3DCompile = reinterpret_cast<PFN_D3DCompile>(
+            reinterpret_cast<void*>(GetProcAddress(d3dCompilerMod, "D3DCompile")));
         if (!pfnD3DCompile) {
             CBR_LOG_WARN("CreateDX12Pipeline: D3DCompile export unavailable in d3dcompiler_47.dll.");
             return false;

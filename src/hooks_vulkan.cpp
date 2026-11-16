@@ -1215,7 +1215,7 @@ int Hooked_vkEnumeratePhysicalDevices(void* instance, uint32_t* pPhysicalDeviceC
                     HMODULE mod = GetModuleHandleA("vulkan-1.dll");
                     if (mod) {
                         pfnGetProps = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
-                            GetProcAddress(mod, "vkGetPhysicalDeviceProperties"));
+                            reinterpret_cast<void*>(GetProcAddress(mod, "vkGetPhysicalDeviceProperties")));
                     }
                 }
 #endif

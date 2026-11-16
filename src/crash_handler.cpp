@@ -320,7 +320,7 @@ void CrashHandler::Install(const std::filesystem::path& logDirectory) {
     }
     if (g_hDbgHelp && !g_pfnMiniDumpWriteDump) {
         g_pfnMiniDumpWriteDump = reinterpret_cast<PFN_MiniDumpWriteDump>(
-            GetProcAddress(g_hDbgHelp, "MiniDumpWriteDump"));
+            reinterpret_cast<void*>(GetProcAddress(g_hDbgHelp, "MiniDumpWriteDump")));
     }
 
     g_previousFilter = SetUnhandledExceptionFilter(CBRUnhandledExceptionFilter);

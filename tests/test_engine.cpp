@@ -163,8 +163,9 @@ static void RunVulkanTests() {
     const OverlayMetrics metrics = ui.GetCurrentMetrics();
     CHECK(metrics.targetWidth == 3840 && metrics.targetHeight == 2160);
     CHECK(metrics.cbrEnabled == true);
-    CHECK(metrics.vramFootprintMiB > 300.0);
-    CHECK(metrics.vramFootprintMB > 310.0);
+    // Item M-06: VRAM footprint at 4K without unused output buffers is 237.30 MiB (248.83 MB)
+    CHECK(metrics.vramFootprintMiB > 230.0);
+    CHECK(metrics.vramFootprintMB > 240.0);
     CHECK(metrics.lastReconDurationMs > 0.0f);
 
     // Default HUD callback runs cleanly when visible before custom override (Item H-04)

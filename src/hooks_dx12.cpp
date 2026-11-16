@@ -577,8 +577,10 @@ bool HookManager::InstallDX12Hooks() {
     typedef HRESULT (WINAPI *PFN_D3D12CreateDevice)(IUnknown*, int, REFIID, void**);
     typedef HRESULT (WINAPI *PFN_CreateDXGIFactory1)(REFIID, void**);
 
-    auto pfnD3D12CreateDevice = reinterpret_cast<PFN_D3D12CreateDevice>(GetProcAddress(d3d12Module, "D3D12CreateDevice"));
-    auto pfnCreateDXGIFactory1 = reinterpret_cast<PFN_CreateDXGIFactory1>(GetProcAddress(dxgiModule, "CreateDXGIFactory1"));
+    auto pfnD3D12CreateDevice = reinterpret_cast<PFN_D3D12CreateDevice>(
+        reinterpret_cast<void*>(GetProcAddress(d3d12Module, "D3D12CreateDevice")));
+    auto pfnCreateDXGIFactory1 = reinterpret_cast<PFN_CreateDXGIFactory1>(
+        reinterpret_cast<void*>(GetProcAddress(dxgiModule, "CreateDXGIFactory1")));
 
     if (!pfnD3D12CreateDevice || !pfnCreateDXGIFactory1) {
         CBR_LOG_WARN("Failed to resolve D3D12CreateDevice or CreateDXGIFactory1.");
