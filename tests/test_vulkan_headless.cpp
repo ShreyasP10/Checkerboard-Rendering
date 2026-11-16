@@ -594,6 +594,7 @@ int main() {
         c.debugView = 0;
         c.sharpeningStrength = 0.0f;
         c.enableCameraMotionFallback = false;
+        c.jitterCompensation = 0.0f; // Headless synthetic test uses unjittered clear rects
     });
 
     auto& rtm = cbr::RenderTargetManager::Get();
