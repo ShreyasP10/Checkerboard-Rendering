@@ -327,6 +327,46 @@ static void TestCheckerboardGeometry() {
     }
     ConfigManager::Get().Modify([](CBRConfig& c) { c.jitterDirection = 1; });
 
+    // Strategy B: Hardware Programmable Sample Locations (stationary viewport, shiftDir = 0)
+    {
+        int coverage[kH][kW] = {};
+        for (uint32_t parity = 0; parity < 2; ++parity) {
+            for (int qy = 0; qy < kQH; ++qy) {
+                for (int qx = 0; qx < kQW; ++qx) {
+                    for (uint32_t s = 0; s < 2; ++s) {
+                        const double px = 2.0 * (qx + kCheckerboardSampleLocations[parity][s].x);
+                        const double py = 2.0 * (qy + kCheckerboardSampleLocations[parity][s].y);
+                        const int tx = static_cast<int>(std::floor(px));
+                        const int ty = static_cast<int>(std::floor(py));
+                        CHECK(std::fabs((px - std::floor(px)) - 0.5) < 1e-4);
+                        CHECK(std::fabs((py - std::floor(py)) - 0.5) < 1e-4);
+                        if (tx < 0 || tx >= kW || ty < 0 || ty >= kH) continue;
+                        ++coverage[ty][tx];
+
+                        const CheckerboardSample m = MapPixelToSample(tx, ty, parity, 0);
+                        CHECK(m.active);
+                        CHECK(m.quarterX == qx && m.quarterY == qy && m.sample == s);
+                    }
+                }
+            }
+        }
+        int wrong = 0;
+        for (int y = 0; y < kH; ++y) {
+            for (int x = 0; x < kW; ++x) {
+                if (coverage[y][x] != 1) ++wrong;
+            }
+        }
+        CHECK(wrong == 0);
+
+        for (uint32_t parity = 0; parity < 2; ++parity) {
+            int active = 0;
+            for (int y = 0; y < kH; ++y)
+                for (int x = 0; x < kW; ++x)
+                    if (MapPixelToSample(x, y, parity, 0).active) ++active;
+            CHECK(active == kW * kH / 2);
+        }
+    }
+
     // Negative controls: the previous schemes must be rejected by the same simulation
     auto covered = [&](double sx0, double sy0, double sx1, double sy1) {
         bool seen[kH][kW] = {};

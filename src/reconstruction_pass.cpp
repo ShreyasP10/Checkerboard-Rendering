@@ -2250,14 +2250,14 @@ void ReconstructionPass::DispatchDX12(void* d3d12GraphicsCommandList, uint32_t f
         typedef void (__stdcall *PFN_SetComputeRootConstantBufferView)(void*, uint32_t, uint64_t);
 
         void** vmt = *reinterpret_cast<void***>(d3d12GraphicsCommandList);
-        if (vmt && vmt[14] && vmt[25] && vmt[26] && vmt[28] && vmt[29] && vmt[31] && vmt[34]) {
+        if (vmt && vmt[14] && vmt[25] && vmt[26] && vmt[28] && vmt[29] && vmt[31] && vmt[35]) {
             auto pfnDispatch       = reinterpret_cast<PFN_Dispatch>(vmt[14]);
             auto pfnSetPSO         = reinterpret_cast<PFN_SetPipelineState>(vmt[25]);
             auto pfnBarrier        = reinterpret_cast<PFN_ResourceBarrier>(vmt[26]);
             auto pfnSetHeaps       = reinterpret_cast<PFN_SetDescriptorHeaps>(vmt[28]);
             auto pfnSetRootSig     = reinterpret_cast<PFN_SetComputeRootSignature>(vmt[29]);
             auto pfnSetRootTable   = reinterpret_cast<PFN_SetComputeRootDescriptorTable>(vmt[31]);
-            auto pfnSetConstants   = reinterpret_cast<PFN_SetComputeRoot32BitConstants>(vmt[34]);
+            auto pfnSetConstants   = reinterpret_cast<PFN_SetComputeRoot32BitConstants>(vmt[35]);
 
             auto& rtm = RenderTargetManager::Get();
             const auto& dx12 = rtm.GetDX12Resources();

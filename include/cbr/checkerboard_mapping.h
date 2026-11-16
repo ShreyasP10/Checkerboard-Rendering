@@ -93,9 +93,9 @@ constexpr CheckerboardSample MapPixelToSample(int32_t x, int32_t y, uint32_t fra
     const int32_t yBit = y & 1;
     const bool active = ((static_cast<uint32_t>(x ^ y) & 1u) == (frameParity & 1u));
     int32_t qx = 0;
-    if ((frameParity & 1u) == 0u) {
+    if ((frameParity & 1u) == 0u || shiftDir == 0) {
         qx = x >> 1;
-    } else if (shiftDir >= 0) {
+    } else if (shiftDir > 0) {
         // +1 px shift: the bottom-right sample of the neighbouring render pixel lands here
         qx = (x > yBit ? x - yBit : 0) >> 1;
     } else {

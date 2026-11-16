@@ -1044,16 +1044,11 @@ bool RenderTargetManager::CanCopyToQuarterColor(const VulkanImageMetadata& srcMe
     if (srcMeta.samples != 0u && srcMeta.samples != dims.msaaSamples) {
         return false;
     }
-    // Verify format compatibility: either 64bpp copy-compatible (Item C-01) or B10G11R11 (122)
-    // which is converted via vkCmdBlitImage in 1x APU mode (Item 7).
+    // Verify format compatibility: must be size-compatible (64bpp) with quarterColor (R16G16B16A16_SFLOAT = 97)
     if (srcMeta.format != 0u) {
-        if (IsColorCopyFormatCompatible(srcMeta.format, kVkFormatR16G16B16A16Sfloat)) {
-            return true;
+        if (!IsColorCopyFormatCompatible(srcMeta.format, kVkFormatR16G16B16A16Sfloat)) {
+            return false;
         }
-        if (srcMeta.format == 122u /* B10G11R11_UFLOAT_PACK32 */ && dims.msaaSamples == 1u) {
-            return true;
-        }
-        return false;
     }
     return true;
 }
@@ -1085,8 +1080,12 @@ bool RenderTargetManager::CanCopyToVelocity(const VulkanImageMetadata& srcMeta) 
             return false;
         }
     }
-    // m_vkResources.velocity is allocated at 1x sample count.
+    // m_vkResources.velocity is allocated at 1x sample count and R16G16B16A16_SFLOAT (64-bit).
+    // vkCmdCopyImage requires matching texel block size (VUID-vkCmdCopyImage-srcImage-00146).
     if (srcMeta.samples != 0u && srcMeta.samples != kVkSampleCount1Bit) {
+        return false;
+    }
+    if (srcMeta.format != 0u && !IsColorCopyFormatCompatible(srcMeta.format, kVkFormatR16G16B16A16Sfloat)) {
         return false;
     }
     return true;
@@ -1105,6 +1104,11 @@ bool RenderTargetManager::ShouldBlitReconstructionToSceneColor(const void* gameC
         return false;
     }
     if (dstMeta.format != 0u && IsVulkanDepthFormat(static_cast<int32_t>(dstMeta.format))) {
+        return false;
+    }
+    // vkCmdBlitImage permits format conversion only between formats with matching texel block size.
+    // Source historyColor is R16G16B16A16_SFLOAT (64-bit). Destination must also be 64-bit copy-compatible.
+    if (dstMeta.format != 0u && !IsColorCopyFormatCompatible(kVkFormatR16G16B16A16Sfloat, dstMeta.format)) {
         return false;
     }
     const TargetDimensions dims = GetDimensions();

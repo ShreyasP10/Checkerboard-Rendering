@@ -81,6 +81,8 @@ typedef int   (*PFN_vkEnumeratePhysicalDevices)(void* instance, uint32_t* pPhysi
 typedef void  (*PFN_vkGetPhysicalDeviceProperties)(void* physicalDevice, void* pProperties);
 typedef void  (*PFN_vkGetPhysicalDeviceMemoryProperties)(void* physicalDevice, void* pMemoryProperties);
 typedef void  (*PFN_vkCmdResolveImage)(void* commandBuffer, void* srcImage, uint32_t srcImageLayout, void* dstImage, uint32_t dstImageLayout, uint32_t regionCount, const void* pRegions);
+typedef void  (*PFN_vkCmdBeginRendering)(void* commandBuffer, const void* pRenderingInfo);
+typedef void  (*PFN_vkCmdEndRendering)(void* commandBuffer);
 
 PFN_vkGetDeviceProcAddr                     g_Original_vkGetDeviceProcAddr = nullptr;
 PFN_vkGetInstanceProcAddr                   g_Original_vkGetInstanceProcAddr = nullptr;
@@ -95,6 +97,10 @@ PFN_vkCmdSetViewport                        g_Original_vkCmdSetViewport = nullpt
 PFN_vkCmdSetScissor                         g_Original_vkCmdSetScissor = nullptr;
 PFN_vkCmdBeginRenderPass                    g_Original_vkCmdBeginRenderPass = nullptr;
 PFN_vkCmdEndRenderPass                      g_Original_vkCmdEndRenderPass = nullptr;
+PFN_vkCmdBeginRendering                     g_Original_vkCmdBeginRendering = nullptr;
+PFN_vkCmdBeginRendering                     g_Original_vkCmdBeginRenderingKHR = nullptr;
+PFN_vkCmdEndRendering                       g_Original_vkCmdEndRendering = nullptr;
+PFN_vkCmdEndRendering                       g_Original_vkCmdEndRenderingKHR = nullptr;
 PFN_vkCmdDraw                               g_Original_vkCmdDraw = nullptr;
 PFN_vkCmdDrawIndexed                        g_Original_vkCmdDrawIndexed = nullptr;
 PFN_vkCmdSetSampleLocationsEXT              g_Original_vkCmdSetSampleLocationsEXT = nullptr;

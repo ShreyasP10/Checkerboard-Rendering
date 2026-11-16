@@ -153,9 +153,9 @@ CbrSample MapPixelToSample(int2 p, uint frameParity) {
     int yBit = p.y & 1;
     s.isActive = (((uint(p.x) ^ uint(p.y)) & 1u) == frameParity);
     int qx;
-    if (frameParity == 0u) {
+    if (frameParity == 0u || g_ShiftDirection == 0) {
         qx = p.x >> 1;
-    } else if (g_ShiftDirection >= 0) {
+    } else if (g_ShiftDirection > 0) {
         qx = max(p.x - yBit, 0) >> 1;
     } else {
         qx = (p.x + 1 - yBit) >> 1;

@@ -86,9 +86,9 @@ struct CBRConfig {
     // (proj[8] / proj[9]). Accounts for engine projection-matrix handedness / column-major vs
     // row-major conventions independently of reconstruction sample parity (+1 or -1).
     int32_t       projectionJitterSign{ 1 };
-    // Multiplier applied to the jitter delta when reprojecting history: default 0.0
-    // (whole-pixel coverage jitter is absorbed by the sample mapping, so history needs no compensation).
-    float         jitterCompensation{ 0.0f };
+    // Multiplier applied to the jitter delta when reprojecting history: default 1.0 (Item H-02).
+    // Compensates for the 1-pixel horizontal shift when sampling unjittered history from the previous frame.
+    float         jitterCompensation{ 1.0f };
 
     // Debug
     bool        showOverlay{ false };

@@ -28,9 +28,9 @@ def cpp_map_pixel_to_sample(x: int, y: int, frame_parity: int, shift_dir: int = 
         raise ValueError(f"frame_parity must be 0/1, got {frame_parity}")
     y_bit = y & 1
     active = bool(((x ^ y) & 1) == (frame_parity & 1))
-    if (frame_parity & 1) == 0:
+    if (frame_parity & 1) == 0 or shift_dir == 0:
         qx = x >> 1
-    elif shift_dir >= 0:
+    elif shift_dir > 0:
         qx = (x - y_bit if x > y_bit else 0) >> 1
     else:
         qx = (x + 1 - y_bit) >> 1
@@ -47,9 +47,9 @@ def glsl_map_pixel_to_sample(x: int, y: int, frame_parity: int, shift_dir: int, 
     _check_coords(x, y, target_w, target_h)
     y_bit = y & 1
     is_active = bool(((x ^ y) & 1) == (frame_parity & 1))
-    if frame_parity == 0:
+    if frame_parity == 0 or shift_dir == 0:
         qx = x >> 1
-    elif shift_dir >= 0:
+    elif shift_dir > 0:
         qx = max(x - y_bit, 0) >> 1
     else:
         qx = (x + 1 - y_bit) >> 1
@@ -74,7 +74,7 @@ def test_mapping_equivalence():
     target_w = 3840
     target_h = 2160
     tested = 0
-    for shift_dir in [1, -1]:
+    for shift_dir in [1, -1, 0]:
         for frame_parity in [0, 1]:
             # Test interior and boundary regions
             x_samples = list(range(0, 32)) + list(range(target_w // 2 - 16, target_w // 2 + 16)) + list(range(target_w - 32, target_w))
@@ -106,7 +106,7 @@ def test_mapping_equivalence():
 
 def test_two_frame_coverage():
     # Verify 100% 4-quadrant coverage across 2 frames for 2x2 pixel blocks
-    for shift_dir in [1, -1]:
+    for shift_dir in [1, -1, 0]:
         for block_x in range(0, 64, 2):
             for block_y in range(0, 64, 2):
                 pixels = [
@@ -157,8 +157,8 @@ def test_source_code_consistency():
     # Regex extraction of MapPixelToSample qx branch expressions across GLSL and HLSL (Item M-06)
     map_fn_re = re.compile(r"CbrSample\s+MapPixelToSample\s*\([^)]*\)\s*\{(?P<body>.*?)\n\}", re.DOTALL)
     qx_branch_re = re.compile(
-        r"if\s*\(\s*frameParity\s*==\s*0u\s*\)\s*\{\s*qx\s*=\s*p\.x\s*>>\s*1\s*;\s*\}\s*"
-        r"else\s+if\s*\(\s*(?:pc\.u_ShiftDirection|g_ShiftDirection)\s*>=\s*0\s*\)\s*\{\s*qx\s*=\s*max\(\s*p\.x\s*-\s*yBit\s*,\s*0\s*\)\s*>>\s*1\s*;\s*\}\s*"
+        r"if\s*\(\s*(?:frameParity\s*==\s*0u\s*\|\|\s*(?:pc\.u_ShiftDirection|g_ShiftDirection)\s*==\s*0)\s*\)\s*\{\s*qx\s*=\s*p\.x\s*>>\s*1\s*;\s*\}\s*"
+        r"else\s+if\s*\(\s*(?:pc\.u_ShiftDirection|g_ShiftDirection)\s*>\s*0\s*\)\s*\{\s*qx\s*=\s*max\(\s*p\.x\s*-\s*yBit\s*,\s*0\s*\)\s*>>\s*1\s*;\s*\}\s*"
         r"else\s*\{\s*qx\s*=\s*\(\s*p\.x\s*\+\s*1\s*-\s*yBit\s*\)\s*>>\s*1\s*;\s*\}",
         re.DOTALL,
     )

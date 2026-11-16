@@ -443,9 +443,8 @@ JitterDirection = 1
 ProjectionJitterSign = 1
 
 ; Sub-pixel jitter compensation applied when reprojecting history.
-; Default: 0.0 (the whole-pixel 2x MSAA checkerboard shift is absorbed by the sample mapping,
-; so history reprojection needs no jitter delta compensation).
-JitterCompensation = 0.0
+; Default: 1.0 (compensates for the 1-pixel horizontal shift when sampling history from the previous frame).
+JitterCompensation = 1.0
 
 ; Sampling Strategy: StrategyA (ViewportShift) or StrategyB (ProgrammableSampleLocations)
 ; - StrategyA: Shorter pass jitter via 0.5px horizontal viewport offset on odd frames.
@@ -799,9 +798,9 @@ constexpr CheckerboardSample MapPixelToSample(int32_t x, int32_t y, uint32_t fra
     const int32_t yBit = y & 1;
     const bool active = ((static_cast<uint32_t>(x ^ y) & 1u) == (frameParity & 1u));
     int32_t qx = 0;
-    if ((frameParity & 1u) == 0u) {
+    if ((frameParity & 1u) == 0u || shiftDir == 0) {
         qx = x >> 1;
-    } else if (shiftDir >= 0) {
+    } else if (shiftDir > 0) {
         // +1 px shift: the bottom-right sample of the neighbouring render pixel lands here
         qx = (x > yBit ? x - yBit : 0) >> 1;
     } else {
@@ -905,9 +904,9 @@ struct CBRConfig {
     // (proj[8] / proj[9]). Accounts for engine projection-matrix handedness / column-major vs
     // row-major conventions independently of reconstruction sample parity (+1 or -1).
     int32_t       projectionJitterSign{ 1 };
-    // Multiplier applied to the jitter delta when reprojecting history: default 0.0
-    // (whole-pixel coverage jitter is absorbed by the sample mapping, so history needs no compensation).
-    float         jitterCompensation{ 0.0f };
+    // Multiplier applied to the jitter delta when reprojecting history: default 1.0 (Item H-02).
+    // Compensates for the 1-pixel horizontal shift when sampling unjittered history from the previous frame.
+    float         jitterCompensation{ 1.0f };
 
     // Debug
     bool        showOverlay{ false };
@@ -3278,6 +3277,8 @@ typedef int   (*PFN_vkEnumeratePhysicalDevices)(void* instance, uint32_t* pPhysi
 typedef void  (*PFN_vkGetPhysicalDeviceProperties)(void* physicalDevice, void* pProperties);
 typedef void  (*PFN_vkGetPhysicalDeviceMemoryProperties)(void* physicalDevice, void* pMemoryProperties);
 typedef void  (*PFN_vkCmdResolveImage)(void* commandBuffer, void* srcImage, uint32_t srcImageLayout, void* dstImage, uint32_t dstImageLayout, uint32_t regionCount, const void* pRegions);
+typedef void  (*PFN_vkCmdBeginRendering)(void* commandBuffer, const void* pRenderingInfo);
+typedef void  (*PFN_vkCmdEndRendering)(void* commandBuffer);
 
 PFN_vkGetDeviceProcAddr                     g_Original_vkGetDeviceProcAddr = nullptr;
 PFN_vkGetInstanceProcAddr                   g_Original_vkGetInstanceProcAddr = nullptr;
@@ -3292,6 +3293,10 @@ PFN_vkCmdSetViewport                        g_Original_vkCmdSetViewport = nullpt
 PFN_vkCmdSetScissor                         g_Original_vkCmdSetScissor = nullptr;
 PFN_vkCmdBeginRenderPass                    g_Original_vkCmdBeginRenderPass = nullptr;
 PFN_vkCmdEndRenderPass                      g_Original_vkCmdEndRenderPass = nullptr;
+PFN_vkCmdBeginRendering                     g_Original_vkCmdBeginRendering = nullptr;
+PFN_vkCmdBeginRendering                     g_Original_vkCmdBeginRenderingKHR = nullptr;
+PFN_vkCmdEndRendering                       g_Original_vkCmdEndRendering = nullptr;
+PFN_vkCmdEndRendering                       g_Original_vkCmdEndRenderingKHR = nullptr;
 PFN_vkCmdDraw                               g_Original_vkCmdDraw = nullptr;
 PFN_vkCmdDrawIndexed                        g_Original_vkCmdDrawIndexed = nullptr;
 PFN_vkCmdSetSampleLocationsEXT              g_Original_vkCmdSetSampleLocationsEXT = nullptr;
@@ -5462,6 +5467,61 @@ struct MinimalD3D12CommandQueueDesc {
     unsigned int NodeMask;
 };
 
+// Direct3D 12 COM Interface VMT Index Constants (from official Microsoft d3d12.h / d3d12.idl)
+namespace D3D12Vmt {
+    namespace Device {
+        constexpr size_t GetNodeCount                     = 7;
+        constexpr size_t CreateCommandQueue               = 8;
+        constexpr size_t CreateCommandAllocator           = 9;
+        constexpr size_t CreateGraphicsPipelineState      = 10;
+        constexpr size_t CreateComputePipelineState       = 11;
+        constexpr size_t CreateCommandList                = 12;
+        constexpr size_t CheckFeatureSupport              = 13;
+        constexpr size_t CreateDescriptorHeap             = 14;
+        constexpr size_t GetDescriptorHandleIncrementSize = 15;
+        constexpr size_t CreateRootSignature              = 16;
+        constexpr size_t CreateShaderResourceView         = 18;
+        constexpr size_t CreateUnorderedAccessView        = 19;
+        constexpr size_t CreateSampler                    = 22;
+        constexpr size_t CreateCommittedResource          = 27;
+    }
+
+    namespace CommandList {
+        constexpr size_t Close                            = 9;
+        constexpr size_t Reset                            = 10;
+        constexpr size_t ClearState                       = 11;
+        constexpr size_t DrawInstanced                    = 12;
+        constexpr size_t DrawIndexedInstanced             = 13;
+        constexpr size_t Dispatch                         = 14;
+        constexpr size_t RSSetViewports                   = 21;
+        constexpr size_t RSSetScissorRects                = 22;
+        constexpr size_t SetPipelineState                 = 25;
+        constexpr size_t ResourceBarrier                  = 26;
+        constexpr size_t SetDescriptorHeaps               = 28;
+        constexpr size_t SetComputeRootSignature          = 29;
+        constexpr size_t SetGraphicsRootSignature         = 30;
+        constexpr size_t SetComputeRootDescriptorTable    = 31;
+        constexpr size_t SetComputeRoot32BitConstants     = 35;
+        constexpr size_t SetComputeRootConstantBufferView = 37;
+        constexpr size_t OMSetRenderTargets               = 46;
+    }
+
+    namespace SwapChain {
+        constexpr size_t Present                          = 8;
+        constexpr size_t ResizeBuffers                    = 13;
+        constexpr size_t Present1                         = 22;
+    }
+
+    namespace CommandQueue {
+        constexpr size_t GetDevice                        = 7;
+        constexpr size_t ExecuteCommandLists              = 10;
+    }
+
+    namespace Factory {
+        constexpr size_t CreateSwapChain                  = 10;
+    }
+}
+
 // Type-safe and null-checked COM VMT invocation helper
 template <typename T, typename... Args>
 inline HRESULT CallVmt(void* obj, size_t index, Args... args) {
@@ -5470,7 +5530,11 @@ inline HRESULT CallVmt(void* obj, size_t index, Args... args) {
     if (!vmt) return E_POINTER;
     auto func = reinterpret_cast<T>(vmt[index]);
     if (!func) return E_UNEXPECTED;
-    return func(obj, args...);
+    HRESULT hr = func(obj, args...);
+    if (FAILED(hr)) {
+        CBR_LOG_WARN("CallVmt failed at index %zu: HRESULT = 0x%08lX", index, static_cast<unsigned long>(hr));
+    }
+    return hr;
 }
 
 inline ULONG ReleaseCom(void* obj) {
@@ -5490,7 +5554,7 @@ void __stdcall Hooked_D3D12ExecuteCommandLists(void* commandQueue, unsigned int 
                     { 0x189819f1, 0x1db6, 0x4b57, { 0xbe, 0x54, 0x18, 0x21, 0x33, 0x9b, 0x85, 0xf7 } };
                 void* liveDev = nullptr;
                 typedef HRESULT (__stdcall *PFN_GetDevice)(void*, const GUID*, void**);
-                if (SUCCEEDED(CallVmt<PFN_GetDevice>(commandQueue, 7, &kIID_ID3D12Device, &liveDev)) && liveDev) {
+                if (SUCCEEDED(CallVmt<PFN_GetDevice>(commandQueue, D3D12Vmt::CommandQueue::GetDevice, &kIID_ID3D12Device, &liveDev)) && liveDev) {
                     void* prevDev = g_liveD3D12Device.load(std::memory_order_acquire);
                     if (prevDev != liveDev || !RenderTargetManager::Get().AreDX12ResourcesCreated()) {
                         if (g_liveD3D12Device.exchange(liveDev, std::memory_order_acq_rel) != liveDev ||
@@ -5784,17 +5848,17 @@ bool HookManager::InstallDX12Hooks() {
     MinimalD3D12CommandQueueDesc queueDesc{};
     queueDesc.Type = 0; // D3D12_COMMAND_LIST_TYPE_DIRECT
     void* cmdQueue = nullptr;
-    hr = CallVmt<PFN_CreateCommandQueue>(d3d12Device, 8, &queueDesc, kIID_ID3D12CommandQueue, &cmdQueue);
+    hr = CallVmt<PFN_CreateCommandQueue>(d3d12Device, D3D12Vmt::Device::CreateCommandQueue, &queueDesc, kIID_ID3D12CommandQueue, &cmdQueue);
 
     // Create temporary allocator & graphics command list for VMT hooking (Item H-02)
     typedef HRESULT (__stdcall *PFN_CreateCommandAllocator)(void*, unsigned int, REFIID, void**);
     typedef HRESULT (__stdcall *PFN_CreateCommandList)(void*, unsigned int, unsigned int, void*, void*, REFIID, void**);
     void* cmdAllocator = nullptr;
     void* cmdList = nullptr;
-    if (SUCCEEDED(CallVmt<PFN_CreateCommandAllocator>(d3d12Device, 9, 0u, kIID_ID3D12CommandAllocator, &cmdAllocator)) && cmdAllocator) {
-        if (SUCCEEDED(CallVmt<PFN_CreateCommandList>(d3d12Device, 12, 0u, 0u, cmdAllocator, nullptr, kIID_ID3D12GraphicsCommandList, &cmdList)) && cmdList) {
+    if (SUCCEEDED(CallVmt<PFN_CreateCommandAllocator>(d3d12Device, D3D12Vmt::Device::CreateCommandAllocator, 0u, kIID_ID3D12CommandAllocator, &cmdAllocator)) && cmdAllocator) {
+        if (SUCCEEDED(CallVmt<PFN_CreateCommandList>(d3d12Device, D3D12Vmt::Device::CreateCommandList, 0u, 0u, cmdAllocator, nullptr, kIID_ID3D12GraphicsCommandList, &cmdList)) && cmdList) {
             typedef HRESULT (__stdcall *PFN_CloseCmdList)(void*);
-            CallVmt<PFN_CloseCmdList>(cmdList, 9);
+            CallVmt<PFN_CloseCmdList>(cmdList, D3D12Vmt::CommandList::Close);
         }
     }
 
@@ -5816,7 +5880,7 @@ bool HookManager::InstallDX12Hooks() {
 
         // VMT index 10 on IDXGIFactory1: CreateSwapChain
         typedef HRESULT (__stdcall *PFN_CreateSwapChain)(void*, void*, const MinimalDxgiSwapChainDesc*, void**);
-        hr = CallVmt<PFN_CreateSwapChain>(dxgiFactory, 10, cmdQueue, &scDesc, &swapChain);
+        hr = CallVmt<PFN_CreateSwapChain>(dxgiFactory, D3D12Vmt::Factory::CreateSwapChain, cmdQueue, &scDesc, &swapChain);
     }
 
     auto installVmtHook = [&](void* target, void* detour, void** original, const char* name) -> bool {
@@ -5835,30 +5899,30 @@ bool HookManager::InstallDX12Hooks() {
     bool hooked = false;
     if (SUCCEEDED(hr) && swapChain) {
         void** swapChainVmt = *reinterpret_cast<void***>(swapChain);
-        hooked |= installVmtHook(swapChainVmt[8],  reinterpret_cast<LPVOID>(&Hooked_D3D12Present),       reinterpret_cast<LPVOID*>(&g_Original_D3D12Present),       "IDXGISwapChain::Present[8]");
-        hooked |= installVmtHook(swapChainVmt[22], reinterpret_cast<LPVOID>(&Hooked_D3D12Present1),      reinterpret_cast<LPVOID*>(&g_Original_D3D12Present1),      "IDXGISwapChain1::Present1[22]");
-        installVmtHook(swapChainVmt[13],           reinterpret_cast<LPVOID>(&Hooked_D3D12ResizeBuffers), reinterpret_cast<LPVOID*>(&g_Original_D3D12ResizeBuffers), "IDXGISwapChain::ResizeBuffers[13]");
+        hooked |= installVmtHook(swapChainVmt[D3D12Vmt::SwapChain::Present],       reinterpret_cast<LPVOID>(&Hooked_D3D12Present),       reinterpret_cast<LPVOID*>(&g_Original_D3D12Present),       "IDXGISwapChain::Present[8]");
+        hooked |= installVmtHook(swapChainVmt[D3D12Vmt::SwapChain::Present1],      reinterpret_cast<LPVOID>(&Hooked_D3D12Present1),      reinterpret_cast<LPVOID*>(&g_Original_D3D12Present1),      "IDXGISwapChain1::Present1[22]");
+        installVmtHook(swapChainVmt[D3D12Vmt::SwapChain::ResizeBuffers],           reinterpret_cast<LPVOID>(&Hooked_D3D12ResizeBuffers), reinterpret_cast<LPVOID*>(&g_Original_D3D12ResizeBuffers), "IDXGISwapChain::ResizeBuffers[13]");
     }
 
     if (cmdQueue) {
         void** queueVmt = *reinterpret_cast<void***>(cmdQueue);
         if (queueVmt) {
-            installVmtHook(queueVmt[10], reinterpret_cast<LPVOID>(&Hooked_D3D12ExecuteCommandLists), reinterpret_cast<LPVOID*>(&g_Original_D3D12ExecuteCommandLists), "ID3D12CommandQueue::ExecuteCommandLists[10]");
+            installVmtHook(queueVmt[D3D12Vmt::CommandQueue::ExecuteCommandLists], reinterpret_cast<LPVOID>(&Hooked_D3D12ExecuteCommandLists), reinterpret_cast<LPVOID*>(&g_Original_D3D12ExecuteCommandLists), "ID3D12CommandQueue::ExecuteCommandLists[10]");
         }
     }
 
     if (cmdList) {
         void** listVmt = *reinterpret_cast<void***>(cmdList);
         if (listVmt) {
-            installVmtHook(listVmt[12], reinterpret_cast<LPVOID>(&Hooked_D3D12DrawInstanced),        reinterpret_cast<LPVOID*>(&g_Original_D3D12DrawInstanced),        "ID3D12GraphicsCommandList::DrawInstanced[12]");
-            installVmtHook(listVmt[13], reinterpret_cast<LPVOID>(&Hooked_D3D12DrawIndexedInstanced), reinterpret_cast<LPVOID*>(&g_Original_D3D12DrawIndexedInstanced), "ID3D12GraphicsCommandList::DrawIndexedInstanced[13]");
-            installVmtHook(listVmt[21], reinterpret_cast<LPVOID>(&Hooked_D3D12RSSetViewports),       reinterpret_cast<LPVOID*>(&g_Original_D3D12RSSetViewports),       "ID3D12GraphicsCommandList::RSSetViewports[21]");
-            installVmtHook(listVmt[22], reinterpret_cast<LPVOID>(&Hooked_D3D12RSSetScissorRects),    reinterpret_cast<LPVOID*>(&g_Original_D3D12RSSetScissorRects),    "ID3D12GraphicsCommandList::RSSetScissorRects[22]");
-            installVmtHook(listVmt[25], reinterpret_cast<LPVOID>(&Hooked_D3D12SetPipelineState),    reinterpret_cast<LPVOID*>(&g_Original_D3D12SetPipelineState),    "ID3D12GraphicsCommandList::SetPipelineState[25]");
-            installVmtHook(listVmt[28], reinterpret_cast<LPVOID>(&Hooked_D3D12SetDescriptorHeaps),  reinterpret_cast<LPVOID*>(&g_Original_D3D12SetDescriptorHeaps),  "ID3D12GraphicsCommandList::SetDescriptorHeaps[28]");
-            installVmtHook(listVmt[29], reinterpret_cast<LPVOID>(&Hooked_D3D12SetComputeRootSignature), reinterpret_cast<LPVOID*>(&g_Original_D3D12SetComputeRootSignature), "ID3D12GraphicsCommandList::SetComputeRootSignature[29]");
-            installVmtHook(listVmt[30], reinterpret_cast<LPVOID>(&Hooked_D3D12SetGraphicsRootSignature), reinterpret_cast<LPVOID*>(&g_Original_D3D12SetGraphicsRootSignature), "ID3D12GraphicsCommandList::SetGraphicsRootSignature[30]");
-            installVmtHook(listVmt[46], reinterpret_cast<LPVOID>(&Hooked_D3D12OMSetRenderTargets),   reinterpret_cast<LPVOID*>(&g_Original_D3D12OMSetRenderTargets),   "ID3D12GraphicsCommandList::OMSetRenderTargets[46]");
+            installVmtHook(listVmt[D3D12Vmt::CommandList::DrawInstanced],                reinterpret_cast<LPVOID>(&Hooked_D3D12DrawInstanced),                reinterpret_cast<LPVOID*>(&g_Original_D3D12DrawInstanced),                "ID3D12GraphicsCommandList::DrawInstanced[12]");
+            installVmtHook(listVmt[D3D12Vmt::CommandList::DrawIndexedInstanced],         reinterpret_cast<LPVOID>(&Hooked_D3D12DrawIndexedInstanced),         reinterpret_cast<LPVOID*>(&g_Original_D3D12DrawIndexedInstanced),         "ID3D12GraphicsCommandList::DrawIndexedInstanced[13]");
+            installVmtHook(listVmt[D3D12Vmt::CommandList::RSSetViewports],               reinterpret_cast<LPVOID>(&Hooked_D3D12RSSetViewports),               reinterpret_cast<LPVOID*>(&g_Original_D3D12RSSetViewports),               "ID3D12GraphicsCommandList::RSSetViewports[21]");
+            installVmtHook(listVmt[D3D12Vmt::CommandList::RSSetScissorRects],            reinterpret_cast<LPVOID>(&Hooked_D3D12RSSetScissorRects),            reinterpret_cast<LPVOID*>(&g_Original_D3D12RSSetScissorRects),            "ID3D12GraphicsCommandList::RSSetScissorRects[22]");
+            installVmtHook(listVmt[D3D12Vmt::CommandList::SetPipelineState],            reinterpret_cast<LPVOID>(&Hooked_D3D12SetPipelineState),            reinterpret_cast<LPVOID*>(&g_Original_D3D12SetPipelineState),            "ID3D12GraphicsCommandList::SetPipelineState[25]");
+            installVmtHook(listVmt[D3D12Vmt::CommandList::SetDescriptorHeaps],          reinterpret_cast<LPVOID>(&Hooked_D3D12SetDescriptorHeaps),          reinterpret_cast<LPVOID*>(&g_Original_D3D12SetDescriptorHeaps),          "ID3D12GraphicsCommandList::SetDescriptorHeaps[28]");
+            installVmtHook(listVmt[D3D12Vmt::CommandList::SetComputeRootSignature],      reinterpret_cast<LPVOID>(&Hooked_D3D12SetComputeRootSignature),      reinterpret_cast<LPVOID*>(&g_Original_D3D12SetComputeRootSignature),      "ID3D12GraphicsCommandList::SetComputeRootSignature[29]");
+            installVmtHook(listVmt[D3D12Vmt::CommandList::SetGraphicsRootSignature],     reinterpret_cast<LPVOID>(&Hooked_D3D12SetGraphicsRootSignature),     reinterpret_cast<LPVOID*>(&g_Original_D3D12SetGraphicsRootSignature),     "ID3D12GraphicsCommandList::SetGraphicsRootSignature[30]");
+            installVmtHook(listVmt[D3D12Vmt::CommandList::OMSetRenderTargets],           reinterpret_cast<LPVOID>(&Hooked_D3D12OMSetRenderTargets),           reinterpret_cast<LPVOID*>(&g_Original_D3D12OMSetRenderTargets),           "ID3D12GraphicsCommandList::OMSetRenderTargets[46]");
         }
     }
 
@@ -9196,14 +9260,14 @@ void ReconstructionPass::DispatchDX12(void* d3d12GraphicsCommandList, uint32_t f
         typedef void (__stdcall *PFN_SetComputeRootConstantBufferView)(void*, uint32_t, uint64_t);
 
         void** vmt = *reinterpret_cast<void***>(d3d12GraphicsCommandList);
-        if (vmt && vmt[14] && vmt[25] && vmt[26] && vmt[28] && vmt[29] && vmt[31] && vmt[34]) {
+        if (vmt && vmt[14] && vmt[25] && vmt[26] && vmt[28] && vmt[29] && vmt[31] && vmt[35]) {
             auto pfnDispatch       = reinterpret_cast<PFN_Dispatch>(vmt[14]);
             auto pfnSetPSO         = reinterpret_cast<PFN_SetPipelineState>(vmt[25]);
             auto pfnBarrier        = reinterpret_cast<PFN_ResourceBarrier>(vmt[26]);
             auto pfnSetHeaps       = reinterpret_cast<PFN_SetDescriptorHeaps>(vmt[28]);
             auto pfnSetRootSig     = reinterpret_cast<PFN_SetComputeRootSignature>(vmt[29]);
             auto pfnSetRootTable   = reinterpret_cast<PFN_SetComputeRootDescriptorTable>(vmt[31]);
-            auto pfnSetConstants   = reinterpret_cast<PFN_SetComputeRoot32BitConstants>(vmt[34]);
+            auto pfnSetConstants   = reinterpret_cast<PFN_SetComputeRoot32BitConstants>(vmt[35]);
 
             auto& rtm = RenderTargetManager::Get();
             const auto& dx12 = rtm.GetDX12Resources();
@@ -10334,16 +10398,11 @@ bool RenderTargetManager::CanCopyToQuarterColor(const VulkanImageMetadata& srcMe
     if (srcMeta.samples != 0u && srcMeta.samples != dims.msaaSamples) {
         return false;
     }
-    // Verify format compatibility: either 64bpp copy-compatible (Item C-01) or B10G11R11 (122)
-    // which is converted via vkCmdBlitImage in 1x APU mode (Item 7).
+    // Verify format compatibility: must be size-compatible (64bpp) with quarterColor (R16G16B16A16_SFLOAT = 97)
     if (srcMeta.format != 0u) {
-        if (IsColorCopyFormatCompatible(srcMeta.format, kVkFormatR16G16B16A16Sfloat)) {
-            return true;
+        if (!IsColorCopyFormatCompatible(srcMeta.format, kVkFormatR16G16B16A16Sfloat)) {
+            return false;
         }
-        if (srcMeta.format == 122u /* B10G11R11_UFLOAT_PACK32 */ && dims.msaaSamples == 1u) {
-            return true;
-        }
-        return false;
     }
     return true;
 }
@@ -10375,8 +10434,12 @@ bool RenderTargetManager::CanCopyToVelocity(const VulkanImageMetadata& srcMeta) 
             return false;
         }
     }
-    // m_vkResources.velocity is allocated at 1x sample count.
+    // m_vkResources.velocity is allocated at 1x sample count and R16G16B16A16_SFLOAT (64-bit).
+    // vkCmdCopyImage requires matching texel block size (VUID-vkCmdCopyImage-srcImage-00146).
     if (srcMeta.samples != 0u && srcMeta.samples != kVkSampleCount1Bit) {
+        return false;
+    }
+    if (srcMeta.format != 0u && !IsColorCopyFormatCompatible(srcMeta.format, kVkFormatR16G16B16A16Sfloat)) {
         return false;
     }
     return true;
@@ -10395,6 +10458,11 @@ bool RenderTargetManager::ShouldBlitReconstructionToSceneColor(const void* gameC
         return false;
     }
     if (dstMeta.format != 0u && IsVulkanDepthFormat(static_cast<int32_t>(dstMeta.format))) {
+        return false;
+    }
+    // vkCmdBlitImage permits format conversion only between formats with matching texel block size.
+    // Source historyColor is R16G16B16A16_SFLOAT (64-bit). Destination must also be 64-bit copy-compatible.
+    if (dstMeta.format != 0u && !IsColorCopyFormatCompatible(kVkFormatR16G16B16A16Sfloat, dstMeta.format)) {
         return false;
     }
     const TargetDimensions dims = GetDimensions();
@@ -10847,9 +10915,9 @@ CbrSample MapPixelToSample(ivec2 p, uint frameParity) {
     int yBit = p.y & 1;
     s.isActive = (((uint(p.x) ^ uint(p.y)) & 1u) == frameParity);
     int qx;
-    if (frameParity == 0u) {
+    if (frameParity == 0u || pc.u_ShiftDirection == 0) {
         qx = p.x >> 1;
-    } else if (pc.u_ShiftDirection >= 0) {
+    } else if (pc.u_ShiftDirection > 0) {
         qx = max(p.x - yBit, 0) >> 1;
     } else {
         qx = (p.x + 1 - yBit) >> 1;
@@ -11439,9 +11507,9 @@ CbrSample MapPixelToSample(ivec2 p, uint frameParity) {
     int yBit = p.y & 1;
     s.isActive = (((uint(p.x) ^ uint(p.y)) & 1u) == frameParity);
     int qx;
-    if (frameParity == 0u) {
+    if (frameParity == 0u || pc.u_ShiftDirection == 0) {
         qx = p.x >> 1;
-    } else if (pc.u_ShiftDirection >= 0) {
+    } else if (pc.u_ShiftDirection > 0) {
         qx = max(p.x - yBit, 0) >> 1;
     } else {
         qx = (p.x + 1 - yBit) >> 1;
@@ -12038,9 +12106,9 @@ CbrSample MapPixelToSample(int2 p, uint frameParity) {
     int yBit = p.y & 1;
     s.isActive = (((uint(p.x) ^ uint(p.y)) & 1u) == frameParity);
     int qx;
-    if (frameParity == 0u) {
+    if (frameParity == 0u || g_ShiftDirection == 0) {
         qx = p.x >> 1;
-    } else if (g_ShiftDirection >= 0) {
+    } else if (g_ShiftDirection > 0) {
         qx = max(p.x - yBit, 0) >> 1;
     } else {
         qx = (p.x + 1 - yBit) >> 1;
@@ -12897,6 +12965,46 @@ static void TestCheckerboardGeometry() {
         }
     }
     ConfigManager::Get().Modify([](CBRConfig& c) { c.jitterDirection = 1; });
+
+    // Strategy B: Hardware Programmable Sample Locations (stationary viewport, shiftDir = 0)
+    {
+        int coverage[kH][kW] = {};
+        for (uint32_t parity = 0; parity < 2; ++parity) {
+            for (int qy = 0; qy < kQH; ++qy) {
+                for (int qx = 0; qx < kQW; ++qx) {
+                    for (uint32_t s = 0; s < 2; ++s) {
+                        const double px = 2.0 * (qx + kCheckerboardSampleLocations[parity][s].x);
+                        const double py = 2.0 * (qy + kCheckerboardSampleLocations[parity][s].y);
+                        const int tx = static_cast<int>(std::floor(px));
+                        const int ty = static_cast<int>(std::floor(py));
+                        CHECK(std::fabs((px - std::floor(px)) - 0.5) < 1e-4);
+                        CHECK(std::fabs((py - std::floor(py)) - 0.5) < 1e-4);
+                        if (tx < 0 || tx >= kW || ty < 0 || ty >= kH) continue;
+                        ++coverage[ty][tx];
+
+                        const CheckerboardSample m = MapPixelToSample(tx, ty, parity, 0);
+                        CHECK(m.active);
+                        CHECK(m.quarterX == qx && m.quarterY == qy && m.sample == s);
+                    }
+                }
+            }
+        }
+        int wrong = 0;
+        for (int y = 0; y < kH; ++y) {
+            for (int x = 0; x < kW; ++x) {
+                if (coverage[y][x] != 1) ++wrong;
+            }
+        }
+        CHECK(wrong == 0);
+
+        for (uint32_t parity = 0; parity < 2; ++parity) {
+            int active = 0;
+            for (int y = 0; y < kH; ++y)
+                for (int x = 0; x < kW; ++x)
+                    if (MapPixelToSample(x, y, parity, 0).active) ++active;
+            CHECK(active == kW * kH / 2);
+        }
+    }
 
     // Negative controls: the previous schemes must be rejected by the same simulation
     auto covered = [&](double sx0, double sy0, double sx1, double sy1) {
@@ -14632,9 +14740,9 @@ def cpp_map_pixel_to_sample(x: int, y: int, frame_parity: int, shift_dir: int = 
         raise ValueError(f"frame_parity must be 0/1, got {frame_parity}")
     y_bit = y & 1
     active = bool(((x ^ y) & 1) == (frame_parity & 1))
-    if (frame_parity & 1) == 0:
+    if (frame_parity & 1) == 0 or shift_dir == 0:
         qx = x >> 1
-    elif shift_dir >= 0:
+    elif shift_dir > 0:
         qx = (x - y_bit if x > y_bit else 0) >> 1
     else:
         qx = (x + 1 - y_bit) >> 1
@@ -14651,9 +14759,9 @@ def glsl_map_pixel_to_sample(x: int, y: int, frame_parity: int, shift_dir: int, 
     _check_coords(x, y, target_w, target_h)
     y_bit = y & 1
     is_active = bool(((x ^ y) & 1) == (frame_parity & 1))
-    if frame_parity == 0:
+    if frame_parity == 0 or shift_dir == 0:
         qx = x >> 1
-    elif shift_dir >= 0:
+    elif shift_dir > 0:
         qx = max(x - y_bit, 0) >> 1
     else:
         qx = (x + 1 - y_bit) >> 1
@@ -14678,7 +14786,7 @@ def test_mapping_equivalence():
     target_w = 3840
     target_h = 2160
     tested = 0
-    for shift_dir in [1, -1]:
+    for shift_dir in [1, -1, 0]:
         for frame_parity in [0, 1]:
             # Test interior and boundary regions
             x_samples = list(range(0, 32)) + list(range(target_w // 2 - 16, target_w // 2 + 16)) + list(range(target_w - 32, target_w))
@@ -14710,7 +14818,7 @@ def test_mapping_equivalence():
 
 def test_two_frame_coverage():
     # Verify 100% 4-quadrant coverage across 2 frames for 2x2 pixel blocks
-    for shift_dir in [1, -1]:
+    for shift_dir in [1, -1, 0]:
         for block_x in range(0, 64, 2):
             for block_y in range(0, 64, 2):
                 pixels = [
@@ -14761,8 +14869,8 @@ def test_source_code_consistency():
     # Regex extraction of MapPixelToSample qx branch expressions across GLSL and HLSL (Item M-06)
     map_fn_re = re.compile(r"CbrSample\s+MapPixelToSample\s*\([^)]*\)\s*\{(?P<body>.*?)\n\}", re.DOTALL)
     qx_branch_re = re.compile(
-        r"if\s*\(\s*frameParity\s*==\s*0u\s*\)\s*\{\s*qx\s*=\s*p\.x\s*>>\s*1\s*;\s*\}\s*"
-        r"else\s+if\s*\(\s*(?:pc\.u_ShiftDirection|g_ShiftDirection)\s*>=\s*0\s*\)\s*\{\s*qx\s*=\s*max\(\s*p\.x\s*-\s*yBit\s*,\s*0\s*\)\s*>>\s*1\s*;\s*\}\s*"
+        r"if\s*\(\s*(?:frameParity\s*==\s*0u\s*\|\|\s*(?:pc\.u_ShiftDirection|g_ShiftDirection)\s*==\s*0)\s*\)\s*\{\s*qx\s*=\s*p\.x\s*>>\s*1\s*;\s*\}\s*"
+        r"else\s+if\s*\(\s*(?:pc\.u_ShiftDirection|g_ShiftDirection)\s*>\s*0\s*\)\s*\{\s*qx\s*=\s*max\(\s*p\.x\s*-\s*yBit\s*,\s*0\s*\)\s*>>\s*1\s*;\s*\}\s*"
         r"else\s*\{\s*qx\s*=\s*\(\s*p\.x\s*\+\s*1\s*-\s*yBit\s*\)\s*>>\s*1\s*;\s*\}",
         re.DOTALL,
     )
