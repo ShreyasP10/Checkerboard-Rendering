@@ -491,6 +491,36 @@ float* PatternScanner::GetCameraProjectionMatrix() {
     return mat;
 }
 
+#if defined(_WIN32)
+namespace {
+
+bool TryApplyJitterSEH(float* cameraMatrix, uint32_t frameIndex, bool isVulkan) {
+#if defined(_MSC_VER)
+    __try {
+        if (JitterManager::Get().IsProjectionJitterApplied(cameraMatrix, frameIndex, isVulkan)) {
+            return true;
+        }
+        JitterManager::Get().ApplyJitterToProjection(cameraMatrix, isVulkan);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+#else
+    try {
+        if (JitterManager::Get().IsProjectionJitterApplied(cameraMatrix, frameIndex, isVulkan)) {
+            return true;
+        }
+        JitterManager::Get().ApplyJitterToProjection(cameraMatrix, isVulkan);
+        return true;
+    } catch (...) {
+        return false;
+    }
+#endif
+}
+
+} // namespace
+#endif
+
 bool PatternScanner::UpdateCameraJitter(uint32_t frameIndex, bool isVulkan) {
     // Item H-06: Opt-in gate for memory writes to game space (default: false, preserving safe viewport shift)
     if (!ConfigManager::Get().GetConfig().enableProjectionJitterWrite) {
@@ -514,31 +544,12 @@ bool PatternScanner::UpdateCameraJitter(uint32_t frameIndex, bool isVulkan) {
             CBR_LOG_WARN("Camera projection matrix memory not writable; falling back to Viewport Redirection.");
             return false;
         }
-#if defined(_MSC_VER)
-        __try {
-            if (JitterManager::Get().IsProjectionJitterApplied(cameraMatrix, frameIndex, isVulkan)) {
-                return true;
-            }
-            JitterManager::Get().ApplyJitterToProjection(cameraMatrix, isVulkan);
+        if (TryApplyJitterSEH(cameraMatrix, frameIndex, isVulkan)) {
             return true;
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            g_cachedCameraMatrix.store(nullptr, std::memory_order_release);
-            CBR_LOG_WARN("Camera projection matrix access faulted; falling back to Viewport Redirection.");
-            return false;
         }
-#else
-        try {
-            if (JitterManager::Get().IsProjectionJitterApplied(cameraMatrix, frameIndex, isVulkan)) {
-                return true;
-            }
-            JitterManager::Get().ApplyJitterToProjection(cameraMatrix, isVulkan);
-            return true;
-        } catch (...) {
-            g_cachedCameraMatrix.store(nullptr, std::memory_order_release);
-            CBR_LOG_WARN("Camera projection matrix access faulted; falling back to Viewport Redirection.");
-            return false;
-        }
-#endif
+        g_cachedCameraMatrix.store(nullptr, std::memory_order_release);
+        CBR_LOG_WARN("Camera projection matrix access faulted; falling back to Viewport Redirection.");
+        return false;
     }
     return false;
 }
