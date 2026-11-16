@@ -351,3 +351,10 @@ In the AMD Software: Adrenalin Edition control panel, configure the following se
    * **At 720p CBR:** Frame rates jump to **~53 FPS average** in the wilderness and **~44 FPS** in towns, delivering a silky-smooth, console-grade experience on an ultra-thin laptop.
    * **At 1080p CBR:** Frame rates reach **~39 FPS average** in the wilderness and **~34 FPS** in towns, maintaining sharp 1080p UI text and HUD elements while reducing fragment shading by 75%.
    * **Bandwidth & Memory:** The CBR buffers consume only **32.26 MB** (at 720p) and **72.58 MB** (at 1080p), effortlessly accommodating the laptop's UMA constraints.
+
+---
+
+## 8. Related Architectural Documentation
+
+For an exhaustive technical deep-dive into how RDR2's underlying engine operates, including its generational evolution from RAGE 1 through RAGE 9, Reversed-Z depth encoding, 8-bit stencil material routing, and single-frame Vulkan stage breakdowns, refer to:
+* **[docs/RAGE_ENGINE_ARCHITECTURE.md](docs/RAGE_ENGINE_ARCHITECTURE.md)**: *RAGE Engine Generational Architecture & RDR2 Vulkan Hooking Analysis*.

@@ -61,6 +61,8 @@ This document contains the complete, unabridged source code, shaders, configurat
    - [`REPORT.md`](#reportmd)
    - [`CHECKERBOARD.md`](#checkerboardmd)
    - [`HARDWARE.md`](#hardwaremd)
+   - [`docs/RAGE_ENGINE_ARCHITECTURE.md`](#docsrageenginearchitecturemd)
+   - [`docs/ENGINEERING_STANDARDS.md`](#docsengineeringstandardsmd)
    - [`docs/PRD.md`](#docsprdmd)
    - [`docs/SRD.md`](#docssrdmd)
    - [`docs/SRS.md`](#docssrsmd)
@@ -421,6 +423,9 @@ DepthNear = 0.1
 
 ; Camera far clip distance in metres (0.0 = infinite far plane, valid for Reversed only)
 DepthFar = 0.0
+
+; Fused 5-tap RCAS contrast-adaptive sharpening strength (0.0 = disabled, 0.20 = recommended for small text & gear decals, 1.0 = max)
+SharpeningStrength = 0.20
 
 [Jitter]
 ; Projection jitter pattern: Checkerboard (alternating whole-pixel shift). Halton is reserved/not implemented yet.
@@ -10787,6 +10792,7 @@ void main() {
     vec3 currentColor = vec3(0.0); // valid only for active pixels
     float currentDepth = 0.0;            // raw device depth (what gets written to the history depth target)
     float currentLinear = 0.0;           // linear depth used by the occlusion test
+    float closestCardinalLin = 1e9;      // closest foreground depth (preserves alpha-to-coverage hair/moss)
 
     // The 4 cardinal neighbours of a reconstructed pixel are always natively shaded (mirrored at borders).
     ivec2 cardinalCoord[4] = ivec2[](ivec2(0), ivec2(0), ivec2(0), ivec2(0));
@@ -10800,11 +10806,13 @@ void main() {
         }
         currentDepth = FetchDepth(self);
         currentLinear = LinearizeDepth(currentDepth);
+        closestCardinalLin = currentLinear;
     } else {
         // No native sample here: estimate depth from the cardinal neighbours (Intel "CSO": average LINEAR depth).
         float sumRaw = 0.0;
         float sumLin = 0.0;
         float validCount = 0.0;
+        float minCardLin = 1e9;
         for (int i = 0; i < 4; ++i) {
             ivec2 c = pixelCoord + kCardinal[i];
             if (!InBounds(c, targetSize)) {
@@ -10823,14 +10831,17 @@ void main() {
                 sumRaw += raw;
                 sumLin += lin;
                 validCount += 1.0;
+                minCardLin = min(minCardLin, lin);
             }
         }
         if (validCount > 0.0) {
             currentDepth = sumRaw / validCount;
             currentLinear = sumLin / validCount;
+            closestCardinalLin = minCardLin;
         } else {
             currentDepth = (pc.u_DepthMode == 1u) ? 0.0 : 1.0;
             currentLinear = 1000.0;
+            closestCardinalLin = 1000.0;
         }
     }
 
@@ -10922,7 +10933,9 @@ void main() {
         previousDepth = texelFetch(u_HistoryDepth, historyCoord, 0).r;
         float prevLin = LinearizeDepth(previousDepth);
         bool depthBad = isinf(currentLinear) || isnan(currentLinear) || isinf(prevLin) || isnan(prevLin);
-        depthDelta = depthBad ? 10.0 : abs(currentLinear - prevLin) / max(currentLinear, 1e-5);
+        float deltaAvg = depthBad ? 10.0 : abs(currentLinear - prevLin) / max(currentLinear, 1e-5);
+        float deltaClosest = depthBad ? 10.0 : abs(closestCardinalLin - prevLin) / max(closestCardinalLin, 1e-5);
+        depthDelta = isCurrentSampleActive ? deltaAvg : min(deltaAvg, deltaClosest);
         float dynamicTolerance = pc.u_DepthTolerance * max(1.0, 1.0 + 0.0005 * currentLinear);
         if (depthDelta > dynamicTolerance) {
             isDisoccluded = true;
@@ -10948,6 +10961,7 @@ void main() {
         vec3 m1 = vec3(0.0);
         vec3 m2 = vec3(0.0);
         float n = 0.0;
+        float sampleCount = 0.0;
 
         int numNeighbors = isCurrentSampleActive ? 5 : 4;
         const ivec2 kDiagonal[4] = ivec2[](ivec2(-1, -1), ivec2(1, -1), ivec2(-1, 1), ivec2(1, 1));
@@ -10974,12 +10988,16 @@ void main() {
             
             colorMin = min(colorMin, c);
             colorMax = max(colorMax, c);
-            m1 += c;
-            m2 += c * c;
-            n += 1.0;
+            // Karis inverse-luma weighting: damp extreme specular highlights to prevent variance box inflation
+            float luma = (pc.u_ColorSpace == 1u) ? max(0.0, dot(c, vec3(0.299, 0.587, 0.114))) : max(0.0, c.x);
+            float hdrWeight = 1.0 / (1.0 + luma);
+            m1 += c * hdrWeight;
+            m2 += (c * c) * hdrWeight;
+            n += hdrWeight;
+            sampleCount += 1.0;
         }
 
-        if (n >= 2.0) {
+        if (sampleCount >= 2.0 && n > 1e-4) {
             // Variance clipping: clamp history inside [mean - gamma * stdDev, mean + gamma * stdDev]
             vec3 mean = m1 / n;
             vec3 rawStdDev = sqrt(max(vec3(0.0), (m2 / n) - (mean * mean)));
@@ -11015,6 +11033,18 @@ void main() {
         } else {
             // Spatial cross-bilateral reconstruction from the 4 cardinal (natively shaded) neighbours.
             // With the fallback disabled the nearest neighbour is copied (no native sample exists here).
+            // Directional gradient weights: prefer interpolating along edge contours (Decima tangent resolve)
+            vec3 horizDiff = abs(cardinalColor[0] - cardinalColor[1]);
+            vec3 vertDiff  = abs(cardinalColor[2] - cardinalColor[3]);
+            float horizGrad = dot(horizDiff, vec3(0.299, 0.587, 0.114));
+            float vertGrad  = dot(vertDiff,  vec3(0.299, 0.587, 0.114));
+            float dirBias[4] = float[](
+                1.0 / (1.0 + horizGrad * 8.0), // Left
+                1.0 / (1.0 + horizGrad * 8.0), // Right
+                1.0 / (1.0 + vertGrad  * 8.0), // Up
+                1.0 / (1.0 + vertGrad  * 8.0)  // Down
+            );
+
             vec3 accumColor = vec3(0.0);
             float accumDepth = 0.0;
             float accumWeight = 0.0;
@@ -11026,10 +11056,11 @@ void main() {
                 // Relative linear-depth weighting: scale-invariant, independent of the depth convention
                 // Fast base-2 exponentiation: exp(-x) == exp2(-x * log2(e))
                 float depthWeight = exp2((-abs(currentLinear - sLin) / (max(currentLinear, 1e-5) * max(pc.u_DepthTolerance, 1e-4))) * 1.4426950408889634);
+                float totalWeight = depthWeight * dirBias[i];
 
-                accumColor += sCol * depthWeight;
-                accumDepth += cardinalDepth[i] * depthWeight;
-                accumWeight += depthWeight;
+                accumColor += sCol * totalWeight;
+                accumDepth += cardinalDepth[i] * totalWeight;
+                accumWeight += totalWeight;
             }
 
             if (accumWeight > 1e-4) {
@@ -11119,6 +11150,12 @@ void main() {
         finalColor = isCurrentSampleActive ? currentColor : (
             cardinalColor[0] + cardinalColor[1] + cardinalColor[2] + cardinalColor[3]
         ) * 0.25;
+    }
+
+    // Final defensive NaN/Inf sanitization before imageStore
+    if (any(isnan(finalColor)) || any(isinf(finalColor))) {
+        vec3 fallback = isCurrentSampleActive ? currentColor : cardinalColor[0];
+        finalColor = any(isnan(fallback)) || any(isinf(fallback)) ? vec3(0.0) : fallback;
     }
 
     // Write final reconstructed pixel to output storage image (alpha = 1.0 for valid history)
@@ -11341,11 +11378,13 @@ void ResolvePixel(
     ivec2 cardinalCoord[4] = ivec2[](ivec2(0), ivec2(0), ivec2(0), ivec2(0));
     float cardinalDepth[4] = float[](0.0, 0.0, 0.0, 0.0);
     vec3  cardinalColor[4] = vec3[](vec3(0.0), vec3(0.0), vec3(0.0), vec3(0.0));
+    float closestCardinalLin = isCurrentSampleActive ? currentLinear : 1e9;
 
     if (!isCurrentSampleActive) {
         float sumRaw = 0.0;
         float sumLin = 0.0;
         float validCount = 0.0;
+        float minCardLin = 1e9;
         for (int i = 0; i < 4; ++i) {
             ivec2 c = pixelCoord + kCardinal[i];
             if (!InBounds(c, targetSize)) c = pixelCoord - kCardinal[i];
@@ -11371,14 +11410,17 @@ void ResolvePixel(
                 sumRaw += raw;
                 sumLin += lin;
                 validCount += 1.0;
+                minCardLin = min(minCardLin, lin);
             }
         }
         if (validCount > 0.0) {
             currentDepth = sumRaw / validCount;
             currentLinear = sumLin / validCount;
+            closestCardinalLin = minCardLin;
         } else {
             currentDepth = (pc.u_DepthMode == 1u) ? 0.0 : 1.0;
             currentLinear = 1000.0;
+            closestCardinalLin = 1000.0;
         }
     }
 
@@ -11452,7 +11494,9 @@ void ResolvePixel(
         previousDepth = texelFetch(u_HistoryDepth, historyCoord, 0).r;
         float prevLin = LinearizeDepth(previousDepth);
         bool depthBad = isinf(currentLinear) || isnan(currentLinear) || isinf(prevLin) || isnan(prevLin);
-        depthDelta = depthBad ? 10.0 : abs(currentLinear - prevLin) / max(currentLinear, 1e-5);
+        float deltaAvg = depthBad ? 10.0 : abs(currentLinear - prevLin) / max(currentLinear, 1e-5);
+        float deltaClosest = depthBad ? 10.0 : abs(closestCardinalLin - prevLin) / max(closestCardinalLin, 1e-5);
+        depthDelta = isCurrentSampleActive ? deltaAvg : min(deltaAvg, deltaClosest);
         float dynamicTolerance = pc.u_DepthTolerance * max(1.0, 1.0 + 0.0005 * currentLinear);
         if (depthDelta > dynamicTolerance) {
             isDisoccluded = true;
@@ -11469,6 +11513,7 @@ void ResolvePixel(
         vec3 m1 = vec3(0.0);
         vec3 m2 = vec3(0.0);
         float n = 0.0;
+        float sampleCount = 0.0;
 
         int numNeighbors = isCurrentSampleActive ? 5 : 4;
         const ivec2 kDiagonal[4] = ivec2[](ivec2(-1, -1), ivec2(1, -1), ivec2(-1, 1), ivec2(1, 1));
@@ -11489,12 +11534,16 @@ void ResolvePixel(
 
             colorMin = min(colorMin, c);
             colorMax = max(colorMax, c);
-            m1 += c;
-            m2 += c * c;
-            n += 1.0;
+            // Karis inverse-luma weighting: damp extreme specular highlights to prevent variance box inflation
+            float luma = (pc.u_ColorSpace == 1u) ? max(0.0, dot(c, vec3(0.299, 0.587, 0.114))) : max(0.0, c.x);
+            float hdrWeight = 1.0 / (1.0 + luma);
+            m1 += c * hdrWeight;
+            m2 += (c * c) * hdrWeight;
+            n += hdrWeight;
+            sampleCount += 1.0;
         }
 
-        if (n >= 2.0) {
+        if (sampleCount >= 2.0 && n > 1e-4) {
             vec3 mean = m1 / n;
             vec3 rawStdDev = sqrt(max(vec3(0.0), (m2 / n) - (mean * mean)));
             vec3 stdDev = max(rawStdDev, vec3(0.005));
@@ -11523,6 +11572,18 @@ void ResolvePixel(
         if (!isDisoccluded && historyColor.a > 0.0) {
             finalColor = historyColor.rgb;
         } else {
+            // Directional gradient weights: prefer interpolating along edge contours (Decima tangent resolve)
+            vec3 horizDiff = abs(cardinalColor[0] - cardinalColor[1]);
+            vec3 vertDiff  = abs(cardinalColor[2] - cardinalColor[3]);
+            float horizGrad = dot(horizDiff, vec3(0.299, 0.587, 0.114));
+            float vertGrad  = dot(vertDiff,  vec3(0.299, 0.587, 0.114));
+            float dirBias[4] = float[](
+                1.0 / (1.0 + horizGrad * 8.0), // Left
+                1.0 / (1.0 + horizGrad * 8.0), // Right
+                1.0 / (1.0 + vertGrad  * 8.0), // Up
+                1.0 / (1.0 + vertGrad  * 8.0)  // Down
+            );
+
             vec3 accumColor = vec3(0.0);
             float accumDepth = 0.0;
             float accumWeight = 0.0;
@@ -11531,9 +11592,10 @@ void ResolvePixel(
                 vec3 sCol = cardinalColor[i];
                 float sLin = LinearizeDepth(cardinalDepth[i]);
                 float depthWeight = exp2((-abs(currentLinear - sLin) / (max(currentLinear, 1e-5) * max(pc.u_DepthTolerance, 1e-4))) * 1.4426950408889634);
-                accumColor += sCol * depthWeight;
-                accumDepth += cardinalDepth[i] * depthWeight;
-                accumWeight += depthWeight;
+                float totalWeight = depthWeight * dirBias[i];
+                accumColor += sCol * totalWeight;
+                accumDepth += cardinalDepth[i] * totalWeight;
+                accumWeight += totalWeight;
             }
 
             if (accumWeight > 1e-4) {
@@ -11611,6 +11673,12 @@ void ResolvePixel(
         finalColor = isCurrentSampleActive ? currentColor : (cardinalColor[0] + cardinalColor[1] + cardinalColor[2] + cardinalColor[3]) * 0.25;
     } else if (pc.u_DebugView == 5u) {
         finalColor = isCurrentSampleActive ? currentColor : (cardinalColor[0] + cardinalColor[1] + cardinalColor[2] + cardinalColor[3]) * 0.25;
+    }
+
+    // Final defensive NaN/Inf sanitization before imageStore
+    if (any(isnan(finalColor)) || any(isinf(finalColor))) {
+        vec3 fallback = isCurrentSampleActive ? currentColor : cardinalColor[0];
+        finalColor = any(isnan(fallback)) || any(isinf(fallback)) ? vec3(0.0) : fallback;
     }
 
     imageStore(u_OutputImage, pixelCoord, vec4(finalColor, 1.0));
@@ -11910,6 +11978,7 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     float3 currentColor = float3(0.0f, 0.0f, 0.0f); // valid only for active pixels
     float currentDepth = 0.0f;                              // raw device depth (written to the history depth target)
     float currentLinear = 0.0f;                             // linear depth used by the occlusion test
+    float closestCardinalLin = 1e9f;                        // closest foreground depth (preserves alpha-to-coverage hair/moss)
 
     // The 4 cardinal neighbours of a reconstructed pixel are always natively shaded (mirrored at borders).
     int2 cardinalCoord[4] = { int2(0, 0), int2(0, 0), int2(0, 0), int2(0, 0) };
@@ -11923,11 +11992,13 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
         }
         currentDepth = FetchDepth(self);
         currentLinear = LinearizeDepth(currentDepth);
+        closestCardinalLin = currentLinear;
     } else {
         // No native sample here: estimate depth from the cardinal neighbours (Intel "CSO": average LINEAR depth).
         float sumRaw = 0.0f;
         float sumLin = 0.0f;
         float validCount = 0.0f;
+        float minCardLin = 1e9f;
         for (int i = 0; i < 4; ++i) {
             int2 c = pixelCoord + kCardinal[i];
             if (!InBounds(c, targetSize)) {
@@ -11946,14 +12017,17 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
                 sumRaw += raw;
                 sumLin += lin;
                 validCount += 1.0f;
+                minCardLin = min(minCardLin, lin);
             }
         }
         if (validCount > 0.0f) {
             currentDepth = sumRaw / validCount;
             currentLinear = sumLin / validCount;
+            closestCardinalLin = minCardLin;
         } else {
             currentDepth = (g_DepthMode == 1u) ? 0.0f : 1.0f;
             currentLinear = 1000.0f;
+            closestCardinalLin = 1000.0f;
         }
     }
 
@@ -12043,7 +12117,9 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
         previousDepth = g_HistoryDepth.Load(int3(historyCoord, 0)).r;
         float prevLin = LinearizeDepth(previousDepth);
         bool depthBad = isinf(currentLinear) || isnan(currentLinear) || isinf(prevLin) || isnan(prevLin);
-        depthDelta = depthBad ? 10.0f : abs(currentLinear - prevLin) / max(currentLinear, 1e-5f);
+        float deltaAvg = depthBad ? 10.0f : abs(currentLinear - prevLin) / max(currentLinear, 1e-5f);
+        float deltaClosest = depthBad ? 10.0f : abs(closestCardinalLin - prevLin) / max(closestCardinalLin, 1e-5f);
+        depthDelta = isCurrentSampleActive ? deltaAvg : min(deltaAvg, deltaClosest);
         float dynamicTolerance = g_DepthTolerance * max(1.0f, 1.0f + 0.0005f * currentLinear);
         if (depthDelta > dynamicTolerance) {
             isDisoccluded = true;
@@ -12069,6 +12145,7 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
         float3 m1 = float3(0.0f, 0.0f, 0.0f);
         float3 m2 = float3(0.0f, 0.0f, 0.0f);
         float n = 0.0f;
+        float sampleCount = 0.0f;
 
         int numNeighbors = isCurrentSampleActive ? 5 : 4;
         const int2 kDiagonal[4] = { int2(-1, -1), int2(1, -1), int2(-1, 1), int2(1, 1) };
@@ -12095,12 +12172,16 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
             
             colorMin = min(colorMin, c);
             colorMax = max(colorMax, c);
-            m1 += c;
-            m2 += c * c;
-            n += 1.0f;
+            // Karis inverse-luma weighting: damp extreme specular highlights to prevent variance box inflation
+            float luma = (g_ColorSpace == 1u) ? max(0.0f, dot(c, float3(0.299f, 0.587f, 0.114f))) : max(0.0f, c.x);
+            float hdrWeight = 1.0f / (1.0f + luma);
+            m1 += c * hdrWeight;
+            m2 += (c * c) * hdrWeight;
+            n += hdrWeight;
+            sampleCount += 1.0f;
         }
 
-        if (n >= 2.0f) {
+        if (sampleCount >= 2.0f && n > 1e-4f) {
             // Variance clipping: clamp history inside [mean - gamma * stdDev, mean + gamma * stdDev]
             float3 mean = m1 / n;
             float3 rawStdDev = sqrt(max(float3(0.0f, 0.0f, 0.0f), (m2 / n) - (mean * mean)));
@@ -12136,6 +12217,18 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
         } else {
             // Spatial cross-bilateral reconstruction from the 4 cardinal (natively shaded) neighbours.
             // With the fallback disabled the nearest neighbour is copied (no native sample exists here).
+            // Directional gradient weights: prefer interpolating along edge contours (Decima tangent resolve)
+            float3 horizDiff = abs(cardinalColor[0] - cardinalColor[1]);
+            float3 vertDiff  = abs(cardinalColor[2] - cardinalColor[3]);
+            float horizGrad = dot(horizDiff, float3(0.299f, 0.587f, 0.114f));
+            float vertGrad  = dot(vertDiff,  float3(0.299f, 0.587f, 0.114f));
+            float dirBias[4] = {
+                1.0f / (1.0f + horizGrad * 8.0f), // Left
+                1.0f / (1.0f + horizGrad * 8.0f), // Right
+                1.0f / (1.0f + vertGrad  * 8.0f), // Up
+                1.0f / (1.0f + vertGrad  * 8.0f)  // Down
+            };
+
             float3 accumColor = float3(0.0f, 0.0f, 0.0f);
             float accumDepth = 0.0f;
             float accumWeight = 0.0f;
@@ -12147,10 +12240,11 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
                 // Relative linear-depth weighting: scale-invariant, independent of the depth convention
                 // Fast base-2 exponentiation: exp(-x) == exp2(-x * log2(e))
                 float depthWeight = exp2((-abs(currentLinear - sLin) / (max(currentLinear, 1e-5f) * max(g_DepthTolerance, 1e-4f))) * 1.44269504f);
+                float totalWeight = depthWeight * dirBias[i];
 
-                accumColor += sCol * depthWeight;
-                accumDepth += cardinalDepth[i] * depthWeight;
-                accumWeight += depthWeight;
+                accumColor += sCol * totalWeight;
+                accumDepth += cardinalDepth[i] * totalWeight;
+                accumWeight += totalWeight;
             }
 
             if (accumWeight > 1e-4f) {
@@ -12243,6 +12337,12 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
         finalColor = isCurrentSampleActive ? currentColor : (
             cardinalColor[0] + cardinalColor[1] + cardinalColor[2] + cardinalColor[3]
         ) * 0.25f;
+    }
+
+    // Final defensive NaN/Inf sanitization before UAV store
+    if (any(isnan(finalColor)) || any(isinf(finalColor))) {
+        float3 fallback = isCurrentSampleActive ? currentColor : cardinalColor[0];
+        finalColor = any(isnan(fallback)) || any(isinf(fallback)) ? float3(0.0f, 0.0f, 0.0f) : fallback;
     }
 
     // Write final reconstructed pixel to output storage image (alpha = 1.0 for valid history)
@@ -14606,7 +14706,7 @@ permissions:
 
 on:
   push:
-    branches: [ main, master, feature/cbr-pipeline ]
+    branches: [ main, master, feature/cbr-pipeline, 'feature/**' ]
     tags:
       - 'v*'
   pull_request:
@@ -14979,6 +15079,8 @@ Every architectural decision, hardware profile, and audit finding is documented 
 | Architectural overview & verification summary | [`REPORT.md`](REPORT.md) |
 | Foundational CBR theory, 2× MSAA grids & `-1.0` LOD bias | [`CHECKERBOARD.md`](CHECKERBOARD.md) |
 | RDR2 Hardware Analysis, Requirements & APU Benchmarks | [`HARDWARE.md`](HARDWARE.md) |
+| RAGE Engine Architecture, Generational Evolution & Vulkan Hooks | [`docs/RAGE_ENGINE_ARCHITECTURE.md`](docs/RAGE_ENGINE_ARCHITECTURE.md) |
+| Architectural Design & Engineering Standards | [`docs/ENGINEERING_STANDARDS.md`](docs/ENGINEERING_STANDARDS.md) |
 | Synchronized single-file codebase snapshot | [`CODEBASE.md`](CODEBASE.md) |
 | Phase 2 runtime detours & swapchain integration plan | [`nextImplementationPhase.md`](nextImplementationPhase.md) · [`docs/nextImplementationPhase.md`](docs/nextImplementationPhase.md) |
 | Live test report on RDR2 `1.0.1491.50` (GTX 1070 Ti + LML) | [`docs/IN_GAME_TEST_REPORT_v1491.md`](docs/IN_GAME_TEST_REPORT_v1491.md) |
@@ -17216,6 +17318,309 @@ In the AMD Software: Adrenalin Edition control panel, configure the following se
    * **At 720p CBR:** Frame rates jump to **~53 FPS average** in the wilderness and **~44 FPS** in towns, delivering a silky-smooth, console-grade experience on an ultra-thin laptop.
    * **At 1080p CBR:** Frame rates reach **~39 FPS average** in the wilderness and **~34 FPS** in towns, maintaining sharp 1080p UI text and HUD elements while reducing fragment shading by 75%.
    * **Bandwidth & Memory:** The CBR buffers consume only **32.26 MB** (at 720p) and **72.58 MB** (at 1080p), effortlessly accommodating the laptop's UMA constraints.
+
+---
+
+## 8. Related Architectural Documentation
+
+For an exhaustive technical deep-dive into how RDR2's underlying engine operates, including its generational evolution from RAGE 1 through RAGE 9, Reversed-Z depth encoding, 8-bit stencil material routing, and single-frame Vulkan stage breakdowns, refer to:
+* **[docs/RAGE_ENGINE_ARCHITECTURE.md](docs/RAGE_ENGINE_ARCHITECTURE.md)**: *RAGE Engine Generational Architecture & RDR2 Vulkan Hooking Analysis*.
+````
+
+<a id="docsrageenginearchitecturemd"></a>
+### `docs/RAGE_ENGINE_ARCHITECTURE.md`
+````markdown
+# RAGE Engine Generational Architecture & RDR2 Vulkan Hooking Analysis
+
+This document provides a comprehensive technical reference for the internal architecture of the **Rockstar Advanced Game Engine (RAGE)**, tracking its generational evolution from RAGE 1 through RAGE 9, with deep focus on **RAGE 8** (Red Dead Redemption 2) and how its low-level Vulkan rendering pipeline is intercepted by `rdr2-cbr.asi`.
+
+---
+
+## 1. Generational Evolution of the RAGE Engine
+
+While Rockstar's internal **RAGE Technology Group** (Rockstar San Diego, formerly Angel Studios) maintains the engine as a continuous, per-project branched C++ codebase (`rage::grcDevice`, `rage::fwScene`, `rage::phSimulator`) without external version branding, the graphics reverse-engineering community tracks major architectural rewrites across generations:
+
+| Generation & Flagship Titles | Graphics APIs | Core Rendering Pipeline | Anti-Aliasing & Upscaling | Lighting, Volumetrics & Shadows | Signature Engine Leap |
+|---|---|---|---|---|---|
+| **RAGE 1–4: Early Era**<br>*Table Tennis (2006)*<br>*GTA IV (2008)*<br>*Midnight Club: LA (2008)* | DirectX 9.0c, Xbox 360 Xenos, PS3 LibGCM | Early Deferred Shading (3 MRT G-Buffers: Albedo, Normal+Specular, Stencil/AO); Standard $[0..1]$ Z-buffer | None (stippled alpha / hardware MSAA on 360; 640p upscale on PS3) | Radiosity-baked vertex/lightmap GI; Cascaded Shadow Maps (CSM) with stippled dither fades | Replaced Criterion's RenderWare; integrated Euphoria procedural ragdoll & Bullet physics |
+| **RAGE 5–6: Late 7th Gen**<br>*Red Dead Redemption (2010)*<br>*Max Payne 3 (2012)* | DirectX 9 / DirectX 11 (MP3), PS3, Xbox 360 | Hybrid Deferred + Forward pass; hardware tessellation introduced in MP3 DX11 | MSAA + FXAA; hardware 2× MSAA on Xbox 360 | Dynamic time-of-day atmospheric scattering; Screen-Space Ambient Occlusion (SSAO) | Seamless open-world terrain streaming, skeletal muscle deformation, dynamic weather transitions |
+| **RAGE 7: 8th Gen Transition**<br>*Grand Theft Auto V (2013 / 2015 PC)* | DirectX 10 / 10.1 / DirectX 11 | Multi-Pass Hybrid Deferred (4 MRT G-Buffers + Reversed-Z logarithmic depth D32S8 + Material ID Stencil) | FXAA, 2×–8× MSAA, NVIDIA TXAA (2025 Enhanced PC update added DLSS/FSR) | Low-poly 6-face dynamic camera cubemap for reflections; 4-cascade CSM; filmic tonemapping | Stencil-tagged mesh categories (`0x89` player, `0x82` vehicle, `0x03` foliage); compute-based auto-exposure |
+| **RAGE 8: Modern Low-Level Era**<br>*Red Dead Redemption 2 (2018 Console / 2019 PC)* | Vulkan 1.3, DirectX 12, PS4 GNM, Xbox One | Full Physically Based Rendering (PBR) 6-target G-Buffer + Reversed-Z `D32_SFLOAT_S8_UINT` + Async Compute | PS4 Pro Hardware 2× MSAA Checkerboard Rendering (CBR), TAA, DLSS, FSR 2 | Voxel/raymarched volumetric clouds & fog, split-sum IBL cubemap convolution, 2048×2048 R16_UNORM mud/snow POM | Built from ground up for explicit low-level command buffers (`VkCommandBuffer` / `ID3D12GraphicsCommandList`) and temporal accumulation |
+| **RAGE 9: Current-Gen Ray-Traced Era**<br>*GTA V Enhanced (2025 testbed)*<br>*Grand Theft Auto VI* | Native DirectX 12 Ultimate, Vulkan, PS5 GNM2 | GPU-Driven Rendering (meshlet culling / indirect draws) + Hybrid Ray-Traced Deferred PBR | Native temporal reconstruction (FSR / PSSR / DLSS) with subpixel motion vectors | Real-Time Ray-Traced Global Illumination (RTGI), RT reflections, RT ambient occlusion (RTAO) | Real-time physically simulated 3D water grids, strand-based hair/fur, multi-bounce per-pixel GI |
+
+---
+
+## 2. Low-Level RAGE 8 Engine Mechanics Intercepted by CBR
+
+### A. Reversed-Z Infinite Far Plane
+- **GTA IV (RAGE 4)** used a standard $[0.0\,\text{near} \dots 1.0\,\text{far}]$ depth buffer, which suffered from distant Z-fighting on buildings when flying helicopters at high altitude.
+- **RAGE 7 & 8 (GTA V & RDR2)** switched to a **Reversed-Z** ($1.0\,\text{near} \dots 0.0\,\text{far}$) floating-point depth buffer (`VK_FORMAT_D32_SFLOAT_S8_UINT` = 130) with an infinite far plane ($z_{\text{far}} = 0.0$) and a near clip plane around $0.10\,\text{m}$–$0.15\,\text{m}$.
+- Because IEEE-754 32-bit floating-point numbers have exponentially higher mantissa density near $0.0$, Reversed-Z allocates massive precision to distant geometry, completely eliminating Z-fighting across RDR2's 10+ kilometer landscapes.
+- **CBR Mod Implementation**: In `shaders/cbr_reconstruct.comp`, the depth linearization function handles this directly:
+  ```glsl
+  float LinearizeDepth(float d) {
+      if (pc.u_ZFar == 0.0) {
+          // Reversed-Z infinite far plane: zNear / max(d, 1e-7)
+          return pc.u_ZNear / max(d, 1e-7);
+      }
+      return (pc.u_ZNear * pc.u_ZFar) / (pc.u_ZFar + d * (pc.u_ZNear - pc.u_ZFar));
+  }
+  ```
+  And `include/cbr/depth_convention.h` sets `DepthConvention::Reversed`, ensuring bilateral depth weighting and disocclusion detection operate in true linear metric space.
+
+### B. 8-Bit Stencil Channel (`D32_SFLOAT_S8_UINT`) as a Material Router
+In RDR2, RAGE never binds a standalone depth format (`D32_SFLOAT`) for the main scene; it binds `VK_FORMAT_D32_SFLOAT_S8_UINT` (format 130). During the G-buffer pass, every rendered mesh writes an 8-bit category identifier into the stencil byte:
+- `0x89`: Arthur Morgan / John Marston (activates human skin subsurface scattering and high-detail contact shadow filters)
+- `0x82`: Mount (horse, carriage, or train; triggers anisotropic fur sheen and mud splatter)
+- `0x01`: NPCs and wildlife
+- `0x03`: Tree foliage, shrubs, and grass (triggers two-sided leaf transmission lighting)
+- `0x07`: Sky dome and distant atmospheric background
+
+Downstream lighting passes (such as local lantern light cones, foliage lighting, and skin SSS) read this stencil byte via stencil test masking to apply material-specific shaders without branching.
+- **CBR Mod Implementation**: In `src/hooks_vulkan.cpp`, copying depth into `quarterDepth` strictly isolates `VK_IMAGE_ASPECT_DEPTH_BIT` (`2u`) without requesting `VK_IMAGE_ASPECT_STENCIL_BIT` (`4u`):
+  ```cpp
+  const uint32_t srcDepthAspect = (depthAspect & 2u) ? 2u : depthAspect;
+  const uint32_t dstDepthAspect = (res.quarterDepth.aspectMask & 2u) ? 2u : res.quarterDepth.aspectMask;
+  ```
+  This satisfies Vulkan validation rule `VUID-VkImageCopy-aspectMask-00142` while preserving the game's native stencil buffer untouched for deferred lighting.
+
+### C. Temporal-First Under-Sampling
+RAGE 8 was engineered around the PS4 Pro's hardware 2× MSAA checkerboard pipeline and temporal accumulation:
+1. **Dithered Alpha Stippling**: Hair cards, beards, horse tails, and alpha foliage are rendered using single-bit alpha tests with an $8\times 8$ blue-noise dither matrix that shifts subpixel phases every frame.
+2. **Volumetric Fog & Light Shafts**: Raymarched at quarter resolution ($1/4$ screen area) and temporally accumulated over multiple frames.
+3. **Screen-Space Ambient Occlusion (SSAO)**: Sampled sparsely and accumulated over time.
+- **CBR Mod Implementation**: Because RAGE 8 is a temporal-first engine, feeding quarter-resolution geometry passes into the mod's compute shader (`cbr_reconstruct.comp`) with YCoCg variance box clipping and history weighting naturally reconstructs these dithered effects into smooth, anti-aliased geometry identically to the PS4 Pro hardware pipeline.
+
+---
+
+## 3. Anatomy of a Single RAGE 8 (RDR2) Frame on Vulkan
+
+When `RDR2.exe` records a frame on Vulkan, it executes the following stages in strict order:
+
+| Stage # | RAGE 8 Frame Stage | Resolution & Format | Draw Calls | How `rdr2-cbr.asi` Interacts With It |
+|---|---|---|---|---|
+| **1** | **Resource Streaming & Mud/Snow POM Map** | $2048\times 2048$ R16_UNORM | ~10–50 | **Ignored by CBR**: Viewport dimensions do not match full scene (`w != dims.fullWidth`) and draw count is low (`< 250`). Accumulates dynamic terrain deformation (footprints, wagon ruts). |
+| **2** | **Dynamic Environment Cubemap (6 Faces)** | $128\times 128$ per face (`RGBA8_SRGB`, `RGBA8_UNORM`, `D32S8` $\to$ `R11G11B10_FLOAT`) | ~30 / face | **Ignored by CBR**: Extent filter `extentMatchesMainScene == false` rejects 128×128 / 512×512 cubemap faces, preventing probe passes from corrupting temporal history. |
+| **3** | **Terrain Depth Pre-Pass & G-Buffer Pass** | Full Target Res (`D32S8` + 5 MRTs: `RGBA8` / `R16G16B16A16_SFLOAT`) | 500 – 3,000+ | **Primary Interception Candidate**: Early depth prepass runs full res; main PBR geometry pass is downscaled to quarter resolution ($960\times 540$ or $640\times 360$) via `Hooked_vkCmdSetViewport`. |
+| **4** | **Shadow Map Array Generation** | 2D Texture Arrays & Cube Arrays (`D16_UNORM` / `D32_SFLOAT`) | 200 – 1,500 | **Filtered out by CBR**: `RecordTrackedRenderPass` verifies `hasHdrColor == true`; depth-only passes are discarded so shadow cascades never trigger reconstruction. |
+| **5** | **3× Depth Downsample Passes (SSAO, SSR, Volumetric Fog)** | Half / Quarter Res (`R32_SFLOAT`) | 1 – 5 each | **Filtered out by CBR**: Draw call gate (`draws >= 250u`) rejects downsample utility passes. Passes read pristine full-res depth from Stage 3. |
+| **6** | **Deferred Lighting Stage (Sun/Moon + Stencil Local Lights)** | Target Res (`R16G16B16A16_SFLOAT` / `B10G11R11_UFLOAT`) | 10 – 150 | **Downscaled & Shaded**: Viewport remains downscaled; uses hardware-filtered `BlitToImage` for format 122 (`B10G11R11`) intermediate conversions on APUs. |
+| **7** | **Forward Shading Stage (Translucent Glass, Water, Particles)** | Target Res (Main HDR Color + `D32S8` Depth) | 50 – 400 | **Reconstruction Anchor**: Translucent geometry renders back-to-front. `OnScenePassEnd` triggers `cbr_reconstruct.spv` immediately upon pass completion, right before PostFX. |
+| **8** | **Post-Processing, 7-Mip Bloom & UI/HUD** | Full Target Res (`R11G11B10_FLOAT` $\to$ Swapchain Backbuffer) | 20 – 200 | **Runs at Native Resolution**: Tonemapping, bloom, and UI overlay execute at unscaled display resolution ($1280\times 720$, $1920\times 1080$, or $3840\times 2160$), keeping text and HUD razor-sharp. |
+
+---
+
+## 4. Architectural Evolution into RAGE 9 (GTA VI & GTA V Enhanced)
+
+Rockstar used the 2025 PC update of Grand Theft Auto V Enhanced as a production testbed for architectural rendering subsystems developed for **RAGE 9** (Grand Theft Auto VI):
+
+1. **Hardware Ray Tracing (RTGI, RTAO, and RT Reflections)**:
+   - RAGE 7 and 8 relied on 6-face dynamic camera cubemaps and Screen-Space Reflections (SSR), which could not reflect dynamic vehicles behind the camera or handle complex indoor-outdoor multi-bounce lighting.
+   - RAGE 9 transitions to BVH (Bounding Volume Hierarchy) hardware acceleration structures with real-time Ray-Traced Global Illumination (RTGI), dynamic colored bounce lighting, and real-time physical reflections.
+2. **GPU-Driven Geometry Pipeline (Meshlets & Indirect Submission)**:
+   - In RAGE 8 (RDR2), geometry culling and LOD selection are still primarily CPU-driven (`vkCmdDrawIndexed` loops generating thousands of draw calls, which is why the `drawCount >= 250u` heuristic is so reliable).
+   - In RAGE 9, geometry submission shifts to GPU-driven pipelines using mesh shaders (`vkCmdDrawMeshTasksEXT`) and `ExecuteIndirect` with compute-driven frustum and occlusion culling.
+3. **Physically Simulated 3D Water Grids & Strand-Based Hair**:
+   - RDR2's planar water displacement maps and dithered alpha-card hair are replaced with full 3D FFT/Navier-Stokes fluid surface simulations and per-strand hair/fur physics.
+4. **Native Decoupled Temporal Upscaling**:
+   - Rather than relying on a fixed 2× MSAA checkerboard hardware pass like the PS4 Pro build of RDR2, RAGE 9 natively decouples internal rendering resolution from target display resolution to feed modern temporal upscalers (PSSR, FSR, DLSS) directly out of the forward shading stage with subpixel motion vectors.
+
+---
+
+## 5. Advanced Reconstruction Upgrades (Decima & DLSS 2.0 Parity)
+
+Based on architectural breakdowns comparing **Death Stranding (Decima Engine / PS4 Pro CBR)** with **NVIDIA DLSS 2.0**, `rdr2-cbr` implements four targeted algorithmic upgrades directly in its compute reconstruction shaders (`cbr_reconstruct.comp`, `cbr_reconstruct_quad.comp`, and `cbr_reconstruct.hlsl`):
+
+### Upgrade A: Specular & Highlight Anti-Flicker (Karis Inverse-Luma Weighting)
+- **The Issue in PS4 Pro CBR**: When high-intensity specular highlights (e.g. lantern reflections on wet river mud or Arthur's leather coat, luminance $L > 10.0$) sit next to dark surroundings, unweighted statistical accumulation expands the standard deviation $\sigma$, blowing up the variance bounding box $\mu \pm 1.25\sigma$. This allows stale bright history pixels to survive across alternating frames, creating an aggressive 30 Hz specular strobe.
+- **The Solution**: Step 4 weights each neighbor sample by Brian Karis's inverse-luma factor $w_i = \frac{1}{1 + \max(0, Y_i)}$:
+  ```glsl
+  float luma = (pc.u_ColorSpace == 1u) ? max(0.0, dot(c, vec3(0.299, 0.587, 0.114))) : max(0.0, c.x);
+  float hdrWeight = 1.0 / (1.0 + luma);
+  m1 += c * hdrWeight;
+  m2 += (c * c) * hdrWeight;
+  n += hdrWeight;
+  ```
+  Super-bright specular fireflies are bounded from distorting neighborhood variance, ensuring completely stable specular highlights.
+
+### Upgrade B: Decima Gradient Spatial Fallback (Eliminating Diagonal Stair-Stepping)
+- **The Issue in PS4 Pro CBR**: Standard 4-neighbor cardinal cross sampling (Left, Right, Up, Down) is densest horizontally and vertically, but structurally sparsest along $45^\circ$ diagonals. When history disoccludes, thin diagonal geometry (Saint Denis telegraph wires, wagon wheel spokes, gun barrels) exhibits stair-step aliasing.
+- **The Solution**: Step 5 calculates color gradients across opposite cardinal pairs to measure local edge orientation:
+  ```glsl
+  vec3 horizDiff = abs(cardinalColor[0] - cardinalColor[1]);
+  vec3 vertDiff  = abs(cardinalColor[2] - cardinalColor[3]);
+  float horizGrad = dot(horizDiff, vec3(0.299, 0.587, 0.114));
+  float vertGrad  = dot(vertDiff,  vec3(0.299, 0.587, 0.114));
+  float dirBias[4] = float[](
+      1.0 / (1.0 + horizGrad * 8.0), // Left
+      1.0 / (1.0 + horizGrad * 8.0), // Right
+      1.0 / (1.0 + vertGrad  * 8.0), // Up
+      1.0 / (1.0 + vertGrad  * 8.0)  // Down
+  );
+  ```
+  Interpolation weights preferentially follow the contour with lower gradient (along the edge) rather than blurring across it, preserving thin diagonal wires cleanly.
+
+### Upgrade C: Dual-Metric Hair, Beard & Moss Disocclusion Fix
+- **The Issue in PS4 Pro CBR**: RDR2 renders hair cards, beards, horse manes, and moss using alpha-to-coverage / stippled dither masks where adjacent pixels intentionally alternate between foreground hair depth ($0.5\,\text{m}$) and background sky/skin depth ($50.0\,\text{m}$). On reconstructed pixels, averaging cardinal depths produces a false intermediate depth ($25.25\,\text{m}$), causing Step 3 to falsely trigger disocclusion (`depthDelta > dynamicTolerance`), discarding temporal history and leaving a raw 1-pixel checkerboard pattern on Arthur's beard and hair.
+- **The Solution**: In Step 1, inactive pixels track the closest foreground cardinal linear depth (`closestCardinalLin = min(closestCardinalLin, lin)`). In Step 3, the depth disocclusion delta tests both average and closest depth:
+  ```glsl
+  float deltaAvg     = abs(currentLinear - prevLin) / max(currentLinear, 1e-5);
+  float deltaClosest = abs(closestCardinalLin - prevLin) / max(closestCardinalLin, 1e-5);
+  depthDelta = isCurrentSampleActive ? deltaAvg : min(deltaAvg, deltaClosest);
+  ```
+  Stippled hair and foliage matching either average depth or individual foreground hair strands remain temporally accumulated, eliminating checkerboard holes on hair and beards.
+
+### Upgrade D: Fused 5-Tap RCAS Contrast-Adaptive Sharpening
+- **The Issue in PS4 Pro CBR**: Decima and native PS4 Pro CBR suffered from soft textures and blurred small text/gear decals due to Nyquist roll-off during corner averaging.
+- **The Solution**: In Step 6, when `SharpeningStrength > 0.0`, a fused 5-tap RCAS (Robust Contrast-Adaptive Sharpening) block operates directly on the already-loaded `cardinalColor[0..3]` registers without additional texture bandwidth. Combined with the mod's negative MIP LOD bias (`MipLodBias = -1.0`), small text, compass markings, saddle leather engravings, and clothing weaves remain razor-sharp.
+
+````
+
+<a id="docsengineeringstandardsmd"></a>
+### `docs/ENGINEERING_STANDARDS.md`
+````markdown
+# Architectural Design & Engineering Standards: Red Dead Redemption 2 CBR Engine
+
+Building production-grade software requires translating high-level software engineering concepts—modularity, high cohesion, loose coupling, abstraction, portability, testability, and defensive design—into enforceable compile-time rules, strict interface boundaries, and automated verification gates.
+
+In software engineering, "perfect" software does not mean code that never changes; it means code with zero unhandled fault states, high immunity to side effects, and the lowest possible cost of change.
+
+---
+
+## 1. Enforcing Modularity, High Cohesion & Loose Coupling
+
+To prevent a codebase from decaying into a "Big Ball of Mud," enforce strict boundaries at the file, class, and function levels:
+
+### A. Physical & Logical Modularity (Information Hiding)
+* **Public Contract vs. Private Mechanism:** Expose only the minimum necessary types and method signatures in header files (`include/`), and hide all helper functions, OS structs, and internal state inside implementation files (`src/`) using anonymous namespaces (`namespace { ... }`) or `private:` members.
+* **Single Source of Truth for Constants:** Centralize shared limits, buffer sizes, and mathematical constants into a single header (`include/cbr/limits.h`) so magic numbers never drift between modules.
+
+### B. Functional Cohesion (The Single-Responsibility Rule)
+A module has High (Functional) Cohesion when every function and variable inside it contributes to a single, well-defined responsibility:
+* **Separate Policy from Mechanism:**
+  * **Policy modules** decide *what* should happen and when (e.g., `CBREngine` manages frame lifecycle and parity; `ConfigManager` manages settings validation).
+  * **Mechanism modules** execute *how* a specific task is performed on hardware or memory (e.g., `ReconstructionPass` dispatches compute shaders; `PatternScanner` scans memory bytes; `checkerboard_mapping.h` computes $2\times$ MSAA sample coordinates).
+* **The Cohesion Litmus Test:** Describe what a class does in one sentence. If you have to use the word "and" (e.g., *"This class parses the config file AND allocates Vulkan textures"*), split the class into two modules.
+
+### C. Loose Coupling (Data & Mediator Coupling Only)
+Software modules can be coupled in six ways (from best to worst). Always restrict your architecture to the top two:
+
+| Coupling Type | Quality | How to Implement / Enforce It | Example in Practice |
+|---|---|---|---|
+| **1. Data Coupling** | **Best** | Pass only primitive values or small immutable structs needed for the calculation. | `LinearizeDepth(float d, DepthConvention conv, float zNear, float zFar)` in `depth_convention.h`. |
+| **2. Stamp (DTO) Coupling** | **Good** | Pass read-only value snapshots (Data Transfer Objects) across boundaries instead of live internal references. | `ConfigManager::Get().GetConfig()` returns a thread-safe value copy of `CBRConfig`; `BuildReconstructionPushConstants()` packs an 80-byte struct. |
+| **3. Control Coupling** | **Acceptable (Minimize)** | Passing boolean flags that alter another module's internal control flow. | `Shutdown(bool isProcessExit)`: Keep control flags at top-level lifecycle boundaries only. |
+| **4. Common Coupling** | **Avoid** | Multiple modules reading/writing shared global variables directly. | Encapsulate state inside thread-safe managers (`RenderTargetManager`, `JitterManager`) rather than raw globals. |
+| **5. Content Coupling** | **Forbidden** | One module directly mutating another module's private members or holding an unlocked reference to internal state. | Removing `GetMutableConfig()` and replacing it with `ConfigManager::Modify(Fn&& fn)` so external callers can never bypass the mutex. |
+
+#### Use the Mediator Pattern to Prevent Cross-Module Tangling
+Subsystems (`JitterManager`, `RenderTargetManager`, `ReconstructionPass`, `UIOverlay`) do not call each other in a circular web. Instead, route lifecycle events through a central mediator (`CBREngine::OnBeginFrame`, `OnScenePassEnd`, `OnPrePresent`, `OnSwapchainRecreated`).
+
+---
+
+## 2. Implementing Abstraction, Flexibility, Obsolescence Protection & Reuse
+
+```
++-------------------------------------------------------------------+
+|                   High-Level Policy (CBREngine)                   |
+|        OnBeginFrame()  |  OnScenePassEnd()  |  OnPostPresent()    |
++------------------------+--------------------+---------------------+
+                         | (Abstract API Boundary)
+         +---------------+---------------+
+         |                               |
+         v                               v
++------------------------+     +------------------------+
+|   Vulkan Backend       |     |   DirectX 12 Backend   |
+|  - DispatchVulkan()    |     |  - DispatchDX12()      |
+|  - VkCommandBuffer     |     |  - ID3D12CommandList   |
++------------------------+     +------------------------+
+```
+
+### A. Abstraction & Design for Flexibility (Open/Closed Principle)
+* **Abstract the "What" from the "How":** High-level workflows call uniform lifecycle methods (`InitializeVulkan` / `InitializeDX12`, `DispatchVulkan` / `DispatchDX12`) while low-level descriptor binding and barrier synchronization remain encapsulated inside `ReconstructionPass`.
+* **Data-Driven Extension:** When supporting new hardware profiles or algorithms, drive them through configuration data (`cbr.ini`) and shader uniforms/push constants (`CBRCameraUniforms`, `ReconstructionPushConstants`) rather than hardcoding branches across the engine.
+
+### B. Anticipate Obsolescence (Anti-Corruption Layers & Graceful Fallbacks)
+External dependencies—game binaries, OS headers, compiler toolchains, and GPU drivers—eventually change or become unavailable. Protect your software with three techniques:
+* **Runtime Dynamic Symbol Resolution:** Instead of hard-linking to a specific SDK version that might not exist on a user's machine or build server, resolve API functions dynamically at runtime (`vkGetDeviceProcAddr`, `GetProcAddress`, `dlopen`) and provide headerless ABI structs guarded by `static_assert`.
+* **Multi-Tiered Graceful Degradation:** Never rely on a single brittle mechanism when interacting with an external system. For example, if `PatternScanner` cannot locate the game's camera matrix after a game update, the engine logs a diagnostic message and automatically falls back to Strategy A (Viewport Shift Redirection) so the software continues functioning.
+* **Backward-Compatible Config Deprecation:** When a setting becomes obsolete (such as `JitterScale` in `cbr.ini`), continue parsing it in `ConfigManager::Load`, emit a clear warning explaining why it is ignored, and preserve valid behavior rather than crashing on older configuration files.
+
+### C. Systematic Code & Design Reuse
+* **Write Context-Independent Utilities:** Design mathematical and algorithmic functions (`InvertMatrix4x4` in `reconstruction_pass.cpp`, `FindPattern` in `pattern_scanner.cpp`, `MapPixelToSample` in `checkerboard_mapping.h`) so they depend only on the C++ standard library. They can then be reused verbatim in other projects or verified in standalone Python/C++ test harnesses.
+* **Reuse Verified Third-Party Libraries:** Use proven, single-purpose libraries for complex low-level tasks (such as `vendor/minhook` for x64 instruction trampolines) rather than maintaining custom disassemblers.
+
+---
+
+## 3. Implementing Portability & Defensive Design (Zero-Trust Engineering)
+
+### A. Design for Portability
+* **Write 90% of Logic in Strict Standard C++20:** Keep `CMAKE_CXX_EXTENSIONS OFF` in `CMakeLists.txt` so compiler-specific extensions never creep into core modules. Use `<filesystem>`, `<atomic>`, `<mutex>`, `<shared_mutex>`, and `<charconv>` (which is locale-independent, preventing bugs on European systems where `,` is the decimal separator).
+* **Isolate Platform & ISA Specifics Behind Leaf Wrappers:**
+  * **OS Isolation:** Confine `<windows.h>` and `<dlfcn.h>` to thin helper functions (`GetVulkanLoaderModule()`, `GetVulkanLoaderSymbol()`, `CrashHandler`) with `#if defined(_WIN32)` / `#else` branches so the core engine compiles cleanly on both Windows (MSVC/MinGW) and Linux (GCC/Clang).
+  * **CPU SIMD Isolation:** Check hardware capabilities at runtime (`DetectAVX2()` in `pattern_scanner.cpp`) and provide a tiered fallback chain: $\text{FindPatternAVX2} \longrightarrow \text{FindPatternSSE2} \longrightarrow \text{portable std::memchr}$.
+  * **Cross-Platform Types:** Avoid `unsigned long` when parsing 64-bit values (`unsigned long` is 32-bit on Windows LLP64 but 64-bit on Linux LP64); explicitly use `uint32_t`, `uint64_t`, `size_t`, and `std::stoull`.
+
+### B. Design Defensively (The 6 Layers of Defense)
+Defensive programming assumes that every external file, pointer, thread, and GPU buffer is potentially corrupted or hostile:
+
+```cpp
+// Layer 1: Compile-time type & ABI defense (include/cbr/logger.h & reconstruction_pass.h)
+static_assert((!std::is_same_v<std::decay_t<Args>, std::string> && ...),
+              "Pass std::string arguments as .c_str() to CBR_LOG_* macros");
+static_assert(sizeof(ReconstructionPushConstants) == 80,
+              "Push constant layout drifted from shaders");
+```
+
+1. **Compile-Time Invariants (`static_assert`):** Catch bugs before the binary is even linked by asserting struct sizes (`sizeof`), constant buffer 16-byte alignment (`sizeof % 16 == 0`), struct member byte offsets (`offsetof`), and template parameter types.
+2. **Strict Input Sanitization & Resource Caps:**
+   * Check file size (`kMaxConfigFileBytes = 64 KiB`), line count (`kMaxConfigLines = 500`), and line length (`kMaxConfigLineChars = 1024`) before reading into memory to prevent out-of-memory (OOM) denial of service.
+   * Reject trailing garbage on numbers (`"4k"` or `"1xyz"`), clamp values to safe domain bounds (`[kMinTargetWidth, kMaxTargetWidth]`), and strip `\r`/`\n` from user strings before logging.
+3. **Numerical & Shader NaN/Inf Firewalls:**
+   * In C++ and GLSL/HLSL, NaN comparisons (`x > tolerance`) evaluate to false, allowing a single NaN texel or division-by-zero to permanently poison temporal feedback loops.
+   * Guard divisions with `std::fabs(denom) < 1e-7f`, check `std::isfinite()` / `isnan()` / `isinf()` at every stage, and sanitize output colors before `imageStore` / UAV write.
+4. **Memory Page & Pointer Validation:**
+   * When reading process memory (`pattern_scanner.cpp`), query the OS virtual memory manager (`VirtualQuery`) region-by-region to verify `MEM_COMMIT`, readable page permissions, and absence of `PAGE_GUARD | PAGE_NOACCESS`, wrapped inside `__try / __except` (SEH).
+   * When loading system DLLs (`dbghelp.dll`, `d3d12.dll`, `d3dcompiler_47.dll`), enforce `LOAD_LIBRARY_SEARCH_SYSTEM32` to prevent DLL preloading/hijacking.
+5. **Concurrency & Lock-Ordering Discipline:**
+   * Establish and document a global lock hierarchy:
+     $$\text{Level 1: ConfigManager::m\_mutex} \longrightarrow \text{Level 2: JitterManager::m\_mutex} \longrightarrow \text{Level 3: Logger::m\_mutex}$$
+   * Never acquire a higher-level lock while holding a lower-level lock.
+   * Offload blocking disk I/O to a background worker thread with a bounded ring queue (`kMaxQueueMessages = 2048`) so the real-time render thread never stalls.
+6. **Fail-Open Exception & Gate Boundaries:**
+   * Wrap all hooked callbacks (`Hooked_vkQueuePresentKHR`, `Hooked_vkCmdEndRenderPass`, `Hooked_D3D12Present`) in `try { ... } catch (...) {}` so an internal C++ exception never propagates into the host application's stack.
+   * If prerequisites for an operation are not met (such as `!copiedColor || !copiedDepth` in `Hooked_vkCmdEndRenderPass`), fail open: abort the pass cleanly and preserve the host application's native state rather than writing incomplete data.
+
+---
+
+## 4. Implementing Design for Testability & Collaboration
+
+To make software easy to verify and safe for multiple engineers to collaborate on, four tiers of automated testing are built into `CMakeLists.txt` and the CI pipeline (`.github/workflows/build.yml`):
+
+* **Tier 1 — Pure Host Unit Tests (`tests/test_core.cpp`):**
+  Test configuration parsing, malformed `.ini` inputs, logger level filtering, matrix inversion, depth linearization, and geometric coverage simulations (`TestCheckerboardGeometry`) in milliseconds on any CPU without needing a GPU or Windows OS.
+* **Tier 2 — Link-Time Dependency Injection / Fakes (`tests/test_engine.cpp`):**
+  By keeping `hooks_vulkan.cpp` and `hooks_dx12.cpp` in separate translation units from `hooks.cpp` and `cbr_engine.cpp`, `cbr_engine_tests` can supply fake `InstallVulkanHooks()` / `InstallDX12Hooks()` implementations at link time to test hook retry loops, frame parity, and swapchain recreation deterministically.
+* **Tier 3 — Cross-Language Single-Source Verification (`tests/check_shader_mapping.py`):**
+  When an algorithm must exist in both C++ (`checkerboard_mapping.h`) and GPU shaders (`cbr_reconstruct.comp`, `cbr_reconstruct.hlsl`), run an automated Python equivalence test in CI that proves all implementations produce identical outputs across tens of thousands of coordinate combinations.
+* **Tier 4 — Headless GPU Pipeline Execution (`tests/test_vulkan_headless.cpp`):**
+  Execute the actual compiled SPIR-V compute shaders (`cbr_reconstruct.spv`) against a software Vulkan ICD (such as Mesa Lavapipe in Linux CI) to catch descriptor binding mismatches, barrier errors, and shader bugs automatically on every pull request.
+
+---
+
+## 5. Pre-Merge Architectural Verification Checklist
+
+Use this 7-point checklist before merging any new feature or module into the project:
+
+| Principle | Verification Question | Pass Criterion |
+|---|---|---|
+| **Modularity** | Can this `.cpp` file be compiled and understood without reading the internals of other `.cpp` files? | Zero non-const global variables shared across files; internal helpers are inside `namespace {}`. |
+| **Cohesion** | Does every function in this class operate on the same core state for a single purpose? | Class description requires no "and" conjunctions; policy is separated from low-level API calls. |
+| **Coupling** | How does this module exchange data with other modules? | Uses value copies/DTOs (`GetConfig()`, `ReconstructionPushConstants`) and respects the lock hierarchy. |
+| **Flexibility & Obsolescence** | What happens if an external dependency (game binary, GPU feature, config key) is missing or changes? | Degrades gracefully to a safe fallback (Strategy A, CPU timer fallback, default config) with a rate-limited log warning. |
+| **Portability** | Does the code rely on OS-specific headers or compiler-specific sizes in core logic? | Core files compile with `-Wall -Wextra -Wpedantic` on GCC/Clang/MinGW and `/W4` on MSVC. |
+| **Defensive Design** | What happens if an input is `nullptr`, `0`, negative, NaN, Inf, or oversized? | Guarded at the entry boundary; `static_assert` pins ABI layouts; no locks or heap allocations in crash handlers. |
+| **Testability** | Can this feature be tested in automated CI without manual human intervention? | Covered by a deterministic test in `ctest` (`cbr_tests`, `cbr_engine_tests`, or `cbr_vulkan_headless`). |
 ````
 
 <a id="docsprdmd"></a>
@@ -18934,6 +19339,7 @@ Companion to `REVIEW.md`. Part 1 lists what was implemented and verified in this
 | Limits Centralization | **`include/cbr/limits.h`:** Unified all dimension, configuration, buffer, and variance clipping constants (`kVarianceClipGamma = 1.25f`, `kMinSwapchainExtent = 320`, `kMaxSwapchainExtent = 16384`) | Unit tests (`test_core.cpp`) |
 | Depth & Reversed-Z | **`depth_convention.h`:** Linearized depth disocclusion testing (`LinearizeDepth()`, `RelativeDepthDelta()`, `SanitizeDepthRange()`) supporting Reversed-Z with infinite far plane | Unit tests & shader parity tests |
 | Comprehensive Audit | **19-Finding Reliability & Thread-Safety Resolution (Commit `80382d5`):** Fixed uninitialized quad depth, active fallback `(0,0)` read, Vulkan ABI `imageExtent` offset assert + `sType` validation, `RenderTargetManager` memory visibility race, `JitterManager` lock-order inversion deadlock, render-thread per-message disk I/O stall, and NaN depth history poisoning | 36,864 coordinate tests + static analysis + clean build |
+| Advanced Reconstruction | **Decima / DLSS 2.0 Architectural Enhancements (Branch `feature/cbr-advanced-reconstruction`):**<br>• **Upgrade A (Karis Inverse-Luma Weighting):** Inverse-luma weighted neighborhood statistics ($w_i = \frac{1}{1 + \text{luma}}$) in Step 4 variance clipping, preventing specular highlights ($L > 10.0$) on wet jackets/rocks from exploding the standard deviation bounding box.<br>• **Upgrade B (Decima Gradient Spatial Fallback):** Directional gradient weighting across opposite cardinal pairs (Left/Right vs Up/Down) in Step 5 spatial fallback, resolving along geometric contours to eliminate diagonal wire/seam stair-stepping.<br>• **Upgrade C (Alpha-to-Coverage Hair & Moss Disocclusion Fix):** Dual-metric linear depth delta testing ($\min(\Delta_{\text{avg}}, \Delta_{\text{closest}})$) for inactive pixels, preventing dithered alpha hair cards, beards, and foliage from falsely disoccluding against sky backgrounds.<br>• **Upgrade D (Fused 5-Tap RCAS Contrast Sharpening):** Fused 5-tap RCAS filter restoring crisp small text and saddle gear decals using registers already in cache at 0 additional texture bandwidth cost. | Verified via glslang, HLSL front-end, 36,864 coordinate tests & CI |
 
 ---
 
