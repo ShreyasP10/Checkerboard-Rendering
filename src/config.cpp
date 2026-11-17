@@ -86,6 +86,20 @@ uint32_t ParseUInt(const std::string& val, uint32_t defaultVal, uint32_t minVal,
     }
 }
 
+uint64_t ParseUInt64(const std::string& val, uint64_t defaultVal) {
+    if (val.empty()) return defaultVal;
+    try {
+        if (val.front() == '-') return defaultVal;
+        size_t idx = 0;
+        int base = (val.size() > 2 && (val[1] == 'x' || val[1] == 'X')) ? 16 : 10;
+        unsigned long long result = std::stoull(val, &idx, base);
+        if (idx == 0 || idx != val.size()) return defaultVal;
+        return static_cast<uint64_t>(result);
+    } catch (...) {
+        return defaultVal;
+    }
+}
+
 float ParseFloat(const std::string& val, float defaultVal, float minVal, float maxVal) {
     if (val.empty()) return defaultVal;
     float result = defaultVal;
@@ -275,6 +289,12 @@ bool ConfigManager::Load(const std::filesystem::path& configPath) {
                 }
             } else if (key == "JitterCompensation") {
                 parsed.jitterCompensation = ParseFloat(val, parsed.jitterCompensation, -1.0f, 1.0f);
+            } else if (key == "CameraMatrixVerified") {
+                parsed.cameraMatrixVerified = ParseBool(val, parsed.cameraMatrixVerified);
+            } else if (key == "EnableProjectionJitterWrite") {
+                parsed.enableProjectionJitterWrite = ParseBool(val, parsed.enableProjectionJitterWrite);
+            } else if (key == "ForcedSceneRenderPassHandle") {
+                parsed.forcedSceneRenderPassHandle = ParseUInt64(val, parsed.forcedSceneRenderPassHandle);
             } else if (key == "SamplingStrategy") {
                 const std::string s = ToUpper(Trim(val));
                 if (s == "STRATEGYA" || s == "VIEWPORTSHIFT" || s == "STRATEGY_A") {
@@ -357,6 +377,9 @@ bool ConfigManager::Save(const std::filesystem::path& configPath) {
     file << "JitterDirection = " << snapshot.jitterDirection << "\n";
     file << "ProjectionJitterSign = " << snapshot.projectionJitterSign << "\n";
     file << "JitterCompensation = " << snapshot.jitterCompensation << "\n";
+    file << "CameraMatrixVerified = " << (snapshot.cameraMatrixVerified ? "true" : "false") << "\n";
+    file << "EnableProjectionJitterWrite = " << (snapshot.enableProjectionJitterWrite ? "true" : "false") << "\n";
+    file << "ForcedSceneRenderPassHandle = " << snapshot.forcedSceneRenderPassHandle << "\n";
     file << "SamplingStrategy = "
          << (snapshot.samplingStrategy == SamplingStrategy::StrategyB ? "StrategyB" : "StrategyA") << "\n\n";
 

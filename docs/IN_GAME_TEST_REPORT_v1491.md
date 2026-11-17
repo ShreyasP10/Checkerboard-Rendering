@@ -1,5 +1,9 @@
 # In-Game Execution & Test Report: RDR2 v1.0.1491.50
 
+> [!NOTE]
+> **Phase 1 Baseline Evidence Notice (Item M-16):**
+> This document records Phase 1 in-game baseline evidence for host execution, ASI loader injection, and subsystem initialization on RDR2 build `1.0.1491.50`. It validates that `rdr2-cbr.asi` initializes without crashing, parses configuration, and operates dormant fallback when graphics hooks are unengaged. Active in-game RenderDoc verification of Vulkan attachment formats and pass intercept order represents Phase 2 verification.
+
 **Document ID:** TR-RDR2CBR-1491-01  
 **Test Date:** October 23, 2026  
 **Author:** Shreyas Pawar  
@@ -93,7 +97,7 @@ LOADER: Finished loading *.asi plugins
 |---|---|---|---|
 | **Loader & Entry Point** | Loaded at `0x00007FFE9ABA0000` | ✅ SUCCESS | Module pinning and thread creation worked cleanly. |
 | **Config Parser** | Read `cbr.ini` from game root | ✅ SUCCESS | Parsed 4K target (`3840x2160`), API `Vulkan`, CBR `true`. |
-| **Render Target Math** | Calculated 1080p 2× MSAA buffer | ✅ SUCCESS | Memory footprint evaluated at `300.59 MiB` (exact match to specifications). |
+| **Render Target Math** | Calculated 1080p 2× MSAA buffer | ✅ SUCCESS | Memory footprint evaluated at `300.59 MiB` (exact match to specifications; subsequent Item M-06 optimization eliminated redundant full-res auxiliary storage targets, reducing footprint to `237.30 MiB` / `248.83 MB`). |
 | **API Detection** | Located `vulkan-1.dll` at `0x00007FFE66510000` | ✅ SUCCESS | Host process confirmed running in Vulkan graphics mode. |
 | **Safety Fallback** | Timed out quietly after 60 seconds | ✅ SUCCESS | No game crash, no black screen, game rendered natively. |
 | **Hook Activation** | Stubs active, detours pending | ⚠️ INACTIVE | Requires Phase 2 MinHook detour implementation. |

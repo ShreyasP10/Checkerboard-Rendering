@@ -100,7 +100,7 @@ static void TestConfigHardening(const fs::path& dir) {
 
     // Defaults of a fresh config
     const CBRConfig fresh{};
-    CHECK(fresh.jitterCompensation == 0.0f); // whole-pixel jitter needs NO history compensation
+    CHECK(fresh.jitterCompensation == 1.0f); // default 1.0 history reprojection compensation (Item H-02)
     CHECK(fresh.jitterDirection == 1);
     CHECK(fresh.projectionJitterSign == 1);
     CHECK(fresh.samplingStrategy == SamplingStrategy::StrategyA);
@@ -162,6 +162,9 @@ static void TestConfigMissingFileAndRoundTrip(const fs::path& dir) {
     CHECK(after.depthNear == before.depthNear && after.depthFar == before.depthFar);
     CHECK(after.sharpeningStrength == before.sharpeningStrength);
     CHECK(after.enableCameraMotionFallback == before.enableCameraMotionFallback);
+    CHECK(after.forcedSceneRenderPassHandle == before.forcedSceneRenderPassHandle);
+    CHECK(after.cameraMatrixVerified == before.cameraMatrixVerified);
+    CHECK(after.enableProjectionJitterWrite == before.enableProjectionJitterWrite);
 
     // Verify thread-safe Modify callback executes and commits successfully
     ConfigManager::Get().Modify([](CBRConfig& cfg) {
@@ -327,6 +330,46 @@ static void TestCheckerboardGeometry() {
     }
     ConfigManager::Get().Modify([](CBRConfig& c) { c.jitterDirection = 1; });
 
+    // Strategy B: Hardware Programmable Sample Locations (stationary viewport, shiftDir = 0)
+    {
+        int coverage[kH][kW] = {};
+        for (uint32_t parity = 0; parity < 2; ++parity) {
+            for (int qy = 0; qy < kQH; ++qy) {
+                for (int qx = 0; qx < kQW; ++qx) {
+                    for (uint32_t s = 0; s < 2; ++s) {
+                        const double px = 2.0 * (qx + kCheckerboardSampleLocations[parity][s].x);
+                        const double py = 2.0 * (qy + kCheckerboardSampleLocations[parity][s].y);
+                        const int tx = static_cast<int>(std::floor(px));
+                        const int ty = static_cast<int>(std::floor(py));
+                        CHECK(std::fabs((px - std::floor(px)) - 0.5) < 1e-4);
+                        CHECK(std::fabs((py - std::floor(py)) - 0.5) < 1e-4);
+                        if (tx < 0 || tx >= kW || ty < 0 || ty >= kH) continue;
+                        ++coverage[ty][tx];
+
+                        const CheckerboardSample m = MapPixelToSample(tx, ty, parity, 0);
+                        CHECK(m.active);
+                        CHECK(m.quarterX == qx && m.quarterY == qy && m.sample == s);
+                    }
+                }
+            }
+        }
+        int wrong = 0;
+        for (int y = 0; y < kH; ++y) {
+            for (int x = 0; x < kW; ++x) {
+                if (coverage[y][x] != 1) ++wrong;
+            }
+        }
+        CHECK(wrong == 0);
+
+        for (uint32_t parity = 0; parity < 2; ++parity) {
+            int active = 0;
+            for (int y = 0; y < kH; ++y)
+                for (int x = 0; x < kW; ++x)
+                    if (MapPixelToSample(x, y, parity, 0).active) ++active;
+            CHECK(active == kW * kH / 2);
+        }
+    }
+
     // Negative controls: the previous schemes must be rejected by the same simulation
     auto covered = [&](double sx0, double sy0, double sx1, double sy1) {
         bool seen[kH][kW] = {};
@@ -475,23 +518,23 @@ static void TestRenderTargets() {
     ConfigManager::Get().Modify([](CBRConfig& cfg) { cfg.msaaSamples = 2; });
     r.Initialize(3840, 2160);
     // 4K: quarter colour 33,177,600 + quarter depth 16,588,800 + history colour A/B 132,710,400
-    //    + history depth A/B 66,355,200 + output 66,355,200 = 315,187,200 bytes (300.58 MiB, 315.19 MB)
-    CHECK(r.GetTotalAllocatedVramBytes() == 315187200u);
+    //    + history depth A/B 66,355,200 (Item M-06: unused output targets omitted) = 248,832,000 bytes (237.30 MiB, 248.83 MB)
+    CHECK(r.GetTotalAllocatedVramBytes() == 248832000u);
     const double mib = static_cast<double>(r.GetTotalAllocatedVramBytes()) / (1024.0 * 1024.0);
-    CHECK(std::fabs(mib - 300.58) < 0.01);
+    CHECK(std::fabs(mib - 237.30) < 0.01);
 
-    // 1080p (the AMD Vega 7 profile): 78,796,800 bytes = 78.80 MB
+    // 1080p (the AMD Vega 7 profile): 62,208,000 bytes = 59.33 MiB (62.21 MB)
     r.Initialize(1920, 1080);
-    CHECK(r.GetTotalAllocatedVramBytes() == 78796800u);
+    CHECK(r.GetTotalAllocatedVramBytes() == 62208000u);
 
     // Single-sample 1x ASO mode (APU mode):
     ConfigManager::Get().Modify([](CBRConfig& cfg) { cfg.msaaSamples = 1; });
     r.Initialize(3840, 2160);
-    CHECK(r.GetTotalAllocatedVramBytes() == 290304000u);
+    CHECK(r.GetTotalAllocatedVramBytes() == 223948800u);
 
     // 720p 1x ASO mode:
     r.Initialize(1280, 720);
-    CHECK(r.GetTotalAllocatedVramBytes() == 32256000u);
+    CHECK(r.GetTotalAllocatedVramBytes() == 24883200u);
 
     // Reset back to 2x MSAA for subsequent tests
     ConfigManager::Get().Modify([](CBRConfig& cfg) { cfg.msaaSamples = 2; });
@@ -542,15 +585,15 @@ static void TestRenderTargets() {
     CHECK(!RenderTargetManager::IsDepthCopyFormatCompatible(124, 126)); // D16_UNORM -> D32_SFLOAT disallowed (16bpp vs 32bpp)
 
     r.Initialize(3840, 2160);
-    const VulkanImageMetadata validColor{ 3840, 2160, 97, 2, 0x10 };
-    const VulkanImageMetadata color32bpp{ 3840, 2160, 37, 2, 0x10 };
-    const VulkanImageMetadata singleSampleColor{ 3840, 2160, 97, 1, 0x10 };
-    const VulkanImageMetadata validDepth{ 3840, 2160, 126, 2, 0x20 };
-    const VulkanImageMetadata depthColorMismatch{ 3840, 2160, 100, 2, 0x10 };
-    const VulkanImageMetadata singleSampleDepth{ 3840, 2160, 126, 1, 0x20 };
-    const VulkanImageMetadata depthMetaDst{ 3840, 2160, 126, 1, 0x20 };
-    const VulkanImageMetadata tooSmallColor{ 960, 540, 97, 2, 0x10 };
-    const VulkanImageMetadata validVel{ 1920, 1080, 97, 1, 0x10 };
+    const VulkanImageMetadata validColor{ 3840, 2160, 97, 2, 0x11 }; // 0x10 COLOR_ATTACHMENT | 0x01 TRANSFER_SRC
+    const VulkanImageMetadata color32bpp{ 3840, 2160, 37, 2, 0x11 };
+    const VulkanImageMetadata singleSampleColor{ 3840, 2160, 97, 1, 0x13 }; // 0x10 COLOR_ATTACHMENT | 0x01 TRANSFER_SRC | 0x02 TRANSFER_DST
+    const VulkanImageMetadata validDepth{ 3840, 2160, 126, 2, 0x21 }; // 0x20 DEPTH_ATTACHMENT | 0x01 TRANSFER_SRC
+    const VulkanImageMetadata depthColorMismatch{ 3840, 2160, 100, 2, 0x11 };
+    const VulkanImageMetadata singleSampleDepth{ 3840, 2160, 126, 1, 0x21 };
+    const VulkanImageMetadata depthMetaDst{ 3840, 2160, 126, 1, 0x22 };
+    const VulkanImageMetadata tooSmallColor{ 960, 540, 97, 2, 0x11 };
+    const VulkanImageMetadata validVel{ 1920, 1080, 97, 1, 0x11 };
     CHECK(RenderTargetManager::IsColorCopyFormatCompatible(97, 97));
     CHECK(RenderTargetManager::IsColorCopyFormatCompatible(103, 97));  // 64bpp R32G32_SFLOAT -> RGBA16F
     CHECK(!RenderTargetManager::IsColorCopyFormatCompatible(37, 97));  // 32bpp RGBA8 -> 64bpp RGBA16F disallowed
@@ -562,12 +605,20 @@ static void TestRenderTargets() {
     CHECK(!r.CanCopyToQuarterDepth(depthColorMismatch));
     CHECK(!r.CanCopyToQuarterDepth(singleSampleDepth));
 
+    // Item H-07: Verify VK_IMAGE_USAGE_TRANSFER_SRC_BIT validation
+    const VulkanImageMetadata colorNoTransferSrc{ 3840, 2160, 97, 2, 0x10 }; // Missing TRANSFER_SRC_BIT
+    CHECK(!r.CanCopyToQuarterColor(colorNoTransferSrc));
+    const VulkanImageMetadata depthNoTransferSrc{ 3840, 2160, 126, 2, 0x20 }; // Missing TRANSFER_SRC_BIT
+    CHECK(!r.CanCopyToQuarterDepth(depthNoTransferSrc));
+    const VulkanImageMetadata velNoTransferSrc{ 1920, 1080, 97, 1, 0x10 }; // Missing TRANSFER_SRC_BIT
+    CHECK(!r.CanCopyToVelocity(velNoTransferSrc));
+
     // Verify 1x ASO single-sample copies when msaaSamples == 1
-    const VulkanImageMetadata b10g11r11SingleSample{ 3840, 2160, 122, 1, 0x10 };
+    const VulkanImageMetadata b10g11r11SingleSample{ 3840, 2160, 122, 1, 0x11 };
     ConfigManager::Get().Modify([](CBRConfig& cfg) { cfg.msaaSamples = 1; });
     r.Initialize(3840, 2160);
     CHECK(r.CanCopyToQuarterColor(singleSampleColor));
-    CHECK(r.CanCopyToQuarterColor(b10g11r11SingleSample)); // Format 122 allowed in 1x APU mode (Item 7)
+    CHECK(!r.CanCopyToQuarterColor(b10g11r11SingleSample)); // Format 122 rejected because 32bpp is incompatible with 64bpp quarterColor (C-03)
     CHECK(!r.CanCopyToQuarterColor(validColor)); // 2x rejected in 1x mode
     CHECK(r.CanCopyToQuarterDepth(singleSampleDepth));
     CHECK(!r.CanCopyToQuarterDepth(validDepth)); // 2x rejected in 1x mode
@@ -576,15 +627,28 @@ static void TestRenderTargets() {
     CHECK(!r.CanCopyToQuarterColor(b10g11r11SingleSample)); // Format 122 rejected in 2x mode
     CHECK(r.CanCopyToVelocity(validVel));
     CHECK(!r.CanCopyToVelocity(validColor)); // 2x samples != 1x velocity buffer
+    const VulkanImageMetadata vel32bpp{ 1920, 1080, 37, 1, 0x11 };
+    CHECK(!r.CanCopyToVelocity(vel32bpp)); // 32bpp velocity buffer rejected (C-02)
 
     const int fakeImg = 1;
+    // Item H-07: Verify VK_IMAGE_USAGE_TRANSFER_DST_BIT validation
+    const VulkanImageMetadata dstNoTransferDst{ 3840, 2160, 97, 1, 0x11 }; // Missing TRANSFER_DST_BIT (0x02)
+    CHECK(!r.ShouldBlitReconstructionToSceneColor(&fakeImg, false, 3840, 2160, dstNoTransferDst));
     CHECK(r.ShouldBlitReconstructionToSceneColor(&fakeImg, false, 3840, 2160));
     CHECK(r.ShouldBlitReconstructionToSceneColor(&fakeImg, false, 3840, 2160, singleSampleColor));
+    CHECK(!r.ShouldBlitReconstructionToSceneColor(&fakeImg, false, 3840, 2160, color32bpp));    // 32bpp blit dst invalid (C-03)
     CHECK(!r.ShouldBlitReconstructionToSceneColor(&fakeImg, false, 3840, 2160, validColor));    // 2x MSAA blit dst invalid (C-04)
     CHECK(!r.ShouldBlitReconstructionToSceneColor(&fakeImg, false, 3840, 2160, depthMetaDst));  // depth dst invalid (C-04)
     CHECK(!r.ShouldBlitReconstructionToSceneColor(&fakeImg, true, 3840, 2160));                 // never blit swapchain mid-frame (C-04)
     CHECK(!r.ShouldBlitReconstructionToSceneColor(&fakeImg, false, 1920, 1080));                // never downsample into quarter-res pass
     CHECK(!r.ShouldBlitReconstructionToSceneColor(nullptr, false, 3840, 2160));
+
+    // Section 4.10: Centralized ValidateImageTransfer verification
+    const VulkanImageMetadata quarterDstMeta{ 1920, 1080, 97, 2, 0x12 }; // 0x10 COLOR_ATTACHMENT | 0x02 TRANSFER_DST
+    CHECK(RenderTargetManager::ValidateImageTransfer(validColor, quarterDstMeta, false));
+    CHECK(!RenderTargetManager::ValidateImageTransfer(validColor, singleSampleColor, false)); // sample count mismatch
+    CHECK(RenderTargetManager::ValidateImageTransfer(singleSampleColor, singleSampleColor, true)); // valid 1x color blit
+    CHECK(!RenderTargetManager::ValidateImageTransfer(singleSampleColor, depthMetaDst, true)); // color -> depth blit disallowed
 
     // DX12 resource lifecycle sanity checks (Item H-02)
     CHECK(!r.AreDX12ResourcesCreated());

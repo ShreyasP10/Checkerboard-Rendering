@@ -36,6 +36,8 @@ $$\text{Risk Score} = \text{Probability (1–5)} \times \text{Impact (1–5)}$$
 | **RSK-09** | Technical | Vulkan headerless ABI struct padding mismatch on untrusted pointers. | 2 | 4 | **8** | **Medium** | **MITIGATED** (Static assert on `imageExtent` byte offset 44/28 + `sType` validation) |
 | **RSK-10** | Reliability | Data race on render dimensions / singleton mutex lock inversion deadlock. | 2 | 4 | **8** | **Medium** | **MITIGATED** (`m_initialized` written in `unique_lock`, `JitterManager` acquires config before mutex) |
 | **RSK-11** | Performance | Disk I/O flush on render thread causing micro-stutter / dropped frames. | 2 | 3 | **6** | **Medium** | **MITIGATED** (Logger `flush()` restricted to Warning & Error levels only) |
+| **RSK-12** | Security | Windows 11 CET / CFG incompatibility with x64 MinHook dynamic trampolines. | 2 | 4 | **8** | **Medium** | **MITIGATED** (`/guard:cf` enabled, `/CETCOMPAT:NO` explicitly set, trampoline RWX safe) |
+| **RSK-13** | Security | Late-loaded anti-cheat or online multiplayer modules during active session. | 2 | 5 | **10** | **High** | **MITIGATED** (Periodic present-time module check every 300 frames with auto self-disable) |
 
 ---
 
@@ -92,3 +94,21 @@ $$\text{Risk Score} = \text{Probability (1–5)} \times \text{Impact (1–5)}$$
 - **Mitigation Strategy:**
   - Hardcode an active session state check: If network/multiplayer session flags are detected in game memory, the mod immediately self-terminates and unhooks all functions.
   - Display prominent warnings in the documentation and in-game ImGui overlay indicating the mod is strictly for Single Player / Story Mode.
+
+---
+
+### RSK-12: Control Flow Guard (CFG) & Shadow Stack (CET) Trampoline Incompatibility
+- **Root Cause:** MinHook creates dynamic x64 machine-code trampolines in allocated pages. Windows 11 hardware-enforced CET shadow stack marks non-CET landing pad trampolines as violations if `/CETCOMPAT` is enabled.
+- **Impact:** Process termination with `STATUS_GUARD_PAGE_VIOLATION` on CET-enabled Windows 11 systems.
+- **Mitigation Strategy:**
+  - Build configuration explicitly compiles with `/guard:cf` for compiler direct-call validation while disabling `/CETCOMPAT:NO` at the linker level.
+  - Validated on Windows 11 with Kernel-mode Hardware-enforced Stack Protection: running with `/CETCOMPAT:NO` ensures the OS loader allows MinHook trampolines while retaining full CFG compiler guard integrity.
+
+---
+
+### RSK-13: Late-Loaded Anti-Cheat Modules Post-Session Initialization
+- **Root Cause:** Rockstar Games Services or anti-cheat monitoring modules may be dynamically loaded after the game process enters an online multiplayer lobby, long after ASI initialization.
+- **Impact:** Undetected online play resulting in potential account flags.
+- **Mitigation Strategy:**
+  - `CBREngine::OnPostPresent` executes a lightweight periodic scan (`CheckAntiCheatModules()`) every 300 frames (~5 seconds at 60 FPS).
+  - If any blacklisted module (`BEClient_x64.dll`, `EasyAntiCheat_x64.dll`, `EOSOVH-Win64-Shipping.dll`, etc.) or launch argument is discovered, CBR immediately unloads history buffers and invokes `SetEnabled(false)` permanently for the remainder of the process lifetime.

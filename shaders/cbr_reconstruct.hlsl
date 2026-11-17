@@ -153,14 +153,20 @@ CbrSample MapPixelToSample(int2 p, uint frameParity) {
     int yBit = p.y & 1;
     s.isActive = (((uint(p.x) ^ uint(p.y)) & 1u) == frameParity);
     int qx;
-    if (frameParity == 0u) {
+    if (frameParity == 0u || g_ShiftDirection == 0) {
         qx = p.x >> 1;
-    } else if (g_ShiftDirection >= 0) {
+    } else if (g_ShiftDirection > 0) {
         qx = max(p.x - yBit, 0) >> 1;
     } else {
         qx = (p.x + 1 - yBit) >> 1;
     }
     int2 qMax = int2(g_TargetResolution * 0.5f) - int2(1, 1);
+    // Item M-17: At boundary columns where unclamped qx falls outside [0, qMax.x]
+    // (e.g. x = targetW - 1 on odd frames with shiftDir = -1), no hardware sample exists.
+    // Mark inactive to fail-open to spatial fallback rather than clamping to duplicate neighbor.
+    if (qx < 0 || qx > qMax.x) {
+        s.isActive = false;
+    }
     s.quarter = int2(clamp(qx, 0, qMax.x), min(p.y >> 1, qMax.y));
     s.sampleIdx = 1 - yBit;
     return s;
@@ -235,12 +241,15 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     if (isCurrentSampleActive) {
         currentColor = FetchColor(self);
         if (any(isnan(currentColor)) || any(isinf(currentColor))) {
-            currentColor = float3(0.0f, 0.0f, 0.0f);
+            // Item M-19: Active sample has non-finite color; route through spatial reconstruction rather than falling back to black
+            isCurrentSampleActive = false;
+        } else {
+            currentDepth = FetchDepth(self);
+            currentLinear = LinearizeDepth(currentDepth);
+            closestCardinalLin = currentLinear;
         }
-        currentDepth = FetchDepth(self);
-        currentLinear = LinearizeDepth(currentDepth);
-        closestCardinalLin = currentLinear;
-    } else {
+    }
+    if (!isCurrentSampleActive) {
         // No native sample here: estimate depth from the cardinal neighbours (Intel "CSO": average LINEAR depth).
         float sumRaw = 0.0f;
         float sumLin = 0.0f;
@@ -338,10 +347,9 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     }
     // JitterCompensation (Item M-08): 0.0 when velocity buffer is unjittered or Strategy A viewport shift is active;
     // set to 1.0 only if velocity vectors encode the projection jitter delta (verify via RenderDoc).
-    // Jitter dampener: dampens jitter compensation on zero-velocity passes (transparent particles, fog, smoke)
-    // to prevent half-pixel oscillation when alpha-blended particles lack motion vectors.
-    float jitterDampener = (dot(velocity, velocity) < 1e-9f) ? 0.0f : 1.0f;
-    float2 historyUV = uv - velocity - (g_JitterDelta * (g_JitterCompensation * jitterDampener));
+    // JitterCompensation (Item H-02): Compensates for the 1-pixel horizontal shift when sampling history from the previous frame.
+    // Static geometry has velocity=0, but content shifted by u_JitterDelta; do not zero jitter compensation on static scenes.
+    float2 historyUV = uv - velocity - (g_JitterDelta * g_JitterCompensation);
     float2 minUV = 0.5f * g_InvTargetResolution;
     float2 maxUV = float2(1.0f, 1.0f) - minUV;
     historyUV = clamp(historyUV, minUV, maxUV);
@@ -432,7 +440,8 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
             // Variance clipping: clamp history inside [mean - gamma * stdDev, mean + gamma * stdDev]
             float3 mean = m1 / n;
             float3 rawStdDev = sqrt(max(float3(0.0f, 0.0f, 0.0f), (m2 / n) - (mean * mean)));
-            float3 stdDev = max(rawStdDev, float3(0.005f, 0.005f, 0.005f));
+            // Enforce floor to avoid shadow collapse in SDR while dynamically scaling with mean in HDR (Section 5.7)
+            float3 stdDev = max(rawStdDev, max(float3(0.005f, 0.005f, 0.005f), abs(mean) * 0.01f));
             const float gamma = 1.25f; // kVarianceClipGamma (include/cbr/limits.h)
             float3 varianceMin = max(colorMin, mean - gamma * stdDev);
             float3 varianceMax = min(colorMax, mean + gamma * stdDev);
@@ -462,46 +471,51 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
         if (!isDisoccluded && historyColor.a > 0.0f) {
             finalColor = historyColor.rgb;
         } else {
-            // Spatial cross-bilateral reconstruction from the 4 cardinal (natively shaded) neighbours.
-            // With the fallback disabled the nearest neighbour is copied (no native sample exists here).
-            // Directional gradient weights: prefer interpolating along edge contours (Decima tangent resolve)
-            float3 horizDiff = abs(cardinalColor[0] - cardinalColor[1]);
-            float3 vertDiff  = abs(cardinalColor[2] - cardinalColor[3]);
-            float horizGrad = dot(horizDiff, float3(0.299f, 0.587f, 0.114f));
-            float vertGrad  = dot(vertDiff,  float3(0.299f, 0.587f, 0.114f));
-            float dirBias[4] = {
-                1.0f / (1.0f + horizGrad * 8.0f), // Left
-                1.0f / (1.0f + horizGrad * 8.0f), // Right
-                1.0f / (1.0f + vertGrad  * 8.0f), // Up
-                1.0f / (1.0f + vertGrad  * 8.0f)  // Down
-            };
-
-            float3 accumColor = float3(0.0f, 0.0f, 0.0f);
-            float accumDepth = 0.0f;
-            float accumWeight = 0.0f;
-
-            for (int i = 0; i < 4 && g_EnableSpatialFallback != 0u; ++i) {
-                float3 sCol = cardinalColor[i];
-                float sLin = LinearizeDepth(cardinalDepth[i]);
-
-                // Relative linear-depth weighting: scale-invariant, independent of the depth convention
-                // Fast base-2 exponentiation: exp(-x) == exp2(-x * log2(e))
-                float depthWeight = exp2((-abs(currentLinear - sLin) / (max(currentLinear, 1e-5f) * max(g_DepthTolerance, 1e-4f))) * 1.44269504f);
-                float totalWeight = depthWeight * dirBias[i];
-
-                accumColor += sCol * totalWeight;
-                accumDepth += cardinalDepth[i] * totalWeight;
-                accumWeight += totalWeight;
-            }
-
-            if (accumWeight > 1e-4f) {
-                finalColor = accumColor / accumWeight;
-                spatialDepth = accumDepth / accumWeight;
+            // Spatial reconstruction from the 4 cardinal (natively shaded) neighbours.
+            // When spatial fallback is disabled, copy the nearest cardinal neighbour directly (Item M-04).
+            if (g_EnableSpatialFallback == 0u) {
+                finalColor = cardinalColor[0];
+                spatialDepth = cardinalDepth[0];
             } else {
-                finalColor = isCurrentSampleActive ? currentColor : (
-                    cardinalColor[0] + cardinalColor[1] + cardinalColor[2] + cardinalColor[3]
-                ) * 0.25f;
-                spatialDepth = isCurrentSampleActive ? currentDepth : (cardinalDepth[0] + cardinalDepth[1] + cardinalDepth[2] + cardinalDepth[3]) * 0.25f;
+                // Directional gradient weights: prefer interpolating along edge contours (Decima tangent resolve)
+                float3 horizDiff = abs(cardinalColor[0] - cardinalColor[1]);
+                float3 vertDiff  = abs(cardinalColor[2] - cardinalColor[3]);
+                float horizGrad = dot(horizDiff, float3(0.299f, 0.587f, 0.114f));
+                float vertGrad  = dot(vertDiff,  float3(0.299f, 0.587f, 0.114f));
+                float dirBias[4] = {
+                    1.0f / (1.0f + horizGrad * 8.0f), // Left
+                    1.0f / (1.0f + horizGrad * 8.0f), // Right
+                    1.0f / (1.0f + vertGrad  * 8.0f), // Up
+                    1.0f / (1.0f + vertGrad  * 8.0f)  // Down
+                };
+
+                float3 accumColor = float3(0.0f, 0.0f, 0.0f);
+                float accumDepth = 0.0f;
+                float accumWeight = 0.0f;
+
+                for (int i = 0; i < 4; ++i) {
+                    float3 sCol = cardinalColor[i];
+                    float sLin = LinearizeDepth(cardinalDepth[i]);
+
+                    // Relative linear-depth weighting: scale-invariant, independent of the depth convention
+                    // Fast base-2 exponentiation: exp(-x) == exp2(-x * log2(e))
+                    float depthWeight = exp2((-abs(currentLinear - sLin) / (max(currentLinear, 1e-5f) * max(g_DepthTolerance, 1e-4f))) * 1.44269504f);
+                    float totalWeight = depthWeight * dirBias[i];
+
+                    accumColor += sCol * totalWeight;
+                    accumDepth += cardinalDepth[i] * totalWeight;
+                    accumWeight += totalWeight;
+                }
+
+                if (accumWeight > 1e-4f) {
+                    finalColor = accumColor / accumWeight;
+                    spatialDepth = accumDepth / accumWeight;
+                } else {
+                    finalColor = isCurrentSampleActive ? currentColor : (
+                        cardinalColor[0] + cardinalColor[1] + cardinalColor[2] + cardinalColor[3]
+                    ) * 0.25f;
+                    spatialDepth = isCurrentSampleActive ? currentDepth : (cardinalDepth[0] + cardinalDepth[1] + cardinalDepth[2] + cardinalDepth[3]) * 0.25f;
+                }
             }
         }
     }
@@ -531,9 +545,10 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
                         sc = hc.rgb;
                     }
                 } else {
-                    int2 stepAxis = (i < 2) ? int2(kCardinal[i].x, 1) : int2(1, kCardinal[i].y);
-                    int2 diag = pixelCoord + stepAxis;
-                    if (!InBounds(diag, targetSize)) diag = pixelCoord - stepAxis;
+                    // Item M-02: Use symmetric diagonal offsets (-1,-1), (1,-1), (-1,1), (1,1)
+                    static const int2 kDiag[4] = { int2(-1, -1), int2(1, -1), int2(-1, 1), int2(1, 1) };
+                    int2 diag = pixelCoord + kDiag[i];
+                    if (!InBounds(diag, targetSize)) diag = pixelCoord - kDiag[i];
                     if (InBounds(diag, targetSize)) {
                         float3 dc = FetchColor(MapPixelToSample(diag, frameParity));
                         if (!any(isnan(dc)) && !any(isinf(dc))) sc = dc;
@@ -574,10 +589,11 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
         float speed = clamp(length(normVel), 0.0f, 1.0f);
         finalColor = float3(clamp(normVel * 0.5f + 0.5f, 0.0f, 1.0f), speed);
     } else if (g_DebugView == 4u) {
-        // Quarter-resolution raw colour without directional bias
-        finalColor = isCurrentSampleActive ? currentColor : (
-            cardinalColor[0] + cardinalColor[1] + cardinalColor[2] + cardinalColor[3]
-        ) * 0.25f;
+        // Mode 4: Quarter-resolution raw color nearest-upsampled (Item M-03)
+        // Shows the raw quarter-resolution texel without cardinal averaging
+        int2 qMax = max(int2(g_TargetResolution * 0.5f) - int2(1, 1), int2(0, 0));
+        int2 qCoord = clamp(pixelCoord >> 1, int2(0, 0), qMax);
+        finalColor = g_QuarterColorMSAA.Load(qCoord, 0).rgb;
     } else if (g_DebugView == 5u) {
         // Spatial baseline resolve: average of 4 cardinal samples for reconstructed pixels
         // (direct visual A/B baseline comparison against temporal CBR, matching reference Space toggle)

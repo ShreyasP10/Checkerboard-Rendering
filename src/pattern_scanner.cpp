@@ -3,6 +3,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstring>
+#include "cbr/config.h"
 #include "cbr/jitter_manager.h"
 #include "cbr/logger.h"
 
@@ -302,6 +303,15 @@ const uint8_t* PatternScanner::ResolveRipRelative(const uint8_t* instructionAddr
     const uint8_t* target = instructionAddress + instructionLength + displacement;
 
 #if defined(_WIN32)
+    // Section 4.2: Verify the target lies inside a known mapped module (containment check)
+    HMODULE hTargetMod = nullptr;
+    if (!GetModuleHandleExA(
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        reinterpret_cast<LPCSTR>(target),
+        &hTargetMod) || !hTargetMod) {
+        return nullptr;
+    }
+
     if (!VirtualQuery(target, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT ||
         (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) {
         return nullptr;
@@ -327,6 +337,9 @@ const uint8_t* PatternScanner::ScanModule(const char* moduleName, const char* si
         return nullptr;
     }
 
+// Note: MSVC builds use hardware SEH (__try/__except) to trap potential page faults.
+// For MinGW/GCC builds (which lack MSVC x64 SEH extensions), the granular VirtualQuery
+// region validation (MEM_COMMIT, protection mask, and non-PAGE_GUARD) acts as the primary safety gate.
 #if defined(_MSC_VER)
     __try {
 #endif
@@ -439,13 +452,20 @@ bool PatternScanner::InitializeCameraScanner() {
                             float* matrixPtr = reinterpret_cast<float*>(static_cast<uint8_t*>(targetManager) + 0x40);
                             const float cotX = matrixPtr[0];
                             const float cotY = matrixPtr[5];
+                            const float m11 = matrixPtr[11];
+                            const float m14 = matrixPtr[14];
+                            // Item H-06: Validate perspective row entries and small unjittered base offsets
+                            const bool hasPerspectiveW = (std::fabs(m11 + 1.0f) < 0.05f || std::fabs(m14 + 1.0f) < 0.05f);
+                            const bool hasSmallJitterBase = (std::fabs(matrixPtr[8]) < 0.1f && std::fabs(matrixPtr[9]) < 0.1f);
                             if (!std::isnan(cotX) && !std::isnan(cotY) && !std::isinf(cotX) && !std::isinf(cotY) &&
-                                cotX >= 0.2f && cotX <= 5.0f && cotY >= 0.2f && cotY <= 5.0f) {
+                                cotX >= 0.2f && cotX <= 5.0f && cotY >= 0.2f && cotY <= 5.0f &&
+                                hasPerspectiveW && hasSmallJitterBase) {
                                 g_cachedCameraMatrix.store(matrixPtr, std::memory_order_release);
                                 CBR_LOG_INFO("RDR2 camera projection matrix acquired at 0x%p (cotX=%.4f, cotY=%.4f)", matrixPtr, cotX, cotY);
                                 return true;
                             } else {
-                                CBR_LOG_WARN("Camera matrix candidate at 0x%p rejected: invalid perspective cotangents (cotX=%.4f, cotY=%.4f)", matrixPtr, cotX, cotY);
+                                CBR_LOG_WARN("Camera matrix candidate at 0x%p rejected: failed validation (cotX=%.4f, cotY=%.4f, perspW=%d, base=%d)",
+                                             matrixPtr, cotX, cotY, hasPerspectiveW ? 1 : 0, hasSmallJitterBase ? 1 : 0);
                             }
                         }
                     }
@@ -483,7 +503,42 @@ float* PatternScanner::GetCameraProjectionMatrix() {
     return mat;
 }
 
+#if defined(_WIN32)
+namespace {
+
+bool TryApplyJitterSEH(float* cameraMatrix, uint32_t frameIndex, bool isVulkan) {
+#if defined(_MSC_VER)
+    __try {
+        if (JitterManager::Get().IsProjectionJitterApplied(cameraMatrix, frameIndex, isVulkan)) {
+            return true;
+        }
+        JitterManager::Get().ApplyJitterToProjection(cameraMatrix, isVulkan);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+#else
+    try {
+        if (JitterManager::Get().IsProjectionJitterApplied(cameraMatrix, frameIndex, isVulkan)) {
+            return true;
+        }
+        JitterManager::Get().ApplyJitterToProjection(cameraMatrix, isVulkan);
+        return true;
+    } catch (...) {
+        return false;
+    }
+#endif
+}
+
+} // namespace
+#endif
+
 bool PatternScanner::UpdateCameraJitter(uint32_t frameIndex, bool isVulkan) {
+    // Item H-06: Opt-in gate for memory writes to game space (default: false, preserving safe viewport shift)
+    if (!ConfigManager::Get().GetConfig().enableProjectionJitterWrite) {
+        return false;
+    }
+
     float* cameraMatrix = GetCameraProjectionMatrix();
     if (!cameraMatrix) {
         if (!InitializeCameraScanner()) {
@@ -501,31 +556,12 @@ bool PatternScanner::UpdateCameraJitter(uint32_t frameIndex, bool isVulkan) {
             CBR_LOG_WARN("Camera projection matrix memory not writable; falling back to Viewport Redirection.");
             return false;
         }
-#if defined(_MSC_VER)
-        __try {
-            if (JitterManager::Get().IsProjectionJitterApplied(cameraMatrix, frameIndex, isVulkan)) {
-                return true;
-            }
-            JitterManager::Get().ApplyJitterToProjection(cameraMatrix, isVulkan);
+        if (TryApplyJitterSEH(cameraMatrix, frameIndex, isVulkan)) {
             return true;
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            g_cachedCameraMatrix.store(nullptr, std::memory_order_release);
-            CBR_LOG_WARN("Camera projection matrix access faulted; falling back to Viewport Redirection.");
-            return false;
         }
-#else
-        try {
-            if (JitterManager::Get().IsProjectionJitterApplied(cameraMatrix, frameIndex, isVulkan)) {
-                return true;
-            }
-            JitterManager::Get().ApplyJitterToProjection(cameraMatrix, isVulkan);
-            return true;
-        } catch (...) {
-            g_cachedCameraMatrix.store(nullptr, std::memory_order_release);
-            CBR_LOG_WARN("Camera projection matrix access faulted; falling back to Viewport Redirection.");
-            return false;
-        }
-#endif
+        g_cachedCameraMatrix.store(nullptr, std::memory_order_release);
+        CBR_LOG_WARN("Camera projection matrix access faulted; falling back to Viewport Redirection.");
+        return false;
     }
     return false;
 }

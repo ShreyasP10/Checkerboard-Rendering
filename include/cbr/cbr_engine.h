@@ -52,6 +52,11 @@ public:
     GraphicsApi GetActiveApi() const { return m_activeApi.load(); }
     void        SetActiveApi(GraphicsApi api) { m_activeApi.store(api); }
 
+    [[nodiscard]] bool HasDispatchedThisFrame() const {
+        return m_lastDispatchedFrame.load(std::memory_order_acquire) ==
+               m_frameIndex.load(std::memory_order_acquire);
+    }
+
     // Performance metrics
     float GetLastReconstructionDurationMs() const { return m_lastReconDurationMs.load(); }
     void  SetLastReconstructionDurationMs(float durationMs) { m_lastReconDurationMs.store(durationMs); }

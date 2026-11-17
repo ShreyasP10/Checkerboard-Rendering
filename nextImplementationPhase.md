@@ -11,7 +11,7 @@
 
 In our initial in-game deployment, the mod successfully proved:
 1. **Host Stability:** Loaded cleanly via Alexander Blade's ASI loader alongside Lenny's Mod Loader (`vfs.asi`) and Visual Redemption with **zero game crashes or memory corruption**.
-2. **Subsystem Readiness:** Configuration loaded from [cbr.ini](file:///c:/Users/Dinesh%20B%20Pawar/OneDrive/Desktop/Checkerboard-Rendering/cbr.ini), allocating 2× MSAA quarter-resolution buffers (1920×1080) with a measured 300.59 MiB VRAM footprint.
+2. **Subsystem Readiness:** Configuration loaded from [cbr.ini](file:///c:/Users/Dinesh%20B%20Pawar/OneDrive/Desktop/Checkerboard-Rendering/cbr.ini), allocating 2× MSAA quarter-resolution buffers (1920×1080) with a 237.30 MiB (248.83 MB) VRAM footprint (optimized from the initial 300.59 MiB prototype by eliminating redundant auxiliary output storage buffers in Item M-06).
 3. **Safe Fallback:** Because graphics hook stubs were protected by safety flags, the mod timed out gracefully after 60 seconds without disrupting game rendering.
 
 ### The Core Goal of This Phase

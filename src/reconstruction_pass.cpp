@@ -804,7 +804,7 @@ bool ReconstructionPass::CreateVulkanPipeline() {
         if (!s_loggedMissing.exchange(true)) {
             CBR_LOG_WARN("SPIR-V shader binary 'cbr_reconstruct.spv' not found in search paths. Pipeline compilation deferred.");
         }
-        return true;
+        return false;
     }
 
     CBR_LOG_INFO("Loading CBR SPIR-V shader from: %s (%zu bytes)", resolvedShaderPath.string().c_str(), spvBytecode.size() * sizeof(uint32_t));
@@ -1053,9 +1053,15 @@ bool ReconstructionPass::CreateVulkanPipeline() {
         if (pfnGetPhysProps) {
             uint32_t propsHeader[256]{};
             pfnGetPhysProps(m_vkPhysicalDevice, propsHeader);
-            // On 64-bit platforms, VkPhysicalDeviceLimits::timestampPeriod is located at byte offset 796
-            // (sizeof(VkPhysicalDeviceProperties) is 824 bytes, limits begins at offset 512, timestampPeriod at +284)
-            const float extractedPeriod = *reinterpret_cast<const float*>(reinterpret_cast<const char*>(propsHeader) + 796);
+            // VkPhysicalDeviceProperties memory layout (vulkan_core.h):
+            //   Fixed prefix: apiVersion(4) + driverVersion(4) + vendorID(4) + deviceID(4) + deviceType(4)
+            //                 + deviceName[256] + pipelineCacheUUID[16] = 292 bytes (limits offset = 292).
+            //   VkPhysicalDeviceLimits: timestampPeriod is preceded by 96 members + alignment padding:
+            //     - 64-bit (LP64/LLP64: size_t=8, VkDeviceSize=8): timestampPeriod is at limits offset 424.
+            //     - 32-bit (size_t=4, VkDeviceSize=8): timestampPeriod is at limits offset 416.
+            //   Absolute offset in VkPhysicalDeviceProperties: 292 + 424 = 716 on 64-bit, 292 + 416 = 708 on 32-bit (Item H-08).
+            constexpr size_t kTimestampPeriodOffset = (sizeof(void*) == 8) ? 716 : 708;
+            const float extractedPeriod = *reinterpret_cast<const float*>(reinterpret_cast<const char*>(propsHeader) + kTimestampPeriodOffset);
             if (std::isfinite(extractedPeriod) && extractedPeriod > 0.0f && extractedPeriod <= 1000.0f) {
                 m_vkTimestampPeriodNs = extractedPeriod;
             }
@@ -1208,7 +1214,7 @@ bool ReconstructionPass::CreateDX12Pipeline() {
     typedef long (__stdcall *PFN_D3D12SerializeRootSignature)(
         const MinimalD3D12RootSignatureDesc*, uint32_t, void**, void**);
     auto pfnSerializeRootSig = reinterpret_cast<PFN_D3D12SerializeRootSignature>(
-        GetProcAddress(d3d12Mod, "D3D12SerializeRootSignature"));
+        reinterpret_cast<void*>(GetProcAddress(d3d12Mod, "D3D12SerializeRootSignature")));
     if (!pfnSerializeRootSig) {
         CBR_LOG_ERROR("CreateDX12Pipeline: D3D12SerializeRootSignature not found.");
         return false;
@@ -1269,7 +1275,8 @@ bool ReconstructionPass::CreateDX12Pipeline() {
         typedef long (__stdcall *PFN_D3DCompile)(
             const void*, size_t, const char*, const void*, void*,
             const char*, const char*, uint32_t, uint32_t, void**, void**);
-        auto pfnD3DCompile = reinterpret_cast<PFN_D3DCompile>(GetProcAddress(d3dCompilerMod, "D3DCompile"));
+        auto pfnD3DCompile = reinterpret_cast<PFN_D3DCompile>(
+            reinterpret_cast<void*>(GetProcAddress(d3dCompilerMod, "D3DCompile")));
         if (!pfnD3DCompile) {
             CBR_LOG_WARN("CreateDX12Pipeline: D3DCompile export unavailable in d3dcompiler_47.dll.");
             return false;
@@ -2007,6 +2014,7 @@ ReconstructionPushConstants BuildReconstructionPushConstants(uint32_t frameIndex
     pc.historyWeight = config.historyWeight;
     pc.debugView = config.debugView;
     pc.enableColorClamping = config.enableColorClamping ? 1u : 0u;
+    // MipLodBias applied directly to game material samplers in Hooked_vkCreateSampler (Item M-05); field preserved for push constant ABI stability
     pc.mipLodBias = config.mipLodBias;
     pc.colorSpace = (config.colorSpace == ColorSpace::RGB) ? 1u : ((config.colorSpace == ColorSpace::ICtCp) ? 2u : 0u);
     pc.enableSpatialFallback = config.enableSpatialFallback ? 1u : 0u;
@@ -2090,6 +2098,9 @@ void ReconstructionPass::DispatchVulkan(void* vkCommandBuffer, uint32_t frameInd
             if (!tex.image) return;
             // Use tracked layout rather than hardcoded UNDEFINED (0) so Step-1 copied inputs and initial history aren't discarded (Item C-03).
             const uint32_t oldLayout = RenderTargetManager::Get().GetVulkanImageLayout(tex.image);
+            if (oldLayout == newLayout && oldLayout == kVkImageLayoutShaderReadOnlyOptimal) {
+                return; // Already in SHADER_READ_ONLY_OPTIMAL with compute read visibility from CopyImageRegion / previous pass
+            }
             uint32_t srcStage = kVkPipelineStageTopOfPipeBit;
             uint32_t srcAccess = 0;
             StageAccessForLayout(oldLayout, tex.aspectMask, srcStage, srcAccess);
@@ -2247,14 +2258,14 @@ void ReconstructionPass::DispatchDX12(void* d3d12GraphicsCommandList, uint32_t f
         typedef void (__stdcall *PFN_SetComputeRootConstantBufferView)(void*, uint32_t, uint64_t);
 
         void** vmt = *reinterpret_cast<void***>(d3d12GraphicsCommandList);
-        if (vmt && vmt[14] && vmt[25] && vmt[26] && vmt[28] && vmt[29] && vmt[31] && vmt[34]) {
+        if (vmt && vmt[14] && vmt[25] && vmt[26] && vmt[28] && vmt[29] && vmt[31] && vmt[35]) {
             auto pfnDispatch       = reinterpret_cast<PFN_Dispatch>(vmt[14]);
             auto pfnSetPSO         = reinterpret_cast<PFN_SetPipelineState>(vmt[25]);
             auto pfnBarrier        = reinterpret_cast<PFN_ResourceBarrier>(vmt[26]);
             auto pfnSetHeaps       = reinterpret_cast<PFN_SetDescriptorHeaps>(vmt[28]);
             auto pfnSetRootSig     = reinterpret_cast<PFN_SetComputeRootSignature>(vmt[29]);
             auto pfnSetRootTable   = reinterpret_cast<PFN_SetComputeRootDescriptorTable>(vmt[31]);
-            auto pfnSetConstants   = reinterpret_cast<PFN_SetComputeRoot32BitConstants>(vmt[34]);
+            auto pfnSetConstants   = reinterpret_cast<PFN_SetComputeRoot32BitConstants>(vmt[35]);
 
             auto& rtm = RenderTargetManager::Get();
             const auto& dx12 = rtm.GetDX12Resources();

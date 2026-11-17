@@ -594,6 +594,7 @@ int main() {
         c.debugView = 0;
         c.sharpeningStrength = 0.0f;
         c.enableCameraMotionFallback = false;
+        c.jitterCompensation = 0.0f; // Headless synthetic test uses unjittered clear rects
     });
 
     auto& rtm = cbr::RenderTargetManager::Get();
@@ -773,8 +774,9 @@ int main() {
 
     bool failed = false;
 
-    // Execute Frame 0 (parity 0, writes history[1]) and Frame 1 (parity 1, reads history[1] and writes history[0])
-    for (uint32_t frame = 0; frame < 2; ++frame) {
+    // Execute Frame 0 (parity 0, writes history[1]), Frame 1 (parity 1, reads history[1] and writes history[0]),
+    // and Frame 2 (parity 0, reads history[0] and writes history[1]) to verify full ping-pong feedback loop (Section 5.10)
+    for (uint32_t frame = 0; frame < 3; ++frame) {
         jitter.Update(frame);
         pfnResetCmdBuf(cmdBuf, 0);
 
@@ -942,7 +944,7 @@ int main() {
     if (pfnDestroyInstance) pfnDestroyInstance(instance, nullptr);
 
     if (failed) return 1;
-    std::cout << "Headless Vulkan compute reconstruction test passed (Frame 0 & Frame 1).\n";
+    std::cout << "Headless Vulkan compute reconstruction test passed (Frames 0, 1 & 2).\n";
     return 0;
 }
 

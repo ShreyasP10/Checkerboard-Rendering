@@ -91,13 +91,13 @@ static DX12CmdListSlot g_dx12Slots[kMaxDX12Slots];
 inline DX12CmdListSlot* GetOrCreateDX12Slot(void* cmdList) {
     if (!cmdList) return nullptr;
     const size_t start = (reinterpret_cast<uintptr_t>(cmdList) >> 4) % kMaxDX12Slots;
-    for (size_t i = 0; i < 8; ++i) {
+    for (size_t i = 0; i < kMaxDX12Slots; ++i) {
         size_t idx = (start + i) % kMaxDX12Slots;
         if (g_dx12Slots[idx].cmdList.load(std::memory_order_relaxed) == cmdList) {
             return &g_dx12Slots[idx];
         }
     }
-    for (size_t i = 0; i < 8; ++i) {
+    for (size_t i = 0; i < kMaxDX12Slots; ++i) {
         size_t idx = (start + i) % kMaxDX12Slots;
         void* expected = nullptr;
         if (g_dx12Slots[idx].cmdList.compare_exchange_strong(expected, cmdList, std::memory_order_acq_rel)) {
@@ -120,7 +120,7 @@ inline DX12CmdListSlot* GetOrCreateDX12Slot(void* cmdList) {
 inline DX12CmdListSlot* FindDX12Slot(void* cmdList) {
     if (!cmdList) return nullptr;
     const size_t start = (reinterpret_cast<uintptr_t>(cmdList) >> 4) % kMaxDX12Slots;
-    for (size_t i = 0; i < 8; ++i) {
+    for (size_t i = 0; i < kMaxDX12Slots; ++i) {
         size_t idx = (start + i) % kMaxDX12Slots;
         if (g_dx12Slots[idx].cmdList.load(std::memory_order_relaxed) == cmdList) {
             return &g_dx12Slots[idx];
@@ -242,6 +242,61 @@ struct MinimalD3D12CommandQueueDesc {
     unsigned int NodeMask;
 };
 
+// Direct3D 12 COM Interface VMT Index Constants (from official Microsoft d3d12.h / d3d12.idl)
+namespace D3D12Vmt {
+    namespace Device {
+        constexpr size_t GetNodeCount                     = 7;
+        constexpr size_t CreateCommandQueue               = 8;
+        constexpr size_t CreateCommandAllocator           = 9;
+        constexpr size_t CreateGraphicsPipelineState      = 10;
+        constexpr size_t CreateComputePipelineState       = 11;
+        constexpr size_t CreateCommandList                = 12;
+        constexpr size_t CheckFeatureSupport              = 13;
+        constexpr size_t CreateDescriptorHeap             = 14;
+        constexpr size_t GetDescriptorHandleIncrementSize = 15;
+        constexpr size_t CreateRootSignature              = 16;
+        constexpr size_t CreateShaderResourceView         = 18;
+        constexpr size_t CreateUnorderedAccessView        = 19;
+        constexpr size_t CreateSampler                    = 22;
+        constexpr size_t CreateCommittedResource          = 27;
+    }
+
+    namespace CommandList {
+        constexpr size_t Close                            = 9;
+        constexpr size_t Reset                            = 10;
+        constexpr size_t ClearState                       = 11;
+        constexpr size_t DrawInstanced                    = 12;
+        constexpr size_t DrawIndexedInstanced             = 13;
+        constexpr size_t Dispatch                         = 14;
+        constexpr size_t RSSetViewports                   = 21;
+        constexpr size_t RSSetScissorRects                = 22;
+        constexpr size_t SetPipelineState                 = 25;
+        constexpr size_t ResourceBarrier                  = 26;
+        constexpr size_t SetDescriptorHeaps               = 28;
+        constexpr size_t SetComputeRootSignature          = 29;
+        constexpr size_t SetGraphicsRootSignature         = 30;
+        constexpr size_t SetComputeRootDescriptorTable    = 31;
+        constexpr size_t SetComputeRoot32BitConstants     = 35;
+        constexpr size_t SetComputeRootConstantBufferView = 37;
+        constexpr size_t OMSetRenderTargets               = 46;
+    }
+
+    namespace SwapChain {
+        constexpr size_t Present                          = 8;
+        constexpr size_t ResizeBuffers                    = 13;
+        constexpr size_t Present1                         = 22;
+    }
+
+    namespace CommandQueue {
+        constexpr size_t GetDevice                        = 7;
+        constexpr size_t ExecuteCommandLists              = 10;
+    }
+
+    namespace Factory {
+        constexpr size_t CreateSwapChain                  = 10;
+    }
+}
+
 // Type-safe and null-checked COM VMT invocation helper
 template <typename T, typename... Args>
 inline HRESULT CallVmt(void* obj, size_t index, Args... args) {
@@ -250,7 +305,11 @@ inline HRESULT CallVmt(void* obj, size_t index, Args... args) {
     if (!vmt) return E_POINTER;
     auto func = reinterpret_cast<T>(vmt[index]);
     if (!func) return E_UNEXPECTED;
-    return func(obj, args...);
+    HRESULT hr = func(obj, args...);
+    if (FAILED(hr)) {
+        CBR_LOG_WARN("CallVmt failed at index %zu: HRESULT = 0x%08lX", index, static_cast<unsigned long>(hr));
+    }
+    return hr;
 }
 
 inline ULONG ReleaseCom(void* obj) {
@@ -270,7 +329,7 @@ void __stdcall Hooked_D3D12ExecuteCommandLists(void* commandQueue, unsigned int 
                     { 0x189819f1, 0x1db6, 0x4b57, { 0xbe, 0x54, 0x18, 0x21, 0x33, 0x9b, 0x85, 0xf7 } };
                 void* liveDev = nullptr;
                 typedef HRESULT (__stdcall *PFN_GetDevice)(void*, const GUID*, void**);
-                if (SUCCEEDED(CallVmt<PFN_GetDevice>(commandQueue, 7, &kIID_ID3D12Device, &liveDev)) && liveDev) {
+                if (SUCCEEDED(CallVmt<PFN_GetDevice>(commandQueue, D3D12Vmt::CommandQueue::GetDevice, &kIID_ID3D12Device, &liveDev)) && liveDev) {
                     void* prevDev = g_liveD3D12Device.load(std::memory_order_acquire);
                     if (prevDev != liveDev || !RenderTargetManager::Get().AreDX12ResourcesCreated()) {
                         if (g_liveD3D12Device.exchange(liveDev, std::memory_order_acq_rel) != liveDev ||
@@ -309,7 +368,9 @@ void __stdcall Hooked_D3D12RSSetViewports(void* commandList, unsigned int numVie
     MinimalD3D12Viewport firstVp{};
     std::memcpy(&firstVp, pViewports, sizeof(firstVp));
     const auto dims = RenderTargetManager::Get().GetDimensions();
-    if (numViewports == 1 && RenderTargetManager::Get().IsTargetInterceptCandidate(
+    if (numViewports == 1 &&
+        !CBREngine::Get().HasDispatchedThisFrame() &&
+        RenderTargetManager::Get().IsTargetInterceptCandidate(
             static_cast<uint32_t>(firstVp.Width),
             static_cast<uint32_t>(firstVp.Height),
             0)) {
@@ -318,9 +379,11 @@ void __stdcall Hooked_D3D12RSSetViewports(void* commandList, unsigned int numVie
         if (config.samplingStrategy == SamplingStrategy::StrategyA && config.jitterDirection != 0) {
             PatternScanner::UpdateCameraJitter(currentFrame, false);
         }
-        float* camProj = PatternScanner::GetCameraProjectionMatrix();
-        if (camProj) {
-            ReconstructionPass::Get().SetCameraMatrices(camProj, nullptr);
+        if (config.cameraMatrixVerified) {
+            float* camProj = PatternScanner::GetCameraProjectionMatrix();
+            if (camProj) {
+                ReconstructionPass::Get().SetCameraMatrices(camProj, nullptr);
+            }
         }
 
         DX12CmdListSlot* slot = GetOrCreateDX12Slot(commandList);
@@ -356,7 +419,9 @@ void __stdcall Hooked_D3D12RSSetScissorRects(void* commandList, unsigned int num
     const uint32_t width = (firstRect.right > firstRect.left) ? static_cast<uint32_t>(firstRect.right - firstRect.left) : 0u;
     const uint32_t height = (firstRect.bottom > firstRect.top) ? static_cast<uint32_t>(firstRect.bottom - firstRect.top) : 0u;
     const auto dims = RenderTargetManager::Get().GetDimensions();
-    if (numRects == 1 && RenderTargetManager::Get().IsTargetInterceptCandidate(width, height, 0)) {
+    if (numRects == 1 &&
+        !CBREngine::Get().HasDispatchedThisFrame() &&
+        RenderTargetManager::Get().IsTargetInterceptCandidate(width, height, 0)) {
         firstRect.right = firstRect.left + static_cast<int32_t>(dims.quarterWidth);
         firstRect.bottom = firstRect.top + static_cast<int32_t>(dims.quarterHeight);
         g_Original_D3D12RSSetScissorRects(commandList, 1, &firstRect);
@@ -512,8 +577,10 @@ bool HookManager::InstallDX12Hooks() {
     typedef HRESULT (WINAPI *PFN_D3D12CreateDevice)(IUnknown*, int, REFIID, void**);
     typedef HRESULT (WINAPI *PFN_CreateDXGIFactory1)(REFIID, void**);
 
-    auto pfnD3D12CreateDevice = reinterpret_cast<PFN_D3D12CreateDevice>(GetProcAddress(d3d12Module, "D3D12CreateDevice"));
-    auto pfnCreateDXGIFactory1 = reinterpret_cast<PFN_CreateDXGIFactory1>(GetProcAddress(dxgiModule, "CreateDXGIFactory1"));
+    auto pfnD3D12CreateDevice = reinterpret_cast<PFN_D3D12CreateDevice>(
+        reinterpret_cast<void*>(GetProcAddress(d3d12Module, "D3D12CreateDevice")));
+    auto pfnCreateDXGIFactory1 = reinterpret_cast<PFN_CreateDXGIFactory1>(
+        reinterpret_cast<void*>(GetProcAddress(dxgiModule, "CreateDXGIFactory1")));
 
     if (!pfnD3D12CreateDevice || !pfnCreateDXGIFactory1) {
         CBR_LOG_WARN("Failed to resolve D3D12CreateDevice or CreateDXGIFactory1.");
@@ -560,17 +627,17 @@ bool HookManager::InstallDX12Hooks() {
     MinimalD3D12CommandQueueDesc queueDesc{};
     queueDesc.Type = 0; // D3D12_COMMAND_LIST_TYPE_DIRECT
     void* cmdQueue = nullptr;
-    hr = CallVmt<PFN_CreateCommandQueue>(d3d12Device, 8, &queueDesc, kIID_ID3D12CommandQueue, &cmdQueue);
+    hr = CallVmt<PFN_CreateCommandQueue>(d3d12Device, D3D12Vmt::Device::CreateCommandQueue, &queueDesc, kIID_ID3D12CommandQueue, &cmdQueue);
 
     // Create temporary allocator & graphics command list for VMT hooking (Item H-02)
     typedef HRESULT (__stdcall *PFN_CreateCommandAllocator)(void*, unsigned int, REFIID, void**);
     typedef HRESULT (__stdcall *PFN_CreateCommandList)(void*, unsigned int, unsigned int, void*, void*, REFIID, void**);
     void* cmdAllocator = nullptr;
     void* cmdList = nullptr;
-    if (SUCCEEDED(CallVmt<PFN_CreateCommandAllocator>(d3d12Device, 9, 0u, kIID_ID3D12CommandAllocator, &cmdAllocator)) && cmdAllocator) {
-        if (SUCCEEDED(CallVmt<PFN_CreateCommandList>(d3d12Device, 12, 0u, 0u, cmdAllocator, nullptr, kIID_ID3D12GraphicsCommandList, &cmdList)) && cmdList) {
+    if (SUCCEEDED(CallVmt<PFN_CreateCommandAllocator>(d3d12Device, D3D12Vmt::Device::CreateCommandAllocator, 0u, kIID_ID3D12CommandAllocator, &cmdAllocator)) && cmdAllocator) {
+        if (SUCCEEDED(CallVmt<PFN_CreateCommandList>(d3d12Device, D3D12Vmt::Device::CreateCommandList, 0u, 0u, cmdAllocator, nullptr, kIID_ID3D12GraphicsCommandList, &cmdList)) && cmdList) {
             typedef HRESULT (__stdcall *PFN_CloseCmdList)(void*);
-            CallVmt<PFN_CloseCmdList>(cmdList, 9);
+            CallVmt<PFN_CloseCmdList>(cmdList, D3D12Vmt::CommandList::Close);
         }
     }
 
@@ -592,7 +659,7 @@ bool HookManager::InstallDX12Hooks() {
 
         // VMT index 10 on IDXGIFactory1: CreateSwapChain
         typedef HRESULT (__stdcall *PFN_CreateSwapChain)(void*, void*, const MinimalDxgiSwapChainDesc*, void**);
-        hr = CallVmt<PFN_CreateSwapChain>(dxgiFactory, 10, cmdQueue, &scDesc, &swapChain);
+        hr = CallVmt<PFN_CreateSwapChain>(dxgiFactory, D3D12Vmt::Factory::CreateSwapChain, cmdQueue, &scDesc, &swapChain);
     }
 
     auto installVmtHook = [&](void* target, void* detour, void** original, const char* name) -> bool {
@@ -611,30 +678,30 @@ bool HookManager::InstallDX12Hooks() {
     bool hooked = false;
     if (SUCCEEDED(hr) && swapChain) {
         void** swapChainVmt = *reinterpret_cast<void***>(swapChain);
-        hooked |= installVmtHook(swapChainVmt[8],  reinterpret_cast<LPVOID>(&Hooked_D3D12Present),       reinterpret_cast<LPVOID*>(&g_Original_D3D12Present),       "IDXGISwapChain::Present[8]");
-        hooked |= installVmtHook(swapChainVmt[22], reinterpret_cast<LPVOID>(&Hooked_D3D12Present1),      reinterpret_cast<LPVOID*>(&g_Original_D3D12Present1),      "IDXGISwapChain1::Present1[22]");
-        installVmtHook(swapChainVmt[13],           reinterpret_cast<LPVOID>(&Hooked_D3D12ResizeBuffers), reinterpret_cast<LPVOID*>(&g_Original_D3D12ResizeBuffers), "IDXGISwapChain::ResizeBuffers[13]");
+        hooked |= installVmtHook(swapChainVmt[D3D12Vmt::SwapChain::Present],       reinterpret_cast<LPVOID>(&Hooked_D3D12Present),       reinterpret_cast<LPVOID*>(&g_Original_D3D12Present),       "IDXGISwapChain::Present[8]");
+        hooked |= installVmtHook(swapChainVmt[D3D12Vmt::SwapChain::Present1],      reinterpret_cast<LPVOID>(&Hooked_D3D12Present1),      reinterpret_cast<LPVOID*>(&g_Original_D3D12Present1),      "IDXGISwapChain1::Present1[22]");
+        installVmtHook(swapChainVmt[D3D12Vmt::SwapChain::ResizeBuffers],           reinterpret_cast<LPVOID>(&Hooked_D3D12ResizeBuffers), reinterpret_cast<LPVOID*>(&g_Original_D3D12ResizeBuffers), "IDXGISwapChain::ResizeBuffers[13]");
     }
 
     if (cmdQueue) {
         void** queueVmt = *reinterpret_cast<void***>(cmdQueue);
         if (queueVmt) {
-            installVmtHook(queueVmt[10], reinterpret_cast<LPVOID>(&Hooked_D3D12ExecuteCommandLists), reinterpret_cast<LPVOID*>(&g_Original_D3D12ExecuteCommandLists), "ID3D12CommandQueue::ExecuteCommandLists[10]");
+            installVmtHook(queueVmt[D3D12Vmt::CommandQueue::ExecuteCommandLists], reinterpret_cast<LPVOID>(&Hooked_D3D12ExecuteCommandLists), reinterpret_cast<LPVOID*>(&g_Original_D3D12ExecuteCommandLists), "ID3D12CommandQueue::ExecuteCommandLists[10]");
         }
     }
 
     if (cmdList) {
         void** listVmt = *reinterpret_cast<void***>(cmdList);
         if (listVmt) {
-            installVmtHook(listVmt[12], reinterpret_cast<LPVOID>(&Hooked_D3D12DrawInstanced),        reinterpret_cast<LPVOID*>(&g_Original_D3D12DrawInstanced),        "ID3D12GraphicsCommandList::DrawInstanced[12]");
-            installVmtHook(listVmt[13], reinterpret_cast<LPVOID>(&Hooked_D3D12DrawIndexedInstanced), reinterpret_cast<LPVOID*>(&g_Original_D3D12DrawIndexedInstanced), "ID3D12GraphicsCommandList::DrawIndexedInstanced[13]");
-            installVmtHook(listVmt[21], reinterpret_cast<LPVOID>(&Hooked_D3D12RSSetViewports),       reinterpret_cast<LPVOID*>(&g_Original_D3D12RSSetViewports),       "ID3D12GraphicsCommandList::RSSetViewports[21]");
-            installVmtHook(listVmt[22], reinterpret_cast<LPVOID>(&Hooked_D3D12RSSetScissorRects),    reinterpret_cast<LPVOID*>(&g_Original_D3D12RSSetScissorRects),    "ID3D12GraphicsCommandList::RSSetScissorRects[22]");
-            installVmtHook(listVmt[25], reinterpret_cast<LPVOID>(&Hooked_D3D12SetPipelineState),    reinterpret_cast<LPVOID*>(&g_Original_D3D12SetPipelineState),    "ID3D12GraphicsCommandList::SetPipelineState[25]");
-            installVmtHook(listVmt[28], reinterpret_cast<LPVOID>(&Hooked_D3D12SetDescriptorHeaps),  reinterpret_cast<LPVOID*>(&g_Original_D3D12SetDescriptorHeaps),  "ID3D12GraphicsCommandList::SetDescriptorHeaps[28]");
-            installVmtHook(listVmt[29], reinterpret_cast<LPVOID>(&Hooked_D3D12SetComputeRootSignature), reinterpret_cast<LPVOID*>(&g_Original_D3D12SetComputeRootSignature), "ID3D12GraphicsCommandList::SetComputeRootSignature[29]");
-            installVmtHook(listVmt[30], reinterpret_cast<LPVOID>(&Hooked_D3D12SetGraphicsRootSignature), reinterpret_cast<LPVOID*>(&g_Original_D3D12SetGraphicsRootSignature), "ID3D12GraphicsCommandList::SetGraphicsRootSignature[30]");
-            installVmtHook(listVmt[46], reinterpret_cast<LPVOID>(&Hooked_D3D12OMSetRenderTargets),   reinterpret_cast<LPVOID*>(&g_Original_D3D12OMSetRenderTargets),   "ID3D12GraphicsCommandList::OMSetRenderTargets[46]");
+            installVmtHook(listVmt[D3D12Vmt::CommandList::DrawInstanced],                reinterpret_cast<LPVOID>(&Hooked_D3D12DrawInstanced),                reinterpret_cast<LPVOID*>(&g_Original_D3D12DrawInstanced),                "ID3D12GraphicsCommandList::DrawInstanced[12]");
+            installVmtHook(listVmt[D3D12Vmt::CommandList::DrawIndexedInstanced],         reinterpret_cast<LPVOID>(&Hooked_D3D12DrawIndexedInstanced),         reinterpret_cast<LPVOID*>(&g_Original_D3D12DrawIndexedInstanced),         "ID3D12GraphicsCommandList::DrawIndexedInstanced[13]");
+            installVmtHook(listVmt[D3D12Vmt::CommandList::RSSetViewports],               reinterpret_cast<LPVOID>(&Hooked_D3D12RSSetViewports),               reinterpret_cast<LPVOID*>(&g_Original_D3D12RSSetViewports),               "ID3D12GraphicsCommandList::RSSetViewports[21]");
+            installVmtHook(listVmt[D3D12Vmt::CommandList::RSSetScissorRects],            reinterpret_cast<LPVOID>(&Hooked_D3D12RSSetScissorRects),            reinterpret_cast<LPVOID*>(&g_Original_D3D12RSSetScissorRects),            "ID3D12GraphicsCommandList::RSSetScissorRects[22]");
+            installVmtHook(listVmt[D3D12Vmt::CommandList::SetPipelineState],            reinterpret_cast<LPVOID>(&Hooked_D3D12SetPipelineState),            reinterpret_cast<LPVOID*>(&g_Original_D3D12SetPipelineState),            "ID3D12GraphicsCommandList::SetPipelineState[25]");
+            installVmtHook(listVmt[D3D12Vmt::CommandList::SetDescriptorHeaps],          reinterpret_cast<LPVOID>(&Hooked_D3D12SetDescriptorHeaps),          reinterpret_cast<LPVOID*>(&g_Original_D3D12SetDescriptorHeaps),          "ID3D12GraphicsCommandList::SetDescriptorHeaps[28]");
+            installVmtHook(listVmt[D3D12Vmt::CommandList::SetComputeRootSignature],      reinterpret_cast<LPVOID>(&Hooked_D3D12SetComputeRootSignature),      reinterpret_cast<LPVOID*>(&g_Original_D3D12SetComputeRootSignature),      "ID3D12GraphicsCommandList::SetComputeRootSignature[29]");
+            installVmtHook(listVmt[D3D12Vmt::CommandList::SetGraphicsRootSignature],     reinterpret_cast<LPVOID>(&Hooked_D3D12SetGraphicsRootSignature),     reinterpret_cast<LPVOID*>(&g_Original_D3D12SetGraphicsRootSignature),     "ID3D12GraphicsCommandList::SetGraphicsRootSignature[30]");
+            installVmtHook(listVmt[D3D12Vmt::CommandList::OMSetRenderTargets],           reinterpret_cast<LPVOID>(&Hooked_D3D12OMSetRenderTargets),           reinterpret_cast<LPVOID*>(&g_Original_D3D12OMSetRenderTargets),           "ID3D12GraphicsCommandList::OMSetRenderTargets[46]");
         }
     }
 

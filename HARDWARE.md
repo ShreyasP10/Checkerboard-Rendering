@@ -174,13 +174,13 @@ Our newly implemented `msaaSamples = 1` setting and companion compute shader `cb
 
 Because the ASUS VivoBook 16X has a default dedicated UMA allocation of **512 MB** (`AdapterRAM = 536,870,912`), buffer sizing is vital. The table below illustrates why running the default 4K configuration caused performance regression, and how the 720p/1080p single-sample modes resolve it:
 
-| Configuration Profile | Quarter Color | Quarter Depth | History Color (A+B) | History Depth (A+B) | Output Target | Total CBR VRAM Footprint | Impact on 512 MB UMA Carve-out |
+| Configuration Profile | Quarter Color | Quarter Depth | History Color (A+B) | History Depth (A+B) | Output Target (Item M-06) | Total CBR VRAM Footprint | Impact on 512 MB UMA Carve-out |
 |---|---|---|---|---|---|---|---|
-| **4K Target (2× MSAA - Default)** | 33.18 MB | 16.59 MB | 132.71 MB | 66.36 MB | 66.36 MB | **315.19 MB (300.58 MiB)** | **Consumes 61.5% of VRAM!** (Causes out-of-memory stalls) |
-| **1080p Target (2× MSAA)** | 8.29 MB | 4.15 MB | 33.18 MB | 16.59 MB | 16.59 MB | **78.79 MB (75.14 MiB)** | Consumes 15.4% of VRAM |
-| **1080p Target (1× Single-Sample)**| 4.15 MB | 2.07 MB | 33.18 MB | 16.59 MB | 16.59 MB | **72.58 MB (69.21 MiB)** | **Consumes only 14.1% of VRAM** |
-| **720p Target (2× MSAA)** | 3.69 MB | 1.84 MB | 14.75 MB | 7.37 MB | 7.37 MB | **35.02 MB (33.40 MiB)** | Consumes 6.8% of VRAM |
-| **720p Target (1× Single-Sample)** | 1.84 MB | 0.92 MB | 14.75 MB | 7.37 MB | 7.37 MB | **32.26 MB (30.76 MiB)** | **Consumes only 6.3% of VRAM** |
+| **4K Target (2× MSAA - Default)** | 33.18 MB | 16.59 MB | 132.71 MB | 66.36 MB | 0.00 MB | **248.83 MB (237.30 MiB)** | **Consumes 46.3% of VRAM** |
+| **1080p Target (2× MSAA)** | 8.29 MB | 4.15 MB | 33.18 MB | 16.59 MB | 0.00 MB | **62.21 MB (59.33 MiB)** | Consumes 11.6% of VRAM |
+| **1080p Target (1× Single-Sample)**| 4.15 MB | 2.07 MB | 33.18 MB | 16.59 MB | 0.00 MB | **55.99 MB (53.40 MiB)** | **Consumes only 10.4% of VRAM** |
+| **720p Target (2× MSAA)** | 3.69 MB | 1.84 MB | 14.75 MB | 7.37 MB | 0.00 MB | **27.65 MB (26.37 MiB)** | Consumes 5.2% of VRAM |
+| **720p Target (1× Single-Sample)** | 1.84 MB | 0.92 MB | 14.75 MB | 7.37 MB | 0.00 MB | **24.88 MB (23.73 MiB)** | **Consumes only 4.6% of VRAM** |
 
 ---
 

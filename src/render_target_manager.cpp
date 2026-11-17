@@ -323,9 +323,9 @@ void RenderTargetManager::Initialize(uint32_t width, uint32_t height) {
     size_t qDepth = static_cast<size_t>(dims.quarterWidth) * dims.quarterHeight * 4 * dims.msaaSamples;
     size_t histColor = static_cast<size_t>(dims.fullWidth) * dims.fullHeight * 8 * 2;
     size_t histDepth = static_cast<size_t>(dims.fullWidth) * dims.fullHeight * 4 * 2;
-    size_t outColor = static_cast<size_t>(dims.fullWidth) * dims.fullHeight * 8;
-
-    const size_t total = qColor + qDepth + histColor + histDepth + outColor;
+    // Item M-06: Auxiliary output storage color and depth are omitted because reconstruction writes directly
+    // to alternating history targets; saves ~95 MiB at 4K.
+    const size_t total = qColor + qDepth + histColor + histDepth;
     {
         std::unique_lock<std::shared_mutex> lock(m_mutex);
         m_dims = dims;
@@ -544,17 +544,10 @@ bool RenderTargetManager::CreateVulkanResources(void* vkDevice, void* vkPhysical
         }
     }
 
-    // 4. Create Full-Res Output Storage Color & Depth
-    if (!createTexture(dims.fullWidth, dims.fullHeight, kVkFormatR16G16B16A16Sfloat,
-                       colorUsage, kVkImageAspectColorBit, m_vkResources.outputColor)) {
-        CBR_LOG_ERROR("Failed to allocate device-local OutputColor image");
-        return false;
-    }
-    if (!createTexture(dims.fullWidth, dims.fullHeight, kVkFormatR32Sfloat,
-                       depthUsage, kVkImageAspectColorBit, m_vkResources.outputDepth)) {
-        CBR_LOG_ERROR("Failed to allocate device-local OutputDepth image");
-        return false;
-    }
+    // 4. Auxiliary full-res output targets omitted: reconstruction writes directly to alternating
+    // history targets (Item M-06), saving ~95 MiB of device-local VRAM at 4K.
+    m_vkResources.outputColor = {};
+    m_vkResources.outputDepth = {};
 
     // 5. Create Linear & Point Samplers (Clamp-to-Edge)
     MinimalVkSamplerCreateInfo samplerInfo{};
@@ -803,13 +796,8 @@ bool RenderTargetManager::CreateDX12Resources(void* d3d12Device) {
                    m_dx12Resources.historyDepth[0]) ||
         !createTex(dims.fullWidth, dims.fullHeight, kDxgiFormatR32Float,
                    1, kD3D12ResourceFlagAllowUAV, kD3D12ResourceStateUAV,
-                   m_dx12Resources.historyDepth[1]) ||
-        !createTex(dims.fullWidth, dims.fullHeight, kDxgiFormatR16G16B16A16Float,
-                   1, kD3D12ResourceFlagAllowUAV, kD3D12ResourceStateUAV,
-                   m_dx12Resources.outputColor) ||
-        !createTex(dims.fullWidth, dims.fullHeight, kDxgiFormatR32Float,
-                   1, kD3D12ResourceFlagAllowUAV, kD3D12ResourceStateUAV,
-                   m_dx12Resources.outputDepth)) {
+                   m_dx12Resources.historyDepth[1])) {
+        // Item M-06: Auxiliary output storage color and depth omitted; direct ping-pong to history saves ~95 MiB at 4K.
         CBR_LOG_ERROR("CreateDX12Resources: failed to allocate one or more D3D12 textures.");
         DestroyDX12Resources();
         return false;
@@ -1030,66 +1018,105 @@ bool RenderTargetManager::IsColorCopyFormatCompatible(uint32_t srcFormat, uint32
     return is64BitColor(srcFormat) && is64BitColor(dstFormat);
 }
 
+bool RenderTargetManager::ValidateImageTransfer(const VulkanImageMetadata& srcMeta,
+                                                const VulkanImageMetadata& dstMeta,
+                                                bool isBlit) {
+    // 1. Usage flags (Item H-07): verify TRANSFER_SRC_BIT and TRANSFER_DST_BIT when usage is known
+    if (srcMeta.usage != 0u && (srcMeta.usage & kVkImageUsageTransferSrcBit) == 0u) {
+        return false;
+    }
+    if (dstMeta.usage != 0u && (dstMeta.usage & kVkImageUsageTransferDstBit) == 0u) {
+        return false;
+    }
+
+    const bool srcIsDepth = (srcMeta.format != 0u) && IsVulkanDepthFormat(static_cast<int32_t>(srcMeta.format));
+    const bool dstIsDepth = (dstMeta.format != 0u) && IsVulkanDepthFormat(static_cast<int32_t>(dstMeta.format));
+
+    if (isBlit) {
+        // vkCmdBlitImage: dstImage must have VK_SAMPLE_COUNT_1_BIT and non-depth format (VUID-vkCmdBlitImage-dstImage-00233)
+        if (dstMeta.samples > kVkSampleCount1Bit) {
+            return false;
+        }
+        if (dstIsDepth) {
+            return false;
+        }
+        // Source and destination color formats must be size-compatible
+        if (srcMeta.format != 0u && dstMeta.format != 0u) {
+            if (!IsColorCopyFormatCompatible(srcMeta.format, dstMeta.format)) {
+                return false;
+            }
+        }
+        return true;
+    } else {
+        // vkCmdCopyImage:
+        // Matching sample count (VUID-vkCmdCopyImage-samples-00140)
+        if (srcMeta.samples != 0u && dstMeta.samples != 0u && srcMeta.samples != dstMeta.samples) {
+            return false;
+        }
+        // Dimensions check: src bounds must satisfy required destination bounds
+        if (srcMeta.width > 0u && dstMeta.width > 0u && srcMeta.width < dstMeta.width) {
+            return false;
+        }
+        if (srcMeta.height > 0u && dstMeta.height > 0u && srcMeta.height < dstMeta.height) {
+            return false;
+        }
+        // Format compatibility across depth or color classes
+        if (srcIsDepth || dstIsDepth) {
+            if (srcMeta.format != 0u && dstMeta.format != 0u) {
+                return IsDepthCopyFormatCompatible(srcMeta.format, dstMeta.format);
+            }
+            return srcIsDepth == dstIsDepth;
+        }
+        if (srcMeta.format != 0u && dstMeta.format != 0u) {
+            return IsColorCopyFormatCompatible(srcMeta.format, dstMeta.format);
+        }
+        return true;
+    }
+}
+
 bool RenderTargetManager::CanCopyToQuarterColor(const VulkanImageMetadata& srcMeta) const {
     if (!m_initialized.load()) return false;
     const TargetDimensions dims = GetDimensions();
     if (dims.quarterWidth == 0u || dims.quarterHeight == 0u) return false;
-    // Unknown dimensions (pre-hook image) cannot satisfy copy bounds safely when known to be 0.
-    if (srcMeta.width > 0u && srcMeta.height > 0u) {
-        if (srcMeta.width < dims.quarterWidth || srcMeta.height < dims.quarterHeight) {
-            return false;
-        }
-    }
-    // vkCmdCopyImage requires matching sample count (quarterColor is 2x MSAA when allocated).
-    if (srcMeta.samples != 0u && srcMeta.samples != dims.msaaSamples) {
-        return false;
-    }
-    // Verify format compatibility: either 64bpp copy-compatible (Item C-01) or B10G11R11 (122)
-    // which is converted via vkCmdBlitImage in 1x APU mode (Item 7).
-    if (srcMeta.format != 0u) {
-        if (IsColorCopyFormatCompatible(srcMeta.format, kVkFormatR16G16B16A16Sfloat)) {
-            return true;
-        }
-        if (srcMeta.format == 122u /* B10G11R11_UFLOAT_PACK32 */ && dims.msaaSamples == 1u) {
-            return true;
-        }
-        return false;
-    }
-    return true;
+
+    VulkanImageMetadata dstMeta{};
+    dstMeta.width = dims.quarterWidth;
+    dstMeta.height = dims.quarterHeight;
+    dstMeta.samples = dims.msaaSamples;
+    dstMeta.format = kVkFormatR16G16B16A16Sfloat;
+    dstMeta.usage = kVkImageUsageTransferDstBit;
+
+    return ValidateImageTransfer(srcMeta, dstMeta, false /* isBlit */);
 }
 
 bool RenderTargetManager::CanCopyToQuarterDepth(const VulkanImageMetadata& srcMeta) const {
     if (!m_initialized.load()) return false;
     const TargetDimensions dims = GetDimensions();
     if (dims.quarterWidth == 0u || dims.quarterHeight == 0u) return false;
-    if (srcMeta.width > 0u && srcMeta.height > 0u) {
-        if (srcMeta.width < dims.quarterWidth || srcMeta.height < dims.quarterHeight) {
-            return false;
-        }
-    }
-    if (srcMeta.samples != 0u && srcMeta.samples != dims.msaaSamples) {
-        return false;
-    }
-    if (srcMeta.format != 0u && !IsDepthCopyFormatCompatible(srcMeta.format, kVkFormatD32Sfloat)) {
-        return false;
-    }
-    return true;
+
+    VulkanImageMetadata dstMeta{};
+    dstMeta.width = dims.quarterWidth;
+    dstMeta.height = dims.quarterHeight;
+    dstMeta.samples = dims.msaaSamples;
+    dstMeta.format = kVkFormatD32Sfloat;
+    dstMeta.usage = kVkImageUsageTransferDstBit;
+
+    return ValidateImageTransfer(srcMeta, dstMeta, false /* isBlit */);
 }
 
 bool RenderTargetManager::CanCopyToVelocity(const VulkanImageMetadata& srcMeta) const {
     if (!m_initialized.load()) return false;
     const TargetDimensions dims = GetDimensions();
     if (dims.quarterWidth == 0u || dims.quarterHeight == 0u) return false;
-    if (srcMeta.width > 0u && srcMeta.height > 0u) {
-        if (srcMeta.width < dims.quarterWidth || srcMeta.height < dims.quarterHeight) {
-            return false;
-        }
-    }
-    // m_vkResources.velocity is allocated at 1x sample count.
-    if (srcMeta.samples != 0u && srcMeta.samples != kVkSampleCount1Bit) {
-        return false;
-    }
-    return true;
+
+    VulkanImageMetadata dstMeta{};
+    dstMeta.width = dims.quarterWidth;
+    dstMeta.height = dims.quarterHeight;
+    dstMeta.samples = kVkSampleCount1Bit;
+    dstMeta.format = kVkFormatR16G16B16A16Sfloat;
+    dstMeta.usage = kVkImageUsageTransferDstBit;
+
+    return ValidateImageTransfer(srcMeta, dstMeta, false /* isBlit */);
 }
 
 bool RenderTargetManager::ShouldBlitReconstructionToSceneColor(const void* gameColorImage,
@@ -1100,20 +1127,24 @@ bool RenderTargetManager::ShouldBlitReconstructionToSceneColor(const void* gameC
     if (!m_initialized.load() || !gameColorImage || isSwapchainBackbuffer) {
         return false;
     }
-    // VUID-vkCmdBlitImage-dstImage-00233: dstImage must have VK_SAMPLE_COUNT_1_BIT and non-depth format (Item C-04)
-    if (dstMeta.samples > kVkSampleCount1Bit) {
-        return false;
-    }
-    if (dstMeta.format != 0u && IsVulkanDepthFormat(static_cast<int32_t>(dstMeta.format))) {
-        return false;
-    }
     const TargetDimensions dims = GetDimensions();
+    if (passWidth < dims.fullWidth || passHeight < dims.fullHeight) {
+        return false;
+    }
     if (dstMeta.width > 0u && dstMeta.height > 0u) {
         if (dstMeta.width < dims.fullWidth || dstMeta.height < dims.fullHeight) {
             return false;
         }
     }
-    return (passWidth >= dims.fullWidth) && (passHeight >= dims.fullHeight);
+
+    VulkanImageMetadata srcMeta{};
+    srcMeta.width = dims.fullWidth;
+    srcMeta.height = dims.fullHeight;
+    srcMeta.samples = kVkSampleCount1Bit;
+    srcMeta.format = kVkFormatR16G16B16A16Sfloat;
+    srcMeta.usage = kVkImageUsageTransferSrcBit;
+
+    return ValidateImageTransfer(srcMeta, dstMeta, true /* isBlit */);
 }
 
 } // namespace cbr

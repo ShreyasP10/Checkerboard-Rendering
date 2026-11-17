@@ -126,14 +126,18 @@ CbrSample MapPixelToSample(ivec2 p, uint frameParity) {
     int yBit = p.y & 1;
     s.isActive = (((uint(p.x) ^ uint(p.y)) & 1u) == frameParity);
     int qx;
-    if (frameParity == 0u) {
+    if (frameParity == 0u || pc.u_ShiftDirection == 0) {
         qx = p.x >> 1;
-    } else if (pc.u_ShiftDirection >= 0) {
+    } else if (pc.u_ShiftDirection > 0) {
         qx = max(p.x - yBit, 0) >> 1;
     } else {
         qx = (p.x + 1 - yBit) >> 1;
     }
     ivec2 qMax = ivec2(pc.u_TargetResolution * 0.5) - ivec2(1);
+    // Item M-17: Out-of-bounds boundary columns fail open to spatial fallback
+    if (qx < 0 || qx > qMax.x) {
+        s.isActive = false;
+    }
     s.quarter = ivec2(clamp(qx, 0, qMax.x), min(p.y >> 1, qMax.y));
     s.sampleIdx = 1 - yBit;
     return s;
@@ -291,10 +295,9 @@ void ResolvePixel(
     }
     // JitterCompensation (Item M-08): 0.0 when velocity buffer is unjittered or Strategy A viewport shift is active;
     // set to 1.0 only if velocity vectors encode the projection jitter delta (verify via RenderDoc).
-    // Jitter dampener: dampens jitter compensation on zero-velocity passes (transparent particles, fog, smoke)
-    // to prevent half-pixel oscillation when alpha-blended particles lack motion vectors.
-    float jitterDampener = (dot(velocity, velocity) < 1e-9) ? 0.0 : 1.0;
-    vec2 historyUV = uv - velocity - (pc.u_JitterDelta * (pc.u_JitterCompensation * jitterDampener));
+    // JitterCompensation (Item H-02): Compensates for the 1-pixel horizontal shift when sampling history from the previous frame.
+    // Static geometry has velocity=0, but content shifted by u_JitterDelta; do not zero jitter compensation on static scenes.
+    vec2 historyUV = uv - velocity - (pc.u_JitterDelta * pc.u_JitterCompensation);
     vec2 minUV = 0.5 * pc.u_InvTargetResolution;
     vec2 maxUV = vec2(1.0) - minUV;
     historyUV = clamp(historyUV, minUV, maxUV);
@@ -365,7 +368,8 @@ void ResolvePixel(
         if (sampleCount >= 2.0 && n > 1e-4) {
             vec3 mean = m1 / n;
             vec3 rawStdDev = sqrt(max(vec3(0.0), (m2 / n) - (mean * mean)));
-            vec3 stdDev = max(rawStdDev, vec3(0.005));
+            // Enforce floor to avoid shadow collapse in SDR while dynamically scaling with mean in HDR (Section 5.7)
+            vec3 stdDev = max(rawStdDev, max(vec3(0.005), abs(mean) * 0.01));
             const float gamma = 1.25;
             vec3 varianceMin = max(colorMin, mean - gamma * stdDev);
             vec3 varianceMax = min(colorMax, mean + gamma * stdDev);
@@ -391,38 +395,45 @@ void ResolvePixel(
         if (!isDisoccluded && historyColor.a > 0.0) {
             finalColor = historyColor.rgb;
         } else {
-            // Directional gradient weights: prefer interpolating along edge contours (Decima tangent resolve)
-            vec3 horizDiff = abs(cardinalColor[0] - cardinalColor[1]);
-            vec3 vertDiff  = abs(cardinalColor[2] - cardinalColor[3]);
-            float horizGrad = dot(horizDiff, vec3(0.299, 0.587, 0.114));
-            float vertGrad  = dot(vertDiff,  vec3(0.299, 0.587, 0.114));
-            float dirBias[4] = float[](
-                1.0 / (1.0 + horizGrad * 8.0), // Left
-                1.0 / (1.0 + horizGrad * 8.0), // Right
-                1.0 / (1.0 + vertGrad  * 8.0), // Up
-                1.0 / (1.0 + vertGrad  * 8.0)  // Down
-            );
-
-            vec3 accumColor = vec3(0.0);
-            float accumDepth = 0.0;
-            float accumWeight = 0.0;
-
-            for (int i = 0; i < 4 && pc.u_EnableSpatialFallback != 0u; ++i) {
-                vec3 sCol = cardinalColor[i];
-                float sLin = LinearizeDepth(cardinalDepth[i]);
-                float depthWeight = exp2((-abs(currentLinear - sLin) / (max(currentLinear, 1e-5) * max(pc.u_DepthTolerance, 1e-4))) * 1.4426950408889634);
-                float totalWeight = depthWeight * dirBias[i];
-                accumColor += sCol * totalWeight;
-                accumDepth += cardinalDepth[i] * totalWeight;
-                accumWeight += totalWeight;
-            }
-
-            if (accumWeight > 1e-4) {
-                finalColor = accumColor / accumWeight;
-                spatialDepth = accumDepth / accumWeight;
+            // Spatial reconstruction from the 4 cardinal (natively shaded) neighbours.
+            // When spatial fallback is disabled, copy the nearest cardinal neighbour directly (Item M-04).
+            if (pc.u_EnableSpatialFallback == 0u) {
+                finalColor = cardinalColor[0];
+                spatialDepth = cardinalDepth[0];
             } else {
-                finalColor = isCurrentSampleActive ? currentColor : (cardinalColor[0] + cardinalColor[1] + cardinalColor[2] + cardinalColor[3]) * 0.25;
-                spatialDepth = isCurrentSampleActive ? currentDepth : (cardinalDepth[0] + cardinalDepth[1] + cardinalDepth[2] + cardinalDepth[3]) * 0.25;
+                // Directional gradient weights: prefer interpolating along edge contours (Decima tangent resolve)
+                vec3 horizDiff = abs(cardinalColor[0] - cardinalColor[1]);
+                vec3 vertDiff  = abs(cardinalColor[2] - cardinalColor[3]);
+                float horizGrad = dot(horizDiff, vec3(0.299, 0.587, 0.114));
+                float vertGrad  = dot(vertDiff,  vec3(0.299, 0.587, 0.114));
+                float dirBias[4] = float[](
+                    1.0 / (1.0 + horizGrad * 8.0), // Left
+                    1.0 / (1.0 + horizGrad * 8.0), // Right
+                    1.0 / (1.0 + vertGrad  * 8.0), // Up
+                    1.0 / (1.0 + vertGrad  * 8.0)  // Down
+                );
+
+                vec3 accumColor = vec3(0.0);
+                float accumDepth = 0.0;
+                float accumWeight = 0.0;
+
+                for (int i = 0; i < 4; ++i) {
+                    vec3 sCol = cardinalColor[i];
+                    float sLin = LinearizeDepth(cardinalDepth[i]);
+                    float depthWeight = exp2((-abs(currentLinear - sLin) / (max(currentLinear, 1e-5) * max(pc.u_DepthTolerance, 1e-4))) * 1.4426950408889634);
+                    float totalWeight = depthWeight * dirBias[i];
+                    accumColor += sCol * totalWeight;
+                    accumDepth += cardinalDepth[i] * totalWeight;
+                    accumWeight += totalWeight;
+                }
+
+                if (accumWeight > 1e-4) {
+                    finalColor = accumColor / accumWeight;
+                    spatialDepth = accumDepth / accumWeight;
+                } else {
+                    finalColor = isCurrentSampleActive ? currentColor : (cardinalColor[0] + cardinalColor[1] + cardinalColor[2] + cardinalColor[3]) * 0.25;
+                    spatialDepth = isCurrentSampleActive ? currentDepth : (cardinalDepth[0] + cardinalDepth[1] + cardinalDepth[2] + cardinalDepth[3]) * 0.25;
+                }
             }
         }
     }
@@ -452,9 +463,10 @@ void ResolvePixel(
                         sc = hc.rgb;
                     }
                 } else {
-                    ivec2 stepAxis = (i < 2) ? ivec2(kCardinal[i].x, 1) : ivec2(1, kCardinal[i].y);
-                    ivec2 diag = pixelCoord + stepAxis;
-                    if (!InBounds(diag, targetSize)) diag = pixelCoord - stepAxis;
+                    // Item M-02: Use symmetric diagonal offsets (-1,-1), (1,-1), (-1,1), (1,1)
+                    const ivec2 kDiag[4] = ivec2[](ivec2(-1, -1), ivec2(1, -1), ivec2(-1, 1), ivec2(1, 1));
+                    ivec2 diag = pixelCoord + kDiag[i];
+                    if (!InBounds(diag, targetSize)) diag = pixelCoord - kDiag[i];
                     if (InBounds(diag, targetSize)) {
                         vec3 dc = FetchColor(MapPixelToSample(diag, frameParity));
                         if (!any(isnan(dc)) && !any(isinf(dc))) sc = dc;
@@ -489,7 +501,9 @@ void ResolvePixel(
         float speed = clamp(length(normVel), 0.0, 1.0);
         finalColor = vec3(clamp(normVel * 0.5 + 0.5, 0.0, 1.0), speed);
     } else if (pc.u_DebugView == 4u) {
-        finalColor = isCurrentSampleActive ? currentColor : (cardinalColor[0] + cardinalColor[1] + cardinalColor[2] + cardinalColor[3]) * 0.25;
+        // Mode 4: Quarter-resolution raw color nearest-upsampled (Item M-03)
+        ivec2 qCoord = clamp(pixelCoord >> 1, ivec2(0), max(ivec2(pc.u_TargetResolution * 0.5) - ivec2(1), ivec2(0)));
+        finalColor = texelFetch(u_QuarterColorMSAA, qCoord, 0).rgb;
     } else if (pc.u_DebugView == 5u) {
         finalColor = isCurrentSampleActive ? currentColor : (cardinalColor[0] + cardinalColor[1] + cardinalColor[2] + cardinalColor[3]) * 0.25;
     }
@@ -538,24 +552,32 @@ void main() {
         CbrSample s0 = MapPixelToSample(act0Coord, frameParity);
         act0.coord = act0Coord;
         act0.color = FetchColor(s0);
-        if (any(isnan(act0.color)) || any(isinf(act0.color))) {
+        bool act0Valid = s0.isActive && !any(isnan(act0.color)) && !any(isinf(act0.color));
+        if (act0Valid) {
+            act0.depth = FetchDepth(s0);
+            act0.linearDepth = LinearizeDepth(act0.depth);
+            ResolvePixel(act0Coord, targetSize, frameParity, true, act0.color, act0.depth, act0.linearDepth, false, act0, act1);
+        } else {
             act0.color = vec3(0.0);
+            act0.coord = ivec2(-1);
+            ResolvePixel(act0Coord, targetSize, frameParity, false, vec3(0.0), 0.0, 0.0, false, act0, act1);
         }
-        act0.depth = FetchDepth(s0);
-        act0.linearDepth = LinearizeDepth(act0.depth);
-        ResolvePixel(act0Coord, targetSize, frameParity, true, act0.color, act0.depth, act0.linearDepth, false, act0, act1);
     }
 
     if (InBounds(act1Coord, targetSize)) {
         CbrSample s1 = MapPixelToSample(act1Coord, frameParity);
         act1.coord = act1Coord;
         act1.color = FetchColor(s1);
-        if (any(isnan(act1.color)) || any(isinf(act1.color))) {
+        bool act1Valid = s1.isActive && !any(isnan(act1.color)) && !any(isinf(act1.color));
+        if (act1Valid) {
+            act1.depth = FetchDepth(s1);
+            act1.linearDepth = LinearizeDepth(act1.depth);
+            ResolvePixel(act1Coord, targetSize, frameParity, true, act1.color, act1.depth, act1.linearDepth, false, act0, act1);
+        } else {
             act1.color = vec3(0.0);
+            act1.coord = ivec2(-1);
+            ResolvePixel(act1Coord, targetSize, frameParity, false, vec3(0.0), 0.0, 0.0, false, act0, act1);
         }
-        act1.depth = FetchDepth(s1);
-        act1.linearDepth = LinearizeDepth(act1.depth);
-        ResolvePixel(act1Coord, targetSize, frameParity, true, act1.color, act1.depth, act1.linearDepth, false, act0, act1);
     }
 
     if (InBounds(inact0Coord, targetSize)) {

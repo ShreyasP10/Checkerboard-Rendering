@@ -21,19 +21,24 @@ def _check_coords(x: int, y: int, target_w: int, target_h: int) -> None:
     if target_w <= 0 or target_h <= 0:
         raise ValueError("target dimensions must be positive")
 
-def cpp_map_pixel_to_sample(x: int, y: int, frame_parity: int, shift_dir: int = 1) -> Dict[str, int]:
+def cpp_map_pixel_to_sample(x: int, y: int, frame_parity: int, shift_dir: int = 1, target_w: int = 0) -> Dict[str, int]:
     if x < 0 or y < 0:
         raise ValueError(f"pixel coords must be >= 0, got ({x}, {y})")
     if frame_parity not in (0, 1):
         raise ValueError(f"frame_parity must be 0/1, got {frame_parity}")
     y_bit = y & 1
     active = bool(((x ^ y) & 1) == (frame_parity & 1))
-    if (frame_parity & 1) == 0:
+    if (frame_parity & 1) == 0 or shift_dir == 0:
         qx = x >> 1
-    elif shift_dir >= 0:
+    elif shift_dir > 0:
         qx = (x - y_bit if x > y_bit else 0) >> 1
     else:
         qx = (x + 1 - y_bit) >> 1
+    if target_w > 0:
+        q_max_x = (target_w >> 1) - 1
+        if qx < 0 or qx > q_max_x:
+            active = False
+        qx = max(0, min(qx, q_max_x))
     qy = y >> 1
     sample = 1 - y_bit
     return {
@@ -47,14 +52,17 @@ def glsl_map_pixel_to_sample(x: int, y: int, frame_parity: int, shift_dir: int, 
     _check_coords(x, y, target_w, target_h)
     y_bit = y & 1
     is_active = bool(((x ^ y) & 1) == (frame_parity & 1))
-    if frame_parity == 0:
+    if frame_parity == 0 or shift_dir == 0:
         qx = x >> 1
-    elif shift_dir >= 0:
+    elif shift_dir > 0:
         qx = max(x - y_bit, 0) >> 1
     else:
         qx = (x + 1 - y_bit) >> 1
     q_max_x = (target_w // 2) - 1
     q_max_y = (target_h // 2) - 1
+    # Item M-17: When unclamped qx falls outside [0, q_max_x], mark inactive
+    if qx < 0 or qx > q_max_x:
+        is_active = False
     clamped_qx = max(0, min(qx, q_max_x))
     clamped_qy = min(y >> 1, q_max_y)
     sample_idx = 1 - y_bit
@@ -74,14 +82,14 @@ def test_mapping_equivalence():
     target_w = 3840
     target_h = 2160
     tested = 0
-    for shift_dir in [1, -1]:
+    for shift_dir in [1, -1, 0]:
         for frame_parity in [0, 1]:
             # Test interior and boundary regions
             x_samples = list(range(0, 32)) + list(range(target_w // 2 - 16, target_w // 2 + 16)) + list(range(target_w - 32, target_w))
             y_samples = list(range(0, 32)) + list(range(target_h // 2 - 16, target_h // 2 + 16)) + list(range(target_h - 32, target_h))
             for y in y_samples:
                 for x in x_samples:
-                    cpp_res = cpp_map_pixel_to_sample(x, y, frame_parity, shift_dir)
+                    cpp_res = cpp_map_pixel_to_sample(x, y, frame_parity, shift_dir, target_w)
                     glsl_res = glsl_map_pixel_to_sample(x, y, frame_parity, shift_dir, target_w, target_h)
                     hlsl_res = hlsl_map_pixel_to_sample(x, y, frame_parity, shift_dir, target_w, target_h)
 
@@ -89,12 +97,17 @@ def test_mapping_equivalence():
                     assert cpp_res["sample"] == glsl_res["sample"] == hlsl_res["sample"], f"Sample index mismatch at ({x}, {y})"
                     assert cpp_res["quarterY"] == glsl_res["quarterY"] == hlsl_res["quarterY"], f"quarterY mismatch at ({x}, {y})"
 
-                    # In the interior (not edge), unclamped qx must match C++ exactly
-                    assert cpp_res["quarterX"] == glsl_res["unclamped_qx"], f"quarterX mismatch at ({x}, {y})"
+                    # Section 6: Compare clamped quarterX between C++ and shaders
+                    assert cpp_res["quarterX"] == glsl_res["quarterX"] == hlsl_res["quarterX"], (
+                        f"quarterX mismatch at ({x}, {y}): cpp={cpp_res['quarterX']} glsl={glsl_res['quarterX']}"
+                    )
+                    assert cpp_res["quarterX"] == glsl_res["unclamped_qx"] or not cpp_res["active"], (
+                        f"Unclamped qx mismatch on active sample at ({x}, {y})"
+                    )
                     tested += 1
 
     # Explicit boundary case (Item M-06): (x=0, y=1, frameParity=1, shiftDir=1) -> x - yBit = -1 must clamp to 0
-    neg_edge_cpp = cpp_map_pixel_to_sample(0, 1, 1, 1)
+    neg_edge_cpp = cpp_map_pixel_to_sample(0, 1, 1, 1, target_w)
     neg_edge_glsl = glsl_map_pixel_to_sample(0, 1, 1, 1, target_w, target_h)
     neg_edge_hlsl = hlsl_map_pixel_to_sample(0, 1, 1, 1, target_w, target_h)
     assert neg_edge_cpp["quarterX"] == 0 and neg_edge_glsl["unclamped_qx"] == 0 and neg_edge_glsl["quarterX"] == 0, (
@@ -102,11 +115,23 @@ def test_mapping_equivalence():
     )
     assert neg_edge_hlsl["quarterX"] == 0 and neg_edge_cpp["sample"] == 0 and neg_edge_cpp["active"] is True
 
+    # Explicit right-edge boundary case (Item M-17 & Section 6): (x = target_w - 1, y = 0, frameParity = 1, shiftDir = -1)
+    # qx = (3839 + 1 - 0) >> 1 = 1920 > q_max_x (1919) -> must fail-open to active = False and clamp quarterX to 1919
+    pos_edge_cpp = cpp_map_pixel_to_sample(target_w - 1, 0, 1, -1, target_w)
+    pos_edge_glsl = glsl_map_pixel_to_sample(target_w - 1, 0, 1, -1, target_w, target_h)
+    pos_edge_hlsl = hlsl_map_pixel_to_sample(target_w - 1, 0, 1, -1, target_w, target_h)
+    assert pos_edge_cpp["active"] is False, f"Expected cpp active=False at right edge shiftDir=-1, got {pos_edge_cpp}"
+    assert pos_edge_glsl["active"] is False, f"Expected glsl active=False at right edge shiftDir=-1, got {pos_edge_glsl}"
+    assert pos_edge_hlsl["active"] is False, f"Expected hlsl active=False at right edge shiftDir=-1, got {pos_edge_hlsl}"
+    assert pos_edge_cpp["quarterX"] == (target_w // 2) - 1, f"Expected cpp clamped to {(target_w // 2) - 1}, got {pos_edge_cpp['quarterX']}"
+    assert pos_edge_glsl["quarterX"] == (target_w // 2) - 1, f"Expected glsl clamped to {(target_w // 2) - 1}, got {pos_edge_glsl['quarterX']}"
+    assert pos_edge_hlsl["quarterX"] == (target_w // 2) - 1, f"Expected hlsl clamped to {(target_w // 2) - 1}, got {pos_edge_hlsl['quarterX']}"
+
     print(f"[PASS] Verified mapping equivalence across {tested} coordinate combinations.")
 
 def test_two_frame_coverage():
     # Verify 100% 4-quadrant coverage across 2 frames for 2x2 pixel blocks
-    for shift_dir in [1, -1]:
+    for shift_dir in [1, -1, 0]:
         for block_x in range(0, 64, 2):
             for block_y in range(0, 64, 2):
                 pixels = [
@@ -157,8 +182,8 @@ def test_source_code_consistency():
     # Regex extraction of MapPixelToSample qx branch expressions across GLSL and HLSL (Item M-06)
     map_fn_re = re.compile(r"CbrSample\s+MapPixelToSample\s*\([^)]*\)\s*\{(?P<body>.*?)\n\}", re.DOTALL)
     qx_branch_re = re.compile(
-        r"if\s*\(\s*frameParity\s*==\s*0u\s*\)\s*\{\s*qx\s*=\s*p\.x\s*>>\s*1\s*;\s*\}\s*"
-        r"else\s+if\s*\(\s*(?:pc\.u_ShiftDirection|g_ShiftDirection)\s*>=\s*0\s*\)\s*\{\s*qx\s*=\s*max\(\s*p\.x\s*-\s*yBit\s*,\s*0\s*\)\s*>>\s*1\s*;\s*\}\s*"
+        r"if\s*\(\s*(?:frameParity\s*==\s*0u\s*\|\|\s*(?:pc\.u_ShiftDirection|g_ShiftDirection)\s*==\s*0)\s*\)\s*\{\s*qx\s*=\s*p\.x\s*>>\s*1\s*;\s*\}\s*"
+        r"else\s+if\s*\(\s*(?:pc\.u_ShiftDirection|g_ShiftDirection)\s*>\s*0\s*\)\s*\{\s*qx\s*=\s*max\(\s*p\.x\s*-\s*yBit\s*,\s*0\s*\)\s*>>\s*1\s*;\s*\}\s*"
         r"else\s*\{\s*qx\s*=\s*\(\s*p\.x\s*\+\s*1\s*-\s*yBit\s*\)\s*>>\s*1\s*;\s*\}",
         re.DOTALL,
     )
@@ -194,6 +219,11 @@ def test_source_code_consistency():
     assert "GL_KHR_shader_subgroup" not in quad_src, "M-07 unused subgroup extensions must be removed"
     assert "QuadActiveSample" in quad_src and "cardinalColor" in quad_src, "M-07/H-05 quad register sharing missing"
 
+    # Verify M-17 boundary check presence across all reconstruction shaders
+    assert "if (qx < 0 || qx > qMax.x)" in comp_src, "M-17 boundary check missing in cbr_reconstruct.comp"
+    assert "if (qx < 0 || qx > qMax.x)" in quad_src, "M-17 boundary check missing in cbr_reconstruct_quad.comp"
+    assert "if (qx < 0 || qx > qMax.x)" in hlsl_src, "M-17 boundary check missing in cbr_reconstruct.hlsl"
+
     print("[PASS] Verified source code consistency across GLSL, HLSL, and C++ header.")
 
 def map_velocity_coord(mx: int, my: int, target_w: int, target_h: int):
@@ -225,8 +255,65 @@ def test_velocity_coord_mapping():
                 checked += 1
     print(f"[PASS] Verified quarter-res C-05 velocity coordinate shift & clamp across {checked} cases.")
 
+def test_strategy_b_hardware_mapping():
+    """
+    H-01 / Section 6: Strategy B (VK_EXT_sample_locations) hardware sample verification.
+    Verifies that on stationary viewport (shift_dir=0):
+    - Frame 0 (even): sample 0 = (0.75, 0.75) [bottom-right], sample 1 = (0.25, 0.25) [top-left]
+    - Frame 1 (odd):  sample 0 = (0.25, 0.75) [bottom-left],  sample 1 = (0.75, 0.25) [top-right]
+    Both C++ and compute shader MapPixelToSample correctly match hardware sample coordinates
+    with 100% 4-quadrant coverage and zero divergence.
+    """
+    kCheckerboardSampleLocations = [
+        [ (0.75, 0.75), (0.25, 0.25) ],  # Frame 0: sample 0, sample 1
+        [ (0.25, 0.75), (0.75, 0.25) ]   # Frame 1: sample 0, sample 1
+    ]
+    target_w = 3840
+    target_h = 2160
+    qw = target_w // 2
+    qh = target_h // 2
+
+    tested_points = 0
+    for parity in (0, 1):
+        for qy in (0, 1, 2, 17, qh // 2, qh - 2, qh - 1):
+            for qx in (0, 1, 2, 17, qw // 2, qw - 2, qw - 1):
+                for s in (0, 1):
+                    offset = kCheckerboardSampleLocations[parity][s]
+                    px = 2.0 * (qx + offset[0])
+                    py = 2.0 * (qy + offset[1])
+                    tx = int(px)
+                    ty = int(py)
+
+                    assert abs((px - tx) - 0.5) < 1e-4, f"Hardware sample not on pixel center: px={px}"
+                    assert abs((py - ty) - 0.5) < 1e-4, f"Hardware sample not on pixel center: py={py}"
+
+                    cpp_m = cpp_map_pixel_to_sample(tx, ty, parity, shift_dir=0, target_w=target_w)
+                    glsl_m = glsl_map_pixel_to_sample(tx, ty, parity, shift_dir=0, target_w=target_w, target_h=target_h)
+                    hlsl_m = hlsl_map_pixel_to_sample(tx, ty, parity, shift_dir=0, target_w=target_w, target_h=target_h)
+
+                    assert cpp_m["active"] is True
+                    assert glsl_m["active"] is True
+                    assert hlsl_m["active"] is True
+
+                    assert cpp_m["quarterX"] == qx and cpp_m["quarterY"] == qy and cpp_m["sample"] == s, (
+                        f"Strategy B C++ mapping mismatch at tx={tx}, ty={ty}, parity={parity}: "
+                        f"expected ({qx}, {qy}, s={s}), got {cpp_m}"
+                    )
+                    assert glsl_m["quarterX"] == qx and glsl_m["quarterY"] == qy and glsl_m["sample"] == s, (
+                        f"Strategy B GLSL mapping mismatch at tx={tx}, ty={ty}, parity={parity}: "
+                        f"expected ({qx}, {qy}, s={s}), got {glsl_m}"
+                    )
+                    assert hlsl_m["quarterX"] == qx and hlsl_m["quarterY"] == qy and hlsl_m["sample"] == s, (
+                        f"Strategy B HLSL mapping mismatch at tx={tx}, ty={ty}, parity={parity}: "
+                        f"expected ({qx}, {qy}, s={s}), got {hlsl_m}"
+                    )
+                    tested_points += 1
+
+    print(f"[PASS] Verified Strategy B hardware sample locations (H-01) across {tested_points} test points.")
+
 def main():
     test_mapping_equivalence()
+    test_strategy_b_hardware_mapping()
     test_two_frame_coverage()
     test_velocity_coord_mapping()
     test_source_code_consistency()

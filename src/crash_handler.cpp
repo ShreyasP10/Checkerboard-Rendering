@@ -177,6 +177,9 @@ LONG WINAPI CBRUnhandledExceptionFilter(EXCEPTION_POINTERS* pEx) {
         return (g_previousFilter) ? g_previousFilter(pEx) : EXCEPTION_CONTINUE_SEARCH;
     }
 
+#if defined(_MSC_VER)
+    __try {
+#endif
     const DWORD code = pEx->ExceptionRecord->ExceptionCode;
     void* faultAddress = pEx->ExceptionRecord->ExceptionAddress;
 
@@ -276,9 +279,18 @@ LONG WINAPI CBRUnhandledExceptionFilter(EXCEPTION_POINTERS* pEx) {
     }
 
     // 3. Write minidump (.dmp) for Visual Studio / WinDbg debugging
-    if (g_dumpPathW[0] != L'\0') {
+    // Skip minidump if ExceptionCode indicates heap corruption (0xC0000374 / STATUS_HEAP_CORRUPTION)
+    // because MiniDumpWriteDump allocates and can recurse or deadlock on corrupted heaps (Section 4.1).
+    constexpr DWORD kStatusHeapCorruption = 0xC0000374;
+    if (code != kStatusHeapCorruption && g_dumpPathW[0] != L'\0') {
         WriteMinidump(pEx, g_dumpPathW);
     }
+#if defined(_MSC_VER)
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        // Emergency fallback: secondary fault occurred inside crash reporting; avoid recursion
+    }
+#endif
 
     if (g_previousFilter) {
         return g_previousFilter(pEx);
@@ -294,7 +306,7 @@ CrashHandler& CrashHandler::Get() {
 }
 
 void CrashHandler::Install(const std::filesystem::path& logDirectory) {
-    if (m_installed) return;
+    if (m_installed.exchange(true, std::memory_order_acq_rel)) return;
     m_logDirectory = logDirectory;
     g_crashLogDirectory = logDirectory;
 
@@ -320,16 +332,15 @@ void CrashHandler::Install(const std::filesystem::path& logDirectory) {
     }
     if (g_hDbgHelp && !g_pfnMiniDumpWriteDump) {
         g_pfnMiniDumpWriteDump = reinterpret_cast<PFN_MiniDumpWriteDump>(
-            GetProcAddress(g_hDbgHelp, "MiniDumpWriteDump"));
+            reinterpret_cast<void*>(GetProcAddress(g_hDbgHelp, "MiniDumpWriteDump")));
     }
 
     g_previousFilter = SetUnhandledExceptionFilter(CBRUnhandledExceptionFilter);
-    m_installed = true;
     CBR_LOG_INFO("CrashHandler installed. Unhandled exceptions & crash telemetry will be logged to cbr_crash.log.");
 }
 
 void CrashHandler::Uninstall() {
-    if (!m_installed) return;
+    if (!m_installed.exchange(false, std::memory_order_acq_rel)) return;
     SetUnhandledExceptionFilter(g_previousFilter);
     g_previousFilter = nullptr;
 
@@ -349,7 +360,6 @@ void CrashHandler::Uninstall() {
     }
     g_dumpPathW[0] = L'\0';
 
-    m_installed = false;
     CBR_LOG_INFO("CrashHandler uninstalled.");
 }
 

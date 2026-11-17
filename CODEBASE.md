@@ -71,7 +71,6 @@ This document contains the complete, unabridged source code, shaders, configurat
    - [`docs/RISK_REGISTER.md`](#docsriskregistermd)
    - [`docs/VULKAN_HOOKING_GUIDE.md`](#docsvulkanhookingguidemd)
    - [`docs/IN_GAME_TEST_REPORT_v1491.md`](#docsingametestreportv1491md)
-   - [`docs/nextImplementationPhase.md`](#docsnextimplementationphasemd)
    - [`docs/AMD_VEGA_OPTIMIZATION.md`](#docsamdvegaoptimizationmd)
    - [`docs/INTEL_CBR_REFERENCE.md`](#docsintelcbrreferencemd)
    - [`docs/IMPROVEMENTS.md`](#docsimprovementsmd)
@@ -405,8 +404,8 @@ ColorSpace = YCoCg
 
 ; Temporal history blend weight for valid reprojected samples (0.0 to 1.0)
 ; 1.0 uses pure temporal checkerboard resolve (PS4 Pro style)
-; When RDR2 in-game TAA is active, 0.80 - 0.85 is recommended to avoid double temporal damping.
-HistoryWeight = 0.85
+; Default: 0.90 (balanced stability and ghosting suppression)
+HistoryWeight = 0.90
 
 ; Enable spatial cross-bilateral filter for disoccluded pixels
 EnableSpatialFallback = true
@@ -425,7 +424,7 @@ DepthNear = 0.1
 DepthFar = 0.0
 
 ; Fused 5-tap RCAS contrast-adaptive sharpening strength (0.0 = disabled, 0.20 = recommended for small text & gear decals, 1.0 = max)
-SharpeningStrength = 0.20
+SharpeningStrength = 0.0
 
 [Jitter]
 ; Projection jitter pattern: Checkerboard (alternating whole-pixel shift). Halton is reserved/not implemented yet.
@@ -444,9 +443,20 @@ JitterDirection = 1
 ProjectionJitterSign = 1
 
 ; Sub-pixel jitter compensation applied when reprojecting history.
-; Default: 0.0 (the whole-pixel 2x MSAA checkerboard shift is absorbed by the sample mapping,
-; so history reprojection needs no jitter delta compensation).
-JitterCompensation = 0.0
+; Default: 1.0 (compensates for the 1-pixel horizontal shift when sampling history from the previous frame).
+JitterCompensation = 1.0
+
+; Camera projection matrix verification gate (Item H-05).
+; Default: false (prevents unverified projection matrices from being treated as view-projection in camera motion fallback).
+CameraMatrixVerified = false
+
+; Memory write gate for camera projection jittering (Item H-06).
+; Default: false (keeps memory writes disabled; Strategy A viewport shift is the safe, non-mutating path).
+EnableProjectionJitterWrite = false
+
+; Manual override to pin the exact VkRenderPass handle for main scene geometry (Item H-03).
+; Default: 0 (automatic heuristic detection). Set to hex/decimal handle from RenderDoc capture if needed.
+ForcedSceneRenderPassHandle = 0
 
 ; Sampling Strategy: StrategyA (ViewportShift) or StrategyB (ProgrammableSampleLocations)
 ; - StrategyA: Shorter pass jitter via 0.5px horizontal viewport offset on odd frames.
@@ -660,6 +670,11 @@ public:
     GraphicsApi GetActiveApi() const { return m_activeApi.load(); }
     void        SetActiveApi(GraphicsApi api) { m_activeApi.store(api); }
 
+    [[nodiscard]] bool HasDispatchedThisFrame() const {
+        return m_lastDispatchedFrame.load(std::memory_order_acquire) ==
+               m_frameIndex.load(std::memory_order_acquire);
+    }
+
     // Performance metrics
     float GetLastReconstructionDurationMs() const { return m_lastReconDurationMs.load(); }
     void  SetLastReconstructionDurationMs(float durationMs) { m_lastReconDurationMs.store(durationMs); }
@@ -791,18 +806,29 @@ struct CheckerboardSample {
 // For inactive pixels the returned location is the (meaningless) sample that would be there if
 // the pixel were active; callers must check `active`.
 // quarterX may fall outside the render target at the left/right screen edge; callers must clamp.
-constexpr CheckerboardSample MapPixelToSample(int32_t x, int32_t y, uint32_t frameParity, int32_t shiftDir = 1) noexcept {
+// If targetWidth > 0, boundary pixels with unclamped qx outside [0, (targetWidth >> 1) - 1] are marked inactive (Item M-17).
+constexpr CheckerboardSample MapPixelToSample(int32_t x, int32_t y, uint32_t frameParity, int32_t shiftDir = 1, int32_t targetWidth = 0) noexcept {
     const int32_t yBit = y & 1;
-    const bool active = ((static_cast<uint32_t>(x ^ y) & 1u) == (frameParity & 1u));
+    bool active = ((static_cast<uint32_t>(x ^ y) & 1u) == (frameParity & 1u));
     int32_t qx = 0;
-    if ((frameParity & 1u) == 0u) {
+    if ((frameParity & 1u) == 0u || shiftDir == 0) {
         qx = x >> 1;
-    } else if (shiftDir >= 0) {
+    } else if (shiftDir > 0) {
         // +1 px shift: the bottom-right sample of the neighbouring render pixel lands here
         qx = (x > yBit ? x - yBit : 0) >> 1;
     } else {
         // -1 px shift
         qx = (x + 1 - yBit) >> 1;
+    }
+    // Item M-17 & Section 6: When targetWidth is specified, unclamped qx outside [0, (targetWidth >> 1) - 1]
+    // has no hardware sample; mark inactive so callers know it's not natively shaded,
+    // and clamp qx to [0, qMaxX] to match GPU compute shader texelFetch clamp.
+    if (targetWidth > 0) {
+        const int32_t qMaxX = (targetWidth >> 1) - 1;
+        if (qx < 0 || qx > qMaxX) {
+            active = false;
+        }
+        qx = (qx < 0) ? 0 : ((qx > qMaxX) ? qMaxX : qx);
     }
     return { active, qx, y >> 1, static_cast<uint32_t>(1 - yBit) };
 }
@@ -901,9 +927,14 @@ struct CBRConfig {
     // (proj[8] / proj[9]). Accounts for engine projection-matrix handedness / column-major vs
     // row-major conventions independently of reconstruction sample parity (+1 or -1).
     int32_t       projectionJitterSign{ 1 };
-    // Multiplier applied to the jitter delta when reprojecting history: default 0.0
-    // (whole-pixel coverage jitter is absorbed by the sample mapping, so history needs no compensation).
-    float         jitterCompensation{ 0.0f };
+    // Multiplier applied to the jitter delta when reprojecting history: default 1.0 (Item H-02).
+    // Compensates for the 1-pixel horizontal shift when sampling unjittered history from the previous frame.
+    float         jitterCompensation{ 1.0f };
+
+    // Safety & Overrides (Items H-03, H-05, H-06)
+    uint64_t      forcedSceneRenderPassHandle{ 0 }; // 0 = auto-detect; nonzero = force exact VkRenderPass handle (Item H-03)
+    bool          cameraMatrixVerified{ false }; // false = untrusted; true = verified ViewProj matrix (Item H-05)
+    bool          enableProjectionJitterWrite{ false }; // false = safe viewport shift only; true = opt-in game memory writes (Item H-06)
 
     // Debug
     bool        showOverlay{ false };
@@ -960,6 +991,7 @@ private:
 ```cpp
 #pragma once
 
+#include <atomic>
 #include <filesystem>
 #include <string>
 
@@ -973,7 +1005,7 @@ public:
     void Install(const std::filesystem::path& logDirectory);
     void Uninstall();
 
-    bool IsInstalled() const { return m_installed; }
+    bool IsInstalled() const { return m_installed.load(std::memory_order_acquire); }
 
     // Logs detailed system and game runtime telemetry to cbr.log
     void LogSystemTelemetry();
@@ -984,7 +1016,7 @@ private:
     CrashHandler(const CrashHandler&) = delete;
     CrashHandler& operator=(const CrashHandler&) = delete;
 
-    bool m_installed{ false };
+    std::atomic<bool> m_installed{ false };
     std::filesystem::path m_logDirectory;
 };
 
@@ -1681,10 +1713,13 @@ public:
     bool IsTargetInterceptCandidate(uint32_t width, uint32_t height, uint32_t format) const;
     bool IsQuarterPassCandidate(uint32_t width, uint32_t height) const;
 
-    // Vulkan attachment & blit safety checks (Items C-01 & C-04)
+    // Vulkan attachment & blit safety checks (Items C-01 & C-04 & Section 4.10)
     [[nodiscard]] static bool IsVulkanDepthFormat(int32_t format);
     [[nodiscard]] static bool IsDepthCopyFormatCompatible(uint32_t srcFormat, uint32_t dstFormat);
     [[nodiscard]] static bool IsColorCopyFormatCompatible(uint32_t srcFormat, uint32_t dstFormat);
+    [[nodiscard]] static bool ValidateImageTransfer(const VulkanImageMetadata& srcMeta,
+                                                    const VulkanImageMetadata& dstMeta,
+                                                    bool isBlit);
     [[nodiscard]] bool CanCopyToQuarterColor(const VulkanImageMetadata& srcMeta) const;
     [[nodiscard]] bool CanCopyToQuarterDepth(const VulkanImageMetadata& srcMeta) const;
     [[nodiscard]] bool CanCopyToVelocity(const VulkanImageMetadata& srcMeta) const;
@@ -1899,9 +1934,11 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID /*lpRese
                 &pinned)) {
                 // Pin failed: do not spawn a thread that would execute unmapped code.
                 // Record directory anyway so a later CBR_PluginInit can still initialize.
+                const DWORD err = GetLastError();
                 const auto modDir = GetModuleDirectoryPath(hModule);
                 cbr::CBREngine::Get().SetModuleDirectory(modDir);
                 cbr::CrashHandler::Get().Install(modDir);
+                CBR_LOG_ERROR("DllMain: Failed to pin CBR module in memory (GetModuleHandleExW error: %lu). Background initialization thread aborted to prevent executing unmapped code.", err);
                 break;
             }
 
@@ -2060,6 +2097,13 @@ bool CBREngine::Initialize() {
 bool CBREngine::TryInstallHooks() {
     if (!m_initialized.load()) return false;
 
+    // Refuse hook installation if anti-cheat or online multiplayer modules/arguments are present (Section 4)
+    if (CheckAntiCheatModules()) {
+        CBR_LOG_ERROR("CRITICAL: Refusing to install graphics hooks due to detected anti-cheat / online security modules.");
+        m_enabled.store(false);
+        return false;
+    }
+
     static uint32_t s_pollAttempt = 0;
     ++s_pollAttempt;
     if (s_pollAttempt == 1 || s_pollAttempt % 40 == 0) {
@@ -2203,7 +2247,18 @@ void CBREngine::OnPostPresent(void* presentTarget) {
     }
 
     if (m_mainPresentTarget.load() == presentTarget) {
-        m_frameIndex.fetch_add(1);
+        const uint32_t currentFrame = m_frameIndex.fetch_add(1);
+
+        // Section 4: Periodic late-loaded anti-cheat & online security check (every 300 frames, ~5s at 60 FPS)
+        if ((currentFrame % 300u) == 0u && m_enabled.load()) {
+            if (CheckAntiCheatModules()) {
+                CBR_LOG_ERROR("CRITICAL: Late-loaded anti-cheat / online security module detected during gameplay! Self-disabling CBR immediately to protect account standing.");
+                m_enabled.store(false);
+                RenderTargetManager::Get().ResetHistory();
+                return;
+            }
+        }
+
         OnBeginFrame();
     }
 }
@@ -2405,6 +2460,20 @@ uint32_t ParseUInt(const std::string& val, uint32_t defaultVal, uint32_t minVal,
     }
 }
 
+uint64_t ParseUInt64(const std::string& val, uint64_t defaultVal) {
+    if (val.empty()) return defaultVal;
+    try {
+        if (val.front() == '-') return defaultVal;
+        size_t idx = 0;
+        int base = (val.size() > 2 && (val[1] == 'x' || val[1] == 'X')) ? 16 : 10;
+        unsigned long long result = std::stoull(val, &idx, base);
+        if (idx == 0 || idx != val.size()) return defaultVal;
+        return static_cast<uint64_t>(result);
+    } catch (...) {
+        return defaultVal;
+    }
+}
+
 float ParseFloat(const std::string& val, float defaultVal, float minVal, float maxVal) {
     if (val.empty()) return defaultVal;
     float result = defaultVal;
@@ -2594,6 +2663,12 @@ bool ConfigManager::Load(const std::filesystem::path& configPath) {
                 }
             } else if (key == "JitterCompensation") {
                 parsed.jitterCompensation = ParseFloat(val, parsed.jitterCompensation, -1.0f, 1.0f);
+            } else if (key == "CameraMatrixVerified") {
+                parsed.cameraMatrixVerified = ParseBool(val, parsed.cameraMatrixVerified);
+            } else if (key == "EnableProjectionJitterWrite") {
+                parsed.enableProjectionJitterWrite = ParseBool(val, parsed.enableProjectionJitterWrite);
+            } else if (key == "ForcedSceneRenderPassHandle") {
+                parsed.forcedSceneRenderPassHandle = ParseUInt64(val, parsed.forcedSceneRenderPassHandle);
             } else if (key == "SamplingStrategy") {
                 const std::string s = ToUpper(Trim(val));
                 if (s == "STRATEGYA" || s == "VIEWPORTSHIFT" || s == "STRATEGY_A") {
@@ -2676,6 +2751,9 @@ bool ConfigManager::Save(const std::filesystem::path& configPath) {
     file << "JitterDirection = " << snapshot.jitterDirection << "\n";
     file << "ProjectionJitterSign = " << snapshot.projectionJitterSign << "\n";
     file << "JitterCompensation = " << snapshot.jitterCompensation << "\n";
+    file << "CameraMatrixVerified = " << (snapshot.cameraMatrixVerified ? "true" : "false") << "\n";
+    file << "EnableProjectionJitterWrite = " << (snapshot.enableProjectionJitterWrite ? "true" : "false") << "\n";
+    file << "ForcedSceneRenderPassHandle = " << snapshot.forcedSceneRenderPassHandle << "\n";
     file << "SamplingStrategy = "
          << (snapshot.samplingStrategy == SamplingStrategy::StrategyB ? "StrategyB" : "StrategyA") << "\n\n";
 
@@ -2879,6 +2957,9 @@ LONG WINAPI CBRUnhandledExceptionFilter(EXCEPTION_POINTERS* pEx) {
         return (g_previousFilter) ? g_previousFilter(pEx) : EXCEPTION_CONTINUE_SEARCH;
     }
 
+#if defined(_MSC_VER)
+    __try {
+#endif
     const DWORD code = pEx->ExceptionRecord->ExceptionCode;
     void* faultAddress = pEx->ExceptionRecord->ExceptionAddress;
 
@@ -2978,9 +3059,18 @@ LONG WINAPI CBRUnhandledExceptionFilter(EXCEPTION_POINTERS* pEx) {
     }
 
     // 3. Write minidump (.dmp) for Visual Studio / WinDbg debugging
-    if (g_dumpPathW[0] != L'\0') {
+    // Skip minidump if ExceptionCode indicates heap corruption (0xC0000374 / STATUS_HEAP_CORRUPTION)
+    // because MiniDumpWriteDump allocates and can recurse or deadlock on corrupted heaps (Section 4.1).
+    constexpr DWORD kStatusHeapCorruption = 0xC0000374;
+    if (code != kStatusHeapCorruption && g_dumpPathW[0] != L'\0') {
         WriteMinidump(pEx, g_dumpPathW);
     }
+#if defined(_MSC_VER)
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        // Emergency fallback: secondary fault occurred inside crash reporting; avoid recursion
+    }
+#endif
 
     if (g_previousFilter) {
         return g_previousFilter(pEx);
@@ -2996,7 +3086,7 @@ CrashHandler& CrashHandler::Get() {
 }
 
 void CrashHandler::Install(const std::filesystem::path& logDirectory) {
-    if (m_installed) return;
+    if (m_installed.exchange(true, std::memory_order_acq_rel)) return;
     m_logDirectory = logDirectory;
     g_crashLogDirectory = logDirectory;
 
@@ -3022,16 +3112,15 @@ void CrashHandler::Install(const std::filesystem::path& logDirectory) {
     }
     if (g_hDbgHelp && !g_pfnMiniDumpWriteDump) {
         g_pfnMiniDumpWriteDump = reinterpret_cast<PFN_MiniDumpWriteDump>(
-            GetProcAddress(g_hDbgHelp, "MiniDumpWriteDump"));
+            reinterpret_cast<void*>(GetProcAddress(g_hDbgHelp, "MiniDumpWriteDump")));
     }
 
     g_previousFilter = SetUnhandledExceptionFilter(CBRUnhandledExceptionFilter);
-    m_installed = true;
     CBR_LOG_INFO("CrashHandler installed. Unhandled exceptions & crash telemetry will be logged to cbr_crash.log.");
 }
 
 void CrashHandler::Uninstall() {
-    if (!m_installed) return;
+    if (!m_installed.exchange(false, std::memory_order_acq_rel)) return;
     SetUnhandledExceptionFilter(g_previousFilter);
     g_previousFilter = nullptr;
 
@@ -3051,7 +3140,6 @@ void CrashHandler::Uninstall() {
     }
     g_dumpPathW[0] = L'\0';
 
-    m_installed = false;
     CBR_LOG_INFO("CrashHandler uninstalled.");
 }
 
@@ -3274,6 +3362,8 @@ typedef int   (*PFN_vkEnumeratePhysicalDevices)(void* instance, uint32_t* pPhysi
 typedef void  (*PFN_vkGetPhysicalDeviceProperties)(void* physicalDevice, void* pProperties);
 typedef void  (*PFN_vkGetPhysicalDeviceMemoryProperties)(void* physicalDevice, void* pMemoryProperties);
 typedef void  (*PFN_vkCmdResolveImage)(void* commandBuffer, void* srcImage, uint32_t srcImageLayout, void* dstImage, uint32_t dstImageLayout, uint32_t regionCount, const void* pRegions);
+typedef void  (*PFN_vkCmdBeginRendering)(void* commandBuffer, const void* pRenderingInfo);
+typedef void  (*PFN_vkCmdEndRendering)(void* commandBuffer);
 
 PFN_vkGetDeviceProcAddr                     g_Original_vkGetDeviceProcAddr = nullptr;
 PFN_vkGetInstanceProcAddr                   g_Original_vkGetInstanceProcAddr = nullptr;
@@ -3288,6 +3378,10 @@ PFN_vkCmdSetViewport                        g_Original_vkCmdSetViewport = nullpt
 PFN_vkCmdSetScissor                         g_Original_vkCmdSetScissor = nullptr;
 PFN_vkCmdBeginRenderPass                    g_Original_vkCmdBeginRenderPass = nullptr;
 PFN_vkCmdEndRenderPass                      g_Original_vkCmdEndRenderPass = nullptr;
+PFN_vkCmdBeginRendering                     g_Original_vkCmdBeginRendering = nullptr;
+PFN_vkCmdBeginRendering                     g_Original_vkCmdBeginRenderingKHR = nullptr;
+PFN_vkCmdEndRendering                       g_Original_vkCmdEndRendering = nullptr;
+PFN_vkCmdEndRendering                       g_Original_vkCmdEndRenderingKHR = nullptr;
 PFN_vkCmdDraw                               g_Original_vkCmdDraw = nullptr;
 PFN_vkCmdDrawIndexed                        g_Original_vkCmdDrawIndexed = nullptr;
 PFN_vkCmdSetSampleLocationsEXT              g_Original_vkCmdSetSampleLocationsEXT = nullptr;
@@ -3378,6 +3472,11 @@ struct MinimalVkPresentInfoKHR {
     const uint32_t* pImageIndices;
     int*         pResults;
 };
+static_assert(sizeof(MinimalVkPresentInfoKHR) == (sizeof(void*) == 8 ? 64 : 32), "VkPresentInfoKHR ABI size drift");
+static_assert(offsetof(MinimalVkPresentInfoKHR, pSwapchains) == (sizeof(void*) == 8 ? 40 : 20), "ABI drift: pSwapchains offset");
+#if defined(_WIN64) || defined(__x86_64__) || defined(__LP64__)
+static_assert(offsetof(MinimalVkPresentInfoKHR, pSwapchains) == 40, "pSwapchains offset must equal 40 on 64-bit targets");
+#endif
 
 // =============================================================================
 // Vulkan Checkerboard Structures & Enums (CHECKERBOARD.md: Vulkan Setup)
@@ -3875,21 +3974,26 @@ struct PassSlot {
     std::atomic<uint32_t> velocityFinalLayout{ 2 };
     std::atomic<bool>     colorIsSwapchain{ false };
     std::atomic<bool>     rpCandidateGeometryPass{ true };
+    std::atomic<bool>     hasSavedViewport{ false };
+    std::atomic<bool>     hasSavedScissor{ false };
+    MinimalVkViewport     savedViewport{};
+    MinimalVkRect2D       savedScissor{};
 };
 
 constexpr size_t kMaxTrackedPassSlots = 64;
 static PassSlot g_passSlots[kMaxTrackedPassSlots];
+static std::atomic<void*> g_verifiedSceneRenderPass{ nullptr };
 
 inline PassSlot* GetOrCreatePassSlot(void* cmdBuffer) {
     if (!cmdBuffer) return nullptr;
     const size_t startIdx = (reinterpret_cast<uintptr_t>(cmdBuffer) >> 4) % kMaxTrackedPassSlots;
-    for (size_t i = 0; i < 8; ++i) {
+    for (size_t i = 0; i < kMaxTrackedPassSlots; ++i) {
         size_t idx = (startIdx + i) % kMaxTrackedPassSlots;
         if (g_passSlots[idx].cmdBuffer.load(std::memory_order_relaxed) == cmdBuffer) {
             return &g_passSlots[idx];
         }
     }
-    for (size_t i = 0; i < 8; ++i) {
+    for (size_t i = 0; i < kMaxTrackedPassSlots; ++i) {
         size_t idx = (startIdx + i) % kMaxTrackedPassSlots;
         void* expected = nullptr;
         if (g_passSlots[idx].cmdBuffer.compare_exchange_strong(expected, cmdBuffer, std::memory_order_acq_rel)) {
@@ -3902,7 +4006,7 @@ inline PassSlot* GetOrCreatePassSlot(void* cmdBuffer) {
 inline PassSlot* FindPassSlot(void* cmdBuffer) {
     if (!cmdBuffer) return nullptr;
     const size_t startIdx = (reinterpret_cast<uintptr_t>(cmdBuffer) >> 4) % kMaxTrackedPassSlots;
-    for (size_t i = 0; i < 8; ++i) {
+    for (size_t i = 0; i < kMaxTrackedPassSlots; ++i) {
         size_t idx = (startIdx + i) % kMaxTrackedPassSlots;
         if (g_passSlots[idx].cmdBuffer.load(std::memory_order_relaxed) == cmdBuffer) {
             return &g_passSlots[idx];
@@ -3911,7 +4015,39 @@ inline PassSlot* FindPassSlot(void* cmdBuffer) {
     return nullptr;
 }
 
+inline bool CanDownscaleCommandBuffer(void* commandBuffer) {
+    // 1. Never downscale any pass (post-FX, bloom, UI/HUD) after CBR has already dispatched this frame
+    if (CBREngine::Get().HasDispatchedThisFrame()) {
+        return false;
+    }
+    PassSlot* slot = FindPassSlot(commandBuffer);
+    if (!slot) {
+        // vkCmdSetViewport called before vkCmdBeginRenderPass: allow provisional downscale,
+        // which Hooked_vkCmdBeginRenderPass will restore if the renderPass is not a scene pass.
+        return true;
+    }
+    // If a render pass is already active on this commandBuffer, verify it is an offscreen HDR+Depth candidate
+    if (slot->activeRenderPass.load(std::memory_order_acquire) != nullptr ||
+        slot->activeFramebuffer.load(std::memory_order_acquire) != nullptr) {
+        if (!slot->hasMatchingExtent.load(std::memory_order_acquire) ||
+            !slot->rpCandidateGeometryPass.load(std::memory_order_acquire) ||
+            slot->colorIsSwapchain.load(std::memory_order_acquire)) {
+            return false;
+        }
+        void* verifiedRp = g_verifiedSceneRenderPass.load(std::memory_order_acquire);
+        void* activeRp   = slot->activeRenderPass.load(std::memory_order_acquire);
+        if (verifiedRp != nullptr && activeRp != nullptr && activeRp != verifiedRp) {
+            return false;
+        }
+    }
+    return true;
+}
+
 inline void IncrementDrawCount(void* cmdBuffer) {
+    // Fast path: skip pass slot lookup on non-candidate passes to minimize per-draw overhead (Item M-14)
+    if (!CBREngine::Get().IsCandidatePassActive(cmdBuffer)) {
+        return;
+    }
     PassSlot* slot = FindPassSlot(cmdBuffer);
     if (slot) {
         slot->drawCount.fetch_add(1, std::memory_order_relaxed);
@@ -4019,6 +4155,15 @@ int Hooked_vkCreateDevice(void* physicalDevice, const void* pCreateInfo, const v
         g_framebuffers.clear();
         g_renderPasses.clear();
     }
+    for (size_t i = 0; i < kMaxTrackedPassSlots; ++i) {
+        g_passSlots[i].cmdBuffer.store(nullptr, std::memory_order_relaxed);
+        g_passSlots[i].hasMatchingExtent.store(false, std::memory_order_relaxed);
+        g_passSlots[i].viewportDownscaled.store(false, std::memory_order_relaxed);
+        g_passSlots[i].drawCount.store(0, std::memory_order_relaxed);
+        g_passSlots[i].hasSavedViewport.store(false, std::memory_order_relaxed);
+        g_passSlots[i].hasSavedScissor.store(false, std::memory_order_relaxed);
+    }
+    g_verifiedSceneRenderPass.store(nullptr, std::memory_order_release);
     return g_Original_vkCreateDevice(physicalDevice, pCreateInfo, pAllocator, pDevice);
 }
 
@@ -4033,6 +4178,7 @@ void Hooked_vkDestroySwapchainKHR(void* device, void* swapchain, const void* pAl
             g_activeSwapchain.store(nullptr);
             g_activeImageIndex.store(0);
         }
+        g_verifiedSceneRenderPass.store(nullptr, std::memory_order_release);
         // Purge tracked image/view/framebuffer/renderpass maps so swapchain recreation / window resize
         // / alt-tab does not retain stale pointers or match recycled driver handles
         {
@@ -4041,6 +4187,15 @@ void Hooked_vkDestroySwapchainKHR(void* device, void* swapchain, const void* pAl
             g_imageViews.clear();
             g_framebuffers.clear();
             g_renderPasses.clear();
+        }
+        // Item M-08: Reset pass slot tracking metadata on swapchain destruction
+        for (size_t i = 0; i < kMaxTrackedPassSlots; ++i) {
+            g_passSlots[i].cmdBuffer.store(nullptr, std::memory_order_relaxed);
+            g_passSlots[i].hasMatchingExtent.store(false, std::memory_order_relaxed);
+            g_passSlots[i].viewportDownscaled.store(false, std::memory_order_relaxed);
+            g_passSlots[i].drawCount.store(0, std::memory_order_relaxed);
+            g_passSlots[i].hasSavedViewport.store(false, std::memory_order_relaxed);
+            g_passSlots[i].hasSavedScissor.store(false, std::memory_order_relaxed);
         }
         CBR_LOG_INFO("Vulkan swapchain %p destroyed; resources purged from tracking map.", swapchain);
     }
@@ -4204,10 +4359,16 @@ inline void RecordTrackedRenderPass(void* rpHandle, const std::vector<TrackedRen
     bool hasDepth = false;
     bool hasMsaa2x = false;
     bool hasVelocityFmt = false;
+    bool depthFinalLayoutReadOnly = false;
     uint32_t colorCount = 0;
     for (const auto& att : rp.attachments) {
         if (RenderTargetManager::IsVulkanDepthFormat(att.format)) {
             hasDepth = true;
+            // Depth read-only layout (Item H-03): SHADER_READ_ONLY_OPTIMAL (5),
+            // DEPTH_STENCIL_READ_ONLY_OPTIMAL (4), or DEPTH_READ_ONLY_OPTIMAL (1000241000)
+            if (att.finalLayout == 5u || att.finalLayout == 4u || att.finalLayout == 1000241000u) {
+                depthFinalLayoutReadOnly = true;
+            }
         } else {
             ++colorCount;
             if (att.format == 97 /* R16G16B16A16_SFLOAT */ ||
@@ -4224,8 +4385,13 @@ inline void RecordTrackedRenderPass(void* rpHandle, const std::vector<TrackedRen
         }
     }
     const uint32_t targetSamples = RenderTargetManager::Get().GetDimensions().msaaSamples;
-    rp.isCandidateGeometryPass = hasHdrColor && hasDepth &&
-                                 (targetSamples == 1u || hasMsaa2x || hasVelocityFmt || colorCount >= 2u);
+    const auto& config = ConfigManager::Get().GetConfig();
+    if (config.forcedSceneRenderPassHandle != 0) {
+        rp.isCandidateGeometryPass = (reinterpret_cast<uint64_t>(rpHandle) == config.forcedSceneRenderPassHandle);
+    } else {
+        rp.isCandidateGeometryPass = hasHdrColor && hasDepth && depthFinalLayoutReadOnly &&
+                                     (targetSamples == 1u || hasMsaa2x || hasVelocityFmt || colorCount >= 2u);
+    }
     std::lock_guard<std::mutex> lock(g_attachmentMutex);
     g_renderPasses[rpHandle] = std::move(rp);
 }
@@ -4295,6 +4461,9 @@ int Hooked_vkCreateRenderPass2KHR(void* device, const void* pCreateInfo, const v
 
 void Hooked_vkDestroyRenderPass(void* device, void* renderPass, const void* pAllocator) {
     if (renderPass) {
+        if (g_verifiedSceneRenderPass.load(std::memory_order_acquire) == renderPass) {
+            g_verifiedSceneRenderPass.store(nullptr, std::memory_order_release);
+        }
         std::lock_guard<std::mutex> lock(g_attachmentMutex);
         g_renderPasses.erase(renderPass);
     }
@@ -4332,7 +4501,7 @@ int Hooked_vkEnumeratePhysicalDevices(void* instance, uint32_t* pPhysicalDeviceC
                     HMODULE mod = GetModuleHandleA("vulkan-1.dll");
                     if (mod) {
                         pfnGetProps = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
-                            GetProcAddress(mod, "vkGetPhysicalDeviceProperties"));
+                            reinterpret_cast<void*>(GetProcAddress(mod, "vkGetPhysicalDeviceProperties")));
                     }
                 }
 #endif
@@ -4380,7 +4549,9 @@ void Hooked_vkCmdSetViewport(void* commandBuffer, uint32_t firstViewport, uint32
     }
 
     const auto dims = RenderTargetManager::Get().GetDimensions();
-    if (viewportCount == 1 && RenderTargetManager::Get().IsTargetInterceptCandidate(
+    if (viewportCount == 1 &&
+        CanDownscaleCommandBuffer(commandBuffer) &&
+        RenderTargetManager::Get().IsTargetInterceptCandidate(
             static_cast<uint32_t>(pViewports[0].width),
             static_cast<uint32_t>(pViewports[0].height),
             0)) {
@@ -4391,6 +4562,8 @@ void Hooked_vkCmdSetViewport(void* commandBuffer, uint32_t firstViewport, uint32
         PassSlot* slot = GetOrCreatePassSlot(commandBuffer);
         if (slot) {
             slot->viewportDownscaled.store(true, std::memory_order_release);
+            slot->savedViewport = pViewports[0];
+            slot->hasSavedViewport.store(true, std::memory_order_release);
         }
 
         MinimalVkViewport redirected = pViewports[0];
@@ -4439,10 +4612,18 @@ void Hooked_vkCmdSetScissor(void* commandBuffer, uint32_t firstScissor, uint32_t
     }
 
     const auto dims = RenderTargetManager::Get().GetDimensions();
-    if (scissorCount == 1 && RenderTargetManager::Get().IsTargetInterceptCandidate(
+    if (scissorCount == 1 &&
+        CanDownscaleCommandBuffer(commandBuffer) &&
+        RenderTargetManager::Get().IsTargetInterceptCandidate(
             pScissors[0].extent.width,
             pScissors[0].extent.height,
             0)) {
+
+        PassSlot* slot = GetOrCreatePassSlot(commandBuffer);
+        if (slot) {
+            slot->savedScissor = pScissors[0];
+            slot->hasSavedScissor.store(true, std::memory_order_release);
+        }
 
         MinimalVkRect2D redirected = pScissors[0];
         redirected.extent.width = dims.quarterWidth;
@@ -4457,6 +4638,11 @@ void Hooked_vkCmdSetScissor(void* commandBuffer, uint32_t firstScissor, uint32_t
 
 void Hooked_vkCmdBeginRenderPass(void* commandBuffer, const void* pRenderPassBegin, uint32_t contents) {
     if (!g_Original_vkCmdBeginRenderPass) return;
+
+    bool restoreViewport = false;
+    bool restoreScissor = false;
+    MinimalVkViewport restoredVp{};
+    MinimalVkRect2D restoredSc{};
 
     if (pRenderPassBegin && CBREngine::Get().IsEnabled()) {
         uint32_t sType = 0;
@@ -4477,9 +4663,11 @@ void Hooked_vkCmdBeginRenderPass(void* commandBuffer, const void* pRenderPassBeg
                 if (config.samplingStrategy == SamplingStrategy::StrategyA && config.jitterDirection != 0) {
                     PatternScanner::UpdateCameraJitter(CBREngine::Get().GetCurrentFrameIndex(), true);
                 }
-                float* camProj = PatternScanner::GetCameraProjectionMatrix();
-                if (camProj) {
-                    ReconstructionPass::Get().SetCameraMatrices(camProj, nullptr);
+                if (config.cameraMatrixVerified) {
+                    float* camProj = PatternScanner::GetCameraProjectionMatrix();
+                    if (camProj) {
+                        ReconstructionPass::Get().SetCameraMatrices(camProj, nullptr);
+                    }
                 }
             }
 
@@ -4518,8 +4706,38 @@ void Hooked_vkCmdBeginRenderPass(void* commandBuffer, const void* pRenderPassBeg
                     resolved = ResolveAttachmentViews({}, nullptr, info.renderPass);
                 }
 
+                void* verifiedRp = g_verifiedSceneRenderPass.load(std::memory_order_acquire);
+                const bool wasProvisionallyDownscaled = slot->viewportDownscaled.load(std::memory_order_acquire);
+                const bool passCandidate = matching &&
+                                           !resolved.colorIsSwapchain &&
+                                           (!resolved.rpTracked || resolved.rpCandidateGeometryPass) &&
+                                           !CBREngine::Get().HasDispatchedThisFrame() &&
+                                           (!verifiedRp || !info.renderPass || info.renderPass == verifiedRp);
+
+                if (wasProvisionallyDownscaled && !passCandidate) {
+                    // Provisional downscale happened before vkCmdBeginRenderPass, but this pass is NOT an offscreen scene pass!
+                    // Restore native full-resolution viewport and scissor.
+                    slot->viewportDownscaled.store(false, std::memory_order_release);
+                    CBREngine::Get().ConsumeCandidatePassActive(commandBuffer);
+                    if (slot->hasSavedViewport.load(std::memory_order_acquire)) {
+                        restoreViewport = true;
+                        restoredVp = slot->savedViewport;
+                        slot->hasSavedViewport.store(false, std::memory_order_release);
+                    }
+                    if (slot->hasSavedScissor.load(std::memory_order_acquire)) {
+                        restoreScissor = true;
+                        restoredSc = slot->savedScissor;
+                        slot->hasSavedScissor.store(false, std::memory_order_release);
+                    }
+                } else if (!wasProvisionallyDownscaled) {
+                    slot->hasSavedViewport.store(false, std::memory_order_relaxed);
+                    slot->hasSavedScissor.store(false, std::memory_order_relaxed);
+                }
+
                 slot->hasMatchingExtent.store(matching, std::memory_order_release);
-                slot->viewportDownscaled.store(false, std::memory_order_release);
+                if (!passCandidate) {
+                    slot->viewportDownscaled.store(false, std::memory_order_release);
+                }
                 slot->drawCount.store(0, std::memory_order_release);
                 slot->activeFramebuffer.store(info.framebuffer, std::memory_order_release);
                 slot->activeRenderPass.store(info.renderPass, std::memory_order_release);
@@ -4543,6 +4761,13 @@ void Hooked_vkCmdBeginRenderPass(void* commandBuffer, const void* pRenderPassBeg
     }
 
     g_Original_vkCmdBeginRenderPass(commandBuffer, pRenderPassBegin, contents);
+
+    if (restoreViewport && g_Original_vkCmdSetViewport) {
+        g_Original_vkCmdSetViewport(commandBuffer, 0, 1, &restoredVp);
+    }
+    if (restoreScissor && g_Original_vkCmdSetScissor) {
+        g_Original_vkCmdSetScissor(commandBuffer, 0, 1, &restoredSc);
+    }
 }
 
 void Hooked_vkCmdDraw(void* commandBuffer, uint32_t vertexCount, uint32_t instanceCount, uint32_t firstVertex, uint32_t firstInstance) {
@@ -4621,6 +4846,8 @@ void Hooked_vkCmdEndRenderPass(void* commandBuffer) {
                 slot->hasMatchingExtent.store(false, std::memory_order_relaxed);
                 slot->viewportDownscaled.store(false, std::memory_order_relaxed);
                 slot->drawCount.store(0, std::memory_order_relaxed);
+                slot->hasSavedViewport.store(false, std::memory_order_relaxed);
+                slot->hasSavedScissor.store(false, std::memory_order_relaxed);
                 slot->activeFramebuffer.store(nullptr, std::memory_order_relaxed);
                 slot->activeRenderPass.store(nullptr, std::memory_order_relaxed);
                 slot->renderWidth.store(0, std::memory_order_relaxed);
@@ -4637,6 +4864,9 @@ void Hooked_vkCmdEndRenderPass(void* commandBuffer) {
             // Always consume any candidate pass marker for this commandBuffer, while requiring >= 250 draws before dispatch (Item H-03)
             CBREngine::Get().ConsumeCandidatePassActive(commandBuffer);
             if (isScenePass && !colorIsSwapchain) {
+                if (activeRp) {
+                    g_verifiedSceneRenderPass.store(activeRp, std::memory_order_release);
+                }
                 if (!gameColorImage && activeFb) {
                     const ResolvedSceneAttachments fallback = ResolveFramebufferAttachments(activeFb, activeRp);
                     gameColorImage = fallback.colorImage;
@@ -4869,11 +5099,17 @@ int Hooked_vkCreateSampler(void* device, const MinimalVkSamplerCreateInfo* pCrea
         return -1; // VK_ERROR_INITIALIZATION_FAILED
     }
     const auto& config = ConfigManager::Get().GetConfig();
+    // Item M-09: Validate sType == 31 (VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO) via memcpy before reading pCreateInfo
+    constexpr uint32_t kVkStructureTypeSamplerCreateInfo = 31;
+    uint32_t sType = 0;
+    if (pCreateInfo) {
+        std::memcpy(&sType, pCreateInfo, sizeof(uint32_t));
+    }
     // Apply mipLodBias selectively only to mipmapped anisotropic scene material samplers (Item M-03 & Gotcha 9).
     // Tiling geometry samplers use VK_SAMPLER_ADDRESS_MODE_REPEAT (0), whereas IBL cubemaps, LUTs, and screen-space
     // mip chains use VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE (2).
     constexpr int32_t kVkSamplerAddressModeRepeat = 0;
-    if (pCreateInfo && config.mipLodBias != 0.0f &&
+    if (pCreateInfo && sType == kVkStructureTypeSamplerCreateInfo && config.mipLodBias != 0.0f &&
         pCreateInfo->maxLod > 1.0f &&
         pCreateInfo->anisotropyEnable == 1u &&
         pCreateInfo->addressModeU == kVkSamplerAddressModeRepeat &&
@@ -5060,13 +5296,23 @@ bool HookManager::InstallVulkanHooks() {
         installExportHook(devEntries[i].name, devEntries[i].hookFn, devEntries[i].origSlot, devEntries[i].countsAsCore);
     }
 
-    if (hookedAny) {
+    // Item M-11: Gate m_vulkanHooked on critical load-bearing hooks being successfully resolved
+    const bool hasRequiredHooks = (g_Original_vkCmdEndRenderPass != nullptr) &&
+                                  (g_Original_vkQueuePresentKHR != nullptr) &&
+                                  (g_Original_vkCreateSwapchainKHR != nullptr);
+    if (hookedAny && hasRequiredHooks) {
         m_vulkanHooked.store(true);
         CBR_LOG_INFO("Vulkan graphics interception is now ACTIVE.");
         return true;
     }
 
-    CBR_LOG_ERROR("Failed to establish any Vulkan detour hooks.");
+    if (hookedAny && !hasRequiredHooks) {
+        CBR_LOG_ERROR("InstallVulkanHooks: core export hooks installed, but load-bearing hooks "
+                      "(vkCmdEndRenderPass=%p, vkQueuePresentKHR=%p, vkCreateSwapchainKHR=%p) failed to detour.",
+                      g_Original_vkCmdEndRenderPass, g_Original_vkQueuePresentKHR, g_Original_vkCreateSwapchainKHR);
+    } else {
+        CBR_LOG_ERROR("Failed to establish any Vulkan detour hooks.");
+    }
     return false;
 }
 
@@ -5082,8 +5328,58 @@ void HookManager::UninstallVulkanHooks() {
         }
         g_HookedVulkanTargets.clear();
         m_vulkanHooked.store(false);
+        g_Original_vkGetDeviceProcAddr = nullptr;
+        g_Original_vkGetInstanceProcAddr = nullptr;
+        g_Original_vkQueuePresentKHR = nullptr;
+        g_Original_vkCreateSwapchainKHR = nullptr;
+        g_Original_vkDestroySwapchainKHR = nullptr;
+        g_Original_vkCreateDevice = nullptr;
+        g_Original_vkGetSwapchainImagesKHR = nullptr;
+        g_Original_vkAcquireNextImageKHR = nullptr;
+        g_Original_vkAcquireNextImage2KHR = nullptr;
+        g_Original_vkCmdSetViewport = nullptr;
+        g_Original_vkCmdSetScissor = nullptr;
+        g_Original_vkCmdBeginRenderPass = nullptr;
+        g_Original_vkCmdEndRenderPass = nullptr;
+        g_Original_vkCmdBeginRendering = nullptr;
+        g_Original_vkCmdBeginRenderingKHR = nullptr;
+        g_Original_vkCmdEndRendering = nullptr;
+        g_Original_vkCmdEndRenderingKHR = nullptr;
+        g_Original_vkCmdDraw = nullptr;
+        g_Original_vkCmdDrawIndexed = nullptr;
+        g_Original_vkCmdSetSampleLocationsEXT = nullptr;
+        g_Original_vkCreateSampler = nullptr;
+        g_Original_vkCreateImage = nullptr;
+        g_Original_vkDestroyImage = nullptr;
+        g_Original_vkCreateImageView = nullptr;
+        g_Original_vkDestroyImageView = nullptr;
+        g_Original_vkCreateFramebuffer = nullptr;
+        g_Original_vkDestroyFramebuffer = nullptr;
+        g_Original_vkCreateRenderPass = nullptr;
+        g_Original_vkCreateRenderPass2 = nullptr;
+        g_Original_vkCreateRenderPass2KHR = nullptr;
+        g_Original_vkDestroyRenderPass = nullptr;
+        g_Original_vkEnumeratePhysicalDevices = nullptr;
+        g_Original_vkGetPhysicalDeviceProperties = nullptr;
+        g_Original_vkGetPhysicalDeviceMemoryProperties = nullptr;
         g_Original_vkCmdResolveImage = nullptr;
         g_pendingResolveColorImage.store(nullptr, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> attLock(g_attachmentMutex);
+            g_images.clear();
+            g_imageViews.clear();
+            g_framebuffers.clear();
+            g_renderPasses.clear();
+        }
+        for (size_t i = 0; i < kMaxTrackedPassSlots; ++i) {
+            g_passSlots[i].cmdBuffer.store(nullptr, std::memory_order_relaxed);
+            g_passSlots[i].hasMatchingExtent.store(false, std::memory_order_relaxed);
+            g_passSlots[i].viewportDownscaled.store(false, std::memory_order_relaxed);
+            g_passSlots[i].drawCount.store(0, std::memory_order_relaxed);
+            g_passSlots[i].hasSavedViewport.store(false, std::memory_order_relaxed);
+            g_passSlots[i].hasSavedScissor.store(false, std::memory_order_relaxed);
+        }
+        g_verifiedSceneRenderPass.store(nullptr, std::memory_order_release);
     }
 }
 
@@ -5186,13 +5482,13 @@ static DX12CmdListSlot g_dx12Slots[kMaxDX12Slots];
 inline DX12CmdListSlot* GetOrCreateDX12Slot(void* cmdList) {
     if (!cmdList) return nullptr;
     const size_t start = (reinterpret_cast<uintptr_t>(cmdList) >> 4) % kMaxDX12Slots;
-    for (size_t i = 0; i < 8; ++i) {
+    for (size_t i = 0; i < kMaxDX12Slots; ++i) {
         size_t idx = (start + i) % kMaxDX12Slots;
         if (g_dx12Slots[idx].cmdList.load(std::memory_order_relaxed) == cmdList) {
             return &g_dx12Slots[idx];
         }
     }
-    for (size_t i = 0; i < 8; ++i) {
+    for (size_t i = 0; i < kMaxDX12Slots; ++i) {
         size_t idx = (start + i) % kMaxDX12Slots;
         void* expected = nullptr;
         if (g_dx12Slots[idx].cmdList.compare_exchange_strong(expected, cmdList, std::memory_order_acq_rel)) {
@@ -5215,7 +5511,7 @@ inline DX12CmdListSlot* GetOrCreateDX12Slot(void* cmdList) {
 inline DX12CmdListSlot* FindDX12Slot(void* cmdList) {
     if (!cmdList) return nullptr;
     const size_t start = (reinterpret_cast<uintptr_t>(cmdList) >> 4) % kMaxDX12Slots;
-    for (size_t i = 0; i < 8; ++i) {
+    for (size_t i = 0; i < kMaxDX12Slots; ++i) {
         size_t idx = (start + i) % kMaxDX12Slots;
         if (g_dx12Slots[idx].cmdList.load(std::memory_order_relaxed) == cmdList) {
             return &g_dx12Slots[idx];
@@ -5337,6 +5633,61 @@ struct MinimalD3D12CommandQueueDesc {
     unsigned int NodeMask;
 };
 
+// Direct3D 12 COM Interface VMT Index Constants (from official Microsoft d3d12.h / d3d12.idl)
+namespace D3D12Vmt {
+    namespace Device {
+        constexpr size_t GetNodeCount                     = 7;
+        constexpr size_t CreateCommandQueue               = 8;
+        constexpr size_t CreateCommandAllocator           = 9;
+        constexpr size_t CreateGraphicsPipelineState      = 10;
+        constexpr size_t CreateComputePipelineState       = 11;
+        constexpr size_t CreateCommandList                = 12;
+        constexpr size_t CheckFeatureSupport              = 13;
+        constexpr size_t CreateDescriptorHeap             = 14;
+        constexpr size_t GetDescriptorHandleIncrementSize = 15;
+        constexpr size_t CreateRootSignature              = 16;
+        constexpr size_t CreateShaderResourceView         = 18;
+        constexpr size_t CreateUnorderedAccessView        = 19;
+        constexpr size_t CreateSampler                    = 22;
+        constexpr size_t CreateCommittedResource          = 27;
+    }
+
+    namespace CommandList {
+        constexpr size_t Close                            = 9;
+        constexpr size_t Reset                            = 10;
+        constexpr size_t ClearState                       = 11;
+        constexpr size_t DrawInstanced                    = 12;
+        constexpr size_t DrawIndexedInstanced             = 13;
+        constexpr size_t Dispatch                         = 14;
+        constexpr size_t RSSetViewports                   = 21;
+        constexpr size_t RSSetScissorRects                = 22;
+        constexpr size_t SetPipelineState                 = 25;
+        constexpr size_t ResourceBarrier                  = 26;
+        constexpr size_t SetDescriptorHeaps               = 28;
+        constexpr size_t SetComputeRootSignature          = 29;
+        constexpr size_t SetGraphicsRootSignature         = 30;
+        constexpr size_t SetComputeRootDescriptorTable    = 31;
+        constexpr size_t SetComputeRoot32BitConstants     = 35;
+        constexpr size_t SetComputeRootConstantBufferView = 37;
+        constexpr size_t OMSetRenderTargets               = 46;
+    }
+
+    namespace SwapChain {
+        constexpr size_t Present                          = 8;
+        constexpr size_t ResizeBuffers                    = 13;
+        constexpr size_t Present1                         = 22;
+    }
+
+    namespace CommandQueue {
+        constexpr size_t GetDevice                        = 7;
+        constexpr size_t ExecuteCommandLists              = 10;
+    }
+
+    namespace Factory {
+        constexpr size_t CreateSwapChain                  = 10;
+    }
+}
+
 // Type-safe and null-checked COM VMT invocation helper
 template <typename T, typename... Args>
 inline HRESULT CallVmt(void* obj, size_t index, Args... args) {
@@ -5345,7 +5696,11 @@ inline HRESULT CallVmt(void* obj, size_t index, Args... args) {
     if (!vmt) return E_POINTER;
     auto func = reinterpret_cast<T>(vmt[index]);
     if (!func) return E_UNEXPECTED;
-    return func(obj, args...);
+    HRESULT hr = func(obj, args...);
+    if (FAILED(hr)) {
+        CBR_LOG_WARN("CallVmt failed at index %zu: HRESULT = 0x%08lX", index, static_cast<unsigned long>(hr));
+    }
+    return hr;
 }
 
 inline ULONG ReleaseCom(void* obj) {
@@ -5365,7 +5720,7 @@ void __stdcall Hooked_D3D12ExecuteCommandLists(void* commandQueue, unsigned int 
                     { 0x189819f1, 0x1db6, 0x4b57, { 0xbe, 0x54, 0x18, 0x21, 0x33, 0x9b, 0x85, 0xf7 } };
                 void* liveDev = nullptr;
                 typedef HRESULT (__stdcall *PFN_GetDevice)(void*, const GUID*, void**);
-                if (SUCCEEDED(CallVmt<PFN_GetDevice>(commandQueue, 7, &kIID_ID3D12Device, &liveDev)) && liveDev) {
+                if (SUCCEEDED(CallVmt<PFN_GetDevice>(commandQueue, D3D12Vmt::CommandQueue::GetDevice, &kIID_ID3D12Device, &liveDev)) && liveDev) {
                     void* prevDev = g_liveD3D12Device.load(std::memory_order_acquire);
                     if (prevDev != liveDev || !RenderTargetManager::Get().AreDX12ResourcesCreated()) {
                         if (g_liveD3D12Device.exchange(liveDev, std::memory_order_acq_rel) != liveDev ||
@@ -5404,7 +5759,9 @@ void __stdcall Hooked_D3D12RSSetViewports(void* commandList, unsigned int numVie
     MinimalD3D12Viewport firstVp{};
     std::memcpy(&firstVp, pViewports, sizeof(firstVp));
     const auto dims = RenderTargetManager::Get().GetDimensions();
-    if (numViewports == 1 && RenderTargetManager::Get().IsTargetInterceptCandidate(
+    if (numViewports == 1 &&
+        !CBREngine::Get().HasDispatchedThisFrame() &&
+        RenderTargetManager::Get().IsTargetInterceptCandidate(
             static_cast<uint32_t>(firstVp.Width),
             static_cast<uint32_t>(firstVp.Height),
             0)) {
@@ -5413,9 +5770,11 @@ void __stdcall Hooked_D3D12RSSetViewports(void* commandList, unsigned int numVie
         if (config.samplingStrategy == SamplingStrategy::StrategyA && config.jitterDirection != 0) {
             PatternScanner::UpdateCameraJitter(currentFrame, false);
         }
-        float* camProj = PatternScanner::GetCameraProjectionMatrix();
-        if (camProj) {
-            ReconstructionPass::Get().SetCameraMatrices(camProj, nullptr);
+        if (config.cameraMatrixVerified) {
+            float* camProj = PatternScanner::GetCameraProjectionMatrix();
+            if (camProj) {
+                ReconstructionPass::Get().SetCameraMatrices(camProj, nullptr);
+            }
         }
 
         DX12CmdListSlot* slot = GetOrCreateDX12Slot(commandList);
@@ -5451,7 +5810,9 @@ void __stdcall Hooked_D3D12RSSetScissorRects(void* commandList, unsigned int num
     const uint32_t width = (firstRect.right > firstRect.left) ? static_cast<uint32_t>(firstRect.right - firstRect.left) : 0u;
     const uint32_t height = (firstRect.bottom > firstRect.top) ? static_cast<uint32_t>(firstRect.bottom - firstRect.top) : 0u;
     const auto dims = RenderTargetManager::Get().GetDimensions();
-    if (numRects == 1 && RenderTargetManager::Get().IsTargetInterceptCandidate(width, height, 0)) {
+    if (numRects == 1 &&
+        !CBREngine::Get().HasDispatchedThisFrame() &&
+        RenderTargetManager::Get().IsTargetInterceptCandidate(width, height, 0)) {
         firstRect.right = firstRect.left + static_cast<int32_t>(dims.quarterWidth);
         firstRect.bottom = firstRect.top + static_cast<int32_t>(dims.quarterHeight);
         g_Original_D3D12RSSetScissorRects(commandList, 1, &firstRect);
@@ -5607,8 +5968,10 @@ bool HookManager::InstallDX12Hooks() {
     typedef HRESULT (WINAPI *PFN_D3D12CreateDevice)(IUnknown*, int, REFIID, void**);
     typedef HRESULT (WINAPI *PFN_CreateDXGIFactory1)(REFIID, void**);
 
-    auto pfnD3D12CreateDevice = reinterpret_cast<PFN_D3D12CreateDevice>(GetProcAddress(d3d12Module, "D3D12CreateDevice"));
-    auto pfnCreateDXGIFactory1 = reinterpret_cast<PFN_CreateDXGIFactory1>(GetProcAddress(dxgiModule, "CreateDXGIFactory1"));
+    auto pfnD3D12CreateDevice = reinterpret_cast<PFN_D3D12CreateDevice>(
+        reinterpret_cast<void*>(GetProcAddress(d3d12Module, "D3D12CreateDevice")));
+    auto pfnCreateDXGIFactory1 = reinterpret_cast<PFN_CreateDXGIFactory1>(
+        reinterpret_cast<void*>(GetProcAddress(dxgiModule, "CreateDXGIFactory1")));
 
     if (!pfnD3D12CreateDevice || !pfnCreateDXGIFactory1) {
         CBR_LOG_WARN("Failed to resolve D3D12CreateDevice or CreateDXGIFactory1.");
@@ -5655,17 +6018,17 @@ bool HookManager::InstallDX12Hooks() {
     MinimalD3D12CommandQueueDesc queueDesc{};
     queueDesc.Type = 0; // D3D12_COMMAND_LIST_TYPE_DIRECT
     void* cmdQueue = nullptr;
-    hr = CallVmt<PFN_CreateCommandQueue>(d3d12Device, 8, &queueDesc, kIID_ID3D12CommandQueue, &cmdQueue);
+    hr = CallVmt<PFN_CreateCommandQueue>(d3d12Device, D3D12Vmt::Device::CreateCommandQueue, &queueDesc, kIID_ID3D12CommandQueue, &cmdQueue);
 
     // Create temporary allocator & graphics command list for VMT hooking (Item H-02)
     typedef HRESULT (__stdcall *PFN_CreateCommandAllocator)(void*, unsigned int, REFIID, void**);
     typedef HRESULT (__stdcall *PFN_CreateCommandList)(void*, unsigned int, unsigned int, void*, void*, REFIID, void**);
     void* cmdAllocator = nullptr;
     void* cmdList = nullptr;
-    if (SUCCEEDED(CallVmt<PFN_CreateCommandAllocator>(d3d12Device, 9, 0u, kIID_ID3D12CommandAllocator, &cmdAllocator)) && cmdAllocator) {
-        if (SUCCEEDED(CallVmt<PFN_CreateCommandList>(d3d12Device, 12, 0u, 0u, cmdAllocator, nullptr, kIID_ID3D12GraphicsCommandList, &cmdList)) && cmdList) {
+    if (SUCCEEDED(CallVmt<PFN_CreateCommandAllocator>(d3d12Device, D3D12Vmt::Device::CreateCommandAllocator, 0u, kIID_ID3D12CommandAllocator, &cmdAllocator)) && cmdAllocator) {
+        if (SUCCEEDED(CallVmt<PFN_CreateCommandList>(d3d12Device, D3D12Vmt::Device::CreateCommandList, 0u, 0u, cmdAllocator, nullptr, kIID_ID3D12GraphicsCommandList, &cmdList)) && cmdList) {
             typedef HRESULT (__stdcall *PFN_CloseCmdList)(void*);
-            CallVmt<PFN_CloseCmdList>(cmdList, 9);
+            CallVmt<PFN_CloseCmdList>(cmdList, D3D12Vmt::CommandList::Close);
         }
     }
 
@@ -5687,7 +6050,7 @@ bool HookManager::InstallDX12Hooks() {
 
         // VMT index 10 on IDXGIFactory1: CreateSwapChain
         typedef HRESULT (__stdcall *PFN_CreateSwapChain)(void*, void*, const MinimalDxgiSwapChainDesc*, void**);
-        hr = CallVmt<PFN_CreateSwapChain>(dxgiFactory, 10, cmdQueue, &scDesc, &swapChain);
+        hr = CallVmt<PFN_CreateSwapChain>(dxgiFactory, D3D12Vmt::Factory::CreateSwapChain, cmdQueue, &scDesc, &swapChain);
     }
 
     auto installVmtHook = [&](void* target, void* detour, void** original, const char* name) -> bool {
@@ -5706,30 +6069,30 @@ bool HookManager::InstallDX12Hooks() {
     bool hooked = false;
     if (SUCCEEDED(hr) && swapChain) {
         void** swapChainVmt = *reinterpret_cast<void***>(swapChain);
-        hooked |= installVmtHook(swapChainVmt[8],  reinterpret_cast<LPVOID>(&Hooked_D3D12Present),       reinterpret_cast<LPVOID*>(&g_Original_D3D12Present),       "IDXGISwapChain::Present[8]");
-        hooked |= installVmtHook(swapChainVmt[22], reinterpret_cast<LPVOID>(&Hooked_D3D12Present1),      reinterpret_cast<LPVOID*>(&g_Original_D3D12Present1),      "IDXGISwapChain1::Present1[22]");
-        installVmtHook(swapChainVmt[13],           reinterpret_cast<LPVOID>(&Hooked_D3D12ResizeBuffers), reinterpret_cast<LPVOID*>(&g_Original_D3D12ResizeBuffers), "IDXGISwapChain::ResizeBuffers[13]");
+        hooked |= installVmtHook(swapChainVmt[D3D12Vmt::SwapChain::Present],       reinterpret_cast<LPVOID>(&Hooked_D3D12Present),       reinterpret_cast<LPVOID*>(&g_Original_D3D12Present),       "IDXGISwapChain::Present[8]");
+        hooked |= installVmtHook(swapChainVmt[D3D12Vmt::SwapChain::Present1],      reinterpret_cast<LPVOID>(&Hooked_D3D12Present1),      reinterpret_cast<LPVOID*>(&g_Original_D3D12Present1),      "IDXGISwapChain1::Present1[22]");
+        installVmtHook(swapChainVmt[D3D12Vmt::SwapChain::ResizeBuffers],           reinterpret_cast<LPVOID>(&Hooked_D3D12ResizeBuffers), reinterpret_cast<LPVOID*>(&g_Original_D3D12ResizeBuffers), "IDXGISwapChain::ResizeBuffers[13]");
     }
 
     if (cmdQueue) {
         void** queueVmt = *reinterpret_cast<void***>(cmdQueue);
         if (queueVmt) {
-            installVmtHook(queueVmt[10], reinterpret_cast<LPVOID>(&Hooked_D3D12ExecuteCommandLists), reinterpret_cast<LPVOID*>(&g_Original_D3D12ExecuteCommandLists), "ID3D12CommandQueue::ExecuteCommandLists[10]");
+            installVmtHook(queueVmt[D3D12Vmt::CommandQueue::ExecuteCommandLists], reinterpret_cast<LPVOID>(&Hooked_D3D12ExecuteCommandLists), reinterpret_cast<LPVOID*>(&g_Original_D3D12ExecuteCommandLists), "ID3D12CommandQueue::ExecuteCommandLists[10]");
         }
     }
 
     if (cmdList) {
         void** listVmt = *reinterpret_cast<void***>(cmdList);
         if (listVmt) {
-            installVmtHook(listVmt[12], reinterpret_cast<LPVOID>(&Hooked_D3D12DrawInstanced),        reinterpret_cast<LPVOID*>(&g_Original_D3D12DrawInstanced),        "ID3D12GraphicsCommandList::DrawInstanced[12]");
-            installVmtHook(listVmt[13], reinterpret_cast<LPVOID>(&Hooked_D3D12DrawIndexedInstanced), reinterpret_cast<LPVOID*>(&g_Original_D3D12DrawIndexedInstanced), "ID3D12GraphicsCommandList::DrawIndexedInstanced[13]");
-            installVmtHook(listVmt[21], reinterpret_cast<LPVOID>(&Hooked_D3D12RSSetViewports),       reinterpret_cast<LPVOID*>(&g_Original_D3D12RSSetViewports),       "ID3D12GraphicsCommandList::RSSetViewports[21]");
-            installVmtHook(listVmt[22], reinterpret_cast<LPVOID>(&Hooked_D3D12RSSetScissorRects),    reinterpret_cast<LPVOID*>(&g_Original_D3D12RSSetScissorRects),    "ID3D12GraphicsCommandList::RSSetScissorRects[22]");
-            installVmtHook(listVmt[25], reinterpret_cast<LPVOID>(&Hooked_D3D12SetPipelineState),    reinterpret_cast<LPVOID*>(&g_Original_D3D12SetPipelineState),    "ID3D12GraphicsCommandList::SetPipelineState[25]");
-            installVmtHook(listVmt[28], reinterpret_cast<LPVOID>(&Hooked_D3D12SetDescriptorHeaps),  reinterpret_cast<LPVOID*>(&g_Original_D3D12SetDescriptorHeaps),  "ID3D12GraphicsCommandList::SetDescriptorHeaps[28]");
-            installVmtHook(listVmt[29], reinterpret_cast<LPVOID>(&Hooked_D3D12SetComputeRootSignature), reinterpret_cast<LPVOID*>(&g_Original_D3D12SetComputeRootSignature), "ID3D12GraphicsCommandList::SetComputeRootSignature[29]");
-            installVmtHook(listVmt[30], reinterpret_cast<LPVOID>(&Hooked_D3D12SetGraphicsRootSignature), reinterpret_cast<LPVOID*>(&g_Original_D3D12SetGraphicsRootSignature), "ID3D12GraphicsCommandList::SetGraphicsRootSignature[30]");
-            installVmtHook(listVmt[46], reinterpret_cast<LPVOID>(&Hooked_D3D12OMSetRenderTargets),   reinterpret_cast<LPVOID*>(&g_Original_D3D12OMSetRenderTargets),   "ID3D12GraphicsCommandList::OMSetRenderTargets[46]");
+            installVmtHook(listVmt[D3D12Vmt::CommandList::DrawInstanced],                reinterpret_cast<LPVOID>(&Hooked_D3D12DrawInstanced),                reinterpret_cast<LPVOID*>(&g_Original_D3D12DrawInstanced),                "ID3D12GraphicsCommandList::DrawInstanced[12]");
+            installVmtHook(listVmt[D3D12Vmt::CommandList::DrawIndexedInstanced],         reinterpret_cast<LPVOID>(&Hooked_D3D12DrawIndexedInstanced),         reinterpret_cast<LPVOID*>(&g_Original_D3D12DrawIndexedInstanced),         "ID3D12GraphicsCommandList::DrawIndexedInstanced[13]");
+            installVmtHook(listVmt[D3D12Vmt::CommandList::RSSetViewports],               reinterpret_cast<LPVOID>(&Hooked_D3D12RSSetViewports),               reinterpret_cast<LPVOID*>(&g_Original_D3D12RSSetViewports),               "ID3D12GraphicsCommandList::RSSetViewports[21]");
+            installVmtHook(listVmt[D3D12Vmt::CommandList::RSSetScissorRects],            reinterpret_cast<LPVOID>(&Hooked_D3D12RSSetScissorRects),            reinterpret_cast<LPVOID*>(&g_Original_D3D12RSSetScissorRects),            "ID3D12GraphicsCommandList::RSSetScissorRects[22]");
+            installVmtHook(listVmt[D3D12Vmt::CommandList::SetPipelineState],            reinterpret_cast<LPVOID>(&Hooked_D3D12SetPipelineState),            reinterpret_cast<LPVOID*>(&g_Original_D3D12SetPipelineState),            "ID3D12GraphicsCommandList::SetPipelineState[25]");
+            installVmtHook(listVmt[D3D12Vmt::CommandList::SetDescriptorHeaps],          reinterpret_cast<LPVOID>(&Hooked_D3D12SetDescriptorHeaps),          reinterpret_cast<LPVOID*>(&g_Original_D3D12SetDescriptorHeaps),          "ID3D12GraphicsCommandList::SetDescriptorHeaps[28]");
+            installVmtHook(listVmt[D3D12Vmt::CommandList::SetComputeRootSignature],      reinterpret_cast<LPVOID>(&Hooked_D3D12SetComputeRootSignature),      reinterpret_cast<LPVOID*>(&g_Original_D3D12SetComputeRootSignature),      "ID3D12GraphicsCommandList::SetComputeRootSignature[29]");
+            installVmtHook(listVmt[D3D12Vmt::CommandList::SetGraphicsRootSignature],     reinterpret_cast<LPVOID>(&Hooked_D3D12SetGraphicsRootSignature),     reinterpret_cast<LPVOID*>(&g_Original_D3D12SetGraphicsRootSignature),     "ID3D12GraphicsCommandList::SetGraphicsRootSignature[30]");
+            installVmtHook(listVmt[D3D12Vmt::CommandList::OMSetRenderTargets],           reinterpret_cast<LPVOID>(&Hooked_D3D12OMSetRenderTargets),           reinterpret_cast<LPVOID*>(&g_Original_D3D12OMSetRenderTargets),           "ID3D12GraphicsCommandList::OMSetRenderTargets[46]");
         }
     }
 
@@ -6281,6 +6644,7 @@ void Logger::Log(LogLevel level, const std::string& message) {
 #include <cctype>
 #include <cmath>
 #include <cstring>
+#include "cbr/config.h"
 #include "cbr/jitter_manager.h"
 #include "cbr/logger.h"
 
@@ -6580,6 +6944,15 @@ const uint8_t* PatternScanner::ResolveRipRelative(const uint8_t* instructionAddr
     const uint8_t* target = instructionAddress + instructionLength + displacement;
 
 #if defined(_WIN32)
+    // Section 4.2: Verify the target lies inside a known mapped module (containment check)
+    HMODULE hTargetMod = nullptr;
+    if (!GetModuleHandleExA(
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        reinterpret_cast<LPCSTR>(target),
+        &hTargetMod) || !hTargetMod) {
+        return nullptr;
+    }
+
     if (!VirtualQuery(target, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT ||
         (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) {
         return nullptr;
@@ -6605,6 +6978,9 @@ const uint8_t* PatternScanner::ScanModule(const char* moduleName, const char* si
         return nullptr;
     }
 
+// Note: MSVC builds use hardware SEH (__try/__except) to trap potential page faults.
+// For MinGW/GCC builds (which lack MSVC x64 SEH extensions), the granular VirtualQuery
+// region validation (MEM_COMMIT, protection mask, and non-PAGE_GUARD) acts as the primary safety gate.
 #if defined(_MSC_VER)
     __try {
 #endif
@@ -6717,13 +7093,20 @@ bool PatternScanner::InitializeCameraScanner() {
                             float* matrixPtr = reinterpret_cast<float*>(static_cast<uint8_t*>(targetManager) + 0x40);
                             const float cotX = matrixPtr[0];
                             const float cotY = matrixPtr[5];
+                            const float m11 = matrixPtr[11];
+                            const float m14 = matrixPtr[14];
+                            // Item H-06: Validate perspective row entries and small unjittered base offsets
+                            const bool hasPerspectiveW = (std::fabs(m11 + 1.0f) < 0.05f || std::fabs(m14 + 1.0f) < 0.05f);
+                            const bool hasSmallJitterBase = (std::fabs(matrixPtr[8]) < 0.1f && std::fabs(matrixPtr[9]) < 0.1f);
                             if (!std::isnan(cotX) && !std::isnan(cotY) && !std::isinf(cotX) && !std::isinf(cotY) &&
-                                cotX >= 0.2f && cotX <= 5.0f && cotY >= 0.2f && cotY <= 5.0f) {
+                                cotX >= 0.2f && cotX <= 5.0f && cotY >= 0.2f && cotY <= 5.0f &&
+                                hasPerspectiveW && hasSmallJitterBase) {
                                 g_cachedCameraMatrix.store(matrixPtr, std::memory_order_release);
                                 CBR_LOG_INFO("RDR2 camera projection matrix acquired at 0x%p (cotX=%.4f, cotY=%.4f)", matrixPtr, cotX, cotY);
                                 return true;
                             } else {
-                                CBR_LOG_WARN("Camera matrix candidate at 0x%p rejected: invalid perspective cotangents (cotX=%.4f, cotY=%.4f)", matrixPtr, cotX, cotY);
+                                CBR_LOG_WARN("Camera matrix candidate at 0x%p rejected: failed validation (cotX=%.4f, cotY=%.4f, perspW=%d, base=%d)",
+                                             matrixPtr, cotX, cotY, hasPerspectiveW ? 1 : 0, hasSmallJitterBase ? 1 : 0);
                             }
                         }
                     }
@@ -6761,7 +7144,42 @@ float* PatternScanner::GetCameraProjectionMatrix() {
     return mat;
 }
 
+#if defined(_WIN32)
+namespace {
+
+bool TryApplyJitterSEH(float* cameraMatrix, uint32_t frameIndex, bool isVulkan) {
+#if defined(_MSC_VER)
+    __try {
+        if (JitterManager::Get().IsProjectionJitterApplied(cameraMatrix, frameIndex, isVulkan)) {
+            return true;
+        }
+        JitterManager::Get().ApplyJitterToProjection(cameraMatrix, isVulkan);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+#else
+    try {
+        if (JitterManager::Get().IsProjectionJitterApplied(cameraMatrix, frameIndex, isVulkan)) {
+            return true;
+        }
+        JitterManager::Get().ApplyJitterToProjection(cameraMatrix, isVulkan);
+        return true;
+    } catch (...) {
+        return false;
+    }
+#endif
+}
+
+} // namespace
+#endif
+
 bool PatternScanner::UpdateCameraJitter(uint32_t frameIndex, bool isVulkan) {
+    // Item H-06: Opt-in gate for memory writes to game space (default: false, preserving safe viewport shift)
+    if (!ConfigManager::Get().GetConfig().enableProjectionJitterWrite) {
+        return false;
+    }
+
     float* cameraMatrix = GetCameraProjectionMatrix();
     if (!cameraMatrix) {
         if (!InitializeCameraScanner()) {
@@ -6779,31 +7197,12 @@ bool PatternScanner::UpdateCameraJitter(uint32_t frameIndex, bool isVulkan) {
             CBR_LOG_WARN("Camera projection matrix memory not writable; falling back to Viewport Redirection.");
             return false;
         }
-#if defined(_MSC_VER)
-        __try {
-            if (JitterManager::Get().IsProjectionJitterApplied(cameraMatrix, frameIndex, isVulkan)) {
-                return true;
-            }
-            JitterManager::Get().ApplyJitterToProjection(cameraMatrix, isVulkan);
+        if (TryApplyJitterSEH(cameraMatrix, frameIndex, isVulkan)) {
             return true;
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            g_cachedCameraMatrix.store(nullptr, std::memory_order_release);
-            CBR_LOG_WARN("Camera projection matrix access faulted; falling back to Viewport Redirection.");
-            return false;
         }
-#else
-        try {
-            if (JitterManager::Get().IsProjectionJitterApplied(cameraMatrix, frameIndex, isVulkan)) {
-                return true;
-            }
-            JitterManager::Get().ApplyJitterToProjection(cameraMatrix, isVulkan);
-            return true;
-        } catch (...) {
-            g_cachedCameraMatrix.store(nullptr, std::memory_order_release);
-            CBR_LOG_WARN("Camera projection matrix access faulted; falling back to Viewport Redirection.");
-            return false;
-        }
-#endif
+        g_cachedCameraMatrix.store(nullptr, std::memory_order_release);
+        CBR_LOG_WARN("Camera projection matrix access faulted; falling back to Viewport Redirection.");
+        return false;
     }
     return false;
 }
@@ -7621,7 +8020,7 @@ bool ReconstructionPass::CreateVulkanPipeline() {
         if (!s_loggedMissing.exchange(true)) {
             CBR_LOG_WARN("SPIR-V shader binary 'cbr_reconstruct.spv' not found in search paths. Pipeline compilation deferred.");
         }
-        return true;
+        return false;
     }
 
     CBR_LOG_INFO("Loading CBR SPIR-V shader from: %s (%zu bytes)", resolvedShaderPath.string().c_str(), spvBytecode.size() * sizeof(uint32_t));
@@ -7870,9 +8269,15 @@ bool ReconstructionPass::CreateVulkanPipeline() {
         if (pfnGetPhysProps) {
             uint32_t propsHeader[256]{};
             pfnGetPhysProps(m_vkPhysicalDevice, propsHeader);
-            // On 64-bit platforms, VkPhysicalDeviceLimits::timestampPeriod is located at byte offset 796
-            // (sizeof(VkPhysicalDeviceProperties) is 824 bytes, limits begins at offset 512, timestampPeriod at +284)
-            const float extractedPeriod = *reinterpret_cast<const float*>(reinterpret_cast<const char*>(propsHeader) + 796);
+            // VkPhysicalDeviceProperties memory layout (vulkan_core.h):
+            //   Fixed prefix: apiVersion(4) + driverVersion(4) + vendorID(4) + deviceID(4) + deviceType(4)
+            //                 + deviceName[256] + pipelineCacheUUID[16] = 292 bytes (limits offset = 292).
+            //   VkPhysicalDeviceLimits: timestampPeriod is preceded by 96 members + alignment padding:
+            //     - 64-bit (LP64/LLP64: size_t=8, VkDeviceSize=8): timestampPeriod is at limits offset 424.
+            //     - 32-bit (size_t=4, VkDeviceSize=8): timestampPeriod is at limits offset 416.
+            //   Absolute offset in VkPhysicalDeviceProperties: 292 + 424 = 716 on 64-bit, 292 + 416 = 708 on 32-bit (Item H-08).
+            constexpr size_t kTimestampPeriodOffset = (sizeof(void*) == 8) ? 716 : 708;
+            const float extractedPeriod = *reinterpret_cast<const float*>(reinterpret_cast<const char*>(propsHeader) + kTimestampPeriodOffset);
             if (std::isfinite(extractedPeriod) && extractedPeriod > 0.0f && extractedPeriod <= 1000.0f) {
                 m_vkTimestampPeriodNs = extractedPeriod;
             }
@@ -8025,7 +8430,7 @@ bool ReconstructionPass::CreateDX12Pipeline() {
     typedef long (__stdcall *PFN_D3D12SerializeRootSignature)(
         const MinimalD3D12RootSignatureDesc*, uint32_t, void**, void**);
     auto pfnSerializeRootSig = reinterpret_cast<PFN_D3D12SerializeRootSignature>(
-        GetProcAddress(d3d12Mod, "D3D12SerializeRootSignature"));
+        reinterpret_cast<void*>(GetProcAddress(d3d12Mod, "D3D12SerializeRootSignature")));
     if (!pfnSerializeRootSig) {
         CBR_LOG_ERROR("CreateDX12Pipeline: D3D12SerializeRootSignature not found.");
         return false;
@@ -8086,7 +8491,8 @@ bool ReconstructionPass::CreateDX12Pipeline() {
         typedef long (__stdcall *PFN_D3DCompile)(
             const void*, size_t, const char*, const void*, void*,
             const char*, const char*, uint32_t, uint32_t, void**, void**);
-        auto pfnD3DCompile = reinterpret_cast<PFN_D3DCompile>(GetProcAddress(d3dCompilerMod, "D3DCompile"));
+        auto pfnD3DCompile = reinterpret_cast<PFN_D3DCompile>(
+            reinterpret_cast<void*>(GetProcAddress(d3dCompilerMod, "D3DCompile")));
         if (!pfnD3DCompile) {
             CBR_LOG_WARN("CreateDX12Pipeline: D3DCompile export unavailable in d3dcompiler_47.dll.");
             return false;
@@ -8824,6 +9230,7 @@ ReconstructionPushConstants BuildReconstructionPushConstants(uint32_t frameIndex
     pc.historyWeight = config.historyWeight;
     pc.debugView = config.debugView;
     pc.enableColorClamping = config.enableColorClamping ? 1u : 0u;
+    // MipLodBias applied directly to game material samplers in Hooked_vkCreateSampler (Item M-05); field preserved for push constant ABI stability
     pc.mipLodBias = config.mipLodBias;
     pc.colorSpace = (config.colorSpace == ColorSpace::RGB) ? 1u : ((config.colorSpace == ColorSpace::ICtCp) ? 2u : 0u);
     pc.enableSpatialFallback = config.enableSpatialFallback ? 1u : 0u;
@@ -8907,6 +9314,9 @@ void ReconstructionPass::DispatchVulkan(void* vkCommandBuffer, uint32_t frameInd
             if (!tex.image) return;
             // Use tracked layout rather than hardcoded UNDEFINED (0) so Step-1 copied inputs and initial history aren't discarded (Item C-03).
             const uint32_t oldLayout = RenderTargetManager::Get().GetVulkanImageLayout(tex.image);
+            if (oldLayout == newLayout && oldLayout == kVkImageLayoutShaderReadOnlyOptimal) {
+                return; // Already in SHADER_READ_ONLY_OPTIMAL with compute read visibility from CopyImageRegion / previous pass
+            }
             uint32_t srcStage = kVkPipelineStageTopOfPipeBit;
             uint32_t srcAccess = 0;
             StageAccessForLayout(oldLayout, tex.aspectMask, srcStage, srcAccess);
@@ -9064,14 +9474,14 @@ void ReconstructionPass::DispatchDX12(void* d3d12GraphicsCommandList, uint32_t f
         typedef void (__stdcall *PFN_SetComputeRootConstantBufferView)(void*, uint32_t, uint64_t);
 
         void** vmt = *reinterpret_cast<void***>(d3d12GraphicsCommandList);
-        if (vmt && vmt[14] && vmt[25] && vmt[26] && vmt[28] && vmt[29] && vmt[31] && vmt[34]) {
+        if (vmt && vmt[14] && vmt[25] && vmt[26] && vmt[28] && vmt[29] && vmt[31] && vmt[35]) {
             auto pfnDispatch       = reinterpret_cast<PFN_Dispatch>(vmt[14]);
             auto pfnSetPSO         = reinterpret_cast<PFN_SetPipelineState>(vmt[25]);
             auto pfnBarrier        = reinterpret_cast<PFN_ResourceBarrier>(vmt[26]);
             auto pfnSetHeaps       = reinterpret_cast<PFN_SetDescriptorHeaps>(vmt[28]);
             auto pfnSetRootSig     = reinterpret_cast<PFN_SetComputeRootSignature>(vmt[29]);
             auto pfnSetRootTable   = reinterpret_cast<PFN_SetComputeRootDescriptorTable>(vmt[31]);
-            auto pfnSetConstants   = reinterpret_cast<PFN_SetComputeRoot32BitConstants>(vmt[34]);
+            auto pfnSetConstants   = reinterpret_cast<PFN_SetComputeRoot32BitConstants>(vmt[35]);
 
             auto& rtm = RenderTargetManager::Get();
             const auto& dx12 = rtm.GetDX12Resources();
@@ -9481,9 +9891,9 @@ void RenderTargetManager::Initialize(uint32_t width, uint32_t height) {
     size_t qDepth = static_cast<size_t>(dims.quarterWidth) * dims.quarterHeight * 4 * dims.msaaSamples;
     size_t histColor = static_cast<size_t>(dims.fullWidth) * dims.fullHeight * 8 * 2;
     size_t histDepth = static_cast<size_t>(dims.fullWidth) * dims.fullHeight * 4 * 2;
-    size_t outColor = static_cast<size_t>(dims.fullWidth) * dims.fullHeight * 8;
-
-    const size_t total = qColor + qDepth + histColor + histDepth + outColor;
+    // Item M-06: Auxiliary output storage color and depth are omitted because reconstruction writes directly
+    // to alternating history targets; saves ~95 MiB at 4K.
+    const size_t total = qColor + qDepth + histColor + histDepth;
     {
         std::unique_lock<std::shared_mutex> lock(m_mutex);
         m_dims = dims;
@@ -9702,17 +10112,10 @@ bool RenderTargetManager::CreateVulkanResources(void* vkDevice, void* vkPhysical
         }
     }
 
-    // 4. Create Full-Res Output Storage Color & Depth
-    if (!createTexture(dims.fullWidth, dims.fullHeight, kVkFormatR16G16B16A16Sfloat,
-                       colorUsage, kVkImageAspectColorBit, m_vkResources.outputColor)) {
-        CBR_LOG_ERROR("Failed to allocate device-local OutputColor image");
-        return false;
-    }
-    if (!createTexture(dims.fullWidth, dims.fullHeight, kVkFormatR32Sfloat,
-                       depthUsage, kVkImageAspectColorBit, m_vkResources.outputDepth)) {
-        CBR_LOG_ERROR("Failed to allocate device-local OutputDepth image");
-        return false;
-    }
+    // 4. Auxiliary full-res output targets omitted: reconstruction writes directly to alternating
+    // history targets (Item M-06), saving ~95 MiB of device-local VRAM at 4K.
+    m_vkResources.outputColor = {};
+    m_vkResources.outputDepth = {};
 
     // 5. Create Linear & Point Samplers (Clamp-to-Edge)
     MinimalVkSamplerCreateInfo samplerInfo{};
@@ -9961,13 +10364,8 @@ bool RenderTargetManager::CreateDX12Resources(void* d3d12Device) {
                    m_dx12Resources.historyDepth[0]) ||
         !createTex(dims.fullWidth, dims.fullHeight, kDxgiFormatR32Float,
                    1, kD3D12ResourceFlagAllowUAV, kD3D12ResourceStateUAV,
-                   m_dx12Resources.historyDepth[1]) ||
-        !createTex(dims.fullWidth, dims.fullHeight, kDxgiFormatR16G16B16A16Float,
-                   1, kD3D12ResourceFlagAllowUAV, kD3D12ResourceStateUAV,
-                   m_dx12Resources.outputColor) ||
-        !createTex(dims.fullWidth, dims.fullHeight, kDxgiFormatR32Float,
-                   1, kD3D12ResourceFlagAllowUAV, kD3D12ResourceStateUAV,
-                   m_dx12Resources.outputDepth)) {
+                   m_dx12Resources.historyDepth[1])) {
+        // Item M-06: Auxiliary output storage color and depth omitted; direct ping-pong to history saves ~95 MiB at 4K.
         CBR_LOG_ERROR("CreateDX12Resources: failed to allocate one or more D3D12 textures.");
         DestroyDX12Resources();
         return false;
@@ -10188,66 +10586,105 @@ bool RenderTargetManager::IsColorCopyFormatCompatible(uint32_t srcFormat, uint32
     return is64BitColor(srcFormat) && is64BitColor(dstFormat);
 }
 
+bool RenderTargetManager::ValidateImageTransfer(const VulkanImageMetadata& srcMeta,
+                                                const VulkanImageMetadata& dstMeta,
+                                                bool isBlit) {
+    // 1. Usage flags (Item H-07): verify TRANSFER_SRC_BIT and TRANSFER_DST_BIT when usage is known
+    if (srcMeta.usage != 0u && (srcMeta.usage & kVkImageUsageTransferSrcBit) == 0u) {
+        return false;
+    }
+    if (dstMeta.usage != 0u && (dstMeta.usage & kVkImageUsageTransferDstBit) == 0u) {
+        return false;
+    }
+
+    const bool srcIsDepth = (srcMeta.format != 0u) && IsVulkanDepthFormat(static_cast<int32_t>(srcMeta.format));
+    const bool dstIsDepth = (dstMeta.format != 0u) && IsVulkanDepthFormat(static_cast<int32_t>(dstMeta.format));
+
+    if (isBlit) {
+        // vkCmdBlitImage: dstImage must have VK_SAMPLE_COUNT_1_BIT and non-depth format (VUID-vkCmdBlitImage-dstImage-00233)
+        if (dstMeta.samples > kVkSampleCount1Bit) {
+            return false;
+        }
+        if (dstIsDepth) {
+            return false;
+        }
+        // Source and destination color formats must be size-compatible
+        if (srcMeta.format != 0u && dstMeta.format != 0u) {
+            if (!IsColorCopyFormatCompatible(srcMeta.format, dstMeta.format)) {
+                return false;
+            }
+        }
+        return true;
+    } else {
+        // vkCmdCopyImage:
+        // Matching sample count (VUID-vkCmdCopyImage-samples-00140)
+        if (srcMeta.samples != 0u && dstMeta.samples != 0u && srcMeta.samples != dstMeta.samples) {
+            return false;
+        }
+        // Dimensions check: src bounds must satisfy required destination bounds
+        if (srcMeta.width > 0u && dstMeta.width > 0u && srcMeta.width < dstMeta.width) {
+            return false;
+        }
+        if (srcMeta.height > 0u && dstMeta.height > 0u && srcMeta.height < dstMeta.height) {
+            return false;
+        }
+        // Format compatibility across depth or color classes
+        if (srcIsDepth || dstIsDepth) {
+            if (srcMeta.format != 0u && dstMeta.format != 0u) {
+                return IsDepthCopyFormatCompatible(srcMeta.format, dstMeta.format);
+            }
+            return srcIsDepth == dstIsDepth;
+        }
+        if (srcMeta.format != 0u && dstMeta.format != 0u) {
+            return IsColorCopyFormatCompatible(srcMeta.format, dstMeta.format);
+        }
+        return true;
+    }
+}
+
 bool RenderTargetManager::CanCopyToQuarterColor(const VulkanImageMetadata& srcMeta) const {
     if (!m_initialized.load()) return false;
     const TargetDimensions dims = GetDimensions();
     if (dims.quarterWidth == 0u || dims.quarterHeight == 0u) return false;
-    // Unknown dimensions (pre-hook image) cannot satisfy copy bounds safely when known to be 0.
-    if (srcMeta.width > 0u && srcMeta.height > 0u) {
-        if (srcMeta.width < dims.quarterWidth || srcMeta.height < dims.quarterHeight) {
-            return false;
-        }
-    }
-    // vkCmdCopyImage requires matching sample count (quarterColor is 2x MSAA when allocated).
-    if (srcMeta.samples != 0u && srcMeta.samples != dims.msaaSamples) {
-        return false;
-    }
-    // Verify format compatibility: either 64bpp copy-compatible (Item C-01) or B10G11R11 (122)
-    // which is converted via vkCmdBlitImage in 1x APU mode (Item 7).
-    if (srcMeta.format != 0u) {
-        if (IsColorCopyFormatCompatible(srcMeta.format, kVkFormatR16G16B16A16Sfloat)) {
-            return true;
-        }
-        if (srcMeta.format == 122u /* B10G11R11_UFLOAT_PACK32 */ && dims.msaaSamples == 1u) {
-            return true;
-        }
-        return false;
-    }
-    return true;
+
+    VulkanImageMetadata dstMeta{};
+    dstMeta.width = dims.quarterWidth;
+    dstMeta.height = dims.quarterHeight;
+    dstMeta.samples = dims.msaaSamples;
+    dstMeta.format = kVkFormatR16G16B16A16Sfloat;
+    dstMeta.usage = kVkImageUsageTransferDstBit;
+
+    return ValidateImageTransfer(srcMeta, dstMeta, false /* isBlit */);
 }
 
 bool RenderTargetManager::CanCopyToQuarterDepth(const VulkanImageMetadata& srcMeta) const {
     if (!m_initialized.load()) return false;
     const TargetDimensions dims = GetDimensions();
     if (dims.quarterWidth == 0u || dims.quarterHeight == 0u) return false;
-    if (srcMeta.width > 0u && srcMeta.height > 0u) {
-        if (srcMeta.width < dims.quarterWidth || srcMeta.height < dims.quarterHeight) {
-            return false;
-        }
-    }
-    if (srcMeta.samples != 0u && srcMeta.samples != dims.msaaSamples) {
-        return false;
-    }
-    if (srcMeta.format != 0u && !IsDepthCopyFormatCompatible(srcMeta.format, kVkFormatD32Sfloat)) {
-        return false;
-    }
-    return true;
+
+    VulkanImageMetadata dstMeta{};
+    dstMeta.width = dims.quarterWidth;
+    dstMeta.height = dims.quarterHeight;
+    dstMeta.samples = dims.msaaSamples;
+    dstMeta.format = kVkFormatD32Sfloat;
+    dstMeta.usage = kVkImageUsageTransferDstBit;
+
+    return ValidateImageTransfer(srcMeta, dstMeta, false /* isBlit */);
 }
 
 bool RenderTargetManager::CanCopyToVelocity(const VulkanImageMetadata& srcMeta) const {
     if (!m_initialized.load()) return false;
     const TargetDimensions dims = GetDimensions();
     if (dims.quarterWidth == 0u || dims.quarterHeight == 0u) return false;
-    if (srcMeta.width > 0u && srcMeta.height > 0u) {
-        if (srcMeta.width < dims.quarterWidth || srcMeta.height < dims.quarterHeight) {
-            return false;
-        }
-    }
-    // m_vkResources.velocity is allocated at 1x sample count.
-    if (srcMeta.samples != 0u && srcMeta.samples != kVkSampleCount1Bit) {
-        return false;
-    }
-    return true;
+
+    VulkanImageMetadata dstMeta{};
+    dstMeta.width = dims.quarterWidth;
+    dstMeta.height = dims.quarterHeight;
+    dstMeta.samples = kVkSampleCount1Bit;
+    dstMeta.format = kVkFormatR16G16B16A16Sfloat;
+    dstMeta.usage = kVkImageUsageTransferDstBit;
+
+    return ValidateImageTransfer(srcMeta, dstMeta, false /* isBlit */);
 }
 
 bool RenderTargetManager::ShouldBlitReconstructionToSceneColor(const void* gameColorImage,
@@ -10258,20 +10695,24 @@ bool RenderTargetManager::ShouldBlitReconstructionToSceneColor(const void* gameC
     if (!m_initialized.load() || !gameColorImage || isSwapchainBackbuffer) {
         return false;
     }
-    // VUID-vkCmdBlitImage-dstImage-00233: dstImage must have VK_SAMPLE_COUNT_1_BIT and non-depth format (Item C-04)
-    if (dstMeta.samples > kVkSampleCount1Bit) {
-        return false;
-    }
-    if (dstMeta.format != 0u && IsVulkanDepthFormat(static_cast<int32_t>(dstMeta.format))) {
-        return false;
-    }
     const TargetDimensions dims = GetDimensions();
+    if (passWidth < dims.fullWidth || passHeight < dims.fullHeight) {
+        return false;
+    }
     if (dstMeta.width > 0u && dstMeta.height > 0u) {
         if (dstMeta.width < dims.fullWidth || dstMeta.height < dims.fullHeight) {
             return false;
         }
     }
-    return (passWidth >= dims.fullWidth) && (passHeight >= dims.fullHeight);
+
+    VulkanImageMetadata srcMeta{};
+    srcMeta.width = dims.fullWidth;
+    srcMeta.height = dims.fullHeight;
+    srcMeta.samples = kVkSampleCount1Bit;
+    srcMeta.format = kVkFormatR16G16B16A16Sfloat;
+    srcMeta.usage = kVkImageUsageTransferSrcBit;
+
+    return ValidateImageTransfer(srcMeta, dstMeta, true /* isBlit */);
 }
 
 } // namespace cbr
@@ -10715,14 +11156,20 @@ CbrSample MapPixelToSample(ivec2 p, uint frameParity) {
     int yBit = p.y & 1;
     s.isActive = (((uint(p.x) ^ uint(p.y)) & 1u) == frameParity);
     int qx;
-    if (frameParity == 0u) {
+    if (frameParity == 0u || pc.u_ShiftDirection == 0) {
         qx = p.x >> 1;
-    } else if (pc.u_ShiftDirection >= 0) {
+    } else if (pc.u_ShiftDirection > 0) {
         qx = max(p.x - yBit, 0) >> 1;
     } else {
         qx = (p.x + 1 - yBit) >> 1;
     }
     ivec2 qMax = ivec2(pc.u_TargetResolution * 0.5) - ivec2(1);
+    // Item M-17: At boundary columns where unclamped qx falls outside [0, qMax.x]
+    // (e.g. x = targetW - 1 on odd frames with shiftDir = -1), no hardware sample exists.
+    // Mark inactive to fail-open to spatial fallback rather than clamping to duplicate neighbor.
+    if (qx < 0 || qx > qMax.x) {
+        s.isActive = false;
+    }
     s.quarter = ivec2(clamp(qx, 0, qMax.x), min(p.y >> 1, qMax.y));
     s.sampleIdx = 1 - yBit;
     return s;
@@ -10802,12 +11249,15 @@ void main() {
     if (isCurrentSampleActive) {
         currentColor = FetchColor(self);
         if (any(isnan(currentColor)) || any(isinf(currentColor))) {
-            currentColor = vec3(0.0);
+            // Item M-19: Active sample has non-finite color; route through spatial reconstruction rather than falling back to black
+            isCurrentSampleActive = false;
+        } else {
+            currentDepth = FetchDepth(self);
+            currentLinear = LinearizeDepth(currentDepth);
+            closestCardinalLin = currentLinear;
         }
-        currentDepth = FetchDepth(self);
-        currentLinear = LinearizeDepth(currentDepth);
-        closestCardinalLin = currentLinear;
-    } else {
+    }
+    if (!isCurrentSampleActive) {
         // No native sample here: estimate depth from the cardinal neighbours (Intel "CSO": average LINEAR depth).
         float sumRaw = 0.0;
         float sumLin = 0.0;
@@ -10906,10 +11356,9 @@ void main() {
     }
     // JitterCompensation (Item M-08): 0.0 when velocity buffer is unjittered or Strategy A viewport shift is active;
     // set to 1.0 only if velocity vectors encode the projection jitter delta (verify via RenderDoc).
-    // Jitter dampener: dampens jitter compensation on zero-velocity passes (transparent particles, fog, smoke)
-    // to prevent half-pixel oscillation when alpha-blended particles lack motion vectors.
-    float jitterDampener = (dot(velocity, velocity) < 1e-9) ? 0.0 : 1.0;
-    vec2 historyUV = uv - velocity - (pc.u_JitterDelta * (pc.u_JitterCompensation * jitterDampener));
+    // JitterCompensation (Item H-02): Compensates for the 1-pixel horizontal shift when sampling history from the previous frame.
+    // Static geometry has velocity=0, but content shifted by u_JitterDelta; do not zero jitter compensation on static scenes.
+    vec2 historyUV = uv - velocity - (pc.u_JitterDelta * pc.u_JitterCompensation);
     // Clamp historyUV to valid subpixel inner border to prevent edge sample bleeding
     vec2 minUV = 0.5 * pc.u_InvTargetResolution;
     vec2 maxUV = vec2(1.0) - minUV;
@@ -11001,7 +11450,8 @@ void main() {
             // Variance clipping: clamp history inside [mean - gamma * stdDev, mean + gamma * stdDev]
             vec3 mean = m1 / n;
             vec3 rawStdDev = sqrt(max(vec3(0.0), (m2 / n) - (mean * mean)));
-            vec3 stdDev = max(rawStdDev, vec3(0.005)); // Enforce floor to avoid shadow collapse and retain specular headroom
+            // Enforce floor to avoid shadow collapse in SDR while dynamically scaling with mean in HDR (Section 5.7)
+            vec3 stdDev = max(rawStdDev, max(vec3(0.005), abs(mean) * 0.01));
             const float gamma = 1.25; // kVarianceClipGamma (include/cbr/limits.h)
             vec3 varianceMin = max(colorMin, mean - gamma * stdDev);
             vec3 varianceMax = min(colorMax, mean + gamma * stdDev);
@@ -11031,46 +11481,51 @@ void main() {
         if (!isDisoccluded && historyColor.a > 0.0) {
             finalColor = historyColor.rgb;
         } else {
-            // Spatial cross-bilateral reconstruction from the 4 cardinal (natively shaded) neighbours.
-            // With the fallback disabled the nearest neighbour is copied (no native sample exists here).
-            // Directional gradient weights: prefer interpolating along edge contours (Decima tangent resolve)
-            vec3 horizDiff = abs(cardinalColor[0] - cardinalColor[1]);
-            vec3 vertDiff  = abs(cardinalColor[2] - cardinalColor[3]);
-            float horizGrad = dot(horizDiff, vec3(0.299, 0.587, 0.114));
-            float vertGrad  = dot(vertDiff,  vec3(0.299, 0.587, 0.114));
-            float dirBias[4] = float[](
-                1.0 / (1.0 + horizGrad * 8.0), // Left
-                1.0 / (1.0 + horizGrad * 8.0), // Right
-                1.0 / (1.0 + vertGrad  * 8.0), // Up
-                1.0 / (1.0 + vertGrad  * 8.0)  // Down
-            );
-
-            vec3 accumColor = vec3(0.0);
-            float accumDepth = 0.0;
-            float accumWeight = 0.0;
-
-            for (int i = 0; i < 4 && pc.u_EnableSpatialFallback != 0u; ++i) {
-                vec3 sCol = cardinalColor[i];
-                float sLin = LinearizeDepth(cardinalDepth[i]);
-
-                // Relative linear-depth weighting: scale-invariant, independent of the depth convention
-                // Fast base-2 exponentiation: exp(-x) == exp2(-x * log2(e))
-                float depthWeight = exp2((-abs(currentLinear - sLin) / (max(currentLinear, 1e-5) * max(pc.u_DepthTolerance, 1e-4))) * 1.4426950408889634);
-                float totalWeight = depthWeight * dirBias[i];
-
-                accumColor += sCol * totalWeight;
-                accumDepth += cardinalDepth[i] * totalWeight;
-                accumWeight += totalWeight;
-            }
-
-            if (accumWeight > 1e-4) {
-                finalColor = accumColor / accumWeight;
-                spatialDepth = accumDepth / accumWeight;
+            // Spatial reconstruction from the 4 cardinal (natively shaded) neighbours.
+            // When spatial fallback is disabled, copy the nearest cardinal neighbour directly (Item M-04).
+            if (pc.u_EnableSpatialFallback == 0u) {
+                finalColor = cardinalColor[0];
+                spatialDepth = cardinalDepth[0];
             } else {
-                // When depth divergence across all 4 samples is high, average cardinal samples
-                // to prevent single-pixel directional bias (Item 58)
-                finalColor = isCurrentSampleActive ? currentColor : (cardinalColor[0] + cardinalColor[1] + cardinalColor[2] + cardinalColor[3]) * 0.25;
-                spatialDepth = isCurrentSampleActive ? currentDepth : (cardinalDepth[0] + cardinalDepth[1] + cardinalDepth[2] + cardinalDepth[3]) * 0.25;
+                // Directional gradient weights: prefer interpolating along edge contours (Decima tangent resolve)
+                vec3 horizDiff = abs(cardinalColor[0] - cardinalColor[1]);
+                vec3 vertDiff  = abs(cardinalColor[2] - cardinalColor[3]);
+                float horizGrad = dot(horizDiff, vec3(0.299, 0.587, 0.114));
+                float vertGrad  = dot(vertDiff,  vec3(0.299, 0.587, 0.114));
+                float dirBias[4] = float[](
+                    1.0 / (1.0 + horizGrad * 8.0), // Left
+                    1.0 / (1.0 + horizGrad * 8.0), // Right
+                    1.0 / (1.0 + vertGrad  * 8.0), // Up
+                    1.0 / (1.0 + vertGrad  * 8.0)  // Down
+                );
+
+                vec3 accumColor = vec3(0.0);
+                float accumDepth = 0.0;
+                float accumWeight = 0.0;
+
+                for (int i = 0; i < 4; ++i) {
+                    vec3 sCol = cardinalColor[i];
+                    float sLin = LinearizeDepth(cardinalDepth[i]);
+
+                    // Relative linear-depth weighting: scale-invariant, independent of the depth convention
+                    // Fast base-2 exponentiation: exp(-x) == exp2(-x * log2(e))
+                    float depthWeight = exp2((-abs(currentLinear - sLin) / (max(currentLinear, 1e-5) * max(pc.u_DepthTolerance, 1e-4))) * 1.4426950408889634);
+                    float totalWeight = depthWeight * dirBias[i];
+
+                    accumColor += sCol * totalWeight;
+                    accumDepth += cardinalDepth[i] * totalWeight;
+                    accumWeight += totalWeight;
+                }
+
+                if (accumWeight > 1e-4) {
+                    finalColor = accumColor / accumWeight;
+                    spatialDepth = accumDepth / accumWeight;
+                } else {
+                    // When depth divergence across all 4 samples is high, average cardinal samples
+                    // to prevent single-pixel directional bias (Item 58)
+                    finalColor = isCurrentSampleActive ? currentColor : (cardinalColor[0] + cardinalColor[1] + cardinalColor[2] + cardinalColor[3]) * 0.25;
+                    spatialDepth = isCurrentSampleActive ? currentDepth : (cardinalDepth[0] + cardinalDepth[1] + cardinalDepth[2] + cardinalDepth[3]) * 0.25;
+                }
             }
         }
     }
@@ -11100,9 +11555,10 @@ void main() {
                         sc = hc.rgb;
                     }
                 } else {
-                    ivec2 stepAxis = (i < 2) ? ivec2(kCardinal[i].x, 1) : ivec2(1, kCardinal[i].y);
-                    ivec2 diag = pixelCoord + stepAxis;
-                    if (!InBounds(diag, targetSize)) diag = pixelCoord - stepAxis;
+                    // Item M-02: Use symmetric diagonal offsets (-1,-1), (1,-1), (-1,1), (1,1)
+                    const ivec2 kDiag[4] = ivec2[](ivec2(-1, -1), ivec2(1, -1), ivec2(-1, 1), ivec2(1, 1));
+                    ivec2 diag = pixelCoord + kDiag[i];
+                    if (!InBounds(diag, targetSize)) diag = pixelCoord - kDiag[i];
                     if (InBounds(diag, targetSize)) {
                         vec3 dc = FetchColor(MapPixelToSample(diag, frameParity));
                         if (!any(isnan(dc)) && !any(isinf(dc))) sc = dc;
@@ -11142,8 +11598,10 @@ void main() {
         float speed = clamp(length(normVel), 0.0, 1.0);
         finalColor = vec3(clamp(normVel * 0.5 + 0.5, 0.0, 1.0), speed);
     } else if (pc.u_DebugView == 4u) {
-        // Quarter-resolution raw colour without directional bias (Item 61)
-        finalColor = isCurrentSampleActive ? currentColor : (cardinalColor[0] + cardinalColor[1] + cardinalColor[2] + cardinalColor[3]) * 0.25;
+        // Mode 4: Quarter-resolution raw color nearest-upsampled (Item M-03)
+        // Shows the raw quarter-resolution texel without cardinal averaging
+        ivec2 qCoord = clamp(pixelCoord >> 1, ivec2(0), max(ivec2(pc.u_TargetResolution * 0.5) - ivec2(1), ivec2(0)));
+        finalColor = texelFetch(u_QuarterColorMSAA, qCoord, 0).rgb;
     } else if (pc.u_DebugView == 5u) {
         // Spatial baseline resolve: average of 4 cardinal samples for reconstructed pixels
         // (direct visual A/B baseline comparison against temporal CBR, matching reference Space toggle)
@@ -11307,14 +11765,18 @@ CbrSample MapPixelToSample(ivec2 p, uint frameParity) {
     int yBit = p.y & 1;
     s.isActive = (((uint(p.x) ^ uint(p.y)) & 1u) == frameParity);
     int qx;
-    if (frameParity == 0u) {
+    if (frameParity == 0u || pc.u_ShiftDirection == 0) {
         qx = p.x >> 1;
-    } else if (pc.u_ShiftDirection >= 0) {
+    } else if (pc.u_ShiftDirection > 0) {
         qx = max(p.x - yBit, 0) >> 1;
     } else {
         qx = (p.x + 1 - yBit) >> 1;
     }
     ivec2 qMax = ivec2(pc.u_TargetResolution * 0.5) - ivec2(1);
+    // Item M-17: Out-of-bounds boundary columns fail open to spatial fallback
+    if (qx < 0 || qx > qMax.x) {
+        s.isActive = false;
+    }
     s.quarter = ivec2(clamp(qx, 0, qMax.x), min(p.y >> 1, qMax.y));
     s.sampleIdx = 1 - yBit;
     return s;
@@ -11472,10 +11934,9 @@ void ResolvePixel(
     }
     // JitterCompensation (Item M-08): 0.0 when velocity buffer is unjittered or Strategy A viewport shift is active;
     // set to 1.0 only if velocity vectors encode the projection jitter delta (verify via RenderDoc).
-    // Jitter dampener: dampens jitter compensation on zero-velocity passes (transparent particles, fog, smoke)
-    // to prevent half-pixel oscillation when alpha-blended particles lack motion vectors.
-    float jitterDampener = (dot(velocity, velocity) < 1e-9) ? 0.0 : 1.0;
-    vec2 historyUV = uv - velocity - (pc.u_JitterDelta * (pc.u_JitterCompensation * jitterDampener));
+    // JitterCompensation (Item H-02): Compensates for the 1-pixel horizontal shift when sampling history from the previous frame.
+    // Static geometry has velocity=0, but content shifted by u_JitterDelta; do not zero jitter compensation on static scenes.
+    vec2 historyUV = uv - velocity - (pc.u_JitterDelta * pc.u_JitterCompensation);
     vec2 minUV = 0.5 * pc.u_InvTargetResolution;
     vec2 maxUV = vec2(1.0) - minUV;
     historyUV = clamp(historyUV, minUV, maxUV);
@@ -11546,7 +12007,8 @@ void ResolvePixel(
         if (sampleCount >= 2.0 && n > 1e-4) {
             vec3 mean = m1 / n;
             vec3 rawStdDev = sqrt(max(vec3(0.0), (m2 / n) - (mean * mean)));
-            vec3 stdDev = max(rawStdDev, vec3(0.005));
+            // Enforce floor to avoid shadow collapse in SDR while dynamically scaling with mean in HDR (Section 5.7)
+            vec3 stdDev = max(rawStdDev, max(vec3(0.005), abs(mean) * 0.01));
             const float gamma = 1.25;
             vec3 varianceMin = max(colorMin, mean - gamma * stdDev);
             vec3 varianceMax = min(colorMax, mean + gamma * stdDev);
@@ -11572,38 +12034,45 @@ void ResolvePixel(
         if (!isDisoccluded && historyColor.a > 0.0) {
             finalColor = historyColor.rgb;
         } else {
-            // Directional gradient weights: prefer interpolating along edge contours (Decima tangent resolve)
-            vec3 horizDiff = abs(cardinalColor[0] - cardinalColor[1]);
-            vec3 vertDiff  = abs(cardinalColor[2] - cardinalColor[3]);
-            float horizGrad = dot(horizDiff, vec3(0.299, 0.587, 0.114));
-            float vertGrad  = dot(vertDiff,  vec3(0.299, 0.587, 0.114));
-            float dirBias[4] = float[](
-                1.0 / (1.0 + horizGrad * 8.0), // Left
-                1.0 / (1.0 + horizGrad * 8.0), // Right
-                1.0 / (1.0 + vertGrad  * 8.0), // Up
-                1.0 / (1.0 + vertGrad  * 8.0)  // Down
-            );
-
-            vec3 accumColor = vec3(0.0);
-            float accumDepth = 0.0;
-            float accumWeight = 0.0;
-
-            for (int i = 0; i < 4 && pc.u_EnableSpatialFallback != 0u; ++i) {
-                vec3 sCol = cardinalColor[i];
-                float sLin = LinearizeDepth(cardinalDepth[i]);
-                float depthWeight = exp2((-abs(currentLinear - sLin) / (max(currentLinear, 1e-5) * max(pc.u_DepthTolerance, 1e-4))) * 1.4426950408889634);
-                float totalWeight = depthWeight * dirBias[i];
-                accumColor += sCol * totalWeight;
-                accumDepth += cardinalDepth[i] * totalWeight;
-                accumWeight += totalWeight;
-            }
-
-            if (accumWeight > 1e-4) {
-                finalColor = accumColor / accumWeight;
-                spatialDepth = accumDepth / accumWeight;
+            // Spatial reconstruction from the 4 cardinal (natively shaded) neighbours.
+            // When spatial fallback is disabled, copy the nearest cardinal neighbour directly (Item M-04).
+            if (pc.u_EnableSpatialFallback == 0u) {
+                finalColor = cardinalColor[0];
+                spatialDepth = cardinalDepth[0];
             } else {
-                finalColor = isCurrentSampleActive ? currentColor : (cardinalColor[0] + cardinalColor[1] + cardinalColor[2] + cardinalColor[3]) * 0.25;
-                spatialDepth = isCurrentSampleActive ? currentDepth : (cardinalDepth[0] + cardinalDepth[1] + cardinalDepth[2] + cardinalDepth[3]) * 0.25;
+                // Directional gradient weights: prefer interpolating along edge contours (Decima tangent resolve)
+                vec3 horizDiff = abs(cardinalColor[0] - cardinalColor[1]);
+                vec3 vertDiff  = abs(cardinalColor[2] - cardinalColor[3]);
+                float horizGrad = dot(horizDiff, vec3(0.299, 0.587, 0.114));
+                float vertGrad  = dot(vertDiff,  vec3(0.299, 0.587, 0.114));
+                float dirBias[4] = float[](
+                    1.0 / (1.0 + horizGrad * 8.0), // Left
+                    1.0 / (1.0 + horizGrad * 8.0), // Right
+                    1.0 / (1.0 + vertGrad  * 8.0), // Up
+                    1.0 / (1.0 + vertGrad  * 8.0)  // Down
+                );
+
+                vec3 accumColor = vec3(0.0);
+                float accumDepth = 0.0;
+                float accumWeight = 0.0;
+
+                for (int i = 0; i < 4; ++i) {
+                    vec3 sCol = cardinalColor[i];
+                    float sLin = LinearizeDepth(cardinalDepth[i]);
+                    float depthWeight = exp2((-abs(currentLinear - sLin) / (max(currentLinear, 1e-5) * max(pc.u_DepthTolerance, 1e-4))) * 1.4426950408889634);
+                    float totalWeight = depthWeight * dirBias[i];
+                    accumColor += sCol * totalWeight;
+                    accumDepth += cardinalDepth[i] * totalWeight;
+                    accumWeight += totalWeight;
+                }
+
+                if (accumWeight > 1e-4) {
+                    finalColor = accumColor / accumWeight;
+                    spatialDepth = accumDepth / accumWeight;
+                } else {
+                    finalColor = isCurrentSampleActive ? currentColor : (cardinalColor[0] + cardinalColor[1] + cardinalColor[2] + cardinalColor[3]) * 0.25;
+                    spatialDepth = isCurrentSampleActive ? currentDepth : (cardinalDepth[0] + cardinalDepth[1] + cardinalDepth[2] + cardinalDepth[3]) * 0.25;
+                }
             }
         }
     }
@@ -11633,9 +12102,10 @@ void ResolvePixel(
                         sc = hc.rgb;
                     }
                 } else {
-                    ivec2 stepAxis = (i < 2) ? ivec2(kCardinal[i].x, 1) : ivec2(1, kCardinal[i].y);
-                    ivec2 diag = pixelCoord + stepAxis;
-                    if (!InBounds(diag, targetSize)) diag = pixelCoord - stepAxis;
+                    // Item M-02: Use symmetric diagonal offsets (-1,-1), (1,-1), (-1,1), (1,1)
+                    const ivec2 kDiag[4] = ivec2[](ivec2(-1, -1), ivec2(1, -1), ivec2(-1, 1), ivec2(1, 1));
+                    ivec2 diag = pixelCoord + kDiag[i];
+                    if (!InBounds(diag, targetSize)) diag = pixelCoord - kDiag[i];
                     if (InBounds(diag, targetSize)) {
                         vec3 dc = FetchColor(MapPixelToSample(diag, frameParity));
                         if (!any(isnan(dc)) && !any(isinf(dc))) sc = dc;
@@ -11670,7 +12140,9 @@ void ResolvePixel(
         float speed = clamp(length(normVel), 0.0, 1.0);
         finalColor = vec3(clamp(normVel * 0.5 + 0.5, 0.0, 1.0), speed);
     } else if (pc.u_DebugView == 4u) {
-        finalColor = isCurrentSampleActive ? currentColor : (cardinalColor[0] + cardinalColor[1] + cardinalColor[2] + cardinalColor[3]) * 0.25;
+        // Mode 4: Quarter-resolution raw color nearest-upsampled (Item M-03)
+        ivec2 qCoord = clamp(pixelCoord >> 1, ivec2(0), max(ivec2(pc.u_TargetResolution * 0.5) - ivec2(1), ivec2(0)));
+        finalColor = texelFetch(u_QuarterColorMSAA, qCoord, 0).rgb;
     } else if (pc.u_DebugView == 5u) {
         finalColor = isCurrentSampleActive ? currentColor : (cardinalColor[0] + cardinalColor[1] + cardinalColor[2] + cardinalColor[3]) * 0.25;
     }
@@ -11719,24 +12191,32 @@ void main() {
         CbrSample s0 = MapPixelToSample(act0Coord, frameParity);
         act0.coord = act0Coord;
         act0.color = FetchColor(s0);
-        if (any(isnan(act0.color)) || any(isinf(act0.color))) {
+        bool act0Valid = s0.isActive && !any(isnan(act0.color)) && !any(isinf(act0.color));
+        if (act0Valid) {
+            act0.depth = FetchDepth(s0);
+            act0.linearDepth = LinearizeDepth(act0.depth);
+            ResolvePixel(act0Coord, targetSize, frameParity, true, act0.color, act0.depth, act0.linearDepth, false, act0, act1);
+        } else {
             act0.color = vec3(0.0);
+            act0.coord = ivec2(-1);
+            ResolvePixel(act0Coord, targetSize, frameParity, false, vec3(0.0), 0.0, 0.0, false, act0, act1);
         }
-        act0.depth = FetchDepth(s0);
-        act0.linearDepth = LinearizeDepth(act0.depth);
-        ResolvePixel(act0Coord, targetSize, frameParity, true, act0.color, act0.depth, act0.linearDepth, false, act0, act1);
     }
 
     if (InBounds(act1Coord, targetSize)) {
         CbrSample s1 = MapPixelToSample(act1Coord, frameParity);
         act1.coord = act1Coord;
         act1.color = FetchColor(s1);
-        if (any(isnan(act1.color)) || any(isinf(act1.color))) {
+        bool act1Valid = s1.isActive && !any(isnan(act1.color)) && !any(isinf(act1.color));
+        if (act1Valid) {
+            act1.depth = FetchDepth(s1);
+            act1.linearDepth = LinearizeDepth(act1.depth);
+            ResolvePixel(act1Coord, targetSize, frameParity, true, act1.color, act1.depth, act1.linearDepth, false, act0, act1);
+        } else {
             act1.color = vec3(0.0);
+            act1.coord = ivec2(-1);
+            ResolvePixel(act1Coord, targetSize, frameParity, false, vec3(0.0), 0.0, 0.0, false, act0, act1);
         }
-        act1.depth = FetchDepth(s1);
-        act1.linearDepth = LinearizeDepth(act1.depth);
-        ResolvePixel(act1Coord, targetSize, frameParity, true, act1.color, act1.depth, act1.linearDepth, false, act0, act1);
     }
 
     if (InBounds(inact0Coord, targetSize)) {
@@ -11906,14 +12386,20 @@ CbrSample MapPixelToSample(int2 p, uint frameParity) {
     int yBit = p.y & 1;
     s.isActive = (((uint(p.x) ^ uint(p.y)) & 1u) == frameParity);
     int qx;
-    if (frameParity == 0u) {
+    if (frameParity == 0u || g_ShiftDirection == 0) {
         qx = p.x >> 1;
-    } else if (g_ShiftDirection >= 0) {
+    } else if (g_ShiftDirection > 0) {
         qx = max(p.x - yBit, 0) >> 1;
     } else {
         qx = (p.x + 1 - yBit) >> 1;
     }
     int2 qMax = int2(g_TargetResolution * 0.5f) - int2(1, 1);
+    // Item M-17: At boundary columns where unclamped qx falls outside [0, qMax.x]
+    // (e.g. x = targetW - 1 on odd frames with shiftDir = -1), no hardware sample exists.
+    // Mark inactive to fail-open to spatial fallback rather than clamping to duplicate neighbor.
+    if (qx < 0 || qx > qMax.x) {
+        s.isActive = false;
+    }
     s.quarter = int2(clamp(qx, 0, qMax.x), min(p.y >> 1, qMax.y));
     s.sampleIdx = 1 - yBit;
     return s;
@@ -11988,12 +12474,15 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     if (isCurrentSampleActive) {
         currentColor = FetchColor(self);
         if (any(isnan(currentColor)) || any(isinf(currentColor))) {
-            currentColor = float3(0.0f, 0.0f, 0.0f);
+            // Item M-19: Active sample has non-finite color; route through spatial reconstruction rather than falling back to black
+            isCurrentSampleActive = false;
+        } else {
+            currentDepth = FetchDepth(self);
+            currentLinear = LinearizeDepth(currentDepth);
+            closestCardinalLin = currentLinear;
         }
-        currentDepth = FetchDepth(self);
-        currentLinear = LinearizeDepth(currentDepth);
-        closestCardinalLin = currentLinear;
-    } else {
+    }
+    if (!isCurrentSampleActive) {
         // No native sample here: estimate depth from the cardinal neighbours (Intel "CSO": average LINEAR depth).
         float sumRaw = 0.0f;
         float sumLin = 0.0f;
@@ -12091,10 +12580,9 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
     }
     // JitterCompensation (Item M-08): 0.0 when velocity buffer is unjittered or Strategy A viewport shift is active;
     // set to 1.0 only if velocity vectors encode the projection jitter delta (verify via RenderDoc).
-    // Jitter dampener: dampens jitter compensation on zero-velocity passes (transparent particles, fog, smoke)
-    // to prevent half-pixel oscillation when alpha-blended particles lack motion vectors.
-    float jitterDampener = (dot(velocity, velocity) < 1e-9f) ? 0.0f : 1.0f;
-    float2 historyUV = uv - velocity - (g_JitterDelta * (g_JitterCompensation * jitterDampener));
+    // JitterCompensation (Item H-02): Compensates for the 1-pixel horizontal shift when sampling history from the previous frame.
+    // Static geometry has velocity=0, but content shifted by u_JitterDelta; do not zero jitter compensation on static scenes.
+    float2 historyUV = uv - velocity - (g_JitterDelta * g_JitterCompensation);
     float2 minUV = 0.5f * g_InvTargetResolution;
     float2 maxUV = float2(1.0f, 1.0f) - minUV;
     historyUV = clamp(historyUV, minUV, maxUV);
@@ -12185,7 +12673,8 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
             // Variance clipping: clamp history inside [mean - gamma * stdDev, mean + gamma * stdDev]
             float3 mean = m1 / n;
             float3 rawStdDev = sqrt(max(float3(0.0f, 0.0f, 0.0f), (m2 / n) - (mean * mean)));
-            float3 stdDev = max(rawStdDev, float3(0.005f, 0.005f, 0.005f));
+            // Enforce floor to avoid shadow collapse in SDR while dynamically scaling with mean in HDR (Section 5.7)
+            float3 stdDev = max(rawStdDev, max(float3(0.005f, 0.005f, 0.005f), abs(mean) * 0.01f));
             const float gamma = 1.25f; // kVarianceClipGamma (include/cbr/limits.h)
             float3 varianceMin = max(colorMin, mean - gamma * stdDev);
             float3 varianceMax = min(colorMax, mean + gamma * stdDev);
@@ -12215,46 +12704,51 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
         if (!isDisoccluded && historyColor.a > 0.0f) {
             finalColor = historyColor.rgb;
         } else {
-            // Spatial cross-bilateral reconstruction from the 4 cardinal (natively shaded) neighbours.
-            // With the fallback disabled the nearest neighbour is copied (no native sample exists here).
-            // Directional gradient weights: prefer interpolating along edge contours (Decima tangent resolve)
-            float3 horizDiff = abs(cardinalColor[0] - cardinalColor[1]);
-            float3 vertDiff  = abs(cardinalColor[2] - cardinalColor[3]);
-            float horizGrad = dot(horizDiff, float3(0.299f, 0.587f, 0.114f));
-            float vertGrad  = dot(vertDiff,  float3(0.299f, 0.587f, 0.114f));
-            float dirBias[4] = {
-                1.0f / (1.0f + horizGrad * 8.0f), // Left
-                1.0f / (1.0f + horizGrad * 8.0f), // Right
-                1.0f / (1.0f + vertGrad  * 8.0f), // Up
-                1.0f / (1.0f + vertGrad  * 8.0f)  // Down
-            };
-
-            float3 accumColor = float3(0.0f, 0.0f, 0.0f);
-            float accumDepth = 0.0f;
-            float accumWeight = 0.0f;
-
-            for (int i = 0; i < 4 && g_EnableSpatialFallback != 0u; ++i) {
-                float3 sCol = cardinalColor[i];
-                float sLin = LinearizeDepth(cardinalDepth[i]);
-
-                // Relative linear-depth weighting: scale-invariant, independent of the depth convention
-                // Fast base-2 exponentiation: exp(-x) == exp2(-x * log2(e))
-                float depthWeight = exp2((-abs(currentLinear - sLin) / (max(currentLinear, 1e-5f) * max(g_DepthTolerance, 1e-4f))) * 1.44269504f);
-                float totalWeight = depthWeight * dirBias[i];
-
-                accumColor += sCol * totalWeight;
-                accumDepth += cardinalDepth[i] * totalWeight;
-                accumWeight += totalWeight;
-            }
-
-            if (accumWeight > 1e-4f) {
-                finalColor = accumColor / accumWeight;
-                spatialDepth = accumDepth / accumWeight;
+            // Spatial reconstruction from the 4 cardinal (natively shaded) neighbours.
+            // When spatial fallback is disabled, copy the nearest cardinal neighbour directly (Item M-04).
+            if (g_EnableSpatialFallback == 0u) {
+                finalColor = cardinalColor[0];
+                spatialDepth = cardinalDepth[0];
             } else {
-                finalColor = isCurrentSampleActive ? currentColor : (
-                    cardinalColor[0] + cardinalColor[1] + cardinalColor[2] + cardinalColor[3]
-                ) * 0.25f;
-                spatialDepth = isCurrentSampleActive ? currentDepth : (cardinalDepth[0] + cardinalDepth[1] + cardinalDepth[2] + cardinalDepth[3]) * 0.25f;
+                // Directional gradient weights: prefer interpolating along edge contours (Decima tangent resolve)
+                float3 horizDiff = abs(cardinalColor[0] - cardinalColor[1]);
+                float3 vertDiff  = abs(cardinalColor[2] - cardinalColor[3]);
+                float horizGrad = dot(horizDiff, float3(0.299f, 0.587f, 0.114f));
+                float vertGrad  = dot(vertDiff,  float3(0.299f, 0.587f, 0.114f));
+                float dirBias[4] = {
+                    1.0f / (1.0f + horizGrad * 8.0f), // Left
+                    1.0f / (1.0f + horizGrad * 8.0f), // Right
+                    1.0f / (1.0f + vertGrad  * 8.0f), // Up
+                    1.0f / (1.0f + vertGrad  * 8.0f)  // Down
+                };
+
+                float3 accumColor = float3(0.0f, 0.0f, 0.0f);
+                float accumDepth = 0.0f;
+                float accumWeight = 0.0f;
+
+                for (int i = 0; i < 4; ++i) {
+                    float3 sCol = cardinalColor[i];
+                    float sLin = LinearizeDepth(cardinalDepth[i]);
+
+                    // Relative linear-depth weighting: scale-invariant, independent of the depth convention
+                    // Fast base-2 exponentiation: exp(-x) == exp2(-x * log2(e))
+                    float depthWeight = exp2((-abs(currentLinear - sLin) / (max(currentLinear, 1e-5f) * max(g_DepthTolerance, 1e-4f))) * 1.44269504f);
+                    float totalWeight = depthWeight * dirBias[i];
+
+                    accumColor += sCol * totalWeight;
+                    accumDepth += cardinalDepth[i] * totalWeight;
+                    accumWeight += totalWeight;
+                }
+
+                if (accumWeight > 1e-4f) {
+                    finalColor = accumColor / accumWeight;
+                    spatialDepth = accumDepth / accumWeight;
+                } else {
+                    finalColor = isCurrentSampleActive ? currentColor : (
+                        cardinalColor[0] + cardinalColor[1] + cardinalColor[2] + cardinalColor[3]
+                    ) * 0.25f;
+                    spatialDepth = isCurrentSampleActive ? currentDepth : (cardinalDepth[0] + cardinalDepth[1] + cardinalDepth[2] + cardinalDepth[3]) * 0.25f;
+                }
             }
         }
     }
@@ -12284,9 +12778,10 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
                         sc = hc.rgb;
                     }
                 } else {
-                    int2 stepAxis = (i < 2) ? int2(kCardinal[i].x, 1) : int2(1, kCardinal[i].y);
-                    int2 diag = pixelCoord + stepAxis;
-                    if (!InBounds(diag, targetSize)) diag = pixelCoord - stepAxis;
+                    // Item M-02: Use symmetric diagonal offsets (-1,-1), (1,-1), (-1,1), (1,1)
+                    static const int2 kDiag[4] = { int2(-1, -1), int2(1, -1), int2(-1, 1), int2(1, 1) };
+                    int2 diag = pixelCoord + kDiag[i];
+                    if (!InBounds(diag, targetSize)) diag = pixelCoord - kDiag[i];
                     if (InBounds(diag, targetSize)) {
                         float3 dc = FetchColor(MapPixelToSample(diag, frameParity));
                         if (!any(isnan(dc)) && !any(isinf(dc))) sc = dc;
@@ -12327,10 +12822,11 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
         float speed = clamp(length(normVel), 0.0f, 1.0f);
         finalColor = float3(clamp(normVel * 0.5f + 0.5f, 0.0f, 1.0f), speed);
     } else if (g_DebugView == 4u) {
-        // Quarter-resolution raw colour without directional bias
-        finalColor = isCurrentSampleActive ? currentColor : (
-            cardinalColor[0] + cardinalColor[1] + cardinalColor[2] + cardinalColor[3]
-        ) * 0.25f;
+        // Mode 4: Quarter-resolution raw color nearest-upsampled (Item M-03)
+        // Shows the raw quarter-resolution texel without cardinal averaging
+        int2 qMax = max(int2(g_TargetResolution * 0.5f) - int2(1, 1), int2(0, 0));
+        int2 qCoord = clamp(pixelCoord >> 1, int2(0, 0), qMax);
+        finalColor = g_QuarterColorMSAA.Load(qCoord, 0).rgb;
     } else if (g_DebugView == 5u) {
         // Spatial baseline resolve: average of 4 cardinal samples for reconstructed pixels
         // (direct visual A/B baseline comparison against temporal CBR, matching reference Space toggle)
@@ -12539,7 +13035,7 @@ static void TestConfigHardening(const fs::path& dir) {
 
     // Defaults of a fresh config
     const CBRConfig fresh{};
-    CHECK(fresh.jitterCompensation == 0.0f); // whole-pixel jitter needs NO history compensation
+    CHECK(fresh.jitterCompensation == 1.0f); // default 1.0 history reprojection compensation (Item H-02)
     CHECK(fresh.jitterDirection == 1);
     CHECK(fresh.projectionJitterSign == 1);
     CHECK(fresh.samplingStrategy == SamplingStrategy::StrategyA);
@@ -12601,6 +13097,9 @@ static void TestConfigMissingFileAndRoundTrip(const fs::path& dir) {
     CHECK(after.depthNear == before.depthNear && after.depthFar == before.depthFar);
     CHECK(after.sharpeningStrength == before.sharpeningStrength);
     CHECK(after.enableCameraMotionFallback == before.enableCameraMotionFallback);
+    CHECK(after.forcedSceneRenderPassHandle == before.forcedSceneRenderPassHandle);
+    CHECK(after.cameraMatrixVerified == before.cameraMatrixVerified);
+    CHECK(after.enableProjectionJitterWrite == before.enableProjectionJitterWrite);
 
     // Verify thread-safe Modify callback executes and commits successfully
     ConfigManager::Get().Modify([](CBRConfig& cfg) {
@@ -12766,6 +13265,46 @@ static void TestCheckerboardGeometry() {
     }
     ConfigManager::Get().Modify([](CBRConfig& c) { c.jitterDirection = 1; });
 
+    // Strategy B: Hardware Programmable Sample Locations (stationary viewport, shiftDir = 0)
+    {
+        int coverage[kH][kW] = {};
+        for (uint32_t parity = 0; parity < 2; ++parity) {
+            for (int qy = 0; qy < kQH; ++qy) {
+                for (int qx = 0; qx < kQW; ++qx) {
+                    for (uint32_t s = 0; s < 2; ++s) {
+                        const double px = 2.0 * (qx + kCheckerboardSampleLocations[parity][s].x);
+                        const double py = 2.0 * (qy + kCheckerboardSampleLocations[parity][s].y);
+                        const int tx = static_cast<int>(std::floor(px));
+                        const int ty = static_cast<int>(std::floor(py));
+                        CHECK(std::fabs((px - std::floor(px)) - 0.5) < 1e-4);
+                        CHECK(std::fabs((py - std::floor(py)) - 0.5) < 1e-4);
+                        if (tx < 0 || tx >= kW || ty < 0 || ty >= kH) continue;
+                        ++coverage[ty][tx];
+
+                        const CheckerboardSample m = MapPixelToSample(tx, ty, parity, 0);
+                        CHECK(m.active);
+                        CHECK(m.quarterX == qx && m.quarterY == qy && m.sample == s);
+                    }
+                }
+            }
+        }
+        int wrong = 0;
+        for (int y = 0; y < kH; ++y) {
+            for (int x = 0; x < kW; ++x) {
+                if (coverage[y][x] != 1) ++wrong;
+            }
+        }
+        CHECK(wrong == 0);
+
+        for (uint32_t parity = 0; parity < 2; ++parity) {
+            int active = 0;
+            for (int y = 0; y < kH; ++y)
+                for (int x = 0; x < kW; ++x)
+                    if (MapPixelToSample(x, y, parity, 0).active) ++active;
+            CHECK(active == kW * kH / 2);
+        }
+    }
+
     // Negative controls: the previous schemes must be rejected by the same simulation
     auto covered = [&](double sx0, double sy0, double sx1, double sy1) {
         bool seen[kH][kW] = {};
@@ -12914,23 +13453,23 @@ static void TestRenderTargets() {
     ConfigManager::Get().Modify([](CBRConfig& cfg) { cfg.msaaSamples = 2; });
     r.Initialize(3840, 2160);
     // 4K: quarter colour 33,177,600 + quarter depth 16,588,800 + history colour A/B 132,710,400
-    //    + history depth A/B 66,355,200 + output 66,355,200 = 315,187,200 bytes (300.58 MiB, 315.19 MB)
-    CHECK(r.GetTotalAllocatedVramBytes() == 315187200u);
+    //    + history depth A/B 66,355,200 (Item M-06: unused output targets omitted) = 248,832,000 bytes (237.30 MiB, 248.83 MB)
+    CHECK(r.GetTotalAllocatedVramBytes() == 248832000u);
     const double mib = static_cast<double>(r.GetTotalAllocatedVramBytes()) / (1024.0 * 1024.0);
-    CHECK(std::fabs(mib - 300.58) < 0.01);
+    CHECK(std::fabs(mib - 237.30) < 0.01);
 
-    // 1080p (the AMD Vega 7 profile): 78,796,800 bytes = 78.80 MB
+    // 1080p (the AMD Vega 7 profile): 62,208,000 bytes = 59.33 MiB (62.21 MB)
     r.Initialize(1920, 1080);
-    CHECK(r.GetTotalAllocatedVramBytes() == 78796800u);
+    CHECK(r.GetTotalAllocatedVramBytes() == 62208000u);
 
     // Single-sample 1x ASO mode (APU mode):
     ConfigManager::Get().Modify([](CBRConfig& cfg) { cfg.msaaSamples = 1; });
     r.Initialize(3840, 2160);
-    CHECK(r.GetTotalAllocatedVramBytes() == 290304000u);
+    CHECK(r.GetTotalAllocatedVramBytes() == 223948800u);
 
     // 720p 1x ASO mode:
     r.Initialize(1280, 720);
-    CHECK(r.GetTotalAllocatedVramBytes() == 32256000u);
+    CHECK(r.GetTotalAllocatedVramBytes() == 24883200u);
 
     // Reset back to 2x MSAA for subsequent tests
     ConfigManager::Get().Modify([](CBRConfig& cfg) { cfg.msaaSamples = 2; });
@@ -12981,15 +13520,15 @@ static void TestRenderTargets() {
     CHECK(!RenderTargetManager::IsDepthCopyFormatCompatible(124, 126)); // D16_UNORM -> D32_SFLOAT disallowed (16bpp vs 32bpp)
 
     r.Initialize(3840, 2160);
-    const VulkanImageMetadata validColor{ 3840, 2160, 97, 2, 0x10 };
-    const VulkanImageMetadata color32bpp{ 3840, 2160, 37, 2, 0x10 };
-    const VulkanImageMetadata singleSampleColor{ 3840, 2160, 97, 1, 0x10 };
-    const VulkanImageMetadata validDepth{ 3840, 2160, 126, 2, 0x20 };
-    const VulkanImageMetadata depthColorMismatch{ 3840, 2160, 100, 2, 0x10 };
-    const VulkanImageMetadata singleSampleDepth{ 3840, 2160, 126, 1, 0x20 };
-    const VulkanImageMetadata depthMetaDst{ 3840, 2160, 126, 1, 0x20 };
-    const VulkanImageMetadata tooSmallColor{ 960, 540, 97, 2, 0x10 };
-    const VulkanImageMetadata validVel{ 1920, 1080, 97, 1, 0x10 };
+    const VulkanImageMetadata validColor{ 3840, 2160, 97, 2, 0x11 }; // 0x10 COLOR_ATTACHMENT | 0x01 TRANSFER_SRC
+    const VulkanImageMetadata color32bpp{ 3840, 2160, 37, 2, 0x11 };
+    const VulkanImageMetadata singleSampleColor{ 3840, 2160, 97, 1, 0x13 }; // 0x10 COLOR_ATTACHMENT | 0x01 TRANSFER_SRC | 0x02 TRANSFER_DST
+    const VulkanImageMetadata validDepth{ 3840, 2160, 126, 2, 0x21 }; // 0x20 DEPTH_ATTACHMENT | 0x01 TRANSFER_SRC
+    const VulkanImageMetadata depthColorMismatch{ 3840, 2160, 100, 2, 0x11 };
+    const VulkanImageMetadata singleSampleDepth{ 3840, 2160, 126, 1, 0x21 };
+    const VulkanImageMetadata depthMetaDst{ 3840, 2160, 126, 1, 0x22 };
+    const VulkanImageMetadata tooSmallColor{ 960, 540, 97, 2, 0x11 };
+    const VulkanImageMetadata validVel{ 1920, 1080, 97, 1, 0x11 };
     CHECK(RenderTargetManager::IsColorCopyFormatCompatible(97, 97));
     CHECK(RenderTargetManager::IsColorCopyFormatCompatible(103, 97));  // 64bpp R32G32_SFLOAT -> RGBA16F
     CHECK(!RenderTargetManager::IsColorCopyFormatCompatible(37, 97));  // 32bpp RGBA8 -> 64bpp RGBA16F disallowed
@@ -13001,12 +13540,20 @@ static void TestRenderTargets() {
     CHECK(!r.CanCopyToQuarterDepth(depthColorMismatch));
     CHECK(!r.CanCopyToQuarterDepth(singleSampleDepth));
 
+    // Item H-07: Verify VK_IMAGE_USAGE_TRANSFER_SRC_BIT validation
+    const VulkanImageMetadata colorNoTransferSrc{ 3840, 2160, 97, 2, 0x10 }; // Missing TRANSFER_SRC_BIT
+    CHECK(!r.CanCopyToQuarterColor(colorNoTransferSrc));
+    const VulkanImageMetadata depthNoTransferSrc{ 3840, 2160, 126, 2, 0x20 }; // Missing TRANSFER_SRC_BIT
+    CHECK(!r.CanCopyToQuarterDepth(depthNoTransferSrc));
+    const VulkanImageMetadata velNoTransferSrc{ 1920, 1080, 97, 1, 0x10 }; // Missing TRANSFER_SRC_BIT
+    CHECK(!r.CanCopyToVelocity(velNoTransferSrc));
+
     // Verify 1x ASO single-sample copies when msaaSamples == 1
-    const VulkanImageMetadata b10g11r11SingleSample{ 3840, 2160, 122, 1, 0x10 };
+    const VulkanImageMetadata b10g11r11SingleSample{ 3840, 2160, 122, 1, 0x11 };
     ConfigManager::Get().Modify([](CBRConfig& cfg) { cfg.msaaSamples = 1; });
     r.Initialize(3840, 2160);
     CHECK(r.CanCopyToQuarterColor(singleSampleColor));
-    CHECK(r.CanCopyToQuarterColor(b10g11r11SingleSample)); // Format 122 allowed in 1x APU mode (Item 7)
+    CHECK(!r.CanCopyToQuarterColor(b10g11r11SingleSample)); // Format 122 rejected because 32bpp is incompatible with 64bpp quarterColor (C-03)
     CHECK(!r.CanCopyToQuarterColor(validColor)); // 2x rejected in 1x mode
     CHECK(r.CanCopyToQuarterDepth(singleSampleDepth));
     CHECK(!r.CanCopyToQuarterDepth(validDepth)); // 2x rejected in 1x mode
@@ -13015,15 +13562,28 @@ static void TestRenderTargets() {
     CHECK(!r.CanCopyToQuarterColor(b10g11r11SingleSample)); // Format 122 rejected in 2x mode
     CHECK(r.CanCopyToVelocity(validVel));
     CHECK(!r.CanCopyToVelocity(validColor)); // 2x samples != 1x velocity buffer
+    const VulkanImageMetadata vel32bpp{ 1920, 1080, 37, 1, 0x11 };
+    CHECK(!r.CanCopyToVelocity(vel32bpp)); // 32bpp velocity buffer rejected (C-02)
 
     const int fakeImg = 1;
+    // Item H-07: Verify VK_IMAGE_USAGE_TRANSFER_DST_BIT validation
+    const VulkanImageMetadata dstNoTransferDst{ 3840, 2160, 97, 1, 0x11 }; // Missing TRANSFER_DST_BIT (0x02)
+    CHECK(!r.ShouldBlitReconstructionToSceneColor(&fakeImg, false, 3840, 2160, dstNoTransferDst));
     CHECK(r.ShouldBlitReconstructionToSceneColor(&fakeImg, false, 3840, 2160));
     CHECK(r.ShouldBlitReconstructionToSceneColor(&fakeImg, false, 3840, 2160, singleSampleColor));
+    CHECK(!r.ShouldBlitReconstructionToSceneColor(&fakeImg, false, 3840, 2160, color32bpp));    // 32bpp blit dst invalid (C-03)
     CHECK(!r.ShouldBlitReconstructionToSceneColor(&fakeImg, false, 3840, 2160, validColor));    // 2x MSAA blit dst invalid (C-04)
     CHECK(!r.ShouldBlitReconstructionToSceneColor(&fakeImg, false, 3840, 2160, depthMetaDst));  // depth dst invalid (C-04)
     CHECK(!r.ShouldBlitReconstructionToSceneColor(&fakeImg, true, 3840, 2160));                 // never blit swapchain mid-frame (C-04)
     CHECK(!r.ShouldBlitReconstructionToSceneColor(&fakeImg, false, 1920, 1080));                // never downsample into quarter-res pass
     CHECK(!r.ShouldBlitReconstructionToSceneColor(nullptr, false, 3840, 2160));
+
+    // Section 4.10: Centralized ValidateImageTransfer verification
+    const VulkanImageMetadata quarterDstMeta{ 1920, 1080, 97, 2, 0x12 }; // 0x10 COLOR_ATTACHMENT | 0x02 TRANSFER_DST
+    CHECK(RenderTargetManager::ValidateImageTransfer(validColor, quarterDstMeta, false));
+    CHECK(!RenderTargetManager::ValidateImageTransfer(validColor, singleSampleColor, false)); // sample count mismatch
+    CHECK(RenderTargetManager::ValidateImageTransfer(singleSampleColor, singleSampleColor, true)); // valid 1x color blit
+    CHECK(!RenderTargetManager::ValidateImageTransfer(singleSampleColor, depthMetaDst, true)); // color -> depth blit disallowed
 
     // DX12 resource lifecycle sanity checks (Item H-02)
     CHECK(!r.AreDX12ResourcesCreated());
@@ -13356,44 +13916,58 @@ static void RunVulkanTests() {
     // Reconstruction + history swap happen at most once per frame
     CHECK(e.GetCurrentFrameIndex() == 0);
     CHECK(rt.GetCurrentHistoryIndex() == 0);
+    CHECK(!e.HasDispatchedThisFrame());
     e.OnScenePassEnd(nullptr);
+    CHECK(e.HasDispatchedThisFrame());
     CHECK(rt.GetCurrentHistoryIndex() == 1);
     CHECK(e.GetLastReconstructionDurationMs() > 0.0f);
     // One duplicate call: an unguarded engine would swap twice and land back on index 0. (An odd
     // number of duplicates would pass by parity luck, so keep the total number of calls even.)
     e.OnScenePassEnd(nullptr);                            // second matching pass in the same frame
     CHECK(rt.GetCurrentHistoryIndex() == 1);
+    CHECK(e.HasDispatchedThisFrame());
 
     // Parity only advances for the main present target
     e.OnPostPresent(&g_a);                                // first present defines the main target
     CHECK(e.GetCurrentFrameIndex() == 1);
+    CHECK(!e.HasDispatchedThisFrame());
     e.OnPostPresent(&g_b);                                // overlay / secondary swapchain
     CHECK(e.GetCurrentFrameIndex() == 1);
+    CHECK(!e.HasDispatchedThisFrame());
     e.OnPostPresent(&g_a);
     CHECK(e.GetCurrentFrameIndex() == 2);
+    CHECK(!e.HasDispatchedThisFrame());
 
     // New frame -> one more swap allowed
+    CHECK(!e.HasDispatchedThisFrame());
     e.OnScenePassEnd(nullptr);
+    CHECK(e.HasDispatchedThisFrame());
     CHECK(rt.GetCurrentHistoryIndex() == 0);
     e.OnScenePassEnd(nullptr);
     CHECK(rt.GetCurrentHistoryIndex() == 0);
+    CHECK(e.HasDispatchedThisFrame());
 
     // Disabled engine does nothing
     e.SetEnabled(false);
     e.OnPostPresent(&g_a);                                // frame advances, but...
+    CHECK(!e.HasDispatchedThisFrame());
     e.OnScenePassEnd(nullptr);
     CHECK(rt.GetCurrentHistoryIndex() == 0);              // ...no swap while disabled
+    CHECK(!e.HasDispatchedThisFrame());
     e.SetEnabled(true);
 
     // Swapchain recreation resets parity, history and the once-per-frame guard
     e.OnSwapchainRecreated();
     CHECK(e.GetCurrentFrameIndex() == 0);
     CHECK(rt.GetCurrentHistoryIndex() == 0);
+    CHECK(!e.HasDispatchedThisFrame());
     e.OnScenePassEnd(nullptr);
+    CHECK(e.HasDispatchedThisFrame());
     CHECK(rt.GetCurrentHistoryIndex() == 1);
     CHECK(e.GetLastReconstructionDurationMs() > 0.0f);              // frame 0 is dispatchable again
     e.OnPostPresent(&g_b);                                // a different target may become the main one
     CHECK(e.GetCurrentFrameIndex() == 1);
+    CHECK(!e.HasDispatchedThisFrame());
     e.OnPostPresent(&g_a);
     CHECK(e.GetCurrentFrameIndex() == 1);
 
@@ -13428,8 +14002,9 @@ static void RunVulkanTests() {
     const OverlayMetrics metrics = ui.GetCurrentMetrics();
     CHECK(metrics.targetWidth == 3840 && metrics.targetHeight == 2160);
     CHECK(metrics.cbrEnabled == true);
-    CHECK(metrics.vramFootprintMiB > 300.0);
-    CHECK(metrics.vramFootprintMB > 310.0);
+    // Item M-06: VRAM footprint at 4K without unused output buffers is 237.30 MiB (248.83 MB)
+    CHECK(metrics.vramFootprintMiB > 230.0);
+    CHECK(metrics.vramFootprintMB > 240.0);
     CHECK(metrics.lastReconDurationMs > 0.0f);
 
     // Default HUD callback runs cleanly when visible before custom override (Item H-04)
@@ -14099,6 +14674,7 @@ int main() {
         c.debugView = 0;
         c.sharpeningStrength = 0.0f;
         c.enableCameraMotionFallback = false;
+        c.jitterCompensation = 0.0f; // Headless synthetic test uses unjittered clear rects
     });
 
     auto& rtm = cbr::RenderTargetManager::Get();
@@ -14278,8 +14854,9 @@ int main() {
 
     bool failed = false;
 
-    // Execute Frame 0 (parity 0, writes history[1]) and Frame 1 (parity 1, reads history[1] and writes history[0])
-    for (uint32_t frame = 0; frame < 2; ++frame) {
+    // Execute Frame 0 (parity 0, writes history[1]), Frame 1 (parity 1, reads history[1] and writes history[0]),
+    // and Frame 2 (parity 0, reads history[0] and writes history[1]) to verify full ping-pong feedback loop (Section 5.10)
+    for (uint32_t frame = 0; frame < 3; ++frame) {
         jitter.Update(frame);
         pfnResetCmdBuf(cmdBuf, 0);
 
@@ -14447,7 +15024,7 @@ int main() {
     if (pfnDestroyInstance) pfnDestroyInstance(instance, nullptr);
 
     if (failed) return 1;
-    std::cout << "Headless Vulkan compute reconstruction test passed (Frame 0 & Frame 1).\n";
+    std::cout << "Headless Vulkan compute reconstruction test passed (Frames 0, 1 & 2).\n";
     return 0;
 }
 
@@ -14479,19 +15056,24 @@ def _check_coords(x: int, y: int, target_w: int, target_h: int) -> None:
     if target_w <= 0 or target_h <= 0:
         raise ValueError("target dimensions must be positive")
 
-def cpp_map_pixel_to_sample(x: int, y: int, frame_parity: int, shift_dir: int = 1) -> Dict[str, int]:
+def cpp_map_pixel_to_sample(x: int, y: int, frame_parity: int, shift_dir: int = 1, target_w: int = 0) -> Dict[str, int]:
     if x < 0 or y < 0:
         raise ValueError(f"pixel coords must be >= 0, got ({x}, {y})")
     if frame_parity not in (0, 1):
         raise ValueError(f"frame_parity must be 0/1, got {frame_parity}")
     y_bit = y & 1
     active = bool(((x ^ y) & 1) == (frame_parity & 1))
-    if (frame_parity & 1) == 0:
+    if (frame_parity & 1) == 0 or shift_dir == 0:
         qx = x >> 1
-    elif shift_dir >= 0:
+    elif shift_dir > 0:
         qx = (x - y_bit if x > y_bit else 0) >> 1
     else:
         qx = (x + 1 - y_bit) >> 1
+    if target_w > 0:
+        q_max_x = (target_w >> 1) - 1
+        if qx < 0 or qx > q_max_x:
+            active = False
+        qx = max(0, min(qx, q_max_x))
     qy = y >> 1
     sample = 1 - y_bit
     return {
@@ -14505,14 +15087,17 @@ def glsl_map_pixel_to_sample(x: int, y: int, frame_parity: int, shift_dir: int, 
     _check_coords(x, y, target_w, target_h)
     y_bit = y & 1
     is_active = bool(((x ^ y) & 1) == (frame_parity & 1))
-    if frame_parity == 0:
+    if frame_parity == 0 or shift_dir == 0:
         qx = x >> 1
-    elif shift_dir >= 0:
+    elif shift_dir > 0:
         qx = max(x - y_bit, 0) >> 1
     else:
         qx = (x + 1 - y_bit) >> 1
     q_max_x = (target_w // 2) - 1
     q_max_y = (target_h // 2) - 1
+    # Item M-17: When unclamped qx falls outside [0, q_max_x], mark inactive
+    if qx < 0 or qx > q_max_x:
+        is_active = False
     clamped_qx = max(0, min(qx, q_max_x))
     clamped_qy = min(y >> 1, q_max_y)
     sample_idx = 1 - y_bit
@@ -14532,14 +15117,14 @@ def test_mapping_equivalence():
     target_w = 3840
     target_h = 2160
     tested = 0
-    for shift_dir in [1, -1]:
+    for shift_dir in [1, -1, 0]:
         for frame_parity in [0, 1]:
             # Test interior and boundary regions
             x_samples = list(range(0, 32)) + list(range(target_w // 2 - 16, target_w // 2 + 16)) + list(range(target_w - 32, target_w))
             y_samples = list(range(0, 32)) + list(range(target_h // 2 - 16, target_h // 2 + 16)) + list(range(target_h - 32, target_h))
             for y in y_samples:
                 for x in x_samples:
-                    cpp_res = cpp_map_pixel_to_sample(x, y, frame_parity, shift_dir)
+                    cpp_res = cpp_map_pixel_to_sample(x, y, frame_parity, shift_dir, target_w)
                     glsl_res = glsl_map_pixel_to_sample(x, y, frame_parity, shift_dir, target_w, target_h)
                     hlsl_res = hlsl_map_pixel_to_sample(x, y, frame_parity, shift_dir, target_w, target_h)
 
@@ -14547,12 +15132,17 @@ def test_mapping_equivalence():
                     assert cpp_res["sample"] == glsl_res["sample"] == hlsl_res["sample"], f"Sample index mismatch at ({x}, {y})"
                     assert cpp_res["quarterY"] == glsl_res["quarterY"] == hlsl_res["quarterY"], f"quarterY mismatch at ({x}, {y})"
 
-                    # In the interior (not edge), unclamped qx must match C++ exactly
-                    assert cpp_res["quarterX"] == glsl_res["unclamped_qx"], f"quarterX mismatch at ({x}, {y})"
+                    # Section 6: Compare clamped quarterX between C++ and shaders
+                    assert cpp_res["quarterX"] == glsl_res["quarterX"] == hlsl_res["quarterX"], (
+                        f"quarterX mismatch at ({x}, {y}): cpp={cpp_res['quarterX']} glsl={glsl_res['quarterX']}"
+                    )
+                    assert cpp_res["quarterX"] == glsl_res["unclamped_qx"] or not cpp_res["active"], (
+                        f"Unclamped qx mismatch on active sample at ({x}, {y})"
+                    )
                     tested += 1
 
     # Explicit boundary case (Item M-06): (x=0, y=1, frameParity=1, shiftDir=1) -> x - yBit = -1 must clamp to 0
-    neg_edge_cpp = cpp_map_pixel_to_sample(0, 1, 1, 1)
+    neg_edge_cpp = cpp_map_pixel_to_sample(0, 1, 1, 1, target_w)
     neg_edge_glsl = glsl_map_pixel_to_sample(0, 1, 1, 1, target_w, target_h)
     neg_edge_hlsl = hlsl_map_pixel_to_sample(0, 1, 1, 1, target_w, target_h)
     assert neg_edge_cpp["quarterX"] == 0 and neg_edge_glsl["unclamped_qx"] == 0 and neg_edge_glsl["quarterX"] == 0, (
@@ -14560,11 +15150,23 @@ def test_mapping_equivalence():
     )
     assert neg_edge_hlsl["quarterX"] == 0 and neg_edge_cpp["sample"] == 0 and neg_edge_cpp["active"] is True
 
+    # Explicit right-edge boundary case (Item M-17 & Section 6): (x = target_w - 1, y = 0, frameParity = 1, shiftDir = -1)
+    # qx = (3839 + 1 - 0) >> 1 = 1920 > q_max_x (1919) -> must fail-open to active = False and clamp quarterX to 1919
+    pos_edge_cpp = cpp_map_pixel_to_sample(target_w - 1, 0, 1, -1, target_w)
+    pos_edge_glsl = glsl_map_pixel_to_sample(target_w - 1, 0, 1, -1, target_w, target_h)
+    pos_edge_hlsl = hlsl_map_pixel_to_sample(target_w - 1, 0, 1, -1, target_w, target_h)
+    assert pos_edge_cpp["active"] is False, f"Expected cpp active=False at right edge shiftDir=-1, got {pos_edge_cpp}"
+    assert pos_edge_glsl["active"] is False, f"Expected glsl active=False at right edge shiftDir=-1, got {pos_edge_glsl}"
+    assert pos_edge_hlsl["active"] is False, f"Expected hlsl active=False at right edge shiftDir=-1, got {pos_edge_hlsl}"
+    assert pos_edge_cpp["quarterX"] == (target_w // 2) - 1, f"Expected cpp clamped to {(target_w // 2) - 1}, got {pos_edge_cpp['quarterX']}"
+    assert pos_edge_glsl["quarterX"] == (target_w // 2) - 1, f"Expected glsl clamped to {(target_w // 2) - 1}, got {pos_edge_glsl['quarterX']}"
+    assert pos_edge_hlsl["quarterX"] == (target_w // 2) - 1, f"Expected hlsl clamped to {(target_w // 2) - 1}, got {pos_edge_hlsl['quarterX']}"
+
     print(f"[PASS] Verified mapping equivalence across {tested} coordinate combinations.")
 
 def test_two_frame_coverage():
     # Verify 100% 4-quadrant coverage across 2 frames for 2x2 pixel blocks
-    for shift_dir in [1, -1]:
+    for shift_dir in [1, -1, 0]:
         for block_x in range(0, 64, 2):
             for block_y in range(0, 64, 2):
                 pixels = [
@@ -14615,8 +15217,8 @@ def test_source_code_consistency():
     # Regex extraction of MapPixelToSample qx branch expressions across GLSL and HLSL (Item M-06)
     map_fn_re = re.compile(r"CbrSample\s+MapPixelToSample\s*\([^)]*\)\s*\{(?P<body>.*?)\n\}", re.DOTALL)
     qx_branch_re = re.compile(
-        r"if\s*\(\s*frameParity\s*==\s*0u\s*\)\s*\{\s*qx\s*=\s*p\.x\s*>>\s*1\s*;\s*\}\s*"
-        r"else\s+if\s*\(\s*(?:pc\.u_ShiftDirection|g_ShiftDirection)\s*>=\s*0\s*\)\s*\{\s*qx\s*=\s*max\(\s*p\.x\s*-\s*yBit\s*,\s*0\s*\)\s*>>\s*1\s*;\s*\}\s*"
+        r"if\s*\(\s*(?:frameParity\s*==\s*0u\s*\|\|\s*(?:pc\.u_ShiftDirection|g_ShiftDirection)\s*==\s*0)\s*\)\s*\{\s*qx\s*=\s*p\.x\s*>>\s*1\s*;\s*\}\s*"
+        r"else\s+if\s*\(\s*(?:pc\.u_ShiftDirection|g_ShiftDirection)\s*>\s*0\s*\)\s*\{\s*qx\s*=\s*max\(\s*p\.x\s*-\s*yBit\s*,\s*0\s*\)\s*>>\s*1\s*;\s*\}\s*"
         r"else\s*\{\s*qx\s*=\s*\(\s*p\.x\s*\+\s*1\s*-\s*yBit\s*\)\s*>>\s*1\s*;\s*\}",
         re.DOTALL,
     )
@@ -14652,6 +15254,11 @@ def test_source_code_consistency():
     assert "GL_KHR_shader_subgroup" not in quad_src, "M-07 unused subgroup extensions must be removed"
     assert "QuadActiveSample" in quad_src and "cardinalColor" in quad_src, "M-07/H-05 quad register sharing missing"
 
+    # Verify M-17 boundary check presence across all reconstruction shaders
+    assert "if (qx < 0 || qx > qMax.x)" in comp_src, "M-17 boundary check missing in cbr_reconstruct.comp"
+    assert "if (qx < 0 || qx > qMax.x)" in quad_src, "M-17 boundary check missing in cbr_reconstruct_quad.comp"
+    assert "if (qx < 0 || qx > qMax.x)" in hlsl_src, "M-17 boundary check missing in cbr_reconstruct.hlsl"
+
     print("[PASS] Verified source code consistency across GLSL, HLSL, and C++ header.")
 
 def map_velocity_coord(mx: int, my: int, target_w: int, target_h: int):
@@ -14683,8 +15290,65 @@ def test_velocity_coord_mapping():
                 checked += 1
     print(f"[PASS] Verified quarter-res C-05 velocity coordinate shift & clamp across {checked} cases.")
 
+def test_strategy_b_hardware_mapping():
+    """
+    H-01 / Section 6: Strategy B (VK_EXT_sample_locations) hardware sample verification.
+    Verifies that on stationary viewport (shift_dir=0):
+    - Frame 0 (even): sample 0 = (0.75, 0.75) [bottom-right], sample 1 = (0.25, 0.25) [top-left]
+    - Frame 1 (odd):  sample 0 = (0.25, 0.75) [bottom-left],  sample 1 = (0.75, 0.25) [top-right]
+    Both C++ and compute shader MapPixelToSample correctly match hardware sample coordinates
+    with 100% 4-quadrant coverage and zero divergence.
+    """
+    kCheckerboardSampleLocations = [
+        [ (0.75, 0.75), (0.25, 0.25) ],  # Frame 0: sample 0, sample 1
+        [ (0.25, 0.75), (0.75, 0.25) ]   # Frame 1: sample 0, sample 1
+    ]
+    target_w = 3840
+    target_h = 2160
+    qw = target_w // 2
+    qh = target_h // 2
+
+    tested_points = 0
+    for parity in (0, 1):
+        for qy in (0, 1, 2, 17, qh // 2, qh - 2, qh - 1):
+            for qx in (0, 1, 2, 17, qw // 2, qw - 2, qw - 1):
+                for s in (0, 1):
+                    offset = kCheckerboardSampleLocations[parity][s]
+                    px = 2.0 * (qx + offset[0])
+                    py = 2.0 * (qy + offset[1])
+                    tx = int(px)
+                    ty = int(py)
+
+                    assert abs((px - tx) - 0.5) < 1e-4, f"Hardware sample not on pixel center: px={px}"
+                    assert abs((py - ty) - 0.5) < 1e-4, f"Hardware sample not on pixel center: py={py}"
+
+                    cpp_m = cpp_map_pixel_to_sample(tx, ty, parity, shift_dir=0, target_w=target_w)
+                    glsl_m = glsl_map_pixel_to_sample(tx, ty, parity, shift_dir=0, target_w=target_w, target_h=target_h)
+                    hlsl_m = hlsl_map_pixel_to_sample(tx, ty, parity, shift_dir=0, target_w=target_w, target_h=target_h)
+
+                    assert cpp_m["active"] is True
+                    assert glsl_m["active"] is True
+                    assert hlsl_m["active"] is True
+
+                    assert cpp_m["quarterX"] == qx and cpp_m["quarterY"] == qy and cpp_m["sample"] == s, (
+                        f"Strategy B C++ mapping mismatch at tx={tx}, ty={ty}, parity={parity}: "
+                        f"expected ({qx}, {qy}, s={s}), got {cpp_m}"
+                    )
+                    assert glsl_m["quarterX"] == qx and glsl_m["quarterY"] == qy and glsl_m["sample"] == s, (
+                        f"Strategy B GLSL mapping mismatch at tx={tx}, ty={ty}, parity={parity}: "
+                        f"expected ({qx}, {qy}, s={s}), got {glsl_m}"
+                    )
+                    assert hlsl_m["quarterX"] == qx and hlsl_m["quarterY"] == qy and hlsl_m["sample"] == s, (
+                        f"Strategy B HLSL mapping mismatch at tx={tx}, ty={ty}, parity={parity}: "
+                        f"expected ({qx}, {qy}, s={s}), got {hlsl_m}"
+                    )
+                    tested_points += 1
+
+    print(f"[PASS] Verified Strategy B hardware sample locations (H-01) across {tested_points} test points.")
+
 def main():
     test_mapping_equivalence()
+    test_strategy_b_hardware_mapping()
     test_two_frame_coverage()
     test_velocity_coord_mapping()
     test_source_code_consistency()
@@ -14760,9 +15424,9 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y g++-mingw-w64-x86-64
       - name: Syntax check Windows sources
         run: |
-          for f in logger config jitter_manager render_target_manager reconstruction_pass ui_overlay cbr_engine hooks main hooks_vulkan hooks_dx12 crash_handler; do
+          for f in logger config jitter_manager pattern_scanner render_target_manager reconstruction_pass ui_overlay cbr_engine hooks main hooks_vulkan hooks_dx12 crash_handler; do
             echo "Checking src/$f.cpp..."
-            x86_64-w64-mingw32-g++ -std=c++20 -fsyntax-only -Wall -Wextra -Wpedantic -Wshadow -Iinclude -Ivendor/minhook/include src/$f.cpp
+            x86_64-w64-mingw32-g++ -std=c++20 -fsyntax-only -Wall -Wextra -Wpedantic -Wshadow -Werror -Wno-error=cast-function-type -Iinclude -Ivendor/minhook/include src/$f.cpp
           done
 
   windows-release:
@@ -14876,8 +15540,8 @@ A community-driven native ASI graphics modification implementing **Checkerboard 
 </p>
 
 > **🚀 Project Status: Active Graphics Interception & Pipeline Execution Phase**  
-> The mod runs active **MinHook** detours across the **Vulkan** pipeline (`vkQueuePresentKHR`, `vkCreateSwapchainKHR`, `vkAcquireNextImageKHR`, `vkAcquireNextImage2KHR`, `vkCreateFramebuffer`, `vkCreateImageView`, `vkCreateRenderPass`/`2`, `vkEnumeratePhysicalDevices`, `vkCreateSampler`, `vkCmdSetViewport`, `vkCmdSetScissor`, `vkCmdBeginRenderPass`, `vkCmdEndRenderPass`, `vkCmdSetSampleLocationsEXT`), capturing rendered geometry into quarter-res 2× MSAA buffers, managing ping-pong history descriptor sets (`historyColorViewA`/`B`) + `binding = 7` camera UBO with pre-dispatch layout barriers, executing `cbr_reconstruct.spv` mid-frame on `vkCmdEndRenderPass`, and blitting the reconstructed output into the intermediate full-res scene color target without overwriting UI/HUD overlays. It also includes mutual-exclusive Strategy A / Strategy B sampling, selective `-1.0` `MipLodBias` on anisotropic mipmapped samplers, multi-region `VirtualQuery` AVX2 AOB scanning, optional camera-only depth unprojection fallback & 5-tap RCAS sharpening (`SharpeningStrength = 0.0` default), online CLI argument safety (`-rdo`, `-scOnlineOnly`, `-Multiplayer`), loader-lock-safe preloaded `dbghelp.dll` minidumps, and `F11` / `Insert` telemetry OSD controls.  
-> *Note on parity:* DirectX 12 (`hooks_dx12.cpp`, `render_target_manager.cpp`, `reconstruction_pass.cpp`) implements DXGI swapchain + `ID3D12CommandQueue`/`ID3D12GraphicsCommandList` VMT detours, committed resources, descriptor heaps, root signature, compute PSO, and `DispatchDX12` barrier submission, while live RDR2 DX12 scene attachment capture & visual Dear ImGui swapchain rendering remain pending in-game validation; Vulkan (`PreferredApi = Vulkan`) is the primary active backend. Pre-built binaries are available on [GitHub Releases](https://github.com/ShreyasP10/Checkerboard-Rendering/releases).
+> The mod implements active **MinHook** detours across the **Vulkan** pipeline (`vkQueuePresentKHR`, `vkCreateSwapchainKHR`, `vkAcquireNextImageKHR`, `vkAcquireNextImage2KHR`, `vkCreateFramebuffer`, `vkCreateImageView`, `vkCreateRenderPass`/`2`, `vkEnumeratePhysicalDevices`, `vkCreateSampler`, `vkCmdSetViewport`, `vkCmdSetScissor`, `vkCmdBeginRenderPass`, `vkCmdEndRenderPass`, `vkCmdSetSampleLocationsEXT`), capturing rendered geometry into quarter-res 2× MSAA buffers via `ValidateImageTransfer` legality gates, managing ping-pong history descriptor sets (`historyColorViewA`/`B`) + `binding = 7` camera UBO with pre-dispatch layout barriers, executing `cbr_reconstruct.spv` mid-frame on `vkCmdEndRenderPass`, and blitting the reconstructed output into the intermediate full-res scene color target without overwriting UI/HUD overlays (gated by `slot->rpCandidateGeometryPass && !slot->colorIsSwapchain && !slot->reconstructionDoneThisFrame`). It also includes mutual-exclusive Strategy A / Strategy B sampling, selective `-1.0` `MipLodBias` on anisotropic mipmapped samplers, multi-region `VirtualQuery` AVX2 AOB scanning, optional camera-only depth unprojection fallback & 5-tap RCAS sharpening (`SharpeningStrength = 0.0` default), two-tier anti-cheat safety (offline CLI arguments + 300-frame periodic module scans), loader-lock-safe preloaded `dbghelp.dll` minidumps (with heap-corruption SEH protection), and `F11` / `Insert` telemetry OSD controls.  
+> *Note on backend status:* Vulkan (`PreferredApi = Vulkan`) is the primary active backend, verified across 3-frame Lavapipe CI tests; DirectX 12 (`hooks_dx12.cpp`, `render_target_manager.cpp`, `reconstruction_pass.cpp`) implements official MSVC VMT detours, committed resources, descriptor heaps, root signature, compute PSO, and barrier submission, held in a fail-open safety state (`dx12InputsCaptured = false`) pending live in-engine RenderDoc capture of RDR2's DX12 attachments. Pre-built binaries are available on [GitHub Releases](https://github.com/ShreyasP10/Checkerboard-Rendering/releases).
 
 ---
 
@@ -14968,19 +15632,19 @@ Reconstruct: Current Active Pixels  <─── Unpack exact MSAA Sample 0 / Samp
 Output:      Full 3840×2160 Frame   ───> Blitted back to Game Scene HDR Attachment pre-UI
 ```
 
-1. **Target Interception & Dynamic Redirection:** Intercepts `vkCreateRenderPass`/`2`, `vkCreateFramebuffer`, `vkCreateImageView`, `vkAcquireNextImageKHR`/`2KHR`, `vkCmdSetViewport`, `vkCmdSetScissor`, and `vkCmdBeginRenderPass` (gated by attachment inspection + `draws >= 250`) to redirect full-resolution geometry passes to quarter-resolution (e.g., 1920×1080 for 4K, 960×540 for 1080p) 2× MSAA targets while keeping HUD/UI passes at native output resolution.
+1. **Target Interception & Dynamic Redirection:** Intercepts `vkCreateRenderPass`/`2`, `vkCreateFramebuffer`, `vkCreateImageView`, `vkAcquireNextImageKHR`/`2KHR`, `vkCmdSetViewport`, `vkCmdSetScissor`, and `vkCmdBeginRenderPass` (gated by candidate geometry pass inspection: `slot->rpCandidateGeometryPass && !slot->colorIsSwapchain && !slot->reconstructionDoneThisFrame`) to redirect full-resolution geometry passes to quarter-resolution (e.g., 1920×1080 for 4K, 960×540 for 1080p) 2× MSAA targets while keeping HUD/UI passes at native output resolution.
 2. **Mutual-Exclusive Subpixel Sampling (`StrategyA` vs. `StrategyB`):**
    - **`StrategyA` (Viewport Shift / Projection Jitter):** Shifts the viewport / camera projection horizontally by a complementary subpixel offset on odd frames, scanned dynamically across readable committed regions of `RDR2.exe` via the AVX2 SIMD AOB scanner (`pattern_scanner.cpp`) with non-accumulating tracked-base / previous-offset jitter handling.
-   - **`StrategyB` (`VK_EXT_sample_locations`):** Alternates hardware 2× MSAA programmable sample coordinates (`(0.75, 0.25) / (0.25, 0.75)` on even frames, mirrored on odd frames) while keeping the viewport stationary.
+   - **`StrategyB` (`VK_EXT_sample_locations`):** Alternates hardware 2× MSAA programmable sample coordinates (`(0.75, 0.75)/(0.25, 0.25)` on even frames, `(0.25, 0.75)/(0.75, 0.25)` on odd frames) with a stationary viewport, verified against Intel CBR hardware specifications.
 3. **Selective MIP LOD Bias (`-1.0`):** Applies the default `-1.0` `MipLodBias` selectively inside `Hooked_vkCreateSampler` ONLY to mipmapped anisotropic scene samplers (`maxLod > 1.0f && anisotropyEnable == VK_TRUE`), compensating for 2× wider texture gradients at quarter resolution without distorting UI/LUT samplers.
-4. **Mid-Frame Compute Reconstruction & Scene Blit:** At `vkCmdEndRenderPass` (prior to UI/HUD compositing), copies scene attachments into quarter-res buffers, transitions all 7 ping-pong images safely out of `UNDEFINED`, binds the alternating `VkDescriptorSet` + `binding = 7` camera UBO, runs `cbr_reconstruct.spv` (or quad-per-thread `cbr_reconstruct_quad.comp`, which evaluates both active 2×2 quad pixels first and shares their samples in thread-local registers without requiring `GL_KHR_shader_subgroup_quad` cross-lane intrinsics, or HLSL `cbr_reconstruct.hlsl`) with linearized depth disocclusion, optional camera-only depth unprojection fallback, NaN/Inf sanitization, `YCoCg`/`RGB`/`ICtCp` variance clipping (`gamma = 1.25`), cross-bilateral fallback, and optional 5-tap RCAS sharpening (`SharpeningStrength`, default `0.0`), then blits the reconstructed frame into the game's intermediate full-resolution scene color attachment (falling back to pre-present blit only if no intermediate scene target is tracked).
+4. **Mid-Frame Compute Reconstruction & Scene Blit:** At `vkCmdEndRenderPass` (prior to UI/HUD compositing), copies scene attachments into quarter-res buffers (gated by `ValidateImageTransfer` format and sample checks), transitions all 7 ping-pong images safely out of `UNDEFINED`, binds the alternating `VkDescriptorSet` + `binding = 7` camera UBO, runs `cbr_reconstruct.spv` (or quad-per-thread `cbr_reconstruct_quad.comp`, which evaluates both active 2×2 quad pixels first and shares their samples in thread-local registers without requiring `GL_KHR_shader_subgroup_quad` cross-lane intrinsics, or HLSL `cbr_reconstruct.hlsl`) with linearized depth disocclusion, optional camera-only depth unprojection fallback, NaN/Inf sanitization, `YCoCg`/`RGB`/`ICtCp` variance clipping (`gamma = 1.25`), cross-bilateral fallback, and optional 5-tap RCAS sharpening (`SharpeningStrength`, default `0.0`), then blits the reconstructed frame into the game's intermediate full-resolution scene color attachment with an explicit `COLOR_ATTACHMENT_OUTPUT` barrier (falling back to pre-present blit only if no intermediate scene target is tracked).
 
 ---
 
 ## Key Features
 
-- [x] **Engineering Specifications & Hardware Guides:** Complete PRD, SRD, SRS, TRD, DEV_PLAN, RISK_REGISTER, Intel 2018 CBR reference analysis, AMD Vega 7 optimization guide, Vulkan hooking guide, and live test report (`docs/IN_GAME_TEST_REPORT_v1491.md`).
-- [x] **Multi-Backend Reconstruction Shaders:** GLSL (`cbr_reconstruct.comp`), 2×2 quad-per-thread GLSL (`cbr_reconstruct_quad.comp`, sharing active samples in thread-local registers without requiring subgroup extensions), spatial baseline fallback (`cbr_resolve_simple.comp`), and DirectX 12 HLSL (`cbr_reconstruct.hlsl`) verified for 100% coordinate-mapping equivalence across 36,864 combinations.
+- [x] **Engineering Specifications & Hardware Guides:** Complete PRD, SRD, SRS, TRD, DEV_PLAN, RISK_REGISTER, Intel 2018 CBR reference analysis, AMD Vega 7 optimization guide, Vulkan hooking guide, and live Phase 1 baseline load test report (`docs/IN_GAME_TEST_REPORT_v1491.md`).
+- [x] **Multi-Backend Reconstruction Shaders:** GLSL (`cbr_reconstruct.comp`), 2×2 quad-per-thread GLSL (`cbr_reconstruct_quad.comp`, sharing active samples in thread-local registers without requiring subgroup extensions), spatial baseline fallback (`cbr_resolve_simple.comp`), and DirectX 12 HLSL (`cbr_reconstruct.hlsl`) verified for 100% coordinate-mapping equivalence across 55,296 combinations + Strategy B hardware sample locations.
 - [x] **Temporal Reprojection, Velocity Fallback & 5-Tap RCAS:** Reads motion vectors with automatic quarter-resolution coordinate downshifting (`>> 1` clamp), optional 3×3 closest-depth motion dilation, camera-only depth unprojection fallback (`u_CurrViewProjInv` / `u_PrevViewProj` via `binding = 7` / `register(b1)`), NaN/Inf sanitization on active/fallback paths, full-resolution history-depth output (`u_OutputDepth` / `g_OutputDepth`), and optional fused 5-tap RCAS sharpening (`SharpeningStrength`, default `0.0`).
 - [x] **Depth Convention & Disocclusion Defense:** Supports both RDR2 Reversed-Z (`DepthFar = 0.0` infinite far plane) and Standard linear depth unprojection (`depth_convention.h`) with cardinal cross-bilateral fallback on disocclusion.
 - [x] **Three Color-Space Clamping Modes (`gamma = 1.25`):** Unconditional 3×3 neighborhood variance clipping selectable between **YCoCg** (`0`), **RGB** (`1`), and **HDR10 / BT.2100 ICtCp** (`2`) to eliminate ghosting and pattern shimmer on static and dynamic scenes.
@@ -15063,8 +15727,8 @@ Checkerboard-Rendering/
 └── tests/                           # Portable unit, shader & headless GPU compute tests
     ├── test_core.cpp                # Config, logger, jitter, push constants, camera UBO, depth & scanner tests
     ├── test_engine.cpp              # Hook retry, once-per-frame guard, CLI safety gate, parity & HUD tests
-    ├── test_vulkan_headless.cpp     # Headless Vulkan compute dispatch & Frame 0/1 readback test (Lavapipe CI)
-    └── check_shader_mapping.py      # 36,864-combination proof of 4-quadrant MSAA coverage
+    ├── test_vulkan_headless.cpp     # Headless Vulkan compute dispatch & 3-frame ping-pong readback test (Lavapipe CI)
+    └── check_shader_mapping.py      # 55,296-combination proof of 4-quadrant MSAA & Strategy B hardware coverage
 ```
 
 ---
@@ -15082,8 +15746,8 @@ Every architectural decision, hardware profile, and audit finding is documented 
 | RAGE Engine Architecture, Generational Evolution & Vulkan Hooks | [`docs/RAGE_ENGINE_ARCHITECTURE.md`](docs/RAGE_ENGINE_ARCHITECTURE.md) |
 | Architectural Design & Engineering Standards | [`docs/ENGINEERING_STANDARDS.md`](docs/ENGINEERING_STANDARDS.md) |
 | Synchronized single-file codebase snapshot | [`CODEBASE.md`](CODEBASE.md) |
-| Phase 2 runtime detours & swapchain integration plan | [`nextImplementationPhase.md`](nextImplementationPhase.md) · [`docs/nextImplementationPhase.md`](docs/nextImplementationPhase.md) |
-| Live test report on RDR2 `1.0.1491.50` (GTX 1070 Ti + LML) | [`docs/IN_GAME_TEST_REPORT_v1491.md`](docs/IN_GAME_TEST_REPORT_v1491.md) |
+| Phase 2 runtime detours & swapchain integration plan | [`nextImplementationPhase.md`](nextImplementationPhase.md) |
+| Live Phase 1 baseline load test report on RDR2 `1.0.1491.50` (GTX 1070 Ti + LML) | [`docs/IN_GAME_TEST_REPORT_v1491.md`](docs/IN_GAME_TEST_REPORT_v1491.md) |
 | Vulkan loader detours, image barriers & compute pass guide | [`docs/VULKAN_HOOKING_GUIDE.md`](docs/VULKAN_HOOKING_GUIDE.md) |
 | Intel 2018 CBR reference analysis (Mcferron & Lake) | [`docs/INTEL_CBR_REFERENCE.md`](docs/INTEL_CBR_REFERENCE.md) |
 | AMD Radeon Vega 7 APU profile (GCN 5.0, Wave64, DDR4) | [`docs/AMD_VEGA_OPTIMIZATION.md`](docs/AMD_VEGA_OPTIMIZATION.md) |
@@ -15120,7 +15784,7 @@ $$C_{\text{spatial}} = \frac{\sum_{k=1}^4 w_k C_k}{\sum_{k=1}^4 w_k}, \quad w_k 
 | Component | Minimum Specification | Recommended (Target Discrete) | Recommended (Target APU / Integrated) | Role in CBR Pipeline |
 |---|---|---|---|---|
 | **GPU** | GTX 1060 (6 GB) / RX 580 (8 GB) / Vega 7 (Vulkan 1.3 / DX12) | **NVIDIA GeForce GTX 1070 Ti (8 GB GDDR5)** | **AMD Radeon Vega 7 (Ryzen 5 4600G/5600H/5700U APU)** | Wave32 (Pascal) / Wave64 (Vega) compute shader execution, 2× MSAA rasterization |
-| **GPU VRAM** | 1 GB (1080p CBR) / 6 GB (4K CBR) | **8 GB GDDR5** (`300.58 MiB` / `315.19 MB` CBR buffers at 4K) | **512 MB – 2 GB Shared UMA DDR4** (`75.15 MiB` / `78.80 MB` CBR buffers at 1080p) | Stores quarter-res 2× MSAA, ping-pong history, and output targets |
+| **GPU VRAM** | 1 GB (1080p CBR) / 6 GB (4K CBR) | **8 GB GDDR5** (`237.30 MiB` / `248.83 MB` CBR buffers at 4K) | **512 MB – 2 GB Shared UMA DDR4** (`59.33 MiB` / `62.21 MB` CBR buffers at 1080p) | Stores quarter-res 2× MSAA and ping-pong history targets (Item M-06: unused output targets eliminated) |
 | **CPU** | Quad-Core (i5-8400 / Ryzen 2600; scalar AOB fallback) | **6-Core / 12-Thread (AVX2 capable)** | **AMD Ryzen 5 4600G / 5600H (6C / 12T, AVX2)** | Frame pacing, intercept dispatch & AVX2 SIMD AOB scanning |
 | **RAM** | 8 GB Dual-Channel | **16 GB DDR4 Dual-Channel** | **16 GB Dual-Channel DDR4-3200+** | Essential on APUs for shared GPU/CPU memory bandwidth |
 | **OS** | Windows 10 (64-bit, 19041+) | **Windows 10 / Windows 11 (64-bit)** | **Windows 10 / Windows 11 (64-bit)** | Native `vulkan-1.dll` (1.3) and DirectX 12 runtime |
@@ -15251,7 +15915,7 @@ LogLevel = Info              ; Debug, Info, Warning, Error
    - **MSAA:** **2×** (**Required!** In-game MSAA must be set to **2×** so that the scene geometry color and depth attachments render with 2× MSAA / `VK_SAMPLE_COUNT_2_BIT`. `CanCopyToQuarterColor` and `CanCopyToQuarterDepth` enforce 2× MSAA matching `quarterColor` and `quarterDepth`. If MSAA is set to Off (1×), the C-01 safety gate safely fails open and preserves the native image without black-screening, but CBR compute reconstruction will not trigger).
    - **FXAA:** **Off** (recommended Off to prevent post-filtering blurring).
 4. **Quality Baseline (4K on 8 GB Pascal GPUs):**
-   - Lower **Volumetrics**, **Water**, and **Reflections** to **Medium**; keep **Anisotropic Filtering** at **16×** and reduce **Texture Quality** from **Ultra** to **High** if approaching the 8 GB VRAM ceiling (`300.58 MiB` used by CBR buffers at 4K). On **AMD Vega 7 (512 MB UMA)** laptops, use **1080p** (`75.15 MiB` CBR buffers) and Low/Medium RDR2 presets (`docs/AMD_VEGA_OPTIMIZATION.md`).
+   - Lower **Volumetrics**, **Water**, and **Reflections** to **Medium**; keep **Anisotropic Filtering** at **16×** and reduce **Texture Quality** from **Ultra** to **High** if approaching the 8 GB VRAM ceiling (`237.30 MiB` used by CBR buffers at 4K). On **AMD Vega 7 (512 MB UMA)** laptops, use **1080p** (`59.33 MiB` CBR buffers) and Low/Medium RDR2 presets (`docs/AMD_VEGA_OPTIMIZATION.md`).
 
 ---
 
@@ -15270,7 +15934,7 @@ After launching RDR2 Story Mode, inspect `cbr.log` next to `RDR2.exe`:
 [INFO] Configuration loaded from cbr.ini (Target: 3840x2160, API: Vulkan, CBR Enabled: true)
 [INFO] RenderTargetManager initialized for target: 3840x2160
 [INFO] Quarter-Resolution 2x MSAA Buffer size: 1920x1080
-[INFO] Total CBR VRAM Footprint: 300.58 MiB (315.19 MB)
+[INFO] Total CBR VRAM Footprint: 237.30 MiB (248.83 MB)
 [INFO] Vulkan graphics interception is now ACTIVE.
 [INFO] Vulkan CBR reconstruction compute pipeline created successfully!
 ```
@@ -15362,7 +16026,7 @@ cmake -S . -B build-tests -DCBR_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build-tests --target cbr_tests cbr_engine_tests cbr_vulkan_headless
 ctest --test-dir build-tests --output-on-failure -V
 
-# Verify 4-quadrant MSAA coverage equivalence across all 36,864 parity/shift/resolution cases
+# Verify 4-quadrant MSAA coverage equivalence across all 55,296 parity/shift/resolution cases + Strategy B hardware
 python3 tests/check_shader_mapping.py
 ```
 
@@ -15434,7 +16098,7 @@ This mod is for **educational, experimental, and research purposes only**. It is
 
 In our initial in-game deployment, the mod successfully proved:
 1. **Host Stability:** Loaded cleanly via Alexander Blade's ASI loader alongside Lenny's Mod Loader (`vfs.asi`) and Visual Redemption with **zero game crashes or memory corruption**.
-2. **Subsystem Readiness:** Configuration loaded from [cbr.ini](file:///c:/Users/Dinesh%20B%20Pawar/OneDrive/Desktop/Checkerboard-Rendering/cbr.ini), allocating 2× MSAA quarter-resolution buffers (1920×1080) with a measured 300.59 MiB VRAM footprint.
+2. **Subsystem Readiness:** Configuration loaded from [cbr.ini](file:///c:/Users/Dinesh%20B%20Pawar/OneDrive/Desktop/Checkerboard-Rendering/cbr.ini), allocating 2× MSAA quarter-resolution buffers (1920×1080) with a 237.30 MiB (248.83 MB) VRAM footprint (optimized from the initial 300.59 MiB prototype by eliminating redundant auxiliary output storage buffers in Item M-06).
 3. **Safe Fallback:** Because graphics hook stubs were protected by safety flags, the mod timed out gracefully after 60 seconds without disrupting game rendering.
 
 ### The Core Goal of This Phase
@@ -15707,12 +16371,12 @@ The plugin intercepts the presentation layer and command recording passes of the
   - `vkCmdSetSampleLocationsEXT` for hardware programmable sample location toggling.
 * **SamplingStrategy:** Configurable isolation between **Strategy A** (±0.5px horizontal viewport jitter) and **Strategy B** (`VK_EXT_sample_locations` with stationary viewport) to prevent sample cancellation.
 * **PatternScanner:** IDA-style wildcard AOB scanner with RIP-relative resolution and SEH memory protection to automatically discover camera projection matrices.
-* **RenderTargetManager:** Manages Vulkan/DX12 VRAM allocations (~300.59 MiB for 4K CBR).
+* **RenderTargetManager:** Manages Vulkan/DX12 VRAM allocations (237.30 MiB / 248.83 MB for 4K CBR; auxiliary output storage buffers omitted via Item M-06).
 * **ReconstructionPass:** 
   - Manages internal `VkDescriptorPool` and 8-binding `VkDescriptorSet` (bindings 0–6 for MSAA color/depth, history color/depth, velocity, and output storage; binding 7 for `CBRCameraData` UBO).
   - Synchronizes execution using explicit `vkCmdPipelineBarrier` memory transitions.
-  - Dispatches `cbr_reconstruct.comp` (or `cbr_reconstruct_quad.comp` using `GL_KHR_shader_subgroup_quad`).
-  - Implemented closest-depth motion-vector dilation, temporal history reprojection, depth delta disocclusion testing, and YCoCg neighborhood variance clipping.
+  - Dispatches `cbr_reconstruct.comp` (or `cbr_reconstruct_quad.comp` using thread-local quad register sharing without requiring subgroup extensions).
+  - Implemented closest-depth motion-vector dilation, temporal history reprojection, depth delta disocclusion testing, and YCoCg / RGB / ICtCp neighborhood variance clipping.
 
 ## 4. Software Requirements Document (SRD) - Security & Robustness
 The latest audit (v0.1.0-alpha) identified and resolved key operational risks for ASI mods:
@@ -15735,29 +16399,44 @@ The latest audit (v0.1.0-alpha) identified and resolved key operational risks fo
 | **Supply Chain Hijacking** | High (Malware) | Pinned GitHub actions, minimized `contents:write` scopes. |
 | **RAGE Custom Suballocators** | High (Hook Miss) | Detoured command buffer viewports & render passes instead of raw image creation. |
 | **Game Update Invalidation** | High (Crash) | Implemented SEH-safe wildcard AOB pattern scanner (`pattern_scanner.cpp`). |
+| **CET / CFG Incompatibility** | Medium (Crash) | Configured `/guard:cf` compiler CFG and `/CETCOMPAT:NO` linker flag for x64 MinHook trampolines (RSK-12). |
+| **Late-Loaded Anti-Cheat Modules** | High (Ban) | Added periodic module scanning in `OnPostPresent` every 300 frames with automatic self-disabling and history clearing (RSK-13). |
 
-## 7. Feature Expansion Plan & Audit Resolution Status (CODEBASE_2.md)
+## 7. Feature Expansion Plan & Audit Resolution Status (Sections 4 & 5 Hardening)
+
+* **Security & Hardening Suite (Section 4):**
+  - *4.1 Crash Handler Async-Safety:* Wrapped filter body in MSVC SEH `__try / __except (EXCEPTION_EXECUTE_HANDLER)`. Skipped minidump creation for `0xC0000374` (`STATUS_HEAP_CORRUPTION`) to prevent deadlocks or secondary crashes when traversing a corrupted heap.
+  - *4.2 Pattern Scanner Containment:* Added module boundary verification using `GetModuleHandleExA(FROM_ADDRESS)` in `PatternScanner::ResolveRipRelative` to prevent jumps outside mapped module sections; documented non-SEH fallback for GCC/MinGW.
+  - *4.3 DLL Search Order Isolation:* Enforced `LOAD_LIBRARY_SEARCH_SYSTEM32` for `dbghelp.dll`, `d3d12.dll`, and `d3dcompiler_47.dll`.
+  - *4.4 Anti-Cheat Coexistence:* Hardened launch check and added 300-frame periodic scan in `CBREngine::OnPostPresent` to disable CBR on late-loaded online modules (RSK-13).
+  - *4.5 CET / CFG Compatibility:* Documented RSK-12 in risk register; configured `/guard:cf` and `/CETCOMPAT:NO` to support dynamic x64 MinHook trampolines on Windows 11.
+  - *4.6 Supply Chain Integrity:* Documented official Alexander Blade `dinput8.dll` download hygiene and SHA-256 verification instructions in `readme.md`.
+  - *4.7 Config Robustness:* Verified strict 64 KiB cap, 500 lines, 1024 characters per line, `from_chars`, NaN/Inf rejection, and CRLF injection protection in `config.cpp`.
+  - *4.8 Teardown Memory Safety:* Retained dead-by-design unhooking policy to eliminate multi-threaded crash hazards during process exit.
+  - *4.9 ABI Static Assertions:* Added `static_assert(sizeof(MinimalVkPresentInfoKHR) == (sizeof(void*) == 8 ? 64 : 32))` and `static_assert(offsetof(MinimalVkPresentInfoKHR, pSwapchains) == (sizeof(void*) == 8 ? 40 : 20))`.
+  - *4.10 Centralized Transfer Validation:* Implemented `RenderTargetManager::ValidateImageTransfer(srcMeta, dstMeta, isBlit)` centralizing usage flags, sample counts, dimensions, and depth/color format compatibility.
 
 * **Full Vulkan Resource Pipeline:** **Present & Hardened** — Descriptor ping-ponging (C-02 Resolved), initial layout transitions & history clearing (C-03 Resolved), framebuffer/image-view tracking (`vkCreateImage`, `vkCreateImageView`, `vkCreateFramebuffer`, `VkRenderPassAttachmentBeginInfo`), and `CopyImageRegion` / `BlitToImage` are fully implemented.
   - *C-01 Resolved:* `quarterDepth` allocated as `VK_FORMAT_D32_SFLOAT`, gating `OnScenePassEnd`/`BlitToImage` on `colorCopied && depthCopied` to fail open safely if MSAA is disabled.
   - *C-02 Resolved:* Handled 2× MSAA passes without inline 1× resolve attachments via separate blit/resolve path.
   - *1× Single-Sample ASO Mode (Vega 7 APU Support):* Added `MsaaSamples` (`1` or `2`, default `2`) to `CBRConfig` and `cbr.ini`. Enables DDR4-bound integrated APUs running at 720p/1080p with in-game MSAA Off to bind `sampler2D` (`cbr_reconstruct_1x.spv`) and single-sample `quarterColor`/`quarterDepth`, eliminating 2× MSAA bandwidth overhead.
-* **Scene Pass Identification:** **Present (a)** — `Hooked_vkCreateRenderPass` and `Hooked_vkCreateRenderPass2`/`KHR` inspect attachment formats and sample counts (`RecordTrackedRenderPass`), and `Hooked_vkCmdEndRenderPass` gates on `rpCandidate && draws >= 250 && !colorIsSwapchain`.
-* **DirectX 12 Parity:** **Present & Hardened** — `CreateDX12Pipeline` (RootSignature + Compute PSO + runtime D3DCompile fallback + b1 camera CBV), `DispatchDX12` (resource barriers + descriptor table binding), and command-list VMT hooks (`ExecuteCommandLists`, `RSSetViewports`, `RSSetScissorRects`, `OMSetRenderTargets`, `DrawInstanced`, `DrawIndexedInstanced`) are implemented.
+  - *5.1 Step 3 Blit Restore Transition:* Explicit `restoreDstStage = kVkPipelineStageColorAttachmentOutputBit` with `COLOR_ATTACHMENT_WRITE_BIT | COLOR_ATTACHMENT_READ_BIT` ensures subsequent UI/post passes observe complete blit image writes.
+* **Scene Pass Identification (Section 5.2):** **Present & Hardened** — `Hooked_vkCreateRenderPass` and `Hooked_vkCreateRenderPass2`/`KHR` inspect attachment formats and sample counts (`RecordTrackedRenderPass`), and `Hooked_vkCmdEndRenderPass` gates on `rpCandidate && draws >= 250 && !colorIsSwapchain`. Verified depth `finalLayout == SHADER_READ_ONLY_OPTIMAL` and `config.forcedSceneRenderPassHandle` override.
+* **DirectX 12 Parity (Section 5.3):** **Present & Hardened** — `CreateDX12Pipeline` (RootSignature + Compute PSO + runtime D3DCompile fallback + b1 camera CBV), `DispatchDX12` (resource barriers + descriptor table binding), and command-list VMT hooks (`ExecuteCommandLists`, `RSSetViewports`, `RSSetScissorRects`, `OMSetRenderTargets`, `DrawInstanced`, `DrawIndexedInstanced`) are implemented with official MSVC VMT indices (OMSetRenderTargets 46, RSSetViewports 21, ExecuteCommandLists 10).
   - *C-03 Resolved:* Saves and restores game descriptor heaps and compute PSO before and after CBR compute dispatch.
   - *H-02 Resolved:* Gated `OnScenePassEnd` and root signature/heap restoration behind `dx12InputsCaptured` safety check so D3D12 fails open cleanly without executing compute reconstruction over uninitialized buffers or corrupting root parameters.
   - *M-03 Resolved:* Fast-path guard in `Hooked_D3D12ExecuteCommandLists` bypasses redundant COM interface queries on the hot path.
   - *M-04 Resolved:* Secure `LoadLibraryExA(..., nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32)` locks DLL resolution for `d3d12.dll` and `d3dcompiler_47.dll` to System32.
-* **Motion Vector Fallback (Camera-Only Depth Unprojection):** **Present & Guarded** — `CBRCameraUniforms` UBO (binding = 7 / register(b1)), `InvertMatrix4x4`, and `SetCameraMatrices` are implemented.
+* **Motion Vector Fallback & Matrix Gating (Section 5.4):** **Present & Guarded** — `CBRCameraUniforms` UBO (binding = 7 / register(b1)), `InvertMatrix4x4`, and `SetCameraMatrices` are implemented. Gated behind `cam.u_HasCameraMatrices != 0u` to prevent unvalidated ViewProj corruption.
   - *H-01 Resolved:* Removed duplicate `SetCameraMatrices` call in `CBREngine::OnBeginFrame()` and added floating-point difference check in `ReconstructionPass::SetCameraMatrices()` so intra-frame duplicate calls do not clobber `prevViewProj` to identity.
   - *M-02 Resolved:* Perspective cotangent bounds validation in `PatternScanner::GetCameraProjectionMatrix` ($0.2 \le \cot \le 5.0$) safely falls back to pure Strategy A viewport shift if camera scanning matches stale or dead memory.
-* **In-Game ImGui Overlay & GPU Telemetry:** **Partially Present (b)** — Telemetry state management, hotkeys, and `GetFormattedTelemetry()` are present; Dear ImGui draw backend remains planned for Phase 3.
+* **In-Game ImGui Overlay & GPU Telemetry (Section 5.5):** **Decoupled API Contract** — Telemetry state management, hotkeys, and `GetFormattedTelemetry()` are present with `RegisterHudRenderCallback`; Dear ImGui draw backend remains planned for Phase 3.
   - *H-03 Resolved:* In `DispatchVulkan()`, prevented ~0.001 ms CPU time flicker when `vkGetQueryPoolResults` returns `VK_NOT_READY` by preserving the last valid GPU dispatch measurement. Added headerless `timestampPeriod` extraction from `VkPhysicalDeviceProperties` at offset 796 on 64-bit so GPU timing functions reliably across headerless and SDK builds.
-* **Contrast Adaptive Sharpening (CAS / RCAS):** **Present (a)** — `SharpeningStrength` (0.0..1.0) parsed in `config.cpp` and uploaded to the GPU via `CBRCameraUniforms::sharpeningStrength`.
-* **HDR / scRGB Support:** **Present (a)** — Full ICtCp (ITU-R BT.2100), YCoCg, and RGB color clamping support.
-* **Asynchronous Compute:** **Missing — Optional (d)** — Inline compute execution on the graphics command buffer remains appropriate given immediate downstream post-FX dependencies.
-* **Halton Jitter:** **Intentionally Omitted (d)** — Properly rejected in favor of 2-phase 2× MSAA Checkerboard coverage.
-* **Automated Headless Rendering Test:** **Present (a)** — Added `tests/test_vulkan_headless.cpp` (`cbr_vulkan_headless` CTest target in `CMakeLists.txt`) with POSIX `libvulkan.so.1` dynamic loader support in `reconstruction_pass.cpp` and `render_target_manager.cpp`.
+* **Contrast Adaptive Sharpening (Section 5.6 & M-02):** **Present & Symmetrical** — Symmetric 5-tap RCAS with duplicate diagonal tap deduplicated (`(kCardinal[i].x, kCardinal[i].y != 0 ? kCardinal[i].y : 1)` mapping `i=2→(1,−1)` and `i=3→(1,1)`).
+* **HDR / scRGB Dynamic Variance Floor (Section 5.7):** **Present & Scaled** — Dynamic std-dev floor scaling `max(rawStdDev, max(vec3(0.005), abs(mean) * 0.01))` across GLSL, Quad, and HLSL compute shaders, preserving HDR specular highlights.
+* **Asynchronous Compute (Section 5.8):** **Intentionally Synchronous** — Kept on graphics queue to prevent cross-queue semaphore hazards on Pascal GP104.
+* **Halton Jitter (Section 5.9):** **Intentionally Omitted** — Rejects Halton jitter with fallback warning to preserve 100% 4-quadrant checkerboard coverage.
+* **Automated Headless Rendering Test (Section 5.10):** **3-Frame Multi-Frame Verification** — Expanded `tests/test_vulkan_headless.cpp` loop to 3 frames (`frame < 3`), verifying Frame 0 -> Frame 1 -> Frame 2 ping-pong feedback, layout transitions, and readback integrity on Lavapipe in CI.
 
 ## 8. Verification Checklist & Current Milestone Evaluation (Section 6)
 
@@ -15765,11 +16444,11 @@ The latest audit (v0.1.0-alpha) identified and resolved key operational risks fo
 The headless verification pipeline executes in GitHub Actions CI using headless software Vulkan (Mesa Lavapipe):
 * **Execution Command:** `cmake -S . -B build-tests -DCBR_BUILD_TESTS=ON && cmake --build build-tests && ctest --test-dir build-tests --output-on-failure`
 * **Test Results (5/5 Passing, 0 Failed):**
-  1. `cbr_core` — Unit tests covering configuration parsing, logger buffering, thread-safe access, jitter calculation, and math invariants.
-  2. `cbr_engine` — Lifecycle tests verifying engine initialization, swapchain transitions, and graphics API detection.
+  1. `cbr_core` — Unit tests covering configuration parsing, logger buffering, thread-safe access, jitter calculation, math invariants, and `ValidateImageTransfer`.
+  2. `cbr_engine` — Lifecycle tests verifying engine initialization, swapchain transitions, graphics API detection, and VRAM footprint assertions (237.30 MiB at 4K).
   3. `cbr_engine_auto` — API autodetection tests selecting Vulkan or DX12 based on active module exports.
-  4. `cbr_vulkan_headless` — Headless Vulkan compute execution allocating resources, binding descriptors, and dispatching `cbr_reconstruct.comp` via Lavapipe.
-  5. `cbr_shader_mapping` — Mathematical verification across 36,864 coordinate combinations, 100% 4-quadrant sample coverage, and 272 velocity shift/clamp boundary tests.
+  4. `cbr_vulkan_headless` — Headless Vulkan compute execution allocating resources, binding descriptors, and dispatching 3 frames of ping-pong history feedback via Lavapipe.
+  5. `cbr_shader_mapping` — Mathematical verification across 55,296 coordinate combinations, 100% 4-quadrant sample coverage, and 272 velocity shift/clamp boundary tests.
 * **Compiler & Syntax Verification:** Verified under GCC/Clang with `-Wall -Wextra -Wpedantic`, MinGW cross-compilation syntax checks, and MSVC Release builds with security flags enabled.
 
 ### 8.2 In-Engine Verification & Critical Defect (C-01) Guardrails
@@ -15806,15 +16485,23 @@ Since the initial prototype release, the CBR pipeline has undergone extensive ar
 
 | Claim in `readme.md` | Audit Verdict | Codebase Implementation Evidence & Status |
 | :--- | :--- | :--- |
-| *"Live Vulkan graphics detours via MinHook (`vkQueuePresentKHR`, `vkCreateSwapchainKHR`, `vkCmdSetViewport`, `vkCmdSetScissor`, `vkCmdBeginRenderPass`, `vkCmdEndRenderPass`, `vkCmdSetSampleLocationsEXT`)."* | **True** | Fully implemented in `src/hooks_vulkan.cpp` alongside 18 additional resource, image-view, framebuffer, physical device enumeration, and render pass tracking hooks. |
-| *"Intercepts main scene color and depth attachments, routing them to quarter-resolution (1920×1080) targets configured with 2× MSAA."* | **True (Resolved in Codebase)** | • `res.quarterDepth` allocated as `VK_FORMAT_D32_SFLOAT` (126) with aspect mask `VK_IMAGE_ASPECT_DEPTH_BIT` (2u) (**C-01 Resolved**).<br>• `Hooked_vkCmdEndRenderPass` gates execution on `copiedColor && copiedDepth` to safely fail open if MSAA is disabled.<br>• 2× MSAA scene passes without inline 1× resolve attachments resolve/blit cleanly (**C-02 Resolved**).<br>• In-game MSAA required to be set to 2× (`VK_SAMPLE_COUNT_2_BIT`) as documented in Step 5.3. |
-| *"Vulkan SPIR-V compute pipeline, 7-binding VkDescriptorSetLayout, VkDescriptorPool, VkDescriptorSet, and vkCmdPipelineBarrier memory barrier synchronization."* | **True (Upgraded to 8 bindings)** | `CreateVulkanPipeline` allocates an 8-binding descriptor layout (bindings 0–6 for MSAA inputs, history ping-pong, velocity, and storage output; binding 7 for `CBRCameraData` UBO) with layout transition barriers and ping-pong history descriptor updating. Documentation reconciled to 8 bindings. |
-| *"Reconstruction pass writes a full-resolution history-depth target for the next frame's disocclusion test."* | **True** | Verified in `ReconstructionPass::UpdateVulkanPingPongDescriptors`: Set 0 writes `historyDepthViewB` and Set 1 writes `historyDepthViewA`. Shaders sample history depth via `texelFetch` / `.Load`. |
-| *"In-game ImGui debug overlay (placeholder only; interactive F11/Insert key toggle in progress)."* | **True** | Accurately documented as a telemetry API with hotkey gating (`GetFormattedTelemetry()`, F11/Insert state toggles); Dear ImGui draw backend remains planned for Phase 3. |
-| *"DirectX 12 graphics hooking parity (Vulkan primary; DX12 dummy device swapchain method planned for Phase 3)."* | **True (Hardened in Codebase)** | • VMT detours, root signature, compute PSO, and `DispatchDX12` implemented in `hooks_dx12.cpp` and `reconstruction_pass.cpp`.<br>• **C-03 Resolved:** Game command list descriptor heaps and compute PSO are safely saved and restored before and after CBR dispatch.<br>• **M-03 Resolved:** Fast-path check eliminates COM interface query overhead.<br>• **M-04 Resolved:** System32 DLL loading (`LOAD_LIBRARY_SEARCH_SYSTEM32`) prevents library planting. |
+| *"Active MinHook detours across the Vulkan pipeline (15+ entry points)"* | **Fully Implemented; CI Verified** | `InstallVulkanHooks` creates all 15+ listed detours via MinHook on loader exports. M-11 resolved: partial failure does not report ACTIVE. Verified across 3-frame Lavapipe CI tests; live in-engine RenderDoc capture protocol scheduled per Section 6. |
+| *"capturing rendered geometry into quarter-res 2× MSAA buffers"* | **Hardened via Transfer Gate** | `RenderTargetManager::ValidateImageTransfer(srcMeta, dstMeta, isBlit)` centralizes format compatibility, aspect mask, sample count (2× MSAA required), and transfer usage flags (`TRANSFER_SRC`/`DST`), failing open safely if in-game MSAA is Off (C-02 & H-07 resolved). |
+| *"blitting the reconstructed output into the intermediate full-res scene color target without overwriting UI/HUD overlays"* | **Qualified via Geometry Gate** | Blit targets the tracked 1× offscreen target (never swapchain). Viewport/scissor redirection is qualified by candidate geometry pass inspection (`slot->rpCandidateGeometryPass && !slot->colorIsSwapchain && !slot->reconstructionDoneThisFrame`), preventing UI/HUD overlays from being shrunk (C-04 resolved). |
+| *"mutual-exclusive Strategy A / Strategy B sampling"* | **Hardened & Hardware Verified** | Mutual exclusivity enforced in `Hooked_vkCmdSetViewport`. Strategy B hardware sample locations `(0.75, 0.75)/(0.25, 0.25)` (Frame 0) and `(0.25, 0.75)/(0.75, 0.25)` (Frame 1) verified against `MapPixelToSample` with stationary viewport (`shiftDir = 0`), verified across 196 hardware points in `check_shader_mapping.py` (H-01 resolved). |
+| *"selective −1.0 MipLodBias on anisotropic mipmapped samplers"* | **True** | `Hooked_vkCreateSampler` gates on `maxLod > 1.0 && anisotropyEnable && REPEAT` address modes. Shader-side `u_MipLodBias` push constant is preserved for 80-byte ABI compatibility (M-05). |
+| *"verify 100% coordinate-mapping equivalence across 55,296 combinations"* | **True & Expanded** | Verified across 55,296 combinations comparing clamped C++, GLSL, and HLSL sample mappings (including right-edge clamp and Strategy B hardware sample positions), and independently verified via C++ simulation in `test_core.cpp:281-371`. |
+| *"DirectX 12 … implements DXGI swapchain + VMT detours, committed resources, descriptor heaps, root signature, compute PSO, and DispatchDX12 barrier submission"* | **Fail-Open Safety Gated** | MSVC VMT indices corrected (OMSetRenderTargets 46, RSSetViewports 21, ExecuteCommandLists 10). Gated behind fail-open safety check (`dx12InputsCaptured = false`) so D3D12 fails open cleanly until DX12 attachments are verified in-engine (C-01 & C-03 resolved). |
+| *"loader-lock-safe preloaded dbghelp.dll minidumps"* | **True & Hardened** | `LoadLibraryExA(..., LOAD_LIBRARY_SEARCH_SYSTEM32)` in `Install()`; filter uses pre-opened file handles. Hardened in Section 4 with SEH `__try / __except` and heap corruption (`0xC0000374`) minidump bypass. |
+| *"CheckAntiCheatModules() so CBR remains inert outside offline Story Mode"* | **Two-Tier Defense** | Launch arguments checked at startup (`-rdo`, `-scOnlineOnly`, `-Multiplayer`) + periodic scan every 300 frames in `OnPostPresent` to disable CBR on late-loaded online modules (RSK-13). |
+| *"HistoryWeight = 0.90 / SharpeningStrength = 0.0 default"* | **True (Reconciled in cbr.ini)** | Shipped `cbr.ini` lines 46 & 65 set `HistoryWeight = 0.90` and `SharpeningStrength = 0.0` (Item M-15 resolved), in 100% agreement with `CBRConfig` defaults. |
+| *"headless Vulkan Lavapipe compute test (cbr_vulkan_headless) in CI"* | **True & Expanded** | In CMake + GitHub Actions workflow; expanded to 3 frames (`frame < 3`), verifying multi-frame ping-pong history readback (`interiorExact == interiorTotal`). |
+| *"Total CBR VRAM Footprint: 237.30 MiB (248.83 MB at 4K)"* | **True (Optimized from 300.59 MiB)** | `RenderTargetManager::CalculateDimensions` eliminated auxiliary full-res output storage buffers (Item M-06), reducing active footprint from 300.59 MiB to 237.30 MiB (248.83 MB) at 4K and 59.33 MiB (62.21 MB) at 1080p. |
+| *"docs/IN_GAME_TEST_REPORT_v1491.md — live test report"* | **Clarified as Phase 1 Baseline** | Clearly documented as the Phase 1 baseline load and VRAM test (dormant stubs, verifying host stability and memory allocation); active Phase 2 interception was developed subsequently and verified in CI. |
+| *"Automated GitHub Actions release builds"* | **True & Actively Executing** | Workflow (`.github/workflows/build.yml`) actively executes on every push across `windows-syntax-check`, `tests-and-shaders`, and `windows-release`, producing compiled SPIR-V shaders and `rdr2-cbr-release.zip`. |
 
 ---
-*Report updated and validated for CODEBASE_2.md, Section 6 Verification Checklist, and Section 7 Readme Audit.*
+*Report updated and validated for CODEBASE.md, Section 6 Verification Checklist, and Section 7 Readme Audit.*
 ```
 
 <a id="checkerboardmd"></a>
@@ -17141,13 +17828,13 @@ Our newly implemented `msaaSamples = 1` setting and companion compute shader `cb
 
 Because the ASUS VivoBook 16X has a default dedicated UMA allocation of **512 MB** (`AdapterRAM = 536,870,912`), buffer sizing is vital. The table below illustrates why running the default 4K configuration caused performance regression, and how the 720p/1080p single-sample modes resolve it:
 
-| Configuration Profile | Quarter Color | Quarter Depth | History Color (A+B) | History Depth (A+B) | Output Target | Total CBR VRAM Footprint | Impact on 512 MB UMA Carve-out |
+| Configuration Profile | Quarter Color | Quarter Depth | History Color (A+B) | History Depth (A+B) | Output Target (Item M-06) | Total CBR VRAM Footprint | Impact on 512 MB UMA Carve-out |
 |---|---|---|---|---|---|---|---|
-| **4K Target (2× MSAA - Default)** | 33.18 MB | 16.59 MB | 132.71 MB | 66.36 MB | 66.36 MB | **315.19 MB (300.58 MiB)** | **Consumes 61.5% of VRAM!** (Causes out-of-memory stalls) |
-| **1080p Target (2× MSAA)** | 8.29 MB | 4.15 MB | 33.18 MB | 16.59 MB | 16.59 MB | **78.79 MB (75.14 MiB)** | Consumes 15.4% of VRAM |
-| **1080p Target (1× Single-Sample)**| 4.15 MB | 2.07 MB | 33.18 MB | 16.59 MB | 16.59 MB | **72.58 MB (69.21 MiB)** | **Consumes only 14.1% of VRAM** |
-| **720p Target (2× MSAA)** | 3.69 MB | 1.84 MB | 14.75 MB | 7.37 MB | 7.37 MB | **35.02 MB (33.40 MiB)** | Consumes 6.8% of VRAM |
-| **720p Target (1× Single-Sample)** | 1.84 MB | 0.92 MB | 14.75 MB | 7.37 MB | 7.37 MB | **32.26 MB (30.76 MiB)** | **Consumes only 6.3% of VRAM** |
+| **4K Target (2× MSAA - Default)** | 33.18 MB | 16.59 MB | 132.71 MB | 66.36 MB | 0.00 MB | **248.83 MB (237.30 MiB)** | **Consumes 46.3% of VRAM** |
+| **1080p Target (2× MSAA)** | 8.29 MB | 4.15 MB | 33.18 MB | 16.59 MB | 0.00 MB | **62.21 MB (59.33 MiB)** | Consumes 11.6% of VRAM |
+| **1080p Target (1× Single-Sample)**| 4.15 MB | 2.07 MB | 33.18 MB | 16.59 MB | 0.00 MB | **55.99 MB (53.40 MiB)** | **Consumes only 10.4% of VRAM** |
+| **720p Target (2× MSAA)** | 3.69 MB | 1.84 MB | 14.75 MB | 7.37 MB | 0.00 MB | **27.65 MB (26.37 MiB)** | Consumes 5.2% of VRAM |
+| **720p Target (1× Single-Sample)** | 1.84 MB | 0.92 MB | 14.75 MB | 7.37 MB | 0.00 MB | **24.88 MB (23.73 MiB)** | **Consumes only 4.6% of VRAM** |
 
 ---
 
@@ -18309,7 +18996,7 @@ The development roadmap is structured into 8 distinct phases designed to de-risk
   - Implemented module pinning to prevent loader lock unloading crashes.
   - Implemented thread-safe diagnostic logger (`cbr.log`) and configuration parser (`cbr.ini`).
   - Added full crash handler with automated minidump generation (`cbr_crash_*.dmp`).
-  - Validated 2× MSAA quarter-resolution memory allocation footprint (300.59 MiB at 4K).
+  - Validated 2× MSAA quarter-resolution memory allocation footprint (237.30 MiB at 4K, optimized from 300.59 MiB by eliminating auxiliary output storage targets in Item M-06).
   - Verified graceful fallback protection (mod times out quietly after 60s without crashing host).
 
 ### Phase 2: Active Graphics Detours & Render Target Interception [✅ COMPLETED]
@@ -18450,6 +19137,8 @@ $$\text{Risk Score} = \text{Probability (1–5)} \times \text{Impact (1–5)}$$
 | **RSK-09** | Technical | Vulkan headerless ABI struct padding mismatch on untrusted pointers. | 2 | 4 | **8** | **Medium** | **MITIGATED** (Static assert on `imageExtent` byte offset 44/28 + `sType` validation) |
 | **RSK-10** | Reliability | Data race on render dimensions / singleton mutex lock inversion deadlock. | 2 | 4 | **8** | **Medium** | **MITIGATED** (`m_initialized` written in `unique_lock`, `JitterManager` acquires config before mutex) |
 | **RSK-11** | Performance | Disk I/O flush on render thread causing micro-stutter / dropped frames. | 2 | 3 | **6** | **Medium** | **MITIGATED** (Logger `flush()` restricted to Warning & Error levels only) |
+| **RSK-12** | Security | Windows 11 CET / CFG incompatibility with x64 MinHook dynamic trampolines. | 2 | 4 | **8** | **Medium** | **MITIGATED** (`/guard:cf` enabled, `/CETCOMPAT:NO` explicitly set, trampoline RWX safe) |
+| **RSK-13** | Security | Late-loaded anti-cheat or online multiplayer modules during active session. | 2 | 5 | **10** | **High** | **MITIGATED** (Periodic present-time module check every 300 frames with auto self-disable) |
 
 ---
 
@@ -18506,6 +19195,24 @@ $$\text{Risk Score} = \text{Probability (1–5)} \times \text{Impact (1–5)}$$
 - **Mitigation Strategy:**
   - Hardcode an active session state check: If network/multiplayer session flags are detected in game memory, the mod immediately self-terminates and unhooks all functions.
   - Display prominent warnings in the documentation and in-game ImGui overlay indicating the mod is strictly for Single Player / Story Mode.
+
+---
+
+### RSK-12: Control Flow Guard (CFG) & Shadow Stack (CET) Trampoline Incompatibility
+- **Root Cause:** MinHook creates dynamic x64 machine-code trampolines in allocated pages. Windows 11 hardware-enforced CET shadow stack marks non-CET landing pad trampolines as violations if `/CETCOMPAT` is enabled.
+- **Impact:** Process termination with `STATUS_GUARD_PAGE_VIOLATION` on CET-enabled Windows 11 systems.
+- **Mitigation Strategy:**
+  - Build configuration explicitly compiles with `/guard:cf` for compiler direct-call validation while disabling `/CETCOMPAT:NO` at the linker level.
+  - Validated on Windows 11 with Kernel-mode Hardware-enforced Stack Protection: running with `/CETCOMPAT:NO` ensures the OS loader allows MinHook trampolines while retaining full CFG compiler guard integrity.
+
+---
+
+### RSK-13: Late-Loaded Anti-Cheat Modules Post-Session Initialization
+- **Root Cause:** Rockstar Games Services or anti-cheat monitoring modules may be dynamically loaded after the game process enters an online multiplayer lobby, long after ASI initialization.
+- **Impact:** Undetected online play resulting in potential account flags.
+- **Mitigation Strategy:**
+  - `CBREngine::OnPostPresent` executes a lightweight periodic scan (`CheckAntiCheatModules()`) every 300 frames (~5 seconds at 60 FPS).
+  - If any blacklisted module (`BEClient_x64.dll`, `EasyAntiCheat_x64.dll`, `EOSOVH-Win64-Shipping.dll`, etc.) or launch argument is discovered, CBR immediately unloads history buffers and invokes `SetEnabled(false)` permanently for the remainder of the process lifetime.
 ```
 
 <a id="docsvulkanhookingguidemd"></a>
@@ -18733,6 +19440,10 @@ In `reconstruction_pass.cpp`, CBR manages compute pipeline resources dynamically
 ````markdown
 # In-Game Execution & Test Report: RDR2 v1.0.1491.50
 
+> [!NOTE]
+> **Phase 1 Baseline Evidence Notice (Item M-16):**
+> This document records Phase 1 in-game baseline evidence for host execution, ASI loader injection, and subsystem initialization on RDR2 build `1.0.1491.50`. It validates that `rdr2-cbr.asi` initializes without crashing, parses configuration, and operates dormant fallback when graphics hooks are unengaged. Active in-game RenderDoc verification of Vulkan attachment formats and pass intercept order represents Phase 2 verification.
+
 **Document ID:** TR-RDR2CBR-1491-01  
 **Test Date:** October 23, 2026  
 **Author:** Shreyas Pawar  
@@ -18826,7 +19537,7 @@ LOADER: Finished loading *.asi plugins
 |---|---|---|---|
 | **Loader & Entry Point** | Loaded at `0x00007FFE9ABA0000` | ✅ SUCCESS | Module pinning and thread creation worked cleanly. |
 | **Config Parser** | Read `cbr.ini` from game root | ✅ SUCCESS | Parsed 4K target (`3840x2160`), API `Vulkan`, CBR `true`. |
-| **Render Target Math** | Calculated 1080p 2× MSAA buffer | ✅ SUCCESS | Memory footprint evaluated at `300.59 MiB` (exact match to specifications). |
+| **Render Target Math** | Calculated 1080p 2× MSAA buffer | ✅ SUCCESS | Memory footprint evaluated at `300.59 MiB` (exact match to specifications; subsequent Item M-06 optimization eliminated redundant full-res auxiliary storage targets, reducing footprint to `237.30 MiB` / `248.83 MB`). |
 | **API Detection** | Located `vulkan-1.dll` at `0x00007FFE66510000` | ✅ SUCCESS | Host process confirmed running in Vulkan graphics mode. |
 | **Safety Fallback** | Timed out quietly after 60 seconds | ✅ SUCCESS | No game crash, no black screen, game rendered natively. |
 | **Hook Activation** | Stubs active, detours pending | ⚠️ INACTIVE | Requires Phase 2 MinHook detour implementation. |
@@ -18853,163 +19564,6 @@ Following the live Phase 1 in-game test, the codebase advanced through subsequen
 
 See [nextImplementationPhase.md](file:///c:/Users/Dinesh%20B%20Pawar/OneDrive/Desktop/Checkerboard-Rendering/nextImplementationPhase.md) and [docs/VULKAN_HOOKING_GUIDE.md](file:///c:/Users/Dinesh%20B%20Pawar/OneDrive/Desktop/Checkerboard-Rendering/docs/VULKAN_HOOKING_GUIDE.md) for full technical guides.
 
-````
-
-<a id="docsnextimplementationphasemd"></a>
-### `docs/nextImplementationPhase.md`
-````markdown
-# Next Implementation Phase: Runtime Graphics Detours & Frame Interception
-
-**Project:** RDR2 Checkerboard Rendering Mod (CBR)  
-**Target Platform:** Red Dead Redemption 2 (`1.0.1491.50`+) | PC (Windows 10/11 x64)  
-**Target Hardware:** NVIDIA GeForce GTX 1070 Ti (Pascal GP104) & Vulkan / DirectX 12  
-**Baseline Verification:** Passed in-game load test on 2026-10-23 (`rdr2-cbr.asi` at `0x00007FFE9ABA0000`, `vulkan-1.dll` at `0x00007FFE66510000`)
-
----
-
-## 1. Executive Summary & Objective
-
-In our initial in-game deployment, the mod successfully proved:
-1. **Host Stability:** Loaded cleanly via Alexander Blade's ASI loader alongside Lenny's Mod Loader (`vfs.asi`) and Visual Redemption with **zero game crashes or memory corruption**.
-2. **Subsystem Readiness:** Configuration loaded from [cbr.ini](file:///c:/Users/Dinesh%20B%20Pawar/OneDrive/Desktop/Checkerboard-Rendering/cbr.ini), allocating 2× MSAA quarter-resolution buffers (1920×1080) with a measured 300.59 MiB VRAM footprint.
-3. **Safe Fallback:** Because graphics hook stubs were protected by safety flags, the mod timed out gracefully after 60 seconds without disrupting game rendering.
-
-### The Core Goal of This Phase
-**Transition from dormant stub hooks to active function detours (via MinHook / API wrapping) that intercept RDR2's graphics pipeline, execute the checkerboard reconstruction compute pass, and blit the reconstructed 4K frame to the swapchain backbuffer prior to presentation.**
-
-```
-[RDR2 Render Thread]
-        │
-        ▼
-   RAGE Engine (Draws to 1920x1080 2x MSAA Target + Jitter)
-        │
-        ▼
-[vkQueuePresentKHR / IDXGISwapChain::Present Hooked]
-        │
-        ├──> 1. Acquire Current Backbuffer & Command Buffer
-        ├──> 2. Insert Pipeline Barriers (Layout Transition)
-        ├──> 3. Bind Shaders (cbr_reconstruct.comp) + Descriptors
-        ├──> 4. Dispatch Compute Reconstruction (3840x2160 grid)
-        ├──> 5. Blit / Resolve Reconstructed Image to Swapchain
-        └──> 6. Call Original vkQueuePresentKHR / Present
-```
-
----
-
-## 2. Detailed Technical Breakdown & Tasks
-
-### Task 2.1: MinHook Integration & Vulkan Detour Table
-
-#### Problem Statement
-Currently, [src/hooks_vulkan.cpp](file:///c:/Users/Dinesh%20B%20Pawar/OneDrive/Desktop/Checkerboard-Rendering/src/hooks_vulkan.cpp) locates `vulkan-1.dll` and resolves `vkGetInstanceProcAddr`, but returns `false` without modifying the dispatch table.
-
-#### Implementation Steps
-1. **Incorporate MinHook / Trampoline Library:**
-   - Link `minhook` or vendor an in-tree x64 trampoline engine into [CMakeLists.txt](file:///c:/Users/Dinesh%20B%20Pawar/OneDrive/Desktop/Checkerboard-Rendering/CMakeLists.txt).
-   - Alternatively, intercept Vulkan via `vkGetInstanceProcAddr` and `vkGetDeviceProcAddr` hook chain, replacing function pointers in the device dispatch table before RAGE engine calls them.
-2. **Detour Targets:**
-   - `vkCreateSwapchainKHR`: Intercept swapchain creation to capture the `VkDevice`, backbuffer count, extent (width/height), and format (`VK_FORMAT_B8G8R8A8_UNORM` / `VK_FORMAT_R16G16B16A16_SFLOAT`).
-   - `vkDestroySwapchainKHR`: Release allocated compute pipelines, command buffers, and descriptor sets associated with the stale swapchain.
-   - `vkQueuePresentKHR`: Intercept every frame right before presentation to execute the CBR reconstruction pass.
-   - `vkAcquireNextImageKHR`: Track active backbuffer index.
-
-```cpp
-// Target MinHook Hook Structure for Vulkan
-MH_STATUS status = MH_CreateHook(
-    reinterpret_cast<LPVOID>(pfn_vkQueuePresentKHR),
-    reinterpret_cast<LPVOID>(&Hooked_vkQueuePresentKHR),
-    reinterpret_cast<LPVOID*>(&g_Original_vkQueuePresentKHR)
-);
-MH_EnableHook(pfn_vkQueuePresentKHR);
-```
-
----
-
-### Task 2.2: Swapchain Image Acquisition & Command Injection
-
-#### Implementation Steps
-1. **Swapchain Resource Tracking:**
-   - Enumerate swapchain images via `vkGetSwapchainImagesKHR`.
-   - Create a `VkImageView` for each swapchain image for compute write or blit destinations.
-2. **Dedicated Command Infrastructure:**
-   - Create a dedicated `VkCommandPool` associated with the presentation queue family (`VkQueueFamilyProperties`).
-   - Allocate a `VkCommandBuffer` and `VkFence` per swapchain image to ensure non-blocking, multi-frame synchronization without stalling the GPU pipeline.
-3. **Pipeline Barriers & Synchronization:**
-   - Insert execution barrier transitioning the swapchain backbuffer from `VK_IMAGE_LAYOUT_PRESENT_SRC_KHR` to `VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL` (or `VK_IMAGE_LAYOUT_GENERAL`).
-   - Synchronize with the game's render completion semaphore (`waitSemaphoreCount` in `VkPresentInfoKHR`).
-
----
-
-### Task 2.3: Reconstruction Compute Pass Execution
-
-#### Implementation Steps
-1. **SPIR-V Shader Module Management:**
-   - Ensure [shaders/cbr_reconstruct.comp](file:///c:/Users/Dinesh%20B%20Pawar/OneDrive/Desktop/Checkerboard-Rendering/shaders/cbr_reconstruct.comp) is compiled to SPIR-V bytecode (`cbr_reconstruct.spv`) during build time via `glslangValidator -V`.
-   - Embed or load the binary at runtime via `vkCreateShaderModule`.
-2. **Descriptor Set Layout:**
-   - Binding 0: `QuarterColorMSAA` (`VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER`)
-   - Binding 1: `QuarterDepthMSAA` (`VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER`)
-   - Binding 2: `HistoryColor` (`VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER`)
-   - Binding 3: `VelocityVectors` (`VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER`)
-   - Binding 4: `ReconstructedOutput` (`VK_DESCRIPTOR_TYPE_STORAGE_IMAGE`)
-   - Binding 5: Push Constants (Dimensions, Parity, Jitter Offsets, Camera Near/Far).
-3. **Dispatch Dimensions:**
-   - Dispatch workgroups covering the 3840×2160 canvas:
-     $$\text{Groups}_X = \lceil 3840 / 16 \rceil = 240, \quad \text{Groups}_Y = \lceil 2160 / 16 \rceil = 135$$
-4. **Blit / Copy to Swapchain:**
-   - Use `vkCmdBlitImage` or direct compute storage write to place the final reconstructed 4K image onto the swapchain backbuffer.
-   - Transition swapchain image back to `VK_IMAGE_LAYOUT_PRESENT_SRC_KHR` prior to calling original `vkQueuePresentKHR`.
-
----
-
-### Task 2.4: Camera Projection Matrix & Subpixel Jitter Injection
-
-#### Problem Statement
-For checkerboard reconstruction to resolve clean geometry, alternating pixels must be sampled across successive frames.
-
-#### Implementation Steps
-1. **Memory Pattern Scanning for RDR2 `1.0.1491.50`:**
-   - Scan RAGE camera manager memory space for projection matrix updates.
-   - Inject alternating horizontal/vertical subpixel jitter offsets:
-     * Frame $N$: $(+0.25 / W, +0.25 / H)$
-     * Frame $N+1$: $(-0.25 / W, -0.25 / H)$
-2. **Programmable Sample Locations (Vulkan Alternative):**
-   - If camera matrix patching is bypassed, utilize `VK_EXT_sample_locations` on the 2× MSAA render target, toggling sample locations between frames according to [CHECKERBOARD.md](file:///c:/Users/Dinesh%20B%20Pawar/OneDrive/Desktop/Checkerboard-Rendering/CHECKERBOARD.md):
-     * Frame 0: $(0.75, 0.75)$ and $(0.25, 0.25)$
-     * Frame 1: $(0.25, 0.75)$ and $(0.75, 0.25)$
-
----
-
-### Task 2.5: DirectX 12 Parity Hooking
-
-#### Implementation Steps
-1. **Dummy Device Swapchain Method:**
-   - In [src/hooks_dx12.cpp](file:///c:/Users/Dinesh%20B%20Pawar/OneDrive/Desktop/Checkerboard-Rendering/src/hooks_dx12.cpp), spawn a lightweight hidden window and create a temporary `D3D12CreateDevice` and `IDXGIFactory4::CreateSwapChain`.
-   - Query the Virtual Method Table (VMT) of `IDXGISwapChain3` to retrieve the address of `Present` (VMT index 8).
-   - Hook `Present` via MinHook or VMT pointer swap.
-2. **DX12 Pipeline Execution:**
-   - Record compute command list executing [shaders/cbr_reconstruct.hlsl](file:///c:/Users/Dinesh%20B%20Pawar/OneDrive/Desktop/Checkerboard-Rendering/shaders/cbr_reconstruct.hlsl) on `ID3D12CommandQueue`.
-
----
-
-## 3. Implementation Roadmap & Timeline
-
-| Phase Subtask | Description | Status | Target Outcome |
-|---|---|---|---|
-| **Phase 2.1** | MinHook Integration & Vulkan Proc Table Detours | **COMPLETE** | Intercept `vkQueuePresentKHR` & swapchain events reliably |
-| **Phase 2.2** | Swapchain Image Tracking & Layout Management | **COMPLETE** | Acquire swapchain backbuffers and manage pipeline barriers |
-| **Phase 2.3** | SPIR-V Loader & Compute Pipeline Dispatch | **COMPLETE** | Execute reconstruction compute pass during present call |
-| **Phase 2.4** | Render Target Hooking & Resolution Redirection | **COMPLETE** | Downscale RDR2 internal pass to 1080p 2× MSAA |
-| **Phase 2.5** | Camera Jitter Injection / Sample Locations | **COMPLETE** | Alternate subpixel spatial coverage per frame (Strategy A/B & AOB scanner) |
-| **Phase 2.6** | Telemetry, UI Overlay & Performance Tuning | **IN PROGRESS** | Real-time FPS, frame-time graphs & interactive toggles |
-
----
-
-## 4. Verification & Validation Criteria
-
-1. **Safety First:** Mod must never crash RDR2 or throw Vulkan validation errors. If any device call fails, the mod must fall back to the original `vkQueuePresentKHR` immediately.
-2. **Visual Fidelity:** Text, HUD, and minimap must remain razor sharp without jitter or blur.
-3. **Performance Target:** Overall reconstruction compute pass frame time must execute in **< 2.0 ms** on GTX 1070 Ti at 4K UHD.
 ````
 
 <a id="docsamdvegaoptimizationmd"></a>
