@@ -44,7 +44,7 @@ The development roadmap is structured into 8 distinct phases designed to de-risk
   - Implemented module pinning to prevent loader lock unloading crashes.
   - Implemented thread-safe diagnostic logger (`cbr.log`) and configuration parser (`cbr.ini`).
   - Added full crash handler with automated minidump generation (`cbr_crash_*.dmp`).
-  - Validated 2× MSAA quarter-resolution memory allocation footprint (300.59 MiB at 4K).
+  - Validated 2× MSAA quarter-resolution memory allocation footprint (237.30 MiB at 4K, optimized from 300.59 MiB by eliminating auxiliary output storage targets in Item M-06).
   - Verified graceful fallback protection (mod times out quietly after 60s without crashing host).
 
 ### Phase 2: Active Graphics Detours & Render Target Interception [✅ COMPLETED]
