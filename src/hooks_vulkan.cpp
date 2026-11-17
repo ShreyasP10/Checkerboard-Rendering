@@ -693,7 +693,7 @@ struct PassSlot {
     std::atomic<uint32_t> velocityFinalLayout{ 2 };
     std::atomic<bool>     colorIsSwapchain{ false };
     std::atomic<bool>     rpCandidateGeometryPass{ true };
-    std::atomic<bool>     hasSavedViewport{ false };
+    std::atomic<bool>     hasSavedViewport{ false }; // pendingFullViewport deferred rewrite for candidate pass (P-03)
     std::atomic<bool>     hasSavedScissor{ false };
     MinimalVkViewport     savedViewport{};
     MinimalVkRect2D       savedScissor{};
@@ -1511,8 +1511,10 @@ void Hooked_vkCmdBeginRenderPass(void* commandBuffer, const void* pRenderPassBeg
     g_Original_vkCmdBeginRenderPass(commandBuffer, pRenderPassBegin, contents);
 
     // Deferred rewrite for pre-pass candidate viewport & scissor (audit C-04 / P-03)
+    // pendingFullViewport: rewrite pre-stashed full-res viewport inside qualified candidate pass
     if (slot && passCandidate) {
-        if (slot->hasSavedViewport.load(std::memory_order_acquire)) {
+        const bool pendingFullViewport = slot->hasSavedViewport.load(std::memory_order_acquire);
+        if (pendingFullViewport) {
             const auto dims = RenderTargetManager::Get().GetDimensions();
             MinimalVkViewport redirected = slot->savedViewport;
             redirected.width = static_cast<float>(dims.quarterWidth);

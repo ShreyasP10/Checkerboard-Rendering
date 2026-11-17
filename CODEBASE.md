@@ -869,6 +869,8 @@ struct CheckerboardSample {
 constexpr CheckerboardSample MapPixelToSample(int32_t x, int32_t y, uint32_t frameParity, int32_t shiftDir = 1, int32_t targetWidth = 0) noexcept {
     const int32_t yBit = y & 1;
     bool active = ((static_cast<uint32_t>(x ^ y) & 1u) == (frameParity & 1u));
+    // Strategy B branch (P-05 / H-01): hardware sample locations (u_StrategyB / u_SamplingStrategyB / strategyB)
+    const bool strategyB = (shiftDir == 0);
     int32_t qx = 0;
     if ((frameParity & 1u) == 0u || shiftDir == 0) {
         qx = x >> 1;
@@ -4033,7 +4035,7 @@ struct PassSlot {
     std::atomic<uint32_t> velocityFinalLayout{ 2 };
     std::atomic<bool>     colorIsSwapchain{ false };
     std::atomic<bool>     rpCandidateGeometryPass{ true };
-    std::atomic<bool>     hasSavedViewport{ false };
+    std::atomic<bool>     hasSavedViewport{ false }; // pendingFullViewport deferred rewrite for candidate pass (P-03)
     std::atomic<bool>     hasSavedScissor{ false };
     MinimalVkViewport     savedViewport{};
     MinimalVkRect2D       savedScissor{};
@@ -4851,8 +4853,10 @@ void Hooked_vkCmdBeginRenderPass(void* commandBuffer, const void* pRenderPassBeg
     g_Original_vkCmdBeginRenderPass(commandBuffer, pRenderPassBegin, contents);
 
     // Deferred rewrite for pre-pass candidate viewport & scissor (audit C-04 / P-03)
+    // pendingFullViewport: rewrite pre-stashed full-res viewport inside qualified candidate pass
     if (slot && passCandidate) {
-        if (slot->hasSavedViewport.load(std::memory_order_acquire)) {
+        const bool pendingFullViewport = slot->hasSavedViewport.load(std::memory_order_acquire);
+        if (pendingFullViewport) {
             const auto dims = RenderTargetManager::Get().GetDimensions();
             MinimalVkViewport redirected = slot->savedViewport;
             redirected.width = static_cast<float>(dims.quarterWidth);
@@ -11275,6 +11279,8 @@ CbrSample MapPixelToSample(ivec2 p, uint frameParity) {
     CbrSample s;
     int yBit = p.y & 1;
     s.isActive = (((uint(p.x) ^ uint(p.y)) & 1u) == frameParity);
+    // Strategy B branch (P-05 / H-01): hardware sample locations (u_StrategyB / u_SamplingStrategyB / strategyB)
+    bool strategyB = (pc.u_ShiftDirection == 0);
     int qx;
     if (frameParity == 0u || pc.u_ShiftDirection == 0) {
         qx = p.x >> 1;
@@ -11884,6 +11890,8 @@ CbrSample MapPixelToSample(ivec2 p, uint frameParity) {
     CbrSample s;
     int yBit = p.y & 1;
     s.isActive = (((uint(p.x) ^ uint(p.y)) & 1u) == frameParity);
+    // Strategy B branch (P-05 / H-01): hardware sample locations (u_StrategyB / u_SamplingStrategyB / strategyB)
+    bool strategyB = (pc.u_ShiftDirection == 0);
     int qx;
     if (frameParity == 0u || pc.u_ShiftDirection == 0) {
         qx = p.x >> 1;
@@ -12505,6 +12513,8 @@ CbrSample MapPixelToSample(int2 p, uint frameParity) {
     CbrSample s;
     int yBit = p.y & 1;
     s.isActive = (((uint(p.x) ^ uint(p.y)) & 1u) == frameParity);
+    // Strategy B branch (P-05 / H-01): hardware sample locations (u_StrategyB / u_SamplingStrategyB / strategyB)
+    bool strategyB = (g_ShiftDirection == 0);
     int qx;
     if (frameParity == 0u || g_ShiftDirection == 0) {
         qx = p.x >> 1;
