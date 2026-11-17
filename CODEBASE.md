@@ -4729,6 +4729,8 @@ void Hooked_vkCmdBeginRenderPass(void* commandBuffer, const void* pRenderPassBeg
     bool restoreScissor = false;
     MinimalVkViewport restoredVp{};
     MinimalVkRect2D restoredSc{};
+    PassSlot* slot = nullptr;
+    bool passCandidate = false;
 
     if (pRenderPassBegin && CBREngine::Get().IsEnabled()) {
         uint32_t sType = 0;
@@ -4783,7 +4785,7 @@ void Hooked_vkCmdBeginRenderPass(void* commandBuffer, const void* pRenderPassBeg
                 }
             }
 
-            PassSlot* slot = GetOrCreatePassSlot(commandBuffer);
+            slot = GetOrCreatePassSlot(commandBuffer);
             if (slot) {
                 ResolvedSceneAttachments resolved{};
                 if (matching && (info.framebuffer || !overrideViews.empty())) {
@@ -4794,11 +4796,11 @@ void Hooked_vkCmdBeginRenderPass(void* commandBuffer, const void* pRenderPassBeg
 
                 void* verifiedRp = g_verifiedSceneRenderPass.load(std::memory_order_acquire);
                 const bool wasProvisionallyDownscaled = slot->viewportDownscaled.load(std::memory_order_acquire);
-                const bool passCandidate = matching &&
-                                           !resolved.colorIsSwapchain &&
-                                           (!resolved.rpTracked || resolved.rpCandidateGeometryPass) &&
-                                           !CBREngine::Get().HasDispatchedThisFrame() &&
-                                           (!verifiedRp || !info.renderPass || info.renderPass == verifiedRp);
+                passCandidate = matching &&
+                                !resolved.colorIsSwapchain &&
+                                (!resolved.rpTracked || resolved.rpCandidateGeometryPass) &&
+                                !CBREngine::Get().HasDispatchedThisFrame() &&
+                                (!verifiedRp || !info.renderPass || info.renderPass == verifiedRp);
 
                 if (wasProvisionallyDownscaled && !passCandidate) {
                     // Provisional downscale happened before vkCmdBeginRenderPass, but this pass is NOT an offscreen scene pass!
@@ -4815,7 +4817,7 @@ void Hooked_vkCmdBeginRenderPass(void* commandBuffer, const void* pRenderPassBeg
                         restoredSc = slot->savedScissor;
                         slot->hasSavedScissor.store(false, std::memory_order_release);
                     }
-                } else if (!wasProvisionallyDownscaled) {
+                } else if (!wasProvisionallyDownscaled && !passCandidate) {
                     slot->hasSavedViewport.store(false, std::memory_order_relaxed);
                     slot->hasSavedScissor.store(false, std::memory_order_relaxed);
                 }
