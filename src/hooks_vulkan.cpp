@@ -191,6 +191,8 @@ struct MinimalVkPresentInfoKHR {
     const uint32_t* pImageIndices;
     int*         pResults;
 };
+static_assert(sizeof(MinimalVkPresentInfoKHR) == (sizeof(void*) == 8 ? 64 : 32), "VkPresentInfoKHR ABI size drift");
+static_assert(offsetof(MinimalVkPresentInfoKHR, pSwapchains) == (sizeof(void*) == 8 ? 40 : 20), "ABI drift: pSwapchains offset");
 
 // =============================================================================
 // Vulkan Checkerboard Structures & Enums (CHECKERBOARD.md: Vulkan Setup)

@@ -177,6 +177,9 @@ LONG WINAPI CBRUnhandledExceptionFilter(EXCEPTION_POINTERS* pEx) {
         return (g_previousFilter) ? g_previousFilter(pEx) : EXCEPTION_CONTINUE_SEARCH;
     }
 
+#if defined(_MSC_VER)
+    __try {
+#endif
     const DWORD code = pEx->ExceptionRecord->ExceptionCode;
     void* faultAddress = pEx->ExceptionRecord->ExceptionAddress;
 
@@ -276,9 +279,18 @@ LONG WINAPI CBRUnhandledExceptionFilter(EXCEPTION_POINTERS* pEx) {
     }
 
     // 3. Write minidump (.dmp) for Visual Studio / WinDbg debugging
-    if (g_dumpPathW[0] != L'\0') {
+    // Skip minidump if ExceptionCode indicates heap corruption (0xC0000374 / STATUS_HEAP_CORRUPTION)
+    // because MiniDumpWriteDump allocates and can recurse or deadlock on corrupted heaps (Section 4.1).
+    constexpr DWORD kStatusHeapCorruption = 0xC0000374;
+    if (code != kStatusHeapCorruption && g_dumpPathW[0] != L'\0') {
         WriteMinidump(pEx, g_dumpPathW);
     }
+#if defined(_MSC_VER)
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        // Emergency fallback: secondary fault occurred inside crash reporting; avoid recursion
+    }
+#endif
 
     if (g_previousFilter) {
         return g_previousFilter(pEx);

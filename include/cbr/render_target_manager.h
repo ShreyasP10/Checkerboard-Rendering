@@ -103,10 +103,13 @@ public:
     bool IsTargetInterceptCandidate(uint32_t width, uint32_t height, uint32_t format) const;
     bool IsQuarterPassCandidate(uint32_t width, uint32_t height) const;
 
-    // Vulkan attachment & blit safety checks (Items C-01 & C-04)
+    // Vulkan attachment & blit safety checks (Items C-01 & C-04 & Section 4.10)
     [[nodiscard]] static bool IsVulkanDepthFormat(int32_t format);
     [[nodiscard]] static bool IsDepthCopyFormatCompatible(uint32_t srcFormat, uint32_t dstFormat);
     [[nodiscard]] static bool IsColorCopyFormatCompatible(uint32_t srcFormat, uint32_t dstFormat);
+    [[nodiscard]] static bool ValidateImageTransfer(const VulkanImageMetadata& srcMeta,
+                                                    const VulkanImageMetadata& dstMeta,
+                                                    bool isBlit);
     [[nodiscard]] bool CanCopyToQuarterColor(const VulkanImageMetadata& srcMeta) const;
     [[nodiscard]] bool CanCopyToQuarterDepth(const VulkanImageMetadata& srcMeta) const;
     [[nodiscard]] bool CanCopyToVelocity(const VulkanImageMetadata& srcMeta) const;

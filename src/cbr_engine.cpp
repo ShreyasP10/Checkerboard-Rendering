@@ -120,6 +120,13 @@ bool CBREngine::Initialize() {
 bool CBREngine::TryInstallHooks() {
     if (!m_initialized.load()) return false;
 
+    // Refuse hook installation if anti-cheat or online multiplayer modules/arguments are present (Section 4)
+    if (CheckAntiCheatModules()) {
+        CBR_LOG_ERROR("CRITICAL: Refusing to install graphics hooks due to detected anti-cheat / online security modules.");
+        m_enabled.store(false);
+        return false;
+    }
+
     static uint32_t s_pollAttempt = 0;
     ++s_pollAttempt;
     if (s_pollAttempt == 1 || s_pollAttempt % 40 == 0) {
@@ -263,7 +270,18 @@ void CBREngine::OnPostPresent(void* presentTarget) {
     }
 
     if (m_mainPresentTarget.load() == presentTarget) {
-        m_frameIndex.fetch_add(1);
+        const uint32_t currentFrame = m_frameIndex.fetch_add(1);
+
+        // Section 4: Periodic late-loaded anti-cheat & online security check (every 300 frames, ~5s at 60 FPS)
+        if ((currentFrame % 300u) == 0u && m_enabled.load()) {
+            if (CheckAntiCheatModules()) {
+                CBR_LOG_ERROR("CRITICAL: Late-loaded anti-cheat / online security module detected during gameplay! Self-disabling CBR immediately to protect account standing.");
+                m_enabled.store(false);
+                RenderTargetManager::Get().ResetHistory();
+                return;
+            }
+        }
+
         OnBeginFrame();
     }
 }

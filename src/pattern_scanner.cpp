@@ -303,6 +303,15 @@ const uint8_t* PatternScanner::ResolveRipRelative(const uint8_t* instructionAddr
     const uint8_t* target = instructionAddress + instructionLength + displacement;
 
 #if defined(_WIN32)
+    // Section 4.2: Verify the target lies inside a known mapped module (containment check)
+    HMODULE hTargetMod = nullptr;
+    if (!GetModuleHandleExA(
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        reinterpret_cast<LPCSTR>(target),
+        &hTargetMod) || !hTargetMod) {
+        return nullptr;
+    }
+
     if (!VirtualQuery(target, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT ||
         (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) {
         return nullptr;
@@ -328,6 +337,9 @@ const uint8_t* PatternScanner::ScanModule(const char* moduleName, const char* si
         return nullptr;
     }
 
+// Note: MSVC builds use hardware SEH (__try/__except) to trap potential page faults.
+// For MinGW/GCC builds (which lack MSVC x64 SEH extensions), the granular VirtualQuery
+// region validation (MEM_COMMIT, protection mask, and non-PAGE_GUARD) acts as the primary safety gate.
 #if defined(_MSC_VER)
     __try {
 #endif

@@ -1708,10 +1708,13 @@ public:
     bool IsTargetInterceptCandidate(uint32_t width, uint32_t height, uint32_t format) const;
     bool IsQuarterPassCandidate(uint32_t width, uint32_t height) const;
 
-    // Vulkan attachment & blit safety checks (Items C-01 & C-04)
+    // Vulkan attachment & blit safety checks (Items C-01 & C-04 & Section 4.10)
     [[nodiscard]] static bool IsVulkanDepthFormat(int32_t format);
     [[nodiscard]] static bool IsDepthCopyFormatCompatible(uint32_t srcFormat, uint32_t dstFormat);
     [[nodiscard]] static bool IsColorCopyFormatCompatible(uint32_t srcFormat, uint32_t dstFormat);
+    [[nodiscard]] static bool ValidateImageTransfer(const VulkanImageMetadata& srcMeta,
+                                                    const VulkanImageMetadata& dstMeta,
+                                                    bool isBlit);
     [[nodiscard]] bool CanCopyToQuarterColor(const VulkanImageMetadata& srcMeta) const;
     [[nodiscard]] bool CanCopyToQuarterDepth(const VulkanImageMetadata& srcMeta) const;
     [[nodiscard]] bool CanCopyToVelocity(const VulkanImageMetadata& srcMeta) const;
@@ -2089,6 +2092,13 @@ bool CBREngine::Initialize() {
 bool CBREngine::TryInstallHooks() {
     if (!m_initialized.load()) return false;
 
+    // Refuse hook installation if anti-cheat or online multiplayer modules/arguments are present (Section 4)
+    if (CheckAntiCheatModules()) {
+        CBR_LOG_ERROR("CRITICAL: Refusing to install graphics hooks due to detected anti-cheat / online security modules.");
+        m_enabled.store(false);
+        return false;
+    }
+
     static uint32_t s_pollAttempt = 0;
     ++s_pollAttempt;
     if (s_pollAttempt == 1 || s_pollAttempt % 40 == 0) {
@@ -2232,7 +2242,18 @@ void CBREngine::OnPostPresent(void* presentTarget) {
     }
 
     if (m_mainPresentTarget.load() == presentTarget) {
-        m_frameIndex.fetch_add(1);
+        const uint32_t currentFrame = m_frameIndex.fetch_add(1);
+
+        // Section 4: Periodic late-loaded anti-cheat & online security check (every 300 frames, ~5s at 60 FPS)
+        if ((currentFrame % 300u) == 0u && m_enabled.load()) {
+            if (CheckAntiCheatModules()) {
+                CBR_LOG_ERROR("CRITICAL: Late-loaded anti-cheat / online security module detected during gameplay! Self-disabling CBR immediately to protect account standing.");
+                m_enabled.store(false);
+                RenderTargetManager::Get().ResetHistory();
+                return;
+            }
+        }
+
         OnBeginFrame();
     }
 }
@@ -2931,6 +2952,9 @@ LONG WINAPI CBRUnhandledExceptionFilter(EXCEPTION_POINTERS* pEx) {
         return (g_previousFilter) ? g_previousFilter(pEx) : EXCEPTION_CONTINUE_SEARCH;
     }
 
+#if defined(_MSC_VER)
+    __try {
+#endif
     const DWORD code = pEx->ExceptionRecord->ExceptionCode;
     void* faultAddress = pEx->ExceptionRecord->ExceptionAddress;
 
@@ -3030,9 +3054,18 @@ LONG WINAPI CBRUnhandledExceptionFilter(EXCEPTION_POINTERS* pEx) {
     }
 
     // 3. Write minidump (.dmp) for Visual Studio / WinDbg debugging
-    if (g_dumpPathW[0] != L'\0') {
+    // Skip minidump if ExceptionCode indicates heap corruption (0xC0000374 / STATUS_HEAP_CORRUPTION)
+    // because MiniDumpWriteDump allocates and can recurse or deadlock on corrupted heaps (Section 4.1).
+    constexpr DWORD kStatusHeapCorruption = 0xC0000374;
+    if (code != kStatusHeapCorruption && g_dumpPathW[0] != L'\0') {
         WriteMinidump(pEx, g_dumpPathW);
     }
+#if defined(_MSC_VER)
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        // Emergency fallback: secondary fault occurred inside crash reporting; avoid recursion
+    }
+#endif
 
     if (g_previousFilter) {
         return g_previousFilter(pEx);
@@ -3434,6 +3467,8 @@ struct MinimalVkPresentInfoKHR {
     const uint32_t* pImageIndices;
     int*         pResults;
 };
+static_assert(sizeof(MinimalVkPresentInfoKHR) == (sizeof(void*) == 8 ? 64 : 32), "VkPresentInfoKHR ABI size drift");
+static_assert(offsetof(MinimalVkPresentInfoKHR, pSwapchains) == (sizeof(void*) == 8 ? 40 : 20), "ABI drift: pSwapchains offset");
 
 // =============================================================================
 // Vulkan Checkerboard Structures & Enums (CHECKERBOARD.md: Vulkan Setup)
@@ -6901,6 +6936,15 @@ const uint8_t* PatternScanner::ResolveRipRelative(const uint8_t* instructionAddr
     const uint8_t* target = instructionAddress + instructionLength + displacement;
 
 #if defined(_WIN32)
+    // Section 4.2: Verify the target lies inside a known mapped module (containment check)
+    HMODULE hTargetMod = nullptr;
+    if (!GetModuleHandleExA(
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        reinterpret_cast<LPCSTR>(target),
+        &hTargetMod) || !hTargetMod) {
+        return nullptr;
+    }
+
     if (!VirtualQuery(target, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT ||
         (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) {
         return nullptr;
@@ -6926,6 +6970,9 @@ const uint8_t* PatternScanner::ScanModule(const char* moduleName, const char* si
         return nullptr;
     }
 
+// Note: MSVC builds use hardware SEH (__try/__except) to trap potential page faults.
+// For MinGW/GCC builds (which lack MSVC x64 SEH extensions), the granular VirtualQuery
+// region validation (MEM_COMMIT, protection mask, and non-PAGE_GUARD) acts as the primary safety gate.
 #if defined(_MSC_VER)
     __try {
 #endif
@@ -10531,77 +10578,105 @@ bool RenderTargetManager::IsColorCopyFormatCompatible(uint32_t srcFormat, uint32
     return is64BitColor(srcFormat) && is64BitColor(dstFormat);
 }
 
+bool RenderTargetManager::ValidateImageTransfer(const VulkanImageMetadata& srcMeta,
+                                                const VulkanImageMetadata& dstMeta,
+                                                bool isBlit) {
+    // 1. Usage flags (Item H-07): verify TRANSFER_SRC_BIT and TRANSFER_DST_BIT when usage is known
+    if (srcMeta.usage != 0u && (srcMeta.usage & kVkImageUsageTransferSrcBit) == 0u) {
+        return false;
+    }
+    if (dstMeta.usage != 0u && (dstMeta.usage & kVkImageUsageTransferDstBit) == 0u) {
+        return false;
+    }
+
+    const bool srcIsDepth = (srcMeta.format != 0u) && IsVulkanDepthFormat(static_cast<int32_t>(srcMeta.format));
+    const bool dstIsDepth = (dstMeta.format != 0u) && IsVulkanDepthFormat(static_cast<int32_t>(dstMeta.format));
+
+    if (isBlit) {
+        // vkCmdBlitImage: dstImage must have VK_SAMPLE_COUNT_1_BIT and non-depth format (VUID-vkCmdBlitImage-dstImage-00233)
+        if (dstMeta.samples > kVkSampleCount1Bit) {
+            return false;
+        }
+        if (dstIsDepth) {
+            return false;
+        }
+        // Source and destination color formats must be size-compatible
+        if (srcMeta.format != 0u && dstMeta.format != 0u) {
+            if (!IsColorCopyFormatCompatible(srcMeta.format, dstMeta.format)) {
+                return false;
+            }
+        }
+        return true;
+    } else {
+        // vkCmdCopyImage:
+        // Matching sample count (VUID-vkCmdCopyImage-samples-00140)
+        if (srcMeta.samples != 0u && dstMeta.samples != 0u && srcMeta.samples != dstMeta.samples) {
+            return false;
+        }
+        // Dimensions check: src bounds must satisfy required destination bounds
+        if (srcMeta.width > 0u && dstMeta.width > 0u && srcMeta.width < dstMeta.width) {
+            return false;
+        }
+        if (srcMeta.height > 0u && dstMeta.height > 0u && srcMeta.height < dstMeta.height) {
+            return false;
+        }
+        // Format compatibility across depth or color classes
+        if (srcIsDepth || dstIsDepth) {
+            if (srcMeta.format != 0u && dstMeta.format != 0u) {
+                return IsDepthCopyFormatCompatible(srcMeta.format, dstMeta.format);
+            }
+            return srcIsDepth == dstIsDepth;
+        }
+        if (srcMeta.format != 0u && dstMeta.format != 0u) {
+            return IsColorCopyFormatCompatible(srcMeta.format, dstMeta.format);
+        }
+        return true;
+    }
+}
+
 bool RenderTargetManager::CanCopyToQuarterColor(const VulkanImageMetadata& srcMeta) const {
     if (!m_initialized.load()) return false;
     const TargetDimensions dims = GetDimensions();
     if (dims.quarterWidth == 0u || dims.quarterHeight == 0u) return false;
-    // Unknown dimensions (pre-hook image) cannot satisfy copy bounds safely when known to be 0.
-    if (srcMeta.width > 0u && srcMeta.height > 0u) {
-        if (srcMeta.width < dims.quarterWidth || srcMeta.height < dims.quarterHeight) {
-            return false;
-        }
-    }
-    // vkCmdCopyImage requires matching sample count (quarterColor is 2x MSAA when allocated).
-    if (srcMeta.samples != 0u && srcMeta.samples != dims.msaaSamples) {
-        return false;
-    }
-    // Verify format compatibility: must be size-compatible (64bpp) with quarterColor (R16G16B16A16_SFLOAT = 97)
-    if (srcMeta.format != 0u) {
-        if (!IsColorCopyFormatCompatible(srcMeta.format, kVkFormatR16G16B16A16Sfloat)) {
-            return false;
-        }
-    }
-    // Item H-07: Require VK_IMAGE_USAGE_TRANSFER_SRC_BIT (0x01) on non-zero usage metadata
-    if (srcMeta.usage != 0u && (srcMeta.usage & kVkImageUsageTransferSrcBit) == 0u) {
-        return false;
-    }
-    return true;
+
+    VulkanImageMetadata dstMeta{};
+    dstMeta.width = dims.quarterWidth;
+    dstMeta.height = dims.quarterHeight;
+    dstMeta.samples = dims.msaaSamples;
+    dstMeta.format = kVkFormatR16G16B16A16Sfloat;
+    dstMeta.usage = kVkImageUsageTransferDstBit;
+
+    return ValidateImageTransfer(srcMeta, dstMeta, false /* isBlit */);
 }
 
 bool RenderTargetManager::CanCopyToQuarterDepth(const VulkanImageMetadata& srcMeta) const {
     if (!m_initialized.load()) return false;
     const TargetDimensions dims = GetDimensions();
     if (dims.quarterWidth == 0u || dims.quarterHeight == 0u) return false;
-    if (srcMeta.width > 0u && srcMeta.height > 0u) {
-        if (srcMeta.width < dims.quarterWidth || srcMeta.height < dims.quarterHeight) {
-            return false;
-        }
-    }
-    if (srcMeta.samples != 0u && srcMeta.samples != dims.msaaSamples) {
-        return false;
-    }
-    if (srcMeta.format != 0u && !IsDepthCopyFormatCompatible(srcMeta.format, kVkFormatD32Sfloat)) {
-        return false;
-    }
-    // Item H-07: Require VK_IMAGE_USAGE_TRANSFER_SRC_BIT (0x01) on non-zero usage metadata
-    if (srcMeta.usage != 0u && (srcMeta.usage & kVkImageUsageTransferSrcBit) == 0u) {
-        return false;
-    }
-    return true;
+
+    VulkanImageMetadata dstMeta{};
+    dstMeta.width = dims.quarterWidth;
+    dstMeta.height = dims.quarterHeight;
+    dstMeta.samples = dims.msaaSamples;
+    dstMeta.format = kVkFormatD32Sfloat;
+    dstMeta.usage = kVkImageUsageTransferDstBit;
+
+    return ValidateImageTransfer(srcMeta, dstMeta, false /* isBlit */);
 }
 
 bool RenderTargetManager::CanCopyToVelocity(const VulkanImageMetadata& srcMeta) const {
     if (!m_initialized.load()) return false;
     const TargetDimensions dims = GetDimensions();
     if (dims.quarterWidth == 0u || dims.quarterHeight == 0u) return false;
-    if (srcMeta.width > 0u && srcMeta.height > 0u) {
-        if (srcMeta.width < dims.quarterWidth || srcMeta.height < dims.quarterHeight) {
-            return false;
-        }
-    }
-    // m_vkResources.velocity is allocated at 1x sample count and R16G16B16A16_SFLOAT (64-bit).
-    // vkCmdCopyImage requires matching texel block size (VUID-vkCmdCopyImage-srcImage-00146).
-    if (srcMeta.samples != 0u && srcMeta.samples != kVkSampleCount1Bit) {
-        return false;
-    }
-    if (srcMeta.format != 0u && !IsColorCopyFormatCompatible(srcMeta.format, kVkFormatR16G16B16A16Sfloat)) {
-        return false;
-    }
-    // Item H-07: Require VK_IMAGE_USAGE_TRANSFER_SRC_BIT (0x01) on non-zero usage metadata
-    if (srcMeta.usage != 0u && (srcMeta.usage & kVkImageUsageTransferSrcBit) == 0u) {
-        return false;
-    }
-    return true;
+
+    VulkanImageMetadata dstMeta{};
+    dstMeta.width = dims.quarterWidth;
+    dstMeta.height = dims.quarterHeight;
+    dstMeta.samples = kVkSampleCount1Bit;
+    dstMeta.format = kVkFormatR16G16B16A16Sfloat;
+    dstMeta.usage = kVkImageUsageTransferDstBit;
+
+    return ValidateImageTransfer(srcMeta, dstMeta, false /* isBlit */);
 }
 
 bool RenderTargetManager::ShouldBlitReconstructionToSceneColor(const void* gameColorImage,
@@ -10612,29 +10687,24 @@ bool RenderTargetManager::ShouldBlitReconstructionToSceneColor(const void* gameC
     if (!m_initialized.load() || !gameColorImage || isSwapchainBackbuffer) {
         return false;
     }
-    // VUID-vkCmdBlitImage-dstImage-00233: dstImage must have VK_SAMPLE_COUNT_1_BIT and non-depth format (Item C-04)
-    if (dstMeta.samples > kVkSampleCount1Bit) {
-        return false;
-    }
-    if (dstMeta.format != 0u && IsVulkanDepthFormat(static_cast<int32_t>(dstMeta.format))) {
-        return false;
-    }
-    // vkCmdBlitImage permits format conversion only between formats with matching texel block size.
-    // Source historyColor is R16G16B16A16_SFLOAT (64-bit). Destination must also be 64-bit copy-compatible.
-    if (dstMeta.format != 0u && !IsColorCopyFormatCompatible(kVkFormatR16G16B16A16Sfloat, dstMeta.format)) {
-        return false;
-    }
-    // Item H-07: Require VK_IMAGE_USAGE_TRANSFER_DST_BIT (0x02) on non-zero usage metadata
-    if (dstMeta.usage != 0u && (dstMeta.usage & kVkImageUsageTransferDstBit) == 0u) {
-        return false;
-    }
     const TargetDimensions dims = GetDimensions();
+    if (passWidth < dims.fullWidth || passHeight < dims.fullHeight) {
+        return false;
+    }
     if (dstMeta.width > 0u && dstMeta.height > 0u) {
         if (dstMeta.width < dims.fullWidth || dstMeta.height < dims.fullHeight) {
             return false;
         }
     }
-    return (passWidth >= dims.fullWidth) && (passHeight >= dims.fullHeight);
+
+    VulkanImageMetadata srcMeta{};
+    srcMeta.width = dims.fullWidth;
+    srcMeta.height = dims.fullHeight;
+    srcMeta.samples = kVkSampleCount1Bit;
+    srcMeta.format = kVkFormatR16G16B16A16Sfloat;
+    srcMeta.usage = kVkImageUsageTransferSrcBit;
+
+    return ValidateImageTransfer(srcMeta, dstMeta, true /* isBlit */);
 }
 
 } // namespace cbr
@@ -13496,6 +13566,12 @@ static void TestRenderTargets() {
     CHECK(!r.ShouldBlitReconstructionToSceneColor(&fakeImg, true, 3840, 2160));                 // never blit swapchain mid-frame (C-04)
     CHECK(!r.ShouldBlitReconstructionToSceneColor(&fakeImg, false, 1920, 1080));                // never downsample into quarter-res pass
     CHECK(!r.ShouldBlitReconstructionToSceneColor(nullptr, false, 3840, 2160));
+
+    // Section 4.10: Centralized ValidateImageTransfer verification
+    CHECK(RenderTargetManager::ValidateImageTransfer(validColor, validColor, false));
+    CHECK(!RenderTargetManager::ValidateImageTransfer(validColor, singleSampleColor, false)); // sample count mismatch
+    CHECK(RenderTargetManager::ValidateImageTransfer(singleSampleColor, singleSampleColor, true)); // valid 1x color blit
+    CHECK(!RenderTargetManager::ValidateImageTransfer(singleSampleColor, depthMetaDst, true)); // color -> depth blit disallowed
 
     // DX12 resource lifecycle sanity checks (Item H-02)
     CHECK(!r.AreDX12ResourcesCreated());
@@ -18958,6 +19034,8 @@ $$\text{Risk Score} = \text{Probability (1–5)} \times \text{Impact (1–5)}$$
 | **RSK-09** | Technical | Vulkan headerless ABI struct padding mismatch on untrusted pointers. | 2 | 4 | **8** | **Medium** | **MITIGATED** (Static assert on `imageExtent` byte offset 44/28 + `sType` validation) |
 | **RSK-10** | Reliability | Data race on render dimensions / singleton mutex lock inversion deadlock. | 2 | 4 | **8** | **Medium** | **MITIGATED** (`m_initialized` written in `unique_lock`, `JitterManager` acquires config before mutex) |
 | **RSK-11** | Performance | Disk I/O flush on render thread causing micro-stutter / dropped frames. | 2 | 3 | **6** | **Medium** | **MITIGATED** (Logger `flush()` restricted to Warning & Error levels only) |
+| **RSK-12** | Security | Windows 11 CET / CFG incompatibility with x64 MinHook dynamic trampolines. | 2 | 4 | **8** | **Medium** | **MITIGATED** (`/guard:cf` enabled, `/CETCOMPAT:NO` explicitly set, trampoline RWX safe) |
+| **RSK-13** | Security | Late-loaded anti-cheat or online multiplayer modules during active session. | 2 | 5 | **10** | **High** | **MITIGATED** (Periodic present-time module check every 300 frames with auto self-disable) |
 
 ---
 
@@ -19014,6 +19092,24 @@ $$\text{Risk Score} = \text{Probability (1–5)} \times \text{Impact (1–5)}$$
 - **Mitigation Strategy:**
   - Hardcode an active session state check: If network/multiplayer session flags are detected in game memory, the mod immediately self-terminates and unhooks all functions.
   - Display prominent warnings in the documentation and in-game ImGui overlay indicating the mod is strictly for Single Player / Story Mode.
+
+---
+
+### RSK-12: Control Flow Guard (CFG) & Shadow Stack (CET) Trampoline Incompatibility
+- **Root Cause:** MinHook creates dynamic x64 machine-code trampolines in allocated pages. Windows 11 hardware-enforced CET shadow stack marks non-CET landing pad trampolines as violations if `/CETCOMPAT` is enabled.
+- **Impact:** Process termination with `STATUS_GUARD_PAGE_VIOLATION` on CET-enabled Windows 11 systems.
+- **Mitigation Strategy:**
+  - Build configuration explicitly compiles with `/guard:cf` for compiler direct-call validation while disabling `/CETCOMPAT:NO` at the linker level.
+  - Validated on Windows 11 with Kernel-mode Hardware-enforced Stack Protection: running with `/CETCOMPAT:NO` ensures the OS loader allows MinHook trampolines while retaining full CFG compiler guard integrity.
+
+---
+
+### RSK-13: Late-Loaded Anti-Cheat Modules Post-Session Initialization
+- **Root Cause:** Rockstar Games Services or anti-cheat monitoring modules may be dynamically loaded after the game process enters an online multiplayer lobby, long after ASI initialization.
+- **Impact:** Undetected online play resulting in potential account flags.
+- **Mitigation Strategy:**
+  - `CBREngine::OnPostPresent` executes a lightweight periodic scan (`CheckAntiCheatModules()`) every 300 frames (~5 seconds at 60 FPS).
+  - If any blacklisted module (`BEClient_x64.dll`, `EasyAntiCheat_x64.dll`, `EOSOVH-Win64-Shipping.dll`, etc.) or launch argument is discovered, CBR immediately unloads history buffers and invokes `SetEnabled(false)` permanently for the remainder of the process lifetime.
 ```
 
 <a id="docsvulkanhookingguidemd"></a>
