@@ -93,6 +93,8 @@ struct CheckerboardSample {
 constexpr CheckerboardSample MapPixelToSample(int32_t x, int32_t y, uint32_t frameParity, int32_t shiftDir = 1, int32_t targetWidth = 0) noexcept {
     const int32_t yBit = y & 1;
     bool active = ((static_cast<uint32_t>(x ^ y) & 1u) == (frameParity & 1u));
+    // Strategy B branch (P-05 / H-01): hardware sample locations (u_StrategyB / u_SamplingStrategyB / strategyB)
+    const bool strategyB = (shiftDir == 0);
     int32_t qx = 0;
     if ((frameParity & 1u) == 0u || shiftDir == 0) {
         qx = x >> 1;

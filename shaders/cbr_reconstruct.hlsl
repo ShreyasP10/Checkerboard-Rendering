@@ -152,6 +152,8 @@ CbrSample MapPixelToSample(int2 p, uint frameParity) {
     CbrSample s;
     int yBit = p.y & 1;
     s.isActive = (((uint(p.x) ^ uint(p.y)) & 1u) == frameParity);
+    // Strategy B branch (P-05 / H-01): hardware sample locations (u_StrategyB / u_SamplingStrategyB / strategyB)
+    bool strategyB = (g_ShiftDirection == 0);
     int qx;
     if (frameParity == 0u || g_ShiftDirection == 0) {
         qx = p.x >> 1;
