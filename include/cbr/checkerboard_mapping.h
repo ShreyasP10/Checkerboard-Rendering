@@ -103,10 +103,15 @@ constexpr CheckerboardSample MapPixelToSample(int32_t x, int32_t y, uint32_t fra
         // -1 px shift
         qx = (x + 1 - yBit) >> 1;
     }
-    // Item M-17: When targetWidth is specified, unclamped qx outside [0, (targetWidth >> 1) - 1]
-    // has no hardware sample; mark inactive so callers know it's not natively shaded.
-    if (targetWidth > 0 && (qx < 0 || qx >= (targetWidth >> 1))) {
-        active = false;
+    // Item M-17 & Section 6: When targetWidth is specified, unclamped qx outside [0, (targetWidth >> 1) - 1]
+    // has no hardware sample; mark inactive so callers know it's not natively shaded,
+    // and clamp qx to [0, qMaxX] to match GPU compute shader texelFetch clamp.
+    if (targetWidth > 0) {
+        const int32_t qMaxX = (targetWidth >> 1) - 1;
+        if (qx < 0 || qx > qMaxX) {
+            active = false;
+        }
+        qx = (qx < 0) ? 0 : ((qx > qMaxX) ? qMaxX : qx);
     }
     return { active, qx, y >> 1, static_cast<uint32_t>(1 - yBit) };
 }

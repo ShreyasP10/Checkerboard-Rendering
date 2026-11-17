@@ -193,6 +193,9 @@ struct MinimalVkPresentInfoKHR {
 };
 static_assert(sizeof(MinimalVkPresentInfoKHR) == (sizeof(void*) == 8 ? 64 : 32), "VkPresentInfoKHR ABI size drift");
 static_assert(offsetof(MinimalVkPresentInfoKHR, pSwapchains) == (sizeof(void*) == 8 ? 40 : 20), "ABI drift: pSwapchains offset");
+#if defined(_WIN64) || defined(__x86_64__) || defined(__LP64__)
+static_assert(offsetof(MinimalVkPresentInfoKHR, pSwapchains) == 40, "pSwapchains offset must equal 40 on 64-bit targets");
+#endif
 
 // =============================================================================
 // Vulkan Checkerboard Structures & Enums (CHECKERBOARD.md: Vulkan Setup)
