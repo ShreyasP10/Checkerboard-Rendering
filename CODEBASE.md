@@ -82,6 +82,7 @@ This document contains the complete, unabridged source code, shaders, configurat
    - [`docs/cbr-v3-fixes.patch`](#docscbrv3fixespatch)
    - [`docs/cbr-v4-fixes.patch`](#docscbrv4fixespatch)
    - [`docs/checkerboard-rendering-for-real-time-upscaling-on-intel-integrated-graphics.pdf`](#docscheckerboardrenderingforrealtimeupscalingonintelintegratedgraphicspdf)
+   - [`docs/assets/cbr_pipeline_showcase.png`](#docsassetscbrpipelineshowcasepng)
 7. [Vendor Dependency: MinHook Library (`vendor/minhook/`)](#sec-vendor-minhook)
    - [`vendor/minhook/include/MinHook.h`](#vendorminhookincludeminhookh)
    - [`vendor/minhook/src/hook.c`](#vendorminhooksrchookc)
@@ -23249,15 +23250,23 @@ diff -ruN '--exclude=CODEBASE.md' up4/tests/test_engine.cpp v4/tests/test_engine
 
 <a id="docscheckerboardrenderingforrealtimeupscalingonintelintegratedgraphicspdf"></a>
 ### `docs/checkerboard-rendering-for-real-time-upscaling-on-intel-integrated-graphics.pdf`
-> **Note on Binary Reference Document:**
-> This is a binary reference PDF included in the repository as primary technical literature.
+> **Note on Binary Asset / Reference Document:**
+> This is a binary asset included in the repository.
 > 
 > - **File Name:** `docs/checkerboard-rendering-for-real-time-upscaling-on-intel-integrated-graphics.pdf`
 > - **File Size:** 9,407,008 bytes (8.97 MiB)
-> - **Format:** Adobe Portable Document Format (PDF)
+> - **Format:** PDF Binary Data
 > - **SHA-256 Checksum:** `9b6efa043ce278caab758de57151496a8c50969b280757e0ee3a8ed3659751ef`
-> - **Bibliographic Citation:** Mcferron, G., & Lake, A. (Intel Corporation, 2018). *Checkerboard Rendering for Real-Time Upscaling on Intel Integrated Graphics*.
-> - **Summary & Usage:** Reference publication detailing 2× MSAA checkerboard projection, quarter-resolution rendering geometry, viewport sample location alternation, and temporal reprojection reconstruction shaders.
+
+<a id="docsassetscbrpipelineshowcasepng"></a>
+### `docs/assets/cbr_pipeline_showcase.png`
+> **Note on Binary Asset / Reference Document:**
+> This is a binary asset included in the repository.
+> 
+> - **File Name:** `docs/assets/cbr_pipeline_showcase.png`
+> - **File Size:** 1,180,913 bytes (1.13 MiB)
+> - **Format:** PNG Binary Data
+> - **SHA-256 Checksum:** `0ccb290c0979d63eeb517e077b9c4a81b2c407877810015020e0c9a120ebb57a`
 
 <a id="sec-vendor-minhook"></a>
 ## 7. Vendor Dependency: MinHook Library (`vendor/minhook/`)
