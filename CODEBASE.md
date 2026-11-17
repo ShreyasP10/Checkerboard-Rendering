@@ -13568,7 +13568,8 @@ static void TestRenderTargets() {
     CHECK(!r.ShouldBlitReconstructionToSceneColor(nullptr, false, 3840, 2160));
 
     // Section 4.10: Centralized ValidateImageTransfer verification
-    CHECK(RenderTargetManager::ValidateImageTransfer(validColor, validColor, false));
+    const VulkanImageMetadata quarterDstMeta{ 1920, 1080, 97, 2, 0x12 }; // 0x10 COLOR_ATTACHMENT | 0x02 TRANSFER_DST
+    CHECK(RenderTargetManager::ValidateImageTransfer(validColor, quarterDstMeta, false));
     CHECK(!RenderTargetManager::ValidateImageTransfer(validColor, singleSampleColor, false)); // sample count mismatch
     CHECK(RenderTargetManager::ValidateImageTransfer(singleSampleColor, singleSampleColor, true)); // valid 1x color blit
     CHECK(!RenderTargetManager::ValidateImageTransfer(singleSampleColor, depthMetaDst, true)); // color -> depth blit disallowed
