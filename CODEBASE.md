@@ -15907,6 +15907,7 @@ A community-driven native ASI graphics modification implementing **Checkerboard 
   <a href="#download-releases">Releases</a> ·
   <a href="#install">Install</a> ·
   <a href="#why-checkerboard-rendering-cbr-vs-dlss--fsr">Why CBR</a> ·
+  <a href="#pipeline-showcase">Pipeline Showcase</a> ·
   <a href="#how-it-works">How It Works</a> ·
   <a href="#documentation">Docs</a> ·
   <a href="#configuration-cbrini">Configuration</a> ·
@@ -15946,7 +15947,7 @@ Pre-built binaries and complete packages are published via CI on [GitHub Release
 - [Download & Releases](#download-releases)
 - [About](#about)
 - [Why Checkerboard Rendering? (CBR vs. DLSS / FSR)](#why-checkerboard-rendering-cbr-vs-dlss--fsr)
-- [How It Works](#how-it-works)
+- [How It Works & Pipeline Showcase](#how-it-works)
 - [Key Features](#key-features)
 - [Architecture & Repository Structure](#architecture--repository-structure)
 - [Engineering Documentation](#documentation)
@@ -15994,6 +15995,15 @@ Conventional spatial/temporal upscalers operate on uniform, non-MSAA low-resolut
 ---
 
 ## How It Works
+
+<a id="pipeline-showcase"></a>
+<p align="center">
+  <a href="docs/assets/cbr_pipeline_showcase.png" target="_blank">
+    <img src="docs/assets/cbr_pipeline_showcase.png" alt="RDR2 Checkerboard Rendering (CBR) Pipeline Architecture Showcase" width="100%">
+  </a>
+  <br>
+  <sub><strong>Figure 1: RDR2 Checkerboard Rendering (CBR) Pipeline Architecture Showcase (2200×1400)</strong> — Complete execution flow from Vulkan / DirectX 12 scene pass interception and quarter-resolution 2× MSAA geometry rasterization, through alternating subpixel sample unpacking and motion-vector temporal reprojection, to variance-clipped history accumulation and full-resolution scene compositing. <em>(Click image to open in full 2200×1400 resolution)</em></sub>
+</p>
 
 ```text
 Frame N:     [ X ] [   ] [ X ] [   ]  <-- Shaded at Quarter-Res 2× MSAA + Strategy A/B Jitter
@@ -16050,6 +16060,8 @@ Checkerboard-Rendering/
 ├── .github/workflows/build.yml      # CI: unit tests, glslang/dxc shaders, MinGW syntax, Release ZIP
 │
 ├── docs/                            # Engineering specifications, audits & hardware guides
+│   ├── assets/                      # Architectural pipeline diagrams & visual showcases
+│   │   └── cbr_pipeline_showcase.png # 2200×1400 full-pipeline architecture showcase diagram
 │   ├── PRD.md                       # Product Requirements Document
 │   ├── SRD.md                       # System Requirements Document
 │   ├── SRS.md                       # Software Requirements Specification (IEEE 830)
@@ -23264,9 +23276,9 @@ diff -ruN '--exclude=CODEBASE.md' up4/tests/test_engine.cpp v4/tests/test_engine
 > This is a binary asset included in the repository.
 > 
 > - **File Name:** `docs/assets/cbr_pipeline_showcase.png`
-> - **File Size:** 1,180,913 bytes (1.13 MiB)
+> - **File Size:** 822,788 bytes (0.78 MiB)
 > - **Format:** PNG Binary Data
-> - **SHA-256 Checksum:** `0ccb290c0979d63eeb517e077b9c4a81b2c407877810015020e0c9a120ebb57a`
+> - **SHA-256 Checksum:** `adb143ff881822c7ca19f1e2424274173cba7322549a46f0106198e1b18e5902`
 
 <a id="sec-vendor-minhook"></a>
 ## 7. Vendor Dependency: MinHook Library (`vendor/minhook/`)
