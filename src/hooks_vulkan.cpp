@@ -741,23 +741,24 @@ inline bool CanDownscaleCommandBuffer(void* commandBuffer) {
     }
     PassSlot* slot = FindPassSlot(commandBuffer);
     if (!slot) {
-        // vkCmdSetViewport called before vkCmdBeginRenderPass: allow provisional downscale,
-        // which Hooked_vkCmdBeginRenderPass will restore if the renderPass is not a scene pass.
-        return true;
+        // vkCmdSetViewport called before vkCmdBeginRenderPass: do not downscale provisionally;
+        // stash viewport and perform deferred rewrite in Hooked_vkCmdBeginRenderPass once pass is qualified (P-03).
+        return false;
     }
-    // If a render pass is already active on this commandBuffer, verify it is an offscreen HDR+Depth candidate
-    if (slot->activeRenderPass.load(std::memory_order_acquire) != nullptr ||
-        slot->activeFramebuffer.load(std::memory_order_acquire) != nullptr) {
-        if (!slot->hasMatchingExtent.load(std::memory_order_acquire) ||
-            !slot->rpCandidateGeometryPass.load(std::memory_order_acquire) ||
-            slot->colorIsSwapchain.load(std::memory_order_acquire)) {
-            return false;
-        }
-        void* verifiedRp = g_verifiedSceneRenderPass.load(std::memory_order_acquire);
-        void* activeRp   = slot->activeRenderPass.load(std::memory_order_acquire);
-        if (verifiedRp != nullptr && activeRp != nullptr && activeRp != verifiedRp) {
-            return false;
-        }
+    // Only downscale if a render pass is actively running and has been qualified as an offscreen HDR+Depth scene candidate
+    if (slot->activeRenderPass.load(std::memory_order_acquire) == nullptr &&
+        slot->activeFramebuffer.load(std::memory_order_acquire) == nullptr) {
+        return false;
+    }
+    if (!slot->hasMatchingExtent.load(std::memory_order_acquire) ||
+        !slot->rpCandidateGeometryPass.load(std::memory_order_acquire) ||
+        slot->colorIsSwapchain.load(std::memory_order_acquire)) {
+        return false;
+    }
+    void* verifiedRp = g_verifiedSceneRenderPass.load(std::memory_order_acquire);
+    void* activeRp   = slot->activeRenderPass.load(std::memory_order_acquire);
+    if (verifiedRp != nullptr && activeRp != nullptr && activeRp != verifiedRp) {
+        return false;
     }
     return true;
 }
@@ -1319,6 +1320,19 @@ void Hooked_vkCmdSetViewport(void* commandBuffer, uint32_t firstViewport, uint32
         return;
     }
 
+    // Stash pre-pass candidate viewport for deferred rewrite in Hooked_vkCmdBeginRenderPass (P-03)
+    if (viewportCount == 1 &&
+        RenderTargetManager::Get().IsTargetInterceptCandidate(
+            static_cast<uint32_t>(pViewports[0].width),
+            static_cast<uint32_t>(pViewports[0].height),
+            0)) {
+        PassSlot* slot = GetOrCreatePassSlot(commandBuffer);
+        if (slot) {
+            slot->savedViewport = pViewports[0];
+            slot->hasSavedViewport.store(true, std::memory_order_release);
+        }
+    }
+
     g_Original_vkCmdSetViewport(commandBuffer, firstViewport, viewportCount, pViewports);
 }
 
@@ -1350,6 +1364,19 @@ void Hooked_vkCmdSetScissor(void* commandBuffer, uint32_t firstScissor, uint32_t
 
         g_Original_vkCmdSetScissor(commandBuffer, firstScissor, 1, &redirected);
         return;
+    }
+
+    // Stash pre-pass candidate scissor for deferred rewrite in Hooked_vkCmdBeginRenderPass (P-03)
+    if (scissorCount == 1 &&
+        RenderTargetManager::Get().IsTargetInterceptCandidate(
+            pScissors[0].extent.width,
+            pScissors[0].extent.height,
+            0)) {
+        PassSlot* slot = GetOrCreatePassSlot(commandBuffer);
+        if (slot) {
+            slot->savedScissor = pScissors[0];
+            slot->hasSavedScissor.store(true, std::memory_order_release);
+        }
     }
 
     g_Original_vkCmdSetScissor(commandBuffer, firstScissor, scissorCount, pScissors);
@@ -1480,6 +1507,38 @@ void Hooked_vkCmdBeginRenderPass(void* commandBuffer, const void* pRenderPassBeg
     }
 
     g_Original_vkCmdBeginRenderPass(commandBuffer, pRenderPassBegin, contents);
+
+    // Deferred rewrite for pre-pass candidate viewport & scissor (audit C-04 / P-03)
+    if (slot && passCandidate) {
+        if (slot->hasSavedViewport.load(std::memory_order_acquire)) {
+            const auto dims = RenderTargetManager::Get().GetDimensions();
+            MinimalVkViewport redirected = slot->savedViewport;
+            redirected.width = static_cast<float>(dims.quarterWidth);
+            redirected.height = static_cast<float>(dims.quarterHeight);
+            const auto config = CBREngine::Get().GetCachedFrameConfig();
+            const uint32_t currentFrame = CBREngine::Get().GetCurrentFrameIndex();
+            if (config.samplingStrategy == SamplingStrategy::StrategyA &&
+                config.jitterDirection != 0 && PatternScanner::GetCameraProjectionMatrix() == nullptr) {
+                redirected.x += JitterManager::Get().GetQuarterViewportShiftX(currentFrame);
+            }
+            if (g_Original_vkCmdSetViewport) {
+                g_Original_vkCmdSetViewport(commandBuffer, 0u, 1u, &redirected);
+            }
+            slot->viewportDownscaled.store(true, std::memory_order_release);
+            CBREngine::Get().MarkCandidatePassActive(commandBuffer);
+            slot->hasSavedViewport.store(false, std::memory_order_release);
+        }
+        if (slot->hasSavedScissor.load(std::memory_order_acquire)) {
+            const auto dims = RenderTargetManager::Get().GetDimensions();
+            MinimalVkRect2D redirected = slot->savedScissor;
+            redirected.extent.width = dims.quarterWidth;
+            redirected.extent.height = dims.quarterHeight;
+            if (g_Original_vkCmdSetScissor) {
+                g_Original_vkCmdSetScissor(commandBuffer, 0u, 1u, &redirected);
+            }
+            slot->hasSavedScissor.store(false, std::memory_order_release);
+        }
+    }
 
     if (restoreViewport && g_Original_vkCmdSetViewport) {
         g_Original_vkCmdSetViewport(commandBuffer, 0, 1, &restoredVp);
