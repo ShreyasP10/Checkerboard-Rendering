@@ -11442,7 +11442,8 @@ void main() {
             // Variance clipping: clamp history inside [mean - gamma * stdDev, mean + gamma * stdDev]
             vec3 mean = m1 / n;
             vec3 rawStdDev = sqrt(max(vec3(0.0), (m2 / n) - (mean * mean)));
-            vec3 stdDev = max(rawStdDev, vec3(0.005)); // Enforce floor to avoid shadow collapse and retain specular headroom
+            // Enforce floor to avoid shadow collapse in SDR while dynamically scaling with mean in HDR (Section 5.7)
+            vec3 stdDev = max(rawStdDev, max(vec3(0.005), abs(mean) * 0.01));
             const float gamma = 1.25; // kVarianceClipGamma (include/cbr/limits.h)
             vec3 varianceMin = max(colorMin, mean - gamma * stdDev);
             vec3 varianceMax = min(colorMax, mean + gamma * stdDev);
@@ -11998,7 +11999,8 @@ void ResolvePixel(
         if (sampleCount >= 2.0 && n > 1e-4) {
             vec3 mean = m1 / n;
             vec3 rawStdDev = sqrt(max(vec3(0.0), (m2 / n) - (mean * mean)));
-            vec3 stdDev = max(rawStdDev, vec3(0.005));
+            // Enforce floor to avoid shadow collapse in SDR while dynamically scaling with mean in HDR (Section 5.7)
+            vec3 stdDev = max(rawStdDev, max(vec3(0.005), abs(mean) * 0.01));
             const float gamma = 1.25;
             vec3 varianceMin = max(colorMin, mean - gamma * stdDev);
             vec3 varianceMax = min(colorMax, mean + gamma * stdDev);
@@ -12663,7 +12665,8 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
             // Variance clipping: clamp history inside [mean - gamma * stdDev, mean + gamma * stdDev]
             float3 mean = m1 / n;
             float3 rawStdDev = sqrt(max(float3(0.0f, 0.0f, 0.0f), (m2 / n) - (mean * mean)));
-            float3 stdDev = max(rawStdDev, float3(0.005f, 0.005f, 0.005f));
+            // Enforce floor to avoid shadow collapse in SDR while dynamically scaling with mean in HDR (Section 5.7)
+            float3 stdDev = max(rawStdDev, max(float3(0.005f, 0.005f, 0.005f), abs(mean) * 0.01f));
             const float gamma = 1.25f; // kVarianceClipGamma (include/cbr/limits.h)
             float3 varianceMin = max(colorMin, mean - gamma * stdDev);
             float3 varianceMax = min(colorMax, mean + gamma * stdDev);
@@ -14843,8 +14846,9 @@ int main() {
 
     bool failed = false;
 
-    // Execute Frame 0 (parity 0, writes history[1]) and Frame 1 (parity 1, reads history[1] and writes history[0])
-    for (uint32_t frame = 0; frame < 2; ++frame) {
+    // Execute Frame 0 (parity 0, writes history[1]), Frame 1 (parity 1, reads history[1] and writes history[0]),
+    // and Frame 2 (parity 0, reads history[0] and writes history[1]) to verify full ping-pong feedback loop (Section 5.10)
+    for (uint32_t frame = 0; frame < 3; ++frame) {
         jitter.Update(frame);
         pfnResetCmdBuf(cmdBuf, 0);
 
@@ -15012,7 +15016,7 @@ int main() {
     if (pfnDestroyInstance) pfnDestroyInstance(instance, nullptr);
 
     if (failed) return 1;
-    std::cout << "Headless Vulkan compute reconstruction test passed (Frame 0 & Frame 1).\n";
+    std::cout << "Headless Vulkan compute reconstruction test passed (Frames 0, 1 & 2).\n";
     return 0;
 }
 

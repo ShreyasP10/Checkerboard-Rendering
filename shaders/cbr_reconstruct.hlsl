@@ -440,7 +440,8 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadId : 
             // Variance clipping: clamp history inside [mean - gamma * stdDev, mean + gamma * stdDev]
             float3 mean = m1 / n;
             float3 rawStdDev = sqrt(max(float3(0.0f, 0.0f, 0.0f), (m2 / n) - (mean * mean)));
-            float3 stdDev = max(rawStdDev, float3(0.005f, 0.005f, 0.005f));
+            // Enforce floor to avoid shadow collapse in SDR while dynamically scaling with mean in HDR (Section 5.7)
+            float3 stdDev = max(rawStdDev, max(float3(0.005f, 0.005f, 0.005f), abs(mean) * 0.01f));
             const float gamma = 1.25f; // kVarianceClipGamma (include/cbr/limits.h)
             float3 varianceMin = max(colorMin, mean - gamma * stdDev);
             float3 varianceMax = min(colorMax, mean + gamma * stdDev);

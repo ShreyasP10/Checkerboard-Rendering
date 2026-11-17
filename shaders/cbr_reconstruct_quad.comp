@@ -368,7 +368,8 @@ void ResolvePixel(
         if (sampleCount >= 2.0 && n > 1e-4) {
             vec3 mean = m1 / n;
             vec3 rawStdDev = sqrt(max(vec3(0.0), (m2 / n) - (mean * mean)));
-            vec3 stdDev = max(rawStdDev, vec3(0.005));
+            // Enforce floor to avoid shadow collapse in SDR while dynamically scaling with mean in HDR (Section 5.7)
+            vec3 stdDev = max(rawStdDev, max(vec3(0.005), abs(mean) * 0.01));
             const float gamma = 1.25;
             vec3 varianceMin = max(colorMin, mean - gamma * stdDev);
             vec3 varianceMax = min(colorMax, mean + gamma * stdDev);
